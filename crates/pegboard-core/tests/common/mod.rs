@@ -195,12 +195,13 @@ pub async fn session_fixture() -> SessionFixture {
     let upstream = Arc::new(WsUpstream {
         browser_ws_url: browser.ws_url.clone(),
     });
-    let proxy = ProxyServer::start(upstream, bridge.clone()).await.unwrap();
+    let proxy = ProxyServer::start(upstream).await.unwrap();
     let session = pegboard_protocol::SessionId::generate();
     let endpoint = proxy.register(
         &session,
         &agent_context,
         group.clone(),
+        bridge.clone(),
         vec![first_target.clone()],
     );
     SessionFixture {

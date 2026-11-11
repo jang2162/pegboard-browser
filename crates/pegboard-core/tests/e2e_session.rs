@@ -9,7 +9,9 @@ use pegboard_core::cdp::page_targets;
 use pegboard_core::profiles::Profiles;
 use pegboard_core::proxy::server::{ProxyServer, WsUpstream};
 use pegboard_core::session::SessionManager;
-use pegboard_protocol::{codes, SessionCloseParams, SessionCreateParams, SessionId, SessionState};
+use pegboard_protocol::{
+    codes, ProfileKind, SessionCloseParams, SessionCreateParams, SessionId, SessionState,
+};
 use serde_json::{json, Value};
 
 /// A launched browser, a proxy and a session manager. Everything is killed when this is
@@ -18,7 +20,7 @@ use serde_json::{json, Value};
 struct Harness {
     manager: SessionManager,
     proxy: Arc<ProxyServer>,
-    /// Bridge of the default agent profile (the one the proxy was started with).
+    /// Bridge of the default agent profile, for the tests' own checks.
     bridge: Arc<Bridge>,
     browser: Arc<Browser>,
     fixture: common::Fixture,
@@ -36,7 +38,7 @@ impl Harness {
         let upstream = Arc::new(WsUpstream {
             browser_ws_url: browser.ws_url.clone(),
         });
-        let proxy = Arc::new(ProxyServer::start(upstream, bridge.clone()).await.unwrap());
+        let proxy = Arc::new(ProxyServer::start(upstream).await.unwrap());
         let mut profiles = Profiles::load(&env.paths).unwrap();
         for name in named {
             profiles.create(name).unwrap();
@@ -475,6 +477,171 @@ async fn unknown_profile_is_an_error() {
     assert_eq!(
         h.manager.open_profile("nope").await.unwrap_err().code,
         codes::PROFILE_NOT_FOUND
+    );
+    h.shutdown().await;
+}
+
+/// Clicks the `/opener` page's button in `target` (a user gesture), opening a popup.
+async fn click_open(b: &Browser, target: &str) {
+    let s = b.conn.attach(target).await.unwrap();
+    b.conn
+        .send(
+            "Runtime.evaluate",
+            json!({ "expression": "document.getElementById('open').click()", "userGesture": true }),
+            Some(&s),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn popup_of_session_a_is_not_adopted_by_session_b() {
+    let h = Harness::start(&[]).await;
+    let a = h
+        .manager
+        .create(params(Some("a"), Some(h.url("/opener")), None))
+        .await
+        .unwrap();
+    let b = h
+        .manager
+        .create(params(Some("b"), Some(h.url("/counter")), None))
+        .await
+        .unwrap();
+    let opener = a.targets[0].clone();
+    click_open(&h.browser, &opener).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut popup = None;
+    while tokio::time::Instant::now() < deadline {
+        let in_b = h.manager.info(&b.id).unwrap().targets;
+        assert_eq!(in_b, b.targets, "session b changed");
+        popup = h
+            .manager
+            .info(&a.id)
+            .unwrap()
+            .targets
+            .into_iter()
+            .find(|t| *t != opener);
+        if popup.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let popup = popup.expect("the popup did not join session a within 3 s");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!h.manager.info(&b.id).unwrap().targets.contains(&popup));
+    assert!(!h.proxy.targets(&b.id).contains(&popup));
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn popup_in_the_human_profile_is_never_adopted() {
+    let h = Harness::start(&[]).await;
+    let session = h
+        .manager
+        .create(params(None, Some(h.url("/opener")), None))
+        .await
+        .unwrap();
+    let human = page_targets(&h.browser.conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.browser_context_id.as_deref() == Some(h.browser.human_context.as_str()))
+        .expect("no human page")
+        .target_id;
+    let s = h.browser.conn.attach(&human).await.unwrap();
+    h.browser
+        .conn
+        .navigate(&s, &h.url("/opener"))
+        .await
+        .unwrap();
+    click_open(&h.browser, &human).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let popup = loop {
+        let found = page_targets(&h.browser.conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.opener_id.as_deref() == Some(human.as_str()));
+        if let Some(t) = found {
+            break t.target_id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the human popup did not open"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        common::context_of(&h.browser.conn, &popup).await,
+        h.browser.human_context
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for info in h.manager.list() {
+        assert!(!info.targets.contains(&popup), "{info:?}");
+    }
+    let focused = h.manager.focused_targets();
+    assert!(!focused.contains(&popup), "{focused:?}");
+    assert!(!focused.contains(&human), "{focused:?}");
+    // The view does show the session's own tab.
+    assert!(focused.contains(&session.targets[0]), "{focused:?}");
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn profile_cannot_be_deleted_while_a_session_uses_it() {
+    let h = Harness::start(&[]).await;
+    let created = h.manager.create_profile("work").await.unwrap();
+    assert_eq!(created.name, "work");
+    assert_eq!(created.kind, ProfileKind::Named);
+    assert!(created.sessions.is_empty());
+    let s = h
+        .manager
+        .create(params(None, None, Some("work")))
+        .await
+        .unwrap();
+    let listed = h.manager.list_profiles().await;
+    assert_eq!(
+        listed.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        vec!["default", "work"]
+    );
+    assert_eq!(listed[0].kind, ProfileKind::Default);
+    assert!(listed[0].sessions.is_empty());
+    assert_eq!(listed[1].sessions, vec![s.id.clone()]);
+    assert_eq!(
+        h.manager.delete_profile("work").await.unwrap_err().code,
+        codes::PROFILE_IN_USE
+    );
+    assert_eq!(
+        h.manager.delete_profile("default").await.unwrap_err().code,
+        codes::INVALID_PARAMS
+    );
+    h.manager
+        .close(SessionCloseParams {
+            session_id: s.id.clone(),
+            keep_tabs: false,
+        })
+        .await
+        .unwrap();
+    h.manager.delete_profile("work").await.unwrap();
+    assert_eq!(
+        h.manager
+            .create(params(None, None, Some("work")))
+            .await
+            .unwrap_err()
+            .code,
+        codes::PROFILE_NOT_FOUND
+    );
+    assert_eq!(
+        h.manager.delete_profile("work").await.unwrap_err().code,
+        codes::PROFILE_NOT_FOUND
+    );
+    // The registry on disk agrees.
+    assert_eq!(
+        Profiles::load(&h.env.paths).unwrap().list(),
+        vec!["default"]
     );
     h.shutdown().await;
 }

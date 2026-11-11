@@ -118,9 +118,8 @@ struct SessionEntry {
     token: String,
     /// Chrome deletes a group with its last tab; the session can then move to a new one.
     group: Mutex<GroupId>,
-    /// Bridge of the profile the session lives in, which creates its tabs; `None` means
-    /// the server's own bridge.
-    bridge: Option<Arc<Bridge>>,
+    /// Bridge of the profile the session lives in; it creates the session's tabs.
+    bridge: Arc<Bridge>,
     scope: Mutex<Scope>,
     /// Set to true when the session is unregistered; client connections then close.
     closed: watch::Sender<bool>,
@@ -132,7 +131,7 @@ impl SessionEntry {
         token: String,
         context: &str,
         group: GroupId,
-        bridge: Option<Arc<Bridge>>,
+        bridge: Arc<Bridge>,
         targets: Vec<String>,
     ) -> SessionEntry {
         SessionEntry {
@@ -157,8 +156,6 @@ pub type TargetAdded = Arc<dyn Fn(&SessionId, &str) + Send + Sync>;
 
 struct Shared {
     upstream: Arc<dyn Upstream>,
-    /// Bridge for sessions registered without their own (`register`).
-    bridge: Arc<Bridge>,
     sessions: Sessions,
     on_target_added: Mutex<Option<TargetAdded>>,
     /// Client connections whose upstream is open.
@@ -175,14 +172,13 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
-    pub async fn start(upstream: Arc<dyn Upstream>, bridge: Arc<Bridge>) -> Result<ProxyServer> {
+    pub async fn start(upstream: Arc<dyn Upstream>) -> Result<ProxyServer> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .context("binding the session endpoint listener")?;
         let port = listener.local_addr()?.port();
         let shared = Arc::new(Shared {
             upstream,
-            bridge,
             sessions: Mutex::new(HashMap::new()),
             on_target_added: Mutex::new(None),
             connections: Arc::new(AtomicUsize::new(0)),
@@ -210,38 +206,16 @@ impl ProxyServer {
         })
     }
 
-    /// Registers a session scope whose tabs the server's own bridge creates. Targets and
-    /// CDP sessions are tracked inside the server from then on. Registering an id again
-    /// replaces its scope and token and drops its old clients.
+    /// Registers a session scope; `bridge` (the bridge of the profile `context` belongs
+    /// to) creates its tabs. Targets and CDP sessions are tracked inside the server from
+    /// then on. Registering an id again replaces its scope and token and drops its old
+    /// clients.
     pub fn register(
         &self,
         id: &SessionId,
         context: &str,
         group: GroupId,
-        initial_targets: Vec<String>,
-    ) -> Endpoint {
-        self.register_entry(id, context, group, None, initial_targets)
-    }
-
-    /// Like `register`, for a session whose tabs `bridge` creates (the bridge of the
-    /// profile `context` belongs to).
-    pub fn register_with_bridge(
-        &self,
-        id: &SessionId,
-        context: &str,
-        group: GroupId,
         bridge: Arc<Bridge>,
-        initial_targets: Vec<String>,
-    ) -> Endpoint {
-        self.register_entry(id, context, group, Some(bridge), initial_targets)
-    }
-
-    fn register_entry(
-        &self,
-        id: &SessionId,
-        context: &str,
-        group: GroupId,
-        bridge: Option<Arc<Bridge>>,
         initial_targets: Vec<String>,
     ) -> Endpoint {
         let token = new_token();
@@ -455,8 +429,22 @@ async fn respond_status(sock: &mut TcpStream, status: &str) {
     let _ = sock.shutdown().await;
 }
 
+/// What the handshake needs to know about a registered session.
+trait Authorizable {
+    fn token(&self) -> &str;
+}
+
+impl Authorizable for SessionEntry {
+    fn token(&self) -> &str {
+        &self.token
+    }
+}
+
 /// The session the request may connect to, or the HTTP status to refuse it with.
-fn authorize(sessions: &Sessions, head: &RequestHead) -> Result<Arc<SessionEntry>, &'static str> {
+fn authorize<E: Authorizable>(
+    sessions: &Mutex<HashMap<String, Arc<E>>>,
+    head: &RequestHead,
+) -> Result<Arc<E>, &'static str> {
     if !head.has_token("upgrade", "websocket") {
         return Err("404 Not Found");
     }
@@ -472,7 +460,7 @@ fn authorize(sessions: &Sessions, head: &RequestHead) -> Result<Arc<SessionEntry
         .single("authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(UNAUTHORIZED)?;
-    if !bool::from(presented.as_bytes().ct_eq(entry.token.as_bytes())) {
+    if !bool::from(presented.as_bytes().ct_eq(entry.token().as_bytes())) {
         return Err(UNAUTHORIZED);
     }
     if head.method != "GET"
@@ -822,11 +810,7 @@ impl ClientConn {
             }
             ClientDecision::CreateTab { url } => {
                 self.tabs_in_flight += 1;
-                let bridge = self
-                    .entry
-                    .bridge
-                    .clone()
-                    .unwrap_or_else(|| self.shared.bridge.clone());
+                let bridge = self.entry.bridge.clone();
                 let group = self.entry.group.lock().unwrap().clone();
                 let tx = self.tab_tx.clone();
                 let delay = self.tab_delay;
@@ -1178,15 +1162,16 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const ID: &str = "s_abcdefgh";
 
-    fn sessions() -> Sessions {
-        let entry = SessionEntry::new(
-            SessionId(ID.into()),
-            TOKEN.into(),
-            "AGENT",
-            GroupId(1),
-            None,
-            vec![],
-        );
+    struct TestEntry(String);
+
+    impl Authorizable for TestEntry {
+        fn token(&self) -> &str {
+            &self.0
+        }
+    }
+
+    fn sessions() -> Mutex<HashMap<String, Arc<TestEntry>>> {
+        let entry = TestEntry(TOKEN.into());
         Mutex::new(HashMap::from([(ID.to_string(), Arc::new(entry))]))
     }
 

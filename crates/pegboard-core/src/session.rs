@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use pegboard_protocol::{
-    codes, RpcError, SessionCloseParams, SessionCreateParams, SessionId, SessionInfo, SessionState,
+    codes, ProfileInfo, ProfileKind, RpcError, SessionCloseParams, SessionCreateParams, SessionId,
+    SessionInfo, SessionState,
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, OnceCell};
@@ -98,13 +99,39 @@ struct Table {
     records: HashMap<SessionId, SessionRecord>,
     /// Every id handed out by this manager, so an id (and its recording id) is never reused.
     issued: HashSet<SessionId>,
+    /// Sessions being created that have no record yet, with their profile. Together with
+    /// `records` this is what keeps a profile in use.
+    creating: HashMap<SessionId, String>,
     next_seq: u64,
+}
+
+impl Table {
+    fn profile_in_use(&self, name: &str) -> bool {
+        self.records.values().any(|r| r.info.profile == name)
+            || self.creating.values().any(|p| p == name)
+    }
+}
+
+/// A session id reserved by `create` in a profile; the profile stays in use until the
+/// reservation is dropped (by then the session has a record, or never will).
+struct Reservation {
+    inner: Arc<Inner>,
+    id: SessionId,
+    seq: u64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.inner.table.lock().unwrap().creating.remove(&self.id);
+    }
 }
 
 struct Inner {
     browser: Arc<Browser>,
     proxy: Arc<ProxyServer>,
-    profiles: Mutex<Profiles>,
+    /// Held while the registry changes or `create` checks a profile and reserves a session
+    /// in it, so a profile cannot be deleted while a session is being created in it.
+    profiles: tokio::sync::Mutex<Profiles>,
     paths: Paths,
     cfg: BrowserConfig,
     /// Profile name -> its runtime. The async lock also keeps two callers from opening
@@ -142,7 +169,7 @@ impl SessionManager {
         let inner = Arc::new(Inner {
             browser,
             proxy,
-            profiles: Mutex::new(profiles),
+            profiles: tokio::sync::Mutex::new(profiles),
             paths,
             cfg,
             runtimes: tokio::sync::Mutex::new(HashMap::new()),
@@ -166,24 +193,12 @@ impl SessionManager {
     pub async fn create(&self, p: SessionCreateParams) -> Result<SessionInfo, RpcError> {
         let inner = &self.inner;
         let profile = p.profile.as_deref().unwrap_or(DEFAULT_PROFILE).to_string();
-        inner.check_profile(&profile)?;
+        let reservation = self.reserve(&profile).await?;
+        let (id, seq) = (reservation.id.clone(), reservation.seq);
         let url = p.url.as_deref().map(checked_url).transpose()?;
         inner.ensure_discovery().await?;
         let runtime = inner.runtime(&profile).await?;
 
-        let (id, seq) = {
-            let mut table = inner.table.lock().unwrap();
-            let id = loop {
-                let id = SessionId::generate();
-                if !table.issued.contains(&id) {
-                    break id;
-                }
-            };
-            table.issued.insert(id.clone());
-            let seq = table.next_seq;
-            table.next_seq += 1;
-            (id, seq)
-        };
         let title = group_title(p.name.as_deref(), &id);
         let color = group_color(usize::try_from(seq).unwrap_or(0));
         let (group, first) = runtime
@@ -191,9 +206,19 @@ impl SessionManager {
             .create_group(&title, color)
             .await
             .map_err(browser_failed)?;
+        // The id comes from the extension, not from the browser: it enters the scope only
+        // once the browser confirms it is in the profile. If not, it is not touched; only
+        // the group's members are closed (through the bridge, which refuses foreign tabs).
+        let conn = &inner.browser.conn;
+        if let Err(e) = require_context(conn, &first, &runtime.context).await {
+            if let Ok(members) = runtime.bridge.members(&group).await {
+                let _ = close_tabs(conn, &runtime.bridge, &members.into_iter().collect()).await;
+            }
+            return Err(e);
+        }
 
         // From here on a failure must take back everything made so far.
-        let endpoint = inner.proxy.register_with_bridge(
+        let endpoint = inner.proxy.register(
             &id,
             &runtime.context,
             group.clone(),
@@ -239,6 +264,29 @@ impl SessionManager {
         let record = table.records.get_mut(&id).ok_or_else(|| not_found(&id))?;
         record.ready = true;
         Ok(inner.info_of(record))
+    }
+
+    /// Checks the profile and reserves a new session id in it, in the critical section
+    /// `delete_profile` uses.
+    async fn reserve(&self, profile: &str) -> Result<Reservation, RpcError> {
+        let profiles = self.inner.profiles.lock().await;
+        check_profile(&profiles, profile)?;
+        let mut table = self.inner.table.lock().unwrap();
+        let id = loop {
+            let id = SessionId::generate();
+            if !table.issued.contains(&id) {
+                break id;
+            }
+        };
+        table.issued.insert(id.clone());
+        table.creating.insert(id.clone(), profile.to_string());
+        let seq = table.next_seq;
+        table.next_seq += 1;
+        Ok(Reservation {
+            inner: self.inner.clone(),
+            id,
+            seq,
+        })
     }
 
     /// Open sessions, oldest first.
@@ -319,21 +367,7 @@ impl SessionManager {
             if navigate {
                 open_url(&inner.browser.conn, &target, &url).await?;
             }
-            let r = inner
-                .browser
-                .conn
-                .send("Target.getTargetInfo", json!({ "targetId": target }), None)
-                .await
-                .map_err(browser_failed)?;
-            if r.pointer("/targetInfo/browserContextId")
-                .and_then(Value::as_str)
-                != Some(context.as_str())
-            {
-                return Err(rpc_error(
-                    codes::INTERNAL,
-                    "the new tab was not created in the session's profile",
-                ));
-            }
+            require_context(&inner.browser.conn, &target, &context).await?;
             inner.ensure_focus(&target).await.map_err(browser_failed)?;
             if !inner.proxy.add_target(id, &target) {
                 return Err(not_found(id));
@@ -341,12 +375,10 @@ impl SessionManager {
             Ok(())
         };
         if let Err(e) = added.await {
-            inner.focus.lock().unwrap().remove(&target);
-            let _ = inner
-                .browser
-                .conn
-                .send("Target.closeTarget", json!({ "targetId": target }), None)
-                .await;
+            inner.release_focus(&target).await;
+            // Through the bridge, which refuses a tab outside its profile.
+            let tabs = BTreeSet::from([target]);
+            let _ = close_tabs(&inner.browser.conn, &bridge, &tabs).await;
             return Err(e);
         }
         Ok(target)
@@ -354,7 +386,7 @@ impl SessionManager {
 
     /// Opens a window of the profile (and its bridge) if it has none.
     pub async fn open_profile(&self, name: &str) -> Result<(), RpcError> {
-        self.inner.check_profile(name)?;
+        check_profile(&*self.inner.profiles.lock().await, name)?;
         self.inner.runtime(name).await.map(drop)
     }
 
@@ -365,9 +397,88 @@ impl SessionManager {
         }
     }
 
-    /// The profile registry, for listing, creating and deleting profiles.
-    pub fn with_profiles<R>(&self, f: impl FnOnce(&mut Profiles) -> R) -> R {
-        f(&mut self.inner.profiles.lock().unwrap())
+    /// Every profile with the ids of its open sessions (oldest first).
+    pub async fn list_profiles(&self) -> Vec<ProfileInfo> {
+        let names = self.inner.profiles.lock().await.list();
+        let table = self.inner.table.lock().unwrap();
+        let mut records: Vec<&SessionRecord> = table.records.values().filter(|r| r.ready).collect();
+        records.sort_by_key(|r| r.seq);
+        names
+            .into_iter()
+            .map(|name| ProfileInfo {
+                sessions: records
+                    .iter()
+                    .filter(|r| r.info.profile == name)
+                    .map(|r| r.info.id.clone())
+                    .collect(),
+                kind: profile_kind(&name),
+                name,
+            })
+            .collect()
+    }
+
+    pub async fn create_profile(&self, name: &str) -> Result<ProfileInfo, RpcError> {
+        self.inner.profiles.lock().await.create(name)?;
+        Ok(ProfileInfo {
+            name: name.to_string(),
+            kind: profile_kind(name),
+            sessions: Vec::new(),
+        })
+    }
+
+    /// Refused with profile_in_use while a session uses the profile or is being created in it.
+    pub async fn delete_profile(&self, name: &str) -> Result<(), RpcError> {
+        let mut profiles = self.inner.profiles.lock().await;
+        let in_use = self.inner.table.lock().unwrap().profile_in_use(name);
+        profiles.delete(name, in_use)
+    }
+
+    /// Targets the daemon holds (or is attaching) a focus-emulation session on, sorted.
+    #[doc(hidden)]
+    pub fn focused_targets(&self) -> Vec<String> {
+        let mut targets: Vec<String> = self.inner.focus.lock().unwrap().keys().cloned().collect();
+        targets.sort();
+        targets
+    }
+}
+
+fn profile_kind(name: &str) -> ProfileKind {
+    if name == DEFAULT_PROFILE {
+        ProfileKind::Default
+    } else {
+        ProfileKind::Named
+    }
+}
+
+/// Profile names come from callers: they are checked before any use.
+fn check_profile(profiles: &Profiles, name: &str) -> Result<(), RpcError> {
+    if valid_profile_name(name) && profiles.exists(name) {
+        Ok(())
+    } else {
+        Err(rpc_error(
+            codes::PROFILE_NOT_FOUND,
+            format!("no profile named {name:?}"),
+        ))
+    }
+}
+
+/// The browser's word on which profile a tab is in; ids reported by the bridge are only
+/// trusted after this.
+async fn require_context(conn: &CdpConn, target: &str, context: &str) -> Result<(), RpcError> {
+    let r = conn
+        .send("Target.getTargetInfo", json!({ "targetId": target }), None)
+        .await
+        .map_err(browser_failed)?;
+    if r.pointer("/targetInfo/browserContextId")
+        .and_then(Value::as_str)
+        == Some(context)
+    {
+        Ok(())
+    } else {
+        Err(rpc_error(
+            codes::BROWSER_FAILED,
+            "the bridge reported a tab that is not in the session's profile",
+        ))
     }
 }
 
@@ -384,18 +495,6 @@ impl Inner {
         let mut info = record.info.clone();
         info.targets = self.proxy.targets(&info.id);
         info
-    }
-
-    /// Profile names come from callers: they are checked before any use.
-    fn check_profile(&self, name: &str) -> Result<(), RpcError> {
-        if valid_profile_name(name) && self.profiles.lock().unwrap().exists(name) {
-            Ok(())
-        } else {
-            Err(rpc_error(
-                codes::PROFILE_NOT_FOUND,
-                format!("no profile named {name:?}"),
-            ))
-        }
     }
 
     async fn ensure_discovery(&self) -> Result<(), RpcError> {
