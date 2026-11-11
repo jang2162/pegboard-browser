@@ -1,0 +1,10 @@
+{
+  "name": "pegboard-spikes",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway phase 0 experiments. Not product code.",
+  "dependencies": {
+    "agent-browser": "0.42.0",
+    "ws": "^8"
+  }
+}

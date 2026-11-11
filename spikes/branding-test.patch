@@ -1,0 +1,12 @@
+diff --git a/chrome/app/theme/chromium/BRANDING b/chrome/app/theme/chromium/BRANDING
+index f8363d5b29..7844049c77 100644
+--- a/chrome/app/theme/chromium/BRANDING
++++ b/chrome/app/theme/chromium/BRANDING
+@@ -1,6 +1,6 @@
+ COMPANY_FULLNAME=The Chromium Authors
+ COMPANY_SHORTNAME=The Chromium Authors
+-PRODUCT_FULLNAME=Chromium
++PRODUCT_FULLNAME=Pegboard
+ PRODUCT_SHORTNAME=Chromium
+ PRODUCT_INSTALLER_FULLNAME=Chromium Installer
+ PRODUCT_INSTALLER_SHORTNAME=Chromium Installer

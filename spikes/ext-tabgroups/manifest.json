@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "Pegboard spike: tab groups",
+  "version": "0.0.1",
+  "description": "Throwaway phase 0 experiment. Not product code.",
+  "permissions": ["tabs", "tabGroups", "debugger"],
+  "background": { "service_worker": "sw.js" }
+}
