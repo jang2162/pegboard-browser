@@ -15,3 +15,5 @@ anyhow = "1"
 rand = "0.8"
 time = { version = "0.3", features = ["formatting", "serde"] }
 tempfile = "3"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"

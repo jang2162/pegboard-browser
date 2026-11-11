@@ -1,0 +1,225 @@
+//! Launch and supervise the headed Chrome that pegboard drives.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::json;
+use tokio::process::{Child, Command};
+
+use crate::cdp::{page_targets, CdpConn};
+use crate::paths::{ensure, Paths};
+
+pub const HUMAN_PROFILE_DIR: &str = "Default";
+
+#[derive(Debug, Clone)]
+pub struct BrowserConfig {
+    pub chrome: PathBuf,
+    pub extension_dir: PathBuf,
+}
+
+/// `$PEGBOARD_CHROME`, else the newest Chrome for Testing under `~/.agent-browser/browsers`.
+pub fn find_chrome() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("PEGBOARD_CHROME") {
+        return Ok(PathBuf::from(p));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    let root = PathBuf::from(home).join(".agent-browser/browsers");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .with_context(|| format!("reading {}", root.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("chrome-"))
+        })
+        .collect();
+    // Version numbers compare numerically, not lexicographically.
+    dirs.sort_by_key(|p| version_key(p));
+    for dir in dirs.iter().rev() {
+        let bin = dir
+            .join("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing");
+        if bin.exists() {
+            return Ok(bin);
+        }
+    }
+    bail!("no Chrome found under {}; set PEGBOARD_CHROME", root.display())
+}
+
+fn version_key(p: &std::path::Path) -> Vec<u64> {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .trim_start_matches("chrome-")
+        .split('.')
+        .map(|c| c.parse().unwrap_or(0))
+        .collect()
+}
+
+pub struct Browser {
+    pub pid: u32,
+    pub ws_url: String,
+    pub conn: CdpConn,
+    pub human_context: String,
+    child: Child,
+    /// profile directory -> browserContextId, for profiles whose window we opened.
+    profiles: Mutex<HashMap<String, String>>,
+}
+
+impl Browser {
+    pub async fn launch(paths: &Paths, cfg: &BrowserConfig) -> Result<Browser> {
+        ensure(paths)?;
+        let port_file = paths.chrome_udd.join("DevToolsActivePort");
+        let _ = std::fs::remove_file(&port_file);
+        let mut child = Command::new(&cfg.chrome)
+            .arg(format!("--user-data-dir={}", paths.chrome_udd.display()))
+            .arg(format!("--profile-directory={HUMAN_PROFILE_DIR}"))
+            .arg("--remote-debugging-port=0")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg(format!("--load-extension={}", cfg.extension_dir.display()))
+            .arg("--disable-features=DisableLoadExtensionCommandLineSwitch")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("starting {}", cfg.chrome.display()))?;
+        let pid = child.id().ok_or_else(|| anyhow!("chrome exited immediately"))?;
+
+        let ws_url = match wait_for_ws_url(&port_file, &mut child).await {
+            Ok(u) => u,
+            Err(e) => {
+                let _ = child.kill().await;
+                return Err(e);
+            }
+        };
+        let setup = async {
+            let conn = CdpConn::connect(&ws_url).await?;
+            let human_context = wait_for_first_context(&conn).await?;
+            anyhow::Ok((conn, human_context))
+        };
+        let (conn, human_context) = match setup.await {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = child.kill().await;
+                return Err(e);
+            }
+        };
+        Ok(Browser {
+            pid,
+            ws_url,
+            conn,
+            human_context,
+            child,
+            profiles: Mutex::new(HashMap::from([(
+                HUMAN_PROFILE_DIR.to_string(),
+                String::new(),
+            )])),
+        })
+    }
+
+    /// Opens (or focuses) a window of `profile_dir` and returns that profile's browserContextId.
+    pub async fn open_profile_window(
+        &self,
+        paths: &Paths,
+        cfg: &BrowserConfig,
+        profile_dir: &str,
+    ) -> Result<String> {
+        if profile_dir == HUMAN_PROFILE_DIR {
+            return Ok(self.human_context.clone());
+        }
+        let known = self.profiles.lock().unwrap().get(profile_dir).cloned();
+        if let Some(ctx) = known {
+            let live = page_targets(&self.conn).await?;
+            if live.iter().any(|t| t.browser_context_id.as_deref() == Some(&ctx)) {
+                return Ok(ctx);
+            }
+        }
+        let before: Vec<String> = page_targets(&self.conn)
+            .await?
+            .into_iter()
+            .map(|t| t.target_id)
+            .collect();
+        // Invoking the binary again with the same user data dir hands the request to the
+        // running browser and exits.
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            Command::new(&cfg.chrome)
+                .arg(format!("--user-data-dir={}", paths.chrome_udd.display()))
+                .arg(format!("--profile-directory={profile_dir}"))
+                .arg("--no-first-run")
+                .arg("--new-window")
+                .arg("about:blank")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await
+        .map_err(|_| anyhow!("opening profile window timed out"))?
+        .context("invoking chrome for profile window")?;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let now = page_targets(&self.conn).await?;
+            if let Some(t) = now.iter().find(|t| !before.contains(&t.target_id)) {
+                let ctx = t
+                    .browser_context_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("new page target has no browserContextId"))?;
+                self.profiles
+                    .lock()
+                    .unwrap()
+                    .insert(profile_dir.to_string(), ctx.clone());
+                return Ok(ctx);
+            }
+        }
+        bail!("no window appeared for profile {profile_dir}")
+    }
+
+    /// `Browser.close`, then SIGKILL after 5 s.
+    pub async fn shutdown(mut self) -> Result<()> {
+        let _ = self.conn.send("Browser.close", json!({}), None).await;
+        match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
+            Ok(r) => {
+                r?;
+            }
+            Err(_) => {
+                self.child.kill().await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn wait_for_ws_url(port_file: &std::path::Path, child: &mut Child) -> Result<String> {
+    for _ in 0..150 {
+        if let Ok(text) = std::fs::read_to_string(port_file) {
+            let mut lines = text.lines();
+            if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
+                return Ok(format!("ws://127.0.0.1:{}{}", port.trim(), path.trim()));
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!("chrome exited during startup: {status}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("DevToolsActivePort was not written within 15s")
+}
+
+/// The first page target present after launch belongs to the human profile.
+async fn wait_for_first_context(conn: &CdpConn) -> Result<String> {
+    for _ in 0..100 {
+        let pages = page_targets(conn).await?;
+        if let Some(ctx) = pages.iter().find_map(|t| t.browser_context_id.clone()) {
+            return Ok(ctx);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("no page target appeared after launch")
+}

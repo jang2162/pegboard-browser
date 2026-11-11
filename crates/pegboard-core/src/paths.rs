@@ -24,6 +24,12 @@ pub fn paths() -> Paths {
         None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
             .join("Library/Application Support/Pegboard"),
     };
+    paths_in(&home)
+}
+
+/// Layout for an explicit home directory (no environment lookup).
+pub fn paths_in(home: &Path) -> Paths {
+    let home = home.to_path_buf();
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
     Paths {

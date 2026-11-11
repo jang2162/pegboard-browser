@@ -13,6 +13,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 time.workspace = true
 libc = "0.2"
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
