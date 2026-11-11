@@ -229,6 +229,11 @@ impl Runner {
         *self.targets.lock().unwrap() = Some(Arc::new(f));
     }
 
+    /// `set_session_targets` with an already shared provider (`SessionManager::targets_fn`).
+    pub fn set_session_targets_provider(&self, f: SessionTargets) {
+        *self.targets.lock().unwrap() = Some(f);
+    }
+
     /// Called once right after session creation: attaches agent-browser and turns its stream
     /// server off (see `start_daemon`), then checks that it is still off now that the daemon
     /// is connected to the session.
@@ -304,11 +309,16 @@ impl Runner {
             return false;
         };
         let live = targets(id);
-        let bound = std::fs::read_to_string(self.daemon_file(id, "target"))
+        let bound = self.bound_target(id);
+        live.is_empty() || bound.is_some_and(|b| !live.contains(&b))
+    }
+
+    /// The tab agent-browser's daemon is bound to (from its `.target` file), if it has one.
+    pub fn bound_target(&self, id: &SessionId) -> Option<String> {
+        std::fs::read_to_string(self.daemon_file(id, "target"))
             .ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .and_then(|v| v.get("targetId").and_then(Value::as_str).map(String::from));
-        live.is_empty() || bound.is_some_and(|b| !live.contains(&b))
+            .and_then(|v| v.get("targetId").and_then(Value::as_str).map(String::from))
     }
 
     /// Makes sure the session's daemon runs with its stream server off.
@@ -588,11 +598,13 @@ fn last_json_line(stdout: &str) -> Value {
     serde_json::from_str(last).unwrap_or_else(|_| Value::String(stdout.trim().to_string()))
 }
 
-fn succeeded(r: &CommandExecResult) -> bool {
+/// The command ran and reported success.
+pub fn succeeded(r: &CommandExecResult) -> bool {
     r.exit_code == 0 && r.output.get("success") != Some(&Value::Bool(false))
 }
 
-fn failure_text(r: &CommandExecResult) -> String {
+/// What a failed command said: its `error`, else its stderr.
+pub fn failure_text(r: &CommandExecResult) -> String {
     match r.output.get("error") {
         Some(Value::String(s)) => s.clone(),
         Some(v) => v.to_string(),

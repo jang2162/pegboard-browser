@@ -390,6 +390,59 @@ impl SessionManager {
         self.inner.runtime(name).await.map(drop)
     }
 
+    /// The session's targets as the proxy sees them, for `Runner::set_session_targets`. It
+    /// holds the manager weakly, so it keeps nothing alive.
+    pub fn targets_fn(&self) -> crate::runner::SessionTargets {
+        let inner = Arc::downgrade(&self.inner);
+        Arc::new(move |id| {
+            inner
+                .upgrade()
+                .map(|inner| inner.proxy.targets(id))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Evaluates `expression` in every tab of the session on the daemon's own CDP
+    /// connection (the focus-emulation session of the tab, never the proxy). One entry per
+    /// tab, with its evaluation result or the reason it failed. Fails when the session is
+    /// unknown.
+    pub async fn evaluate_in_targets(
+        &self,
+        id: &SessionId,
+        expression: &str,
+    ) -> Result<Vec<(String, anyhow::Result<Value>)>, RpcError> {
+        {
+            let table = self.inner.table.lock().unwrap();
+            ready(&table, id)?;
+        }
+        let conn = &self.inner.browser.conn;
+        let one = |target: String| async move {
+            let kept = self
+                .inner
+                .focus
+                .lock()
+                .unwrap()
+                .get(&target)
+                .cloned()
+                .flatten();
+            let result = match kept {
+                Some(session) => conn.evaluate(&session, expression).await,
+                // No focus session yet (still attaching): a short-lived one of its own.
+                None => match conn.attach(&target).await {
+                    Ok(session) => {
+                        let r = conn.evaluate(&session, expression).await;
+                        detach(conn, &session).await;
+                        r
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            (target, result)
+        };
+        let targets = self.inner.proxy.targets(id);
+        Ok(futures_util::future::join_all(targets.into_iter().map(one)).await)
+    }
+
     pub fn touch(&self, id: &SessionId) {
         let mut table = self.inner.table.lock().unwrap();
         if let Some(r) = table.records.get_mut(id).filter(|r| r.ready) {

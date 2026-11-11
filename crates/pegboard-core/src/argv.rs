@@ -71,6 +71,18 @@ struct Arg {
     required: bool,
 }
 
+/// What a form does with typed text, which the action log must never record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextUse {
+    /// No typed text.
+    No,
+    /// The words of the rest are typed into (or chosen in) the focused element; the log
+    /// hides them when that element is sensitive.
+    Typed,
+    /// The `Text` positional arguments are always hidden (a dialog's prompt answer).
+    Always,
+}
+
 /// One accepted form of a command.
 struct Form {
     /// Command and subcommand words, matched literally.
@@ -85,6 +97,7 @@ struct Form {
     /// When no `File` argument is given, pegboard names one with this extension, so the
     /// CLI never falls back to a directory of its own.
     default_file: Option<&'static str>,
+    text: TextUse,
 }
 
 const fn req(kind: Kind) -> Arg {
@@ -124,7 +137,12 @@ const fn form(words: &'static [&'static str], args: &'static [Arg]) -> Form {
         flags: &[],
         literal_rest: false,
         default_file: None,
+        text: TextUse::No,
     }
+}
+
+const fn with_text(f: Form, text: TextUse) -> Form {
+    Form { text, ..f }
 }
 
 const fn with_flags(f: Form, flags: &'static [Flag]) -> Form {
@@ -216,17 +234,26 @@ const GRAMMAR: &[Form] = &[
     form(&["highlight"], SEL),
     Form {
         literal_rest: true,
-        ..with_rest(form(&["fill"], SEL), Text, true)
+        ..with_text(with_rest(form(&["fill"], SEL), Text, true), TextUse::Typed)
     },
     Form {
         literal_rest: true,
         flags: &[switch(&["--clear"]), value(&["--delay"], Number)],
-        ..with_rest(form(&["type"], SEL), Text, true)
+        ..with_text(with_rest(form(&["type"], SEL), Text, true), TextUse::Typed)
     },
     form(&["press"], &[req(Key)]),
-    with_rest(form(&["keyboard", "type"], &[]), Text, true),
-    with_rest(form(&["keyboard", "inserttext"], &[]), Text, true),
-    with_rest(form(&["select"], SEL), Text, true),
+    with_text(
+        with_rest(form(&["keyboard", "type"], &[]), Text, true),
+        TextUse::Typed,
+    ),
+    with_text(
+        with_rest(form(&["keyboard", "inserttext"], &[]), Text, true),
+        TextUse::Typed,
+    ),
+    with_text(
+        with_rest(form(&["select"], SEL), Text, true),
+        TextUse::Typed,
+    ),
     with_flags(
         form(
             &["scroll"],
@@ -283,7 +310,7 @@ const GRAMMAR: &[Form] = &[
     form(&["tab", "new"], &[opt(Url)]),
     form(&["tab", "close"], &[opt(TabRef)]),
     form(&["frame"], SEL),
-    form(&["dialog", "accept"], &[opt(Text)]),
+    with_text(form(&["dialog", "accept"], &[opt(Text)]), TextUse::Always),
     form(&["dialog", "dismiss"], &[]),
     form(&["dialog", "status"], &[]),
     form(&["cookies"], &[]),
@@ -329,7 +356,7 @@ const GRAMMAR: &[Form] = &[
 const fn find(words: &'static [&'static str], args: &'static [Arg]) -> Form {
     Form {
         flags: FIND_FLAGS,
-        ..with_rest(form(words, args), Text, false)
+        ..with_text(with_rest(form(words, args), Text, false), TextUse::Typed)
     }
 }
 
@@ -359,19 +386,15 @@ pub fn check(argv: &[String], files_dir: &Path) -> Result<Checked, RpcError> {
     if let Some(bad) = argv.iter().find(|w| w.contains('\0')) {
         return Err(rejected(format!("{bad:?} contains a NUL character")));
     }
-    let form = GRAMMAR
-        .iter()
-        .filter(|f| argv.len() >= f.words.len() && f.words.iter().zip(argv).all(|(a, b)| a == b))
-        .max_by_key(|f| f.words.len())
-        .ok_or_else(|| {
-            let known = GRAMMAR.iter().any(|f| f.words[0] == command.as_str());
-            let what = match argv.get(1) {
-                Some(sub) if known => format!("{command} {sub}"),
-                _ => command.clone(),
-            };
-            rejected(format!("'{what}' is not supported in pegboard phase 1"))
-        })?;
-    let words = parse(form, &argv[form.words.len()..], files_dir)?;
+    let form = form_of(argv).ok_or_else(|| {
+        let known = GRAMMAR.iter().any(|f| f.words[0] == command.as_str());
+        let what = match argv.get(1) {
+            Some(sub) if known => format!("{command} {sub}"),
+            _ => command.clone(),
+        };
+        rejected(format!("'{what}' is not supported in pegboard phase 1"))
+    })?;
+    let (words, _) = parse(form, &argv[form.words.len()..], files_dir)?;
     if form.words == ["tab", "new"] {
         let url = words
             .get(2)
@@ -382,10 +405,43 @@ pub fn check(argv: &[String], files_dir: &Path) -> Result<Checked, RpcError> {
     Ok(Checked::Run(words))
 }
 
-/// Parses the words after the command against the form; returns the full command line.
-fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Vec<String>, RpcError> {
+/// The positions in `argv` (a command line as the caller gave it) that hold typed text,
+/// as the grammar knows them: the words typed by `fill`, `type`, `keyboard type`,
+/// `keyboard inserttext`, `select` and `find ... fill`, and the answer of `dialog accept`.
+/// Empty for a command line the grammar does not accept.
+pub fn text_positions(argv: &[String]) -> Vec<usize> {
+    let Some(form) = form_of(argv) else {
+        return Vec::new();
+    };
+    // Only the shape matters here, so any absolute directory will do.
+    parse(form, &argv[form.words.len()..], Path::new("/"))
+        .map(|(_, positions)| positions)
+        .unwrap_or_default()
+}
+
+/// Whether the typed text of this command line is hidden whatever element it went to.
+pub fn text_always_hidden(argv: &[String]) -> bool {
+    form_of(argv).is_some_and(|f| f.text == TextUse::Always)
+}
+
+fn form_of(argv: &[String]) -> Option<&'static Form> {
+    GRAMMAR
+        .iter()
+        .filter(|f| argv.len() >= f.words.len() && f.words.iter().zip(argv).all(|(a, b)| a == b))
+        .max_by_key(|f| f.words.len())
+}
+
+/// Parses the words after the command against the form; returns the full command line and
+/// the positions of its typed text (the same indices in the input and the output: words are
+/// never added or dropped, except a default file name appended at the end).
+fn parse(
+    form: &Form,
+    words: &[String],
+    files_dir: &Path,
+) -> Result<(Vec<String>, Vec<usize>), RpcError> {
     let name = form.words.join(" ");
     let mut out: Vec<String> = form.words.iter().map(|w| w.to_string()).collect();
+    let mut text_at = Vec::new();
     let mut next_arg = 0;
     let mut file_given = false;
     let mut rest = 0;
@@ -395,6 +451,9 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Vec<String>,
         let word = &words[i];
         i += 1;
         if literal {
+            if form.text == TextUse::Typed {
+                text_at.push(out.len());
+            }
             out.push(word.clone());
             rest += 1;
             continue;
@@ -456,6 +515,9 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Vec<String>,
             next_arg += 1;
             match accept(arg.kind, word, files_dir) {
                 Ok(v) => {
+                    if form.text == TextUse::Always && matches!(arg.kind, Text) {
+                        text_at.push(out.len());
+                    }
                     file_given |= matches!(arg.kind, File(_));
                     placed = Some(v);
                     break;
@@ -472,6 +534,9 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Vec<String>,
             (Some(v), _) => v,
             (None, Some(kind)) => {
                 rest += 1;
+                if form.text == TextUse::Typed {
+                    text_at.push(out.len());
+                }
                 accept(kind, word, files_dir)
                     .map_err(|e| rejected(format!("invalid argument {word:?} for `{name}`: {e}")))?
             }
@@ -498,7 +563,7 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Vec<String>,
         let file = files_dir.join(format!("shot-{millis}.{ext}"));
         out.push(file.display().to_string());
     }
-    Ok(out)
+    Ok((out, text_at))
 }
 
 fn kind_name(kind: Kind) -> &'static str {
@@ -889,6 +954,105 @@ mod tests {
             &["press", "Control a"],
         ] {
             refused(a);
+        }
+    }
+
+    fn sample(kind: Kind) -> String {
+        match kind {
+            Selector | ShotSelector => "#a".into(),
+            Text => "q".into(),
+            Url => "https://a.test/".into(),
+            Key => "Enter".into(),
+            Number => "1".into(),
+            TabRef => "t1".into(),
+            File(exts) => format!("a.{}", exts[0]),
+            Choice(options) => options[0].into(),
+        }
+    }
+
+    /// The command line of a form with every declared argument and `rest` as its rest.
+    fn full_line(f: &Form, rest: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = f.words.iter().map(|w| w.to_string()).collect();
+        v.extend(f.args.iter().map(|a| sample(a.kind)));
+        v.extend(rest.iter().map(|w| w.to_string()));
+        v
+    }
+
+    #[test]
+    fn every_form_that_types_text_has_its_text_positions_known() {
+        let mut typed = 0;
+        for f in GRAMMAR.iter().filter(|f| f.text == TextUse::Typed) {
+            typed += 1;
+            let line = full_line(f, &["SECRETX", "SECRETY"]);
+            let n = line.len();
+            assert!(check(&line, Path::new(FILES)).is_ok(), "{line:?}");
+            assert_eq!(text_positions(&line), vec![n - 2, n - 1], "{line:?}");
+            if f.literal_rest {
+                let mut line = full_line(f, &["--", "-SECRETX"]);
+                let n = line.len();
+                assert!(check(&line, Path::new(FILES)).is_ok(), "{line:?}");
+                assert_eq!(text_positions(&line), vec![n - 1], "{line:?}");
+                line.truncate(n);
+            }
+        }
+        assert!(typed >= 14, "only {typed} typing forms");
+        for f in GRAMMAR.iter().filter(|f| f.text == TextUse::Always) {
+            let line = full_line(f, &[]);
+            assert_eq!(text_positions(&line), vec![line.len() - 1], "{line:?}");
+            assert!(text_always_hidden(&line));
+        }
+    }
+
+    /// A new form that takes free text must be classified: either its text is hidden, or it
+    /// is listed here as text that is not typed into the page.
+    #[test]
+    fn free_text_forms_are_classified() {
+        const NOT_TYPED: &[&str] = &[
+            "eval",
+            "get attr",
+            "find role",
+            "find text",
+            "find label",
+            "find placeholder",
+            "find alt",
+            "find title",
+            "find testid",
+            "cookies set",
+            "storage local",
+            "storage local get",
+            "storage local set",
+            "storage session",
+            "storage session get",
+            "storage session set",
+            "network requests",
+            "wait",
+            "a11y",
+        ];
+        for f in GRAMMAR {
+            let free = matches!(f.rest, Some(Text))
+                || f.args.iter().any(|a| matches!(a.kind, Text))
+                || f.flags
+                    .iter()
+                    .any(|fl| matches!(fl.arity, Arity::Value(Text)));
+            let name = f.words.join(" ");
+            if !free || f.text != TextUse::No {
+                continue;
+            }
+            // `find role` and the like take a query text first, but their rest (after the
+            // action) is typed: they are `Typed`, so they cannot be here.
+            assert!(
+                NOT_TYPED.contains(&name.as_str()),
+                "`{name}` takes free text: hide it (TextUse) or list it as not typed"
+            );
+        }
+        for f in GRAMMAR {
+            if matches!(f.rest, Some(Text)) {
+                let name = f.words.join(" ");
+                assert!(
+                    f.text == TextUse::Typed || name == "eval",
+                    "`{name}` has a free-text rest that is not hidden"
+                );
+            }
         }
     }
 }
