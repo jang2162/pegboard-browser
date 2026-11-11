@@ -7,11 +7,13 @@
 //! The scope (targets and CDP sessions) is maintained here from what passes the filter.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use pegboard_protocol::SessionId;
 use rand::RngCore;
@@ -20,6 +22,8 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
@@ -34,6 +38,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
 /// Dropped target events kept while a tab creation is in flight (see `ClientConn::stash`).
 const STASH_LIMIT: usize = 1024;
+const STASH_MAX_AGE: Duration = Duration::from_secs(10);
+/// Bytes queued for a client that is not reading before it is disconnected.
+const MAX_QUEUED_TO_CLIENT: usize = 64 << 20;
+/// Bounds of the connection shutdown (see `ClientConn::shutdown`).
+const SHUTDOWN_STEP: Duration = Duration::from_millis(500);
+const SHUTDOWN_DRAIN: Duration = Duration::from_millis(500);
+const CLIENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn ws_config() -> WebSocketConfig {
     WebSocketConfig::default()
@@ -110,10 +121,31 @@ struct SessionEntry {
     closed: watch::Sender<bool>,
 }
 
+impl SessionEntry {
+    fn new(token: String, context: &str, group: GroupId, targets: Vec<String>) -> SessionEntry {
+        SessionEntry {
+            token,
+            group,
+            scope: Mutex::new(Scope {
+                context: context.to_string(),
+                targets: targets.into_iter().collect(),
+                cdp_sessions: HashSet::new(),
+            }),
+            closed: watch::channel(false).0,
+        }
+    }
+}
+
+type Sessions = Mutex<HashMap<String, Arc<SessionEntry>>>;
+
 struct Shared {
     upstream: Arc<dyn Upstream>,
     bridge: Arc<Bridge>,
-    sessions: Mutex<HashMap<String, Arc<SessionEntry>>>,
+    sessions: Sessions,
+    /// Client connections whose upstream is open.
+    connections: Arc<AtomicUsize>,
+    /// Test hook: delay before each bridge tab creation.
+    tab_delay_ms: AtomicU64,
 }
 
 /// One loopback listener serving every session's CDP endpoint.
@@ -133,6 +165,8 @@ impl ProxyServer {
             upstream,
             bridge,
             sessions: Mutex::new(HashMap::new()),
+            connections: Arc::new(AtomicUsize::new(0)),
+            tab_delay_ms: AtomicU64::new(0),
         });
         let accepting = shared.clone();
         let accept = tokio::spawn(async move {
@@ -166,16 +200,12 @@ impl ProxyServer {
         initial_targets: Vec<String>,
     ) -> Endpoint {
         let token = new_token();
-        let entry = Arc::new(SessionEntry {
-            token: token.clone(),
+        let entry = Arc::new(SessionEntry::new(
+            token.clone(),
+            context,
             group,
-            scope: Mutex::new(Scope {
-                context: context.to_string(),
-                targets: initial_targets.into_iter().collect(),
-                cdp_sessions: HashSet::new(),
-            }),
-            closed: watch::channel(false).0,
-        });
+            initial_targets,
+        ));
         let old = self
             .shared
             .sessions
@@ -211,6 +241,19 @@ impl ProxyServer {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Client connections (of all sessions) whose browser connection is still open.
+    pub fn open_connections(&self) -> usize {
+        self.shared.connections.load(Ordering::SeqCst)
+    }
+
+    /// Test hook: wait this long before each bridge tab creation of connections opened
+    /// from now on, to make the "tab creation in flight" window deterministic.
+    #[doc(hidden)]
+    pub fn set_tab_creation_delay(&self, delay: Duration) {
+        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.shared.tab_delay_ms.store(ms, Ordering::Relaxed);
     }
 }
 
@@ -311,14 +354,13 @@ async fn respond_status(sock: &mut TcpStream, status: &str) {
 }
 
 /// The session the request may connect to, or the HTTP status to refuse it with.
-fn authorize(shared: &Shared, head: &RequestHead) -> Result<Arc<SessionEntry>, &'static str> {
+fn authorize(sessions: &Sessions, head: &RequestHead) -> Result<Arc<SessionEntry>, &'static str> {
     if !head.has_token("upgrade", "websocket") {
         return Err("404 Not Found");
     }
     const UNAUTHORIZED: &str = "401 Unauthorized";
     let id = head.path.strip_prefix("/s/").ok_or(UNAUTHORIZED)?;
-    let entry = shared
-        .sessions
+    let entry = sessions
         .lock()
         .unwrap()
         .get(id)
@@ -349,7 +391,7 @@ async fn handle_socket(shared: Arc<Shared>, mut sock: TcpStream) -> Result<()> {
         respond_status(&mut sock, "400 Bad Request").await;
         return Ok(());
     };
-    let entry = match authorize(&shared, &head) {
+    let entry = match authorize(&shared.sessions, &head) {
         Ok(entry) => entry,
         Err(status) => {
             respond_status(&mut sock, status).await;
@@ -369,6 +411,7 @@ async fn handle_socket(shared: Arc<Shared>, mut sock: TcpStream) -> Result<()> {
             return Ok(());
         }
     };
+    let open = OpenConnection::new(shared.connections.clone());
     let key = head.single("sec-websocket-key").unwrap_or_default();
     let accept = derive_accept_key(key.as_bytes());
     let resp = format!(
@@ -377,25 +420,91 @@ async fn handle_socket(shared: Arc<Shared>, mut sock: TcpStream) -> Result<()> {
     sock.write_all(resp.as_bytes()).await?;
     let client =
         WebSocketStream::from_partially_read(sock, rest, Role::Server, Some(ws_config())).await;
+    let (sink, client_rx) = client.split();
+    let (client_tx, writer) = ClientSender::spawn(sink);
     let (tab_tx, tab_rx) = mpsc::unbounded_channel();
     let conn = ClientConn {
         bridge: shared.bridge.clone(),
+        tab_delay: Duration::from_millis(shared.tab_delay_ms.load(Ordering::Relaxed)),
         entry,
-        client,
+        client_rx,
+        client_tx,
         up,
+        open,
         pending: HashMap::new(),
         next_upstream_id: 1,
         tabs_in_flight: 0,
         stash: VecDeque::new(),
+        auto_sessions: HashMap::new(),
+        recovered: HashSet::new(),
         tab_tx,
         tab_rx,
     };
-    conn.run(closed).await;
+    conn.run(closed, writer).await;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // One client connection
+
+/// Counts a client connection from the moment its upstream is open until it is dropped.
+struct OpenConnection(Arc<AtomicUsize>);
+
+impl OpenConnection {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        OpenConnection(count)
+    }
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Messages to the client go through a writer task, so a client that stops reading can
+/// never stall the connection loop. The queue is bounded in bytes; a client that lets it
+/// overflow is disconnected.
+struct ClientSender {
+    tx: mpsc::UnboundedSender<Message>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl ClientSender {
+    fn spawn(
+        mut sink: SplitSink<WebSocketStream<TcpStream>, Message>,
+    ) -> (ClientSender, JoinHandle<()>) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let sent = queued.clone();
+        let writer = tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let len = msg.len();
+                let ok = sink.send(msg).await.is_ok();
+                sent.fetch_sub(len, Ordering::SeqCst);
+                if !ok {
+                    return;
+                }
+            }
+            let _ = sink.close().await;
+        });
+        (ClientSender { tx, queued }, writer)
+    }
+
+    fn send(&self, v: &Value) -> Result<()> {
+        let text = v.to_string();
+        let len = text.len();
+        let before = self.queued.fetch_add(len, Ordering::SeqCst);
+        // A single message larger than the budget still goes out when the queue is empty.
+        if before > 0 && before + len > MAX_QUEUED_TO_CLIENT {
+            bail!("the client does not read its messages");
+        }
+        self.tx
+            .send(Message::text(text))
+            .map_err(|_| anyhow!("the client connection is closed"))
+    }
+}
 
 /// What the client needs to recognize a reply: its own request id and session.
 struct ClientRef {
@@ -413,6 +522,10 @@ enum Pending {
     },
     /// The proxy's own request whose reply nobody needs.
     Internal,
+    /// Resume of a hidden auto-attached session (see `ClientConn::release_session`).
+    Resume { target_id: Option<String> },
+    /// Re-attach of a target whose hidden session was detached before it was resumed.
+    Recover,
 }
 
 struct TabCreated {
@@ -422,30 +535,32 @@ struct TabCreated {
 
 struct ClientConn {
     bridge: Arc<Bridge>,
+    tab_delay: Duration,
     entry: Arc<SessionEntry>,
-    client: WebSocketStream<TcpStream>,
+    client_rx: SplitStream<WebSocketStream<TcpStream>>,
+    client_tx: ClientSender,
     up: Box<dyn UpstreamConn>,
+    open: OpenConnection,
     /// Upstream request id -> who asked. Every request upstream carries a proxy-assigned
     /// id, so client ids can neither collide with nor answer the proxy's own requests.
     pending: HashMap<u64, Pending>,
     next_upstream_id: u64,
     tabs_in_flight: usize,
-    /// Top-level target events dropped while a tab creation is in flight. Chrome can
-    /// report the new tab before the bridge returns its id; once the tab is in scope these
-    /// are judged again so the client still sees its own tab appear.
-    stash: VecDeque<Value>,
+    /// Top-level target events about the session's own browser context, dropped while a
+    /// tab creation is in flight. Chrome can report the new tab before the bridge returns
+    /// its id; once the tab is in scope these are judged again so the client still sees its
+    /// own tab appear. Events about other contexts are never kept.
+    stash: VecDeque<(Instant, Value)>,
+    /// Sessions this upstream got from browser-level auto-attach and still holds (shown to
+    /// the client or stashed), with their target. They are released before the upstream
+    /// closes.
+    auto_sessions: HashMap<String, Option<String>>,
+    /// Targets already re-attached once to resume them; never retried, so a target whose
+    /// resume keeps failing cannot loop.
+    recovered: HashSet<String>,
     tab_tx: mpsc::UnboundedSender<TabCreated>,
     tab_rx: mpsc::UnboundedReceiver<TabCreated>,
 }
-
-const TARGET_EVENTS: &[&str] = &[
-    "Target.targetCreated",
-    "Target.targetInfoChanged",
-    "Target.targetDestroyed",
-    "Target.attachedToTarget",
-    "Target.detachedFromTarget",
-    "Target.targetCrashed",
-];
 
 fn reply(client: &ClientRef, body: Result<Value, (i64, String)>) -> Value {
     let mut v = match body {
@@ -461,11 +576,12 @@ fn reply(client: &ClientRef, body: Result<Value, (i64, String)>) -> Value {
 }
 
 impl ClientConn {
-    async fn run(mut self, mut closed: watch::Receiver<bool>) {
+    async fn run(mut self, mut closed: watch::Receiver<bool>, writer: JoinHandle<()>) {
         loop {
+            let stash_expiry = self.stash.front().map(|(at, _)| *at + STASH_MAX_AGE);
             let step = tokio::select! {
                 _ = async { let _ = closed.wait_for(|c| *c).await; } => break,
-                m = self.client.next() => match m {
+                m = self.client_rx.next() => match m {
                     Some(Ok(Message::Text(t))) => self.on_client(t.as_str()).await,
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                     Some(Ok(_)) => Ok(()),
@@ -475,32 +591,111 @@ impl ClientConn {
                     None => break,
                 },
                 Some(done) = self.tab_rx.recv() => self.on_tab_created(done).await,
+                _ = tokio::time::sleep_until(stash_expiry.unwrap_or_else(Instant::now)),
+                    if stash_expiry.is_some() => self.expire_stash().await,
             };
             if step.is_err() {
                 break;
             }
         }
-        let _ = self.client.close(None).await;
+        self.shutdown(writer).await;
     }
 
-    async fn send_client(&mut self, v: &Value) -> Result<()> {
-        self.client.send(Message::text(v.to_string())).await?;
-        Ok(())
+    /// Every exit path ends here. Closing the upstream acts as a detach without a resume,
+    /// which leaves a held page frozen, and so does turning auto-attach off (Chrome then
+    /// detaches every auto-attached session). So, in this order, each step bounded in time:
+    /// release every auto-attached session this upstream holds; turn auto-attach off; read
+    /// the upstream until the browser confirmed that and every release (including the
+    /// re-attach of targets detached before their resume arrived) was answered.
+    async fn shutdown(mut self, writer: JoinHandle<()>) {
+        // Stashed auto-attach sessions are in `auto_sessions` too.
+        self.stash.clear();
+        let held: Vec<_> = self.auto_sessions.drain().collect();
+        for (session_id, target_id) in held {
+            let release = self.release_session(session_id, target_id);
+            let _ = tokio::time::timeout(SHUTDOWN_STEP, release).await;
+        }
+        let off = json!({ "method": "Target.setAutoAttach",
+            "params": { "autoAttach": false, "waitForDebuggerOnStart": false, "flatten": true } });
+        let off_id =
+            tokio::time::timeout(SHUTDOWN_STEP, self.send_upstream(off, Pending::Internal))
+                .await
+                .ok()
+                .and_then(Result::ok);
+        if let Some(off_id) = off_id {
+            let deadline = Instant::now() + SHUTDOWN_DRAIN;
+            let mut off_confirmed = false;
+            while !off_confirmed || self.release_in_flight() {
+                let Ok(Some(text)) = tokio::time::timeout_at(deadline, self.up.recv()).await else {
+                    break;
+                };
+                let Ok(msg) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                off_confirmed |= msg.get("id").and_then(Value::as_u64) == Some(off_id);
+                let _ =
+                    tokio::time::timeout(SHUTDOWN_STEP, self.on_message_while_closing(msg)).await;
+            }
+        }
+        let ClientConn {
+            up,
+            open,
+            client_tx,
+            client_rx,
+            ..
+        } = self;
+        drop(up);
+        drop(open);
+        drop(client_tx);
+        let abort = writer.abort_handle();
+        if tokio::time::timeout(CLIENT_CLOSE_TIMEOUT, writer)
+            .await
+            .is_err()
+        {
+            // The writer is stuck on a client that does not read; aborting it drops the socket.
+            abort.abort();
+        }
+        drop(client_rx);
     }
 
-    async fn send_upstream(&mut self, mut v: Value, pending: Pending) -> Result<()> {
+    fn send_client(&self, v: &Value) -> Result<()> {
+        self.client_tx.send(v)
+    }
+
+    fn release_in_flight(&self) -> bool {
+        self.pending
+            .values()
+            .any(|p| matches!(p, Pending::Resume { .. } | Pending::Recover))
+    }
+
+    /// While closing nothing reaches the client; only releases still matter.
+    async fn on_message_while_closing(&mut self, msg: Value) -> Result<()> {
+        if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+            if let Some(Pending::Resume { target_id }) = self.pending.remove(&id) {
+                return self.on_resume_reply(&msg, target_id).await;
+            }
+            return Ok(());
+        }
+        match auto_attached_session(&msg) {
+            Some((session_id, target_id)) => self.release_session(session_id, target_id).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn send_upstream(&mut self, mut v: Value, pending: Pending) -> Result<u64> {
         let id = self.next_upstream_id;
         self.next_upstream_id += 1;
         v["id"] = json!(id);
         self.pending.insert(id, pending);
-        self.up.send(v.to_string()).await
+        self.up.send(v.to_string()).await?;
+        Ok(id)
     }
 
     async fn on_client(&mut self, text: &str) -> Result<()> {
         let Ok(msg) = serde_json::from_str::<Value>(text) else {
             let err =
                 json!({ "error": { "code": -32700, "message": "Message must be valid JSON" } });
-            return self.send_client(&err).await;
+            return self.send_client(&err);
         };
         let client = ClientRef {
             id: msg.get("id").cloned().unwrap_or(Value::Null),
@@ -511,7 +706,7 @@ impl ClientConn {
                 -32600,
                 "Message must have integer 'id' property".to_string(),
             );
-            return self.send_client(&reply(&client, Err(err))).await;
+            return self.send_client(&reply(&client, Err(err)));
         }
         let decision = filter::client_message(&msg, &self.entry.scope.lock().unwrap());
         // The browser receives the value the decision was made on, re-serialized; never the
@@ -519,20 +714,18 @@ impl ClientConn {
         let forward = match decision {
             ClientDecision::Forward => msg,
             ClientDecision::ForwardRewritten(v) => v,
-            ClientDecision::Reply(result) => {
-                return self.send_client(&reply(&client, Ok(result))).await
-            }
+            ClientDecision::Reply(result) => return self.send_client(&reply(&client, Ok(result))),
             ClientDecision::Error { code, message } => {
-                return self
-                    .send_client(&reply(&client, Err((code, message))))
-                    .await;
+                return self.send_client(&reply(&client, Err((code, message))));
             }
             ClientDecision::CreateTab { url } => {
                 self.tabs_in_flight += 1;
                 let bridge = self.bridge.clone();
                 let group = self.entry.group.clone();
                 let tx = self.tab_tx.clone();
+                let delay = self.tab_delay;
                 tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
                     let result = bridge.create_tab(&group, &url).await;
                     let _ = tx.send(TabCreated { client, result });
                 });
@@ -542,6 +735,7 @@ impl ClientConn {
         let method = forward["method"].as_str().unwrap_or_default().to_string();
         self.send_upstream(forward, Pending::Client { client, method })
             .await
+            .map(drop)
     }
 
     async fn on_browser(&mut self, text: &str) -> Result<()> {
@@ -550,24 +744,23 @@ impl ClientConn {
             return Ok(());
         };
         let Some(id) = msg.get("id") else {
-            return self.on_browser_event(msg).await;
+            return self.on_browser_event(msg, None).await;
         };
         // A reply to nobody's request is dropped.
         let Some(pending) = id.as_u64().and_then(|id| self.pending.remove(&id)) else {
             return Ok(());
         };
         match pending {
-            Pending::Client { client, method } => {
-                self.on_client_response(msg, client, &method).await
-            }
+            Pending::Client { client, method } => self.on_client_response(msg, client, &method),
             Pending::VerifyTab { client, target_id } => {
                 self.finish_tab(&msg, client, target_id).await
             }
-            Pending::Internal => Ok(()),
+            Pending::Resume { target_id } => self.on_resume_reply(&msg, target_id).await,
+            Pending::Internal | Pending::Recover => Ok(()),
         }
     }
 
-    async fn on_client_response(
+    fn on_client_response(
         &mut self,
         mut msg: Value,
         client: ClientRef,
@@ -589,28 +782,39 @@ impl ClientConn {
         };
         match decision {
             BrowserDecision::Forward(v) | BrowserDecision::Adopt { forward: v, .. } => {
-                self.send_client(&v).await
+                self.send_client(&v)
             }
             // The session left the scope while the request was in flight; still answer.
             BrowserDecision::Drop => {
                 let err = (-32001, "Session with given id not found.".to_string());
-                self.send_client(&reply(&client, Err(err))).await
+                self.send_client(&reply(&client, Err(err)))
             }
         }
     }
 
-    async fn on_browser_event(&mut self, msg: Value) -> Result<()> {
+    /// `stashed_at` is set when a stashed event is judged again; it keeps its original age.
+    async fn on_browser_event(&mut self, msg: Value, stashed_at: Option<Instant>) -> Result<()> {
         let method = msg
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let stashable = self.tabs_in_flight > 0
-            && msg.get("sessionId").is_none()
-            && TARGET_EVENTS.contains(&method);
-        let copy = stashable.then(|| msg.clone());
+        let top_level = msg.get("sessionId").is_none();
+        if top_level && method == "Target.detachedFromTarget" {
+            if let Some(s) = msg.pointer("/params/sessionId").and_then(Value::as_str) {
+                self.auto_sessions.remove(s);
+            }
+        }
+        let is_target_event = top_level && filter::TARGET_EVENTS.contains(&method);
+        let event_context = msg
+            .pointer("/params/targetInfo/browserContextId")
+            .and_then(Value::as_str)
+            .map(String::from);
         let auto_attached = auto_attached_session(&msg);
-        let decision = {
+        let copy = (self.tabs_in_flight > 0 && is_target_event && event_context.is_some())
+            .then(|| msg.clone());
+        let (decision, own_context) = {
             let mut scope = self.entry.scope.lock().unwrap();
+            let own_context = event_context.as_deref() == Some(scope.context.as_str());
             let decision = filter::browser_message(msg, None, &scope);
             match &decision {
                 BrowserDecision::Forward(v) => track_event(v, &mut scope),
@@ -620,27 +824,37 @@ impl ClientConn {
                 }
                 BrowserDecision::Drop => {}
             }
-            decision
+            (decision, own_context)
         };
         match decision {
             BrowserDecision::Forward(v) | BrowserDecision::Adopt { forward: v, .. } => {
-                self.send_client(&v).await
+                if let Some((session_id, target_id)) = auto_attached {
+                    self.auto_sessions.insert(session_id, target_id);
+                }
+                self.send_client(&v)
             }
-            BrowserDecision::Drop => {
-                if let Some(copy) = copy {
+            BrowserDecision::Drop => match copy {
+                // Only an event about the session's own context can be adopted later.
+                Some(copy) if own_context => {
+                    if let Some((session_id, target_id)) = auto_attached {
+                        self.auto_sessions.insert(session_id, target_id);
+                    }
                     if self.stash.len() == STASH_LIMIT {
-                        if let Some(oldest) = self.stash.pop_front() {
+                        if let Some((_, oldest)) = self.stash.pop_front() {
                             self.release(&oldest).await?;
                         }
                     }
-                    self.stash.push_back(copy);
-                    Ok(())
-                } else if let Some(session_id) = auto_attached {
-                    self.release_session(session_id).await
-                } else {
+                    self.stash
+                        .push_back((stashed_at.unwrap_or_else(Instant::now), copy));
                     Ok(())
                 }
-            }
+                _ => match auto_attached {
+                    Some((session_id, target_id)) => {
+                        self.release_session(session_id, target_id).await
+                    }
+                    None => Ok(()),
+                },
+            },
         }
     }
 
@@ -648,30 +862,68 @@ impl ClientConn {
     /// the human's. Such a session is never shown to the client, so the proxy releases it
     /// itself: resume, then detach. Chrome 157 holds a human page that calls `window.open`
     /// until the popup's auto-attached session is resumed, even with
-    /// `waitForDebuggerOnStart: false` and even after a detach without a resume.
-    async fn release_session(&mut self, session_id: String) -> Result<()> {
+    /// `waitForDebuggerOnStart: false`; a detach without a resume (also the implicit one when
+    /// auto-attach is turned off or the connection closes) leaves it held.
+    async fn release_session(
+        &mut self,
+        session_id: String,
+        target_id: Option<String>,
+    ) -> Result<()> {
+        self.auto_sessions.remove(&session_id);
         let resume =
             json!({ "method": "Runtime.runIfWaitingForDebugger", "sessionId": session_id });
-        self.send_upstream(resume, Pending::Internal).await?;
+        self.send_upstream(resume, Pending::Resume { target_id })
+            .await?;
         let detach =
             json!({ "method": "Target.detachFromTarget", "params": { "sessionId": session_id } });
-        self.send_upstream(detach, Pending::Internal).await
+        self.send_upstream(detach, Pending::Internal)
+            .await
+            .map(drop)
+    }
+
+    /// A resume that failed means Chrome detached the session before the resume arrived
+    /// (e.g. the client turned auto-attach off meanwhile), and the target may be held. A
+    /// fresh attach is resumed and detached through its `Target.attachedToTarget` event
+    /// like any hidden session; each target is re-attached at most once.
+    async fn on_resume_reply(&mut self, reply: &Value, target_id: Option<String>) -> Result<()> {
+        let Some(target_id) = target_id else {
+            return Ok(());
+        };
+        if reply.get("error").is_none() || !self.recovered.insert(target_id.clone()) {
+            return Ok(());
+        }
+        let attach = json!({ "method": "Target.attachToTarget", "params": { "targetId": target_id, "flatten": true } });
+        self.send_upstream(attach, Pending::Recover).await.map(drop)
     }
 
     /// A stashed event that will not be shown after all.
     async fn release(&mut self, event: &Value) -> Result<()> {
         match auto_attached_session(event) {
-            Some(session_id) => self.release_session(session_id).await,
+            Some((session_id, target_id)) => self.release_session(session_id, target_id).await,
             None => Ok(()),
         }
     }
 
     async fn forget_stash_if_idle(&mut self) -> Result<()> {
         if self.tabs_in_flight == 0 {
-            let stashed: Vec<Value> = self.stash.drain(..).collect();
-            for event in &stashed {
+            let stashed: Vec<_> = self.stash.drain(..).collect();
+            for (_, event) in &stashed {
                 self.release(event).await?;
             }
+        }
+        Ok(())
+    }
+
+    /// Stashed events wait at most `STASH_MAX_AGE`, so back-to-back tab creations cannot
+    /// hold another session's auto-attached tab forever.
+    async fn expire_stash(&mut self) -> Result<()> {
+        let now = Instant::now();
+        while let Some((at, _)) = self.stash.front() {
+            if *at + STASH_MAX_AGE > now {
+                break;
+            }
+            let (_, event) = self.stash.pop_front().unwrap();
+            self.release(&event).await?;
         }
         Ok(())
     }
@@ -684,13 +936,13 @@ impl ClientConn {
                     client: done.client,
                     target_id,
                 };
-                self.send_upstream(check, pending).await
+                self.send_upstream(check, pending).await.map(drop)
             }
             Err(e) => {
                 self.tabs_in_flight -= 1;
                 self.forget_stash_if_idle().await?;
                 let err = (-32000, format!("creating the tab failed: {e:#}"));
-                self.send_client(&reply(&done.client, Err(err))).await
+                self.send_client(&reply(&done.client, Err(err)))
             }
         }
     }
@@ -723,28 +975,27 @@ impl ClientConn {
                 -32000,
                 "the new tab was not created in the session's profile".to_string(),
             );
-            return self.send_client(&reply(&client, Err(err))).await;
+            return self.send_client(&reply(&client, Err(err)));
         }
         // Judge the stashed events again now that the tab is in scope, in arrival order,
         // before the reply (the order Chrome itself uses). Events still dropped are stashed
-        // again only while another tab creation is in flight.
-        let stashed: Vec<Value> = self.stash.drain(..).collect();
-        for event in stashed {
-            self.on_browser_event(event).await?;
+        // again only while another tab creation is in flight (bounded by `STASH_MAX_AGE`).
+        let stashed: Vec<_> = self.stash.drain(..).collect();
+        for (at, event) in stashed {
+            self.on_browser_event(event, Some(at)).await?;
         }
         self.send_client(&reply(&client, Ok(json!({ "targetId": target_id }))))
-            .await
     }
 }
 
-/// The session of a top-level `Target.attachedToTarget` (browser-level auto-attach).
-fn auto_attached_session(msg: &Value) -> Option<String> {
+/// Session and target of a top-level `Target.attachedToTarget` (browser-level auto-attach,
+/// or an attach of this connection).
+fn auto_attached_session(msg: &Value) -> Option<(String, Option<String>)> {
     if msg.get("sessionId").is_some() || msg["method"] != "Target.attachedToTarget" {
         return None;
     }
-    msg.pointer("/params/sessionId")
-        .and_then(Value::as_str)
-        .map(String::from)
+    let s = |p: &str| msg.pointer(p).and_then(Value::as_str).map(String::from);
+    Some((s("/params/sessionId")?, s("/params/targetInfo/targetId")))
 }
 
 /// Scope bookkeeping for an event that passed the filter.
@@ -799,5 +1050,141 @@ fn adopt_listed_popups(msg: &Value, scope: &mut Scope) {
         if !added {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const ID: &str = "s_abcdefgh";
+
+    fn sessions() -> Sessions {
+        let entry = SessionEntry::new(TOKEN.into(), "AGENT", GroupId(1), vec![]);
+        Mutex::new(HashMap::from([(ID.to_string(), Arc::new(entry))]))
+    }
+
+    fn head(path: &str, extra: &[&str]) -> RequestHead {
+        let mut text = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        );
+        for h in extra {
+            text.push_str(h);
+            text.push_str("\r\n");
+        }
+        text.push_str("\r\n");
+        parse_head(text.as_bytes()).expect("head parses")
+    }
+
+    fn status(path: &str, extra: &[&str]) -> Result<(), &'static str> {
+        authorize(&sessions(), &head(path, extra)).map(drop)
+    }
+
+    fn bearer(token: &str) -> String {
+        format!("Authorization: Bearer {token}")
+    }
+
+    #[test]
+    fn parse_head_lowercases_names_and_rejects_garbage() {
+        let h = head("/s/x", &["X-Custom: Value"]);
+        assert_eq!(h.method, "GET");
+        assert_eq!(h.path, "/s/x");
+        assert_eq!(h.single("x-custom"), Some("Value"));
+        assert!(parse_head(b"not http at all\r\n\r\n").is_none());
+        assert!(
+            parse_head(b"GET / HTTP/1.1\r\nHost: x\r\n").is_none(),
+            "incomplete head"
+        );
+    }
+
+    #[test]
+    fn correct_token_is_accepted() {
+        let path = format!("/s/{ID}");
+        assert_eq!(status(&path, &[&bearer(TOKEN)]), Ok(()));
+    }
+
+    #[test]
+    fn missing_authorization_is_401() {
+        assert_eq!(status(&format!("/s/{ID}"), &[]), Err("401 Unauthorized"));
+    }
+
+    #[test]
+    fn two_authorization_headers_are_401() {
+        let path = format!("/s/{ID}");
+        let good = bearer(TOKEN);
+        assert_eq!(status(&path, &[&good, &good]), Err("401 Unauthorized"));
+        assert_eq!(
+            status(&path, &[&good, "Authorization: Bearer wrong"]),
+            Err("401 Unauthorized")
+        );
+    }
+
+    #[test]
+    fn wrong_scheme_is_401() {
+        let path = format!("/s/{ID}");
+        for h in [
+            format!("Authorization: Basic {TOKEN}"),
+            format!("Authorization: bearer {TOKEN}"),
+            format!("Authorization: {TOKEN}"),
+            format!("Authorization: Bearer  {TOKEN}"),
+        ] {
+            assert_eq!(status(&path, &[&h]), Err("401 Unauthorized"), "{h}");
+        }
+    }
+
+    #[test]
+    fn wrong_token_of_same_or_other_length_is_401() {
+        let path = format!("/s/{ID}");
+        let mut same_len = TOKEN.to_string();
+        same_len.replace_range(63.., "0");
+        assert_eq!(same_len.len(), TOKEN.len());
+        for t in [same_len.as_str(), &TOKEN[..63], &format!("{TOKEN}0"), ""] {
+            assert_eq!(status(&path, &[&bearer(t)]), Err("401 Unauthorized"), "{t}");
+        }
+    }
+
+    #[test]
+    fn unknown_or_malformed_session_path_is_401() {
+        let good = bearer(TOKEN);
+        for path in [
+            "/s/s_unknown00".to_string(),
+            format!("/s/{ID}/"),
+            format!("/s/{ID}/x"),
+            format!("/s/{ID}?a=1"),
+            format!("/s/{ID}#f"),
+            format!("/x/{ID}"),
+            format!("/s//{ID}"),
+            "/".to_string(),
+        ] {
+            assert_eq!(status(&path, &[&good]), Err("401 Unauthorized"), "{path}");
+        }
+    }
+
+    #[test]
+    fn plain_http_is_404_whatever_the_token() {
+        let text = format!(
+            "GET /s/{ID} HTTP/1.1\r\nHost: x\r\n{}\r\n\r\n",
+            bearer(TOKEN)
+        );
+        let h = parse_head(text.as_bytes()).unwrap();
+        assert_eq!(authorize(&sessions(), &h).map(drop), Err("404 Not Found"));
+    }
+
+    #[test]
+    fn malformed_upgrade_is_400_only_after_auth() {
+        let text = format!(
+            "GET /s/{ID} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n{}\r\n\r\n",
+            bearer(TOKEN)
+        );
+        let h = parse_head(text.as_bytes()).unwrap();
+        assert_eq!(authorize(&sessions(), &h).map(drop), Err("400 Bad Request"));
+        let text = format!("GET /s/{ID} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n");
+        let h = parse_head(text.as_bytes()).unwrap();
+        assert_eq!(
+            authorize(&sessions(), &h).map(drop),
+            Err("401 Unauthorized")
+        );
     }
 }

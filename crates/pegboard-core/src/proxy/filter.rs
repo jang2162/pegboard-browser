@@ -143,7 +143,7 @@ const BROWSER_LEVEL_EXACT: &[&str] = &[
     "Browser.setDownloadBehavior",
 ];
 const BROWSER_LEVEL_PREFIXES: &[&str] = &["Storage.", "Network.", "Fetch."];
-const TARGET_EVENTS: &[&str] = &[
+pub(crate) const TARGET_EVENTS: &[&str] = &[
     "Target.targetCreated",
     "Target.targetInfoChanged",
     "Target.targetDestroyed",

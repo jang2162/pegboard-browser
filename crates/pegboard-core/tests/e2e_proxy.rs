@@ -497,3 +497,234 @@ async fn human_tab_opened_during_session_loads_normally() {
         .any(|p| p.target_id == t));
     s.shutdown().await;
 }
+
+type RawWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A websocket client of the endpoint with no CDP machinery: it reads only when asked.
+async fn raw_client(endpoint: &pegboard_core::proxy::server::Endpoint) -> RawWs {
+    let mut req = endpoint.url.as_str().into_client_request().unwrap();
+    let auth = format!("Bearer {}", endpoint.token);
+    req.headers_mut()
+        .insert("Authorization", auth.parse().unwrap());
+    tokio_tungstenite::connect_async(req).await.unwrap().0
+}
+
+/// Sends one request and reads until its response, discarding everything else.
+async fn raw_call(ws: &mut RawWs, id: u64, method: &str, params: Value) -> Value {
+    use futures_util::{SinkExt, StreamExt};
+    let msg = json!({ "id": id, "method": method, "params": params });
+    ws.send(tungstenite::Message::text(msg.to_string()))
+        .await
+        .unwrap();
+    loop {
+        let m = ws.next().await.expect("closed").unwrap();
+        if let tungstenite::Message::Text(t) = m {
+            let v: Value = serde_json::from_str(t.as_str()).unwrap();
+            if v["id"] == id {
+                return v;
+            }
+        }
+    }
+}
+
+fn auto_attach_waiting() -> Value {
+    json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true })
+}
+
+fn page_ids(v: Vec<pegboard_core::cdp::TargetInfo>) -> Vec<String> {
+    v.into_iter().map(|p| p.target_id).collect()
+}
+
+/// Makes the human page open `/counter` in a new tab, as a click would, and returns the
+/// page ids from before. The call is deferred with setTimeout so that a frozen popup
+/// cannot block this evaluate.
+async fn schedule_human_popup(s: &common::SessionFixture, human_session: &str) -> Vec<String> {
+    let b = &s.browser.conn;
+    let before = page_ids(page_targets(b).await.unwrap());
+    let open = format!(
+        "setTimeout(() => window.open('{}/counter'), 0); 'scheduled'",
+        s.fixture.origin
+    );
+    b.send(
+        "Runtime.evaluate",
+        json!({ "expression": open, "userGesture": true }),
+        Some(human_session),
+    )
+    .await
+    .unwrap();
+    before
+}
+
+async fn new_page(b: &CdpConn, before: &[String]) -> String {
+    for _ in 0..50 {
+        let now = page_ids(page_targets(b).await.unwrap());
+        if let Some(t) = now.into_iter().find(|id| !before.contains(id)) {
+            return t;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the human page did not open a tab");
+}
+
+async fn open_human_popup(s: &common::SessionFixture, human_session: &str) -> String {
+    let before = schedule_human_popup(s, human_session).await;
+    new_page(&s.browser.conn, &before).await
+}
+
+/// Whether the tab reaches document.title "counter" within `limit`, seen from the browser connection.
+async fn loads_within(b: &CdpConn, target: &str, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    let Ok(Ok(sid)) = tokio::time::timeout(limit, b.attach(target)).await else {
+        return false;
+    };
+    while tokio::time::Instant::now() < deadline {
+        let title = tokio::time::timeout(
+            Duration::from_millis(500),
+            b.evaluate(&sid, "document.title"),
+        )
+        .await;
+        if let Ok(Ok(v)) = title {
+            if v == "counter" {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+async fn connections_reach_zero(s: &common::SessionFixture, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while s.proxy.open_connections() != 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
+}
+
+#[tokio::test]
+#[ignore]
+async fn client_that_stops_reading_cannot_stall_unregister_or_freeze_human_tabs() {
+    use futures_util::SinkExt;
+    let s = common::session_fixture().await;
+    let mut ws = raw_client(&s.endpoint).await;
+    let attached = raw_call(
+        &mut ws,
+        1,
+        "Target.attachToTarget",
+        json!({ "targetId": s.first_target, "flatten": true }),
+    )
+    .await;
+    let sid = attached["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    raw_call(&mut ws, 2, "Target.setAutoAttach", auto_attach_waiting()).await;
+    assert_eq!(s.proxy.open_connections(), 1);
+    // From here on the client never reads: 1 MB answers pile up behind it.
+    for id in 3..203u64 {
+        let msg = json!({ "id": id, "sessionId": sid, "method": "Runtime.evaluate",
+            "params": { "expression": "'x'.repeat(1 << 20)", "returnByValue": true } });
+        if ws
+            .send(tungstenite::Message::text(msg.to_string()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let human = s.browser.conn.attach(&s.human_target).await.unwrap();
+    let popup = open_human_popup(&s, &human).await;
+    assert!(
+        loads_within(&s.browser.conn, &popup, Duration::from_secs(5)).await,
+        "human popup froze behind a client that does not read"
+    );
+    s.proxy.unregister(&s.session);
+    assert!(
+        connections_reach_zero(&s, Duration::from_secs(3)).await,
+        "upstream still open 3 s after unregister"
+    );
+    drop(ws);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn human_popup_is_released_while_tab_creation_is_in_flight() {
+    let s = common::session_fixture().await;
+    // Every tab creation stays in flight for 8 s, longer than the 5 s the popup may take.
+    s.proxy.set_tab_creation_delay(Duration::from_secs(8));
+    let c = common::client(&s.endpoint).await;
+    c.send("Target.setAutoAttach", auto_attach_waiting(), None)
+        .await
+        .unwrap();
+    let creations: Vec<_> = (0..3)
+        .map(|_| {
+            let c = c.clone();
+            tokio::spawn(async move { c.send("Target.createTarget", json!({}), None).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let human = s.browser.conn.attach(&s.human_target).await.unwrap();
+    let popup = open_human_popup(&s, &human).await;
+    assert!(
+        loads_within(&s.browser.conn, &popup, Duration::from_secs(5)).await,
+        "human popup was held while tab creations were in flight"
+    );
+    for h in creations {
+        let r = h.await.unwrap().unwrap();
+        assert!(r["targetId"].is_string());
+    }
+    assert_eq!(listed(&c).await.len(), 4);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn disconnect_right_after_human_popup_does_not_freeze_it() {
+    let s = common::session_fixture().await;
+    let human = s.browser.conn.attach(&s.human_target).await.unwrap();
+    for round in 0..5 {
+        let mut ws = raw_client(&s.endpoint).await;
+        raw_call(&mut ws, 1, "Target.setAutoAttach", auto_attach_waiting()).await;
+        // Schedule the popup, then vanish at once without a close handshake.
+        let before = schedule_human_popup(&s, &human).await;
+        drop(ws);
+        let popup = new_page(&s.browser.conn, &before).await;
+        assert!(
+            loads_within(&s.browser.conn, &popup, Duration::from_secs(5)).await,
+            "round {round}: human popup froze after the client disconnected"
+        );
+    }
+    assert!(connections_reach_zero(&s, Duration::from_secs(3)).await);
+    s.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn client_turning_auto_attach_off_does_not_freeze_human_popup() {
+    let s = common::session_fixture().await;
+    let human = s.browser.conn.attach(&s.human_target).await.unwrap();
+    let c = common::client(&s.endpoint).await;
+    let off = json!({ "autoAttach": false, "waitForDebuggerOnStart": false, "flatten": true });
+    for round in 0..5 {
+        c.send("Target.setAutoAttach", auto_attach_waiting(), None)
+            .await
+            .unwrap();
+        // Chrome detaches every auto-attached session when auto-attach goes off, also the
+        // popup's if the proxy has not resumed it yet.
+        let before = schedule_human_popup(&s, &human).await;
+        c.send("Target.setAutoAttach", off.clone(), None)
+            .await
+            .unwrap();
+        let popup = new_page(&s.browser.conn, &before).await;
+        assert!(
+            loads_within(&s.browser.conn, &popup, Duration::from_secs(5)).await,
+            "round {round}: human popup froze after the client turned auto-attach off"
+        );
+    }
+    s.shutdown().await;
+}
