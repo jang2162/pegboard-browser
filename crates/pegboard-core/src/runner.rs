@@ -4,7 +4,8 @@
 //! and a socket directory of its own, so the user's own agent-browser daemons are never
 //! touched. The session token reaches agent-browser through the environment
 //! (`AGENT_BROWSER_CDP_HEADERS`), never through process arguments, which every local user
-//! can read.
+//! can read. The CLI runs with a minimal environment of pegboard's choosing (its own HOME,
+//! no proxy variables, nothing inherited) in the session's files directory.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::watch;
 
-use crate::paths::{ensure, ensure_socket_dir, Paths};
+use crate::paths::{
+    ensure, ensure_owned_private_dir, ensure_session_files, ensure_socket_dir, Paths,
+};
 use crate::proxy::server::Endpoint;
 
 pub const AGENT_BROWSER_VERSION: &str = "0.42.0";
@@ -31,20 +34,18 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// it is given less time before it is killed.
 const BUSY_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Files agent-browser keeps per session in the socket directory.
-const DAEMON_FILES: &[&str] = &["pid", "sock", "version", "target", "config", "engine"];
-/// Errors meaning the tab agent-browser works on is gone: agent-browser's own once the
-/// session has no tab left, and the proxy's (relayed as CDP errors) for a CDP session or
-/// target that left the session because its tab closed.
-const TAB_GONE_ERRORS: &[&str] = &[
-    "No active page",
-    "Session with given id not found",
-    "No target with given id found",
+const DAEMON_FILES: &[&str] = &[
+    "pid", "sock", "version", "target", "config", "engine", "log", "stream",
 ];
+/// PATH of the agent-browser processes.
+const CHILD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+const CHILD_LANG: &str = "en_US.UTF-8";
+/// Put in place of the session token in any text returned to the caller.
+const REDACTED: &str = "[redacted]";
 /// How long the output pipes are read after the CLI exited (a stray holder of the pipes
 /// must not hang the caller).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const BIN_IN_REPO: &str = "vendor/agent-browser/agent-browser";
-const ENV_PREFIX: &str = "AGENT_BROWSER_";
 
 fn rpc_error(code: &str, message: impl Into<String>) -> RpcError {
     RpcError {
@@ -101,19 +102,13 @@ pub fn daemon_session_name(id: &SessionId) -> String {
     format!("peg-{}", id.0)
 }
 
-/// Drops every inherited `AGENT_BROWSER_*` variable; pegboard sets its own.
-fn clear_agent_browser_env(cmd: &mut std::process::Command) {
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with(ENV_PREFIX) {
-            cmd.env_remove(&key);
-        }
-    }
-}
+/// The session's targets as the proxy sees them (`ProxyServer::targets`).
+pub type SessionTargets = Arc<dyn Fn(&SessionId) -> Vec<String> + Send + Sync>;
 
 /// Runs `<bin> --version` with a time limit and returns its last word.
 fn installed_version(bin: &Path) -> Result<String, RpcError> {
     let mut cmd = std::process::Command::new(bin);
-    clear_agent_browser_env(&mut cmd);
+    cmd.env_clear().env("PATH", CHILD_PATH);
     let mut child = cmd
         .arg("--version")
         .stdin(Stdio::null())
@@ -163,6 +158,8 @@ pub struct Runner {
     config: PathBuf,
     /// Entries stay after `detach`, because session ids are never reused.
     sessions: Mutex<HashMap<SessionId, Slot>>,
+    /// Tells a closed tab from an ordinary failure (see `set_session_targets`).
+    targets: Mutex<Option<SessionTargets>>,
 }
 
 #[derive(Clone)]
@@ -173,6 +170,8 @@ struct Slot {
     starting: Arc<tokio::sync::Mutex<()>>,
     /// Commands of the session running now.
     running: Arc<AtomicUsize>,
+    /// The session's token, scrubbed from any text returned to the caller.
+    token: Arc<Mutex<Option<String>>>,
 }
 
 /// Counts a running command for as long as it lives.
@@ -207,6 +206,8 @@ impl Runner {
         }
         let internal = |e: std::io::Error| rpc_error(codes::INTERNAL, e.to_string());
         ensure(&paths).map_err(internal)?;
+        ensure_owned_private_dir(&paths.ab_home).map_err(internal)?;
+        ensure_owned_private_dir(&paths.ab_home.join("tmp")).map_err(internal)?;
         let config = paths.home.join("agent-browser.json");
         write_private(&config, b"{}\n").map_err(internal)?;
         Ok(Runner {
@@ -214,7 +215,18 @@ impl Runner {
             paths,
             config,
             sessions: Mutex::new(HashMap::new()),
+            targets: Mutex::new(None),
         })
+    }
+
+    /// Gives the runner the session's current targets, so a failed command is reported as
+    /// `tab_gone` exactly when the tab agent-browser works on has left the session. Without
+    /// it, only agent-browser's own `tab_gone` code is.
+    pub fn set_session_targets(
+        &self,
+        f: impl Fn(&SessionId) -> Vec<String> + Send + Sync + 'static,
+    ) {
+        *self.targets.lock().unwrap() = Some(Arc::new(f));
     }
 
     /// Called once right after session creation: attaches agent-browser and turns its stream
@@ -260,16 +272,43 @@ impl Runner {
             return Err(session_closed(id));
         }
         let _running = Running::new(&slot.running);
+        *slot.token.lock().unwrap() = Some(endpoint.token.clone());
         // One time limit for the whole call, including a daemon start.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         self.start_daemon(id, &slot, &closed, deadline).await?;
         let r = self
             .run(id, Some(endpoint), argv, deadline, Some(closed))
             .await?;
-        if tab_gone(&r.output) {
-            return Err(rpc_error(codes::TAB_GONE, failure_text(&r)));
+        if self.tab_gone(id, &r) {
+            return Err(RpcError {
+                code: codes::TAB_GONE.to_string(),
+                message: failure_text(&r),
+                data: Some(json!({ "output": r.output, "stderr": r.stderr })),
+            });
         }
         Ok(r)
+    }
+
+    /// A failed command hit a closed tab: agent-browser says `tab_gone`, or the tab it is
+    /// bound to (recorded in its `.target` file) is no longer one of the session's targets.
+    /// Any other failure (a wrong tab id, an element not found) is an ordinary result.
+    fn tab_gone(&self, id: &SessionId, r: &CommandExecResult) -> bool {
+        if succeeded(r) {
+            return false;
+        }
+        let field = |k: &str| r.output.get(k).and_then(Value::as_str);
+        if field("code") == Some("tab_gone") || field("type") == Some("tab_gone") {
+            return true;
+        }
+        let Some(targets) = self.targets.lock().unwrap().clone() else {
+            return false;
+        };
+        let live = targets(id);
+        let bound = std::fs::read_to_string(self.daemon_file(id, "target"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.get("targetId").and_then(Value::as_str).map(String::from));
+        live.is_empty() || bound.is_some_and(|b| !live.contains(&b))
     }
 
     /// Makes sure the session's daemon runs with its stream server off.
@@ -393,14 +432,27 @@ impl Runner {
                 closed: watch::channel(false).0,
                 starting: Arc::new(tokio::sync::Mutex::new(())),
                 running: Arc::new(AtomicUsize::new(0)),
+                token: Arc::new(Mutex::new(None)),
             })
             .clone()
     }
 
-    fn command(&self, id: &SessionId, endpoint: Option<&Endpoint>, argv: &[String]) -> Command {
+    fn command(
+        &self,
+        id: &SessionId,
+        endpoint: Option<&Endpoint>,
+        argv: &[String],
+        cwd: &Path,
+    ) -> Command {
         let mut std_cmd = std::process::Command::new(&self.bin);
-        clear_agent_browser_env(&mut std_cmd);
         std_cmd
+            .env_clear()
+            .current_dir(cwd)
+            .env("PATH", CHILD_PATH)
+            .env("HOME", &self.paths.ab_home)
+            .env("TMPDIR", self.paths.ab_home.join("tmp"))
+            .env("LANG", CHILD_LANG)
+            .env("LC_ALL", CHILD_LANG)
             .env("AGENT_BROWSER_SOCKET_DIR", &self.paths.ab_socket_dir)
             .env("AGENT_BROWSER_NO_VERSION_CHECK", "1")
             .env("AGENT_BROWSER_CONTENT_BOUNDARIES", "1")
@@ -441,8 +493,13 @@ impl Runner {
             |what: &str, e: std::io::Error| rpc_error(codes::INTERNAL, format!("{what}: {e}"));
         ensure_socket_dir(&self.paths.ab_socket_dir)
             .map_err(|e| internal("socket directory", e))?;
+        let cwd = ensure_session_files(&self.paths, id)
+            .map_err(|e| internal("session files directory", e))?;
+        let token = endpoint
+            .map(|e| e.token.clone())
+            .or_else(|| self.slot(id).token.lock().unwrap().clone());
         let mut child = self
-            .command(id, endpoint, argv)
+            .command(id, endpoint, argv, &cwd)
             .spawn()
             .map_err(|e| internal("starting agent-browser", e))?;
         let stdout = tokio::spawn(read_all(child.stdout.take()));
@@ -478,13 +535,21 @@ impl Runner {
                 }
             }
         };
-        let stdout = drained(stdout).await;
-        let stderr = drained(stderr).await;
+        let stdout = scrub(&drained(stdout).await, token.as_deref());
+        let stderr = scrub(&drained(stderr).await, token.as_deref());
         Ok(CommandExecResult {
             exit_code: status.code().unwrap_or(-1),
             output: last_json_line(&stdout),
             stderr,
         })
+    }
+}
+
+/// Defence in depth: the token never reaches the caller, whatever agent-browser prints.
+fn scrub(text: &str, token: Option<&str>) -> String {
+    match token {
+        Some(t) if !t.is_empty() => text.replace(t, REDACTED),
+        _ => text.to_string(),
     }
 }
 
@@ -536,18 +601,6 @@ fn failure_text(r: &CommandExecResult) -> String {
     }
 }
 
-/// agent-browser's answer when the tab it works on no longer exists: `tab_gone` (pinned
-/// tabs) or one of `TAB_GONE_ERRORS`.
-fn tab_gone(output: &Value) -> bool {
-    if output.get("success") != Some(&Value::Bool(false)) {
-        return false;
-    }
-    let field = |k: &str| output.get(k).and_then(Value::as_str);
-    field("code") == Some("tab_gone")
-        || field("type") == Some("tab_gone")
-        || field("error").is_some_and(|e| TAB_GONE_ERRORS.iter().any(|m| e.contains(m)))
-}
-
 /// Whether process `pid` runs the executable at `bin`.
 #[cfg(target_os = "macos")]
 fn is_this_binary(pid: i32, bin: &Path) -> bool {
@@ -587,7 +640,6 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
 
     fn result(exit_code: i32, output: Value) -> CommandExecResult {
         CommandExecResult {
@@ -608,51 +660,99 @@ mod tests {
     }
 
     #[test]
-    fn closed_tab_errors_are_recognized() {
-        for e in [
-            "No active page",
-            "CDP error (DOM.enable): Session with given id not found.",
-            "CDP error (Target.attachToTarget): No target with given id found",
-        ] {
-            assert!(tab_gone(&json!({ "success": false, "error": e })), "{e}");
-        }
-        assert!(tab_gone(&json!({ "success": false, "code": "tab_gone" })));
-        assert!(!tab_gone(
-            &json!({ "success": false, "error": "Element not found: #x" })
-        ));
-        assert!(!tab_gone(
-            &json!({ "success": true, "error": "No active page" })
-        ));
-    }
-
-    #[test]
     fn success_needs_exit_zero_and_no_failure_flag() {
         assert!(succeeded(&result(0, json!({ "success": true }))));
         assert!(!succeeded(&result(1, json!({ "success": true }))));
         assert!(!succeeded(&result(0, json!({ "success": false }))));
     }
 
-    #[test]
-    fn invocation_keeps_the_token_out_of_argv_and_drops_inherited_settings() {
-        std::env::set_var("AGENT_BROWSER_PROVIDER", "browserbase");
-        let tmp = tempfile::tempdir().unwrap();
-        let runner = Runner {
-            bin: PathBuf::from("/bin/echo"),
-            paths: crate::paths::paths_in(tmp.path()),
-            config: tmp.path().join("agent-browser.json"),
+    /// A runner over a fake `agent-browser` script, with a fresh pegboard home.
+    fn fake_runner(tmp: &Path, script: &str) -> Runner {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tmp.join("agent-browser");
+        std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = crate::paths::paths_in(&tmp.join("home"));
+        ensure_owned_private_dir(&paths.home).unwrap();
+        Runner {
+            bin,
+            config: paths.home.join("agent-browser.json"),
+            paths,
             sessions: Mutex::new(HashMap::new()),
-        };
-        let id = SessionId("s_abcdefgh".into());
-        let ep = Endpoint {
+            targets: Mutex::new(None),
+        }
+    }
+
+    fn endpoint() -> Endpoint {
+        Endpoint {
             url: "ws://127.0.0.1:1/s/s_abcdefgh".into(),
-            token: "tok3n".into(),
-        };
-        let cmd = runner.command(&id, Some(&ep), &["get".into(), "url".into()]);
+            token: "0123456789abcdef0123456789abcdef".into(),
+        }
+    }
+
+    fn deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(10)
+    }
+
+    #[tokio::test]
+    async fn child_environment_is_minimal() {
+        std::env::set_var("AGENT_BROWSER_PROVIDER", "browserbase");
+        std::env::set_var("HTTPS_PROXY", "http://proxy.invalid:1");
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = fake_runner(
+            tmp.path(),
+            r#"env > env.txt; pwd -P > pwd.txt; printf '%s\n' "$@" > args.txt; echo '{"success":true}'"#,
+        );
+        let id = SessionId("s_abcdefgh".into());
+        let ep = endpoint();
+        let argv = vec!["get".to_string(), "url".to_string()];
+        let r = runner
+            .run(&id, Some(&ep), &argv, deadline(), None)
+            .await
+            .unwrap();
         std::env::remove_var("AGENT_BROWSER_PROVIDER");
-        let std_cmd = cmd.as_std();
-        let args: Vec<&OsStr> = std_cmd.get_args().collect();
+        std::env::remove_var("HTTPS_PROXY");
+        assert_eq!(r.output, json!({ "success": true }));
+        let files = runner.paths.session_files(&id);
+        let read = |f: &str| std::fs::read_to_string(files.join(f)).unwrap();
+        let mut env: Vec<String> = read("env.txt")
+            .lines()
+            .map(|l| {
+                l.split_once('=')
+                    .map(|(k, _)| k.to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        env.sort();
+        env.retain(|k| k != "PWD" && k != "SHLVL" && k != "_" && k != "OLDPWD");
         assert_eq!(
-            args,
+            env,
+            [
+                "AGENT_BROWSER_CDP_HEADERS",
+                "AGENT_BROWSER_CONFIG",
+                "AGENT_BROWSER_CONTENT_BOUNDARIES",
+                "AGENT_BROWSER_NO_VERSION_CHECK",
+                "AGENT_BROWSER_SOCKET_DIR",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "PATH",
+                "TMPDIR",
+            ]
+        );
+        let all = read("env.txt");
+        assert!(
+            all.contains(&format!("HOME={}", runner.paths.ab_home.display())),
+            "{all}"
+        );
+        assert!(all.contains("AGENT_BROWSER_CONTENT_BOUNDARIES=1"));
+        assert_eq!(
+            PathBuf::from(read("pwd.txt").trim()),
+            files.canonicalize().unwrap()
+        );
+        let args = read("args.txt");
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
             [
                 "--session",
                 "peg-s_abcdefgh",
@@ -662,22 +762,60 @@ mod tests {
                 "get",
                 "url"
             ]
-            .map(OsStr::new)
         );
-        let envs: HashMap<&OsStr, Option<&OsStr>> = std_cmd.get_envs().collect();
-        assert_eq!(
-            envs[OsStr::new("AGENT_BROWSER_PROVIDER")],
-            None,
-            "inherited value kept"
+        assert!(!args.contains(&ep.token));
+    }
+
+    #[tokio::test]
+    async fn token_is_scrubbed_from_returned_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = fake_runner(
+            tmp.path(),
+            r#"T=$(echo "$AGENT_BROWSER_CDP_HEADERS" | sed 's/.*Bearer //; s/".*//'); echo "$AGENT_BROWSER_CDP_HEADERS" >&2; printf '{"success":false,"error":"bad %s"}\n' "$T""#,
         );
-        assert_eq!(
-            envs[OsStr::new("AGENT_BROWSER_CDP_HEADERS")],
-            Some(OsStr::new(r#"{"Authorization":"Bearer tok3n"}"#))
+        let id = SessionId("s_abcdefgh".into());
+        let ep = endpoint();
+        let argv = vec!["get".to_string(), "url".to_string()];
+        let r = runner
+            .run(&id, Some(&ep), &argv, deadline(), None)
+            .await
+            .unwrap();
+        assert_eq!(r.output["error"], json!("bad [redacted]"));
+        assert!(r.stderr.contains("Bearer [redacted]"), "{}", r.stderr);
+        assert!(!r.stderr.contains(&ep.token));
+    }
+
+    #[test]
+    fn tab_gone_only_when_the_bound_tab_left_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = fake_runner(tmp.path(), "exit 0");
+        let id = SessionId(format!("s_{}", "tabgonet"));
+        crate::paths::ensure_socket_dir(&runner.paths.ab_socket_dir).unwrap();
+        let target_file = runner.daemon_file(&id, "target");
+        std::fs::write(
+            &target_file,
+            r#"{"targetId":"T1","url":"x","pinned":false}"#,
+        )
+        .unwrap();
+        let failed = result(
+            1,
+            json!({ "success": false, "error": "No target with given id found" }),
         );
-        assert_eq!(
-            envs[OsStr::new("AGENT_BROWSER_CONFIG")],
-            Some(runner.config.as_os_str())
-        );
+        let pinned = result(1, json!({ "success": false, "code": "tab_gone" }));
+        // Without the session's targets only agent-browser's own code counts.
+        assert!(!runner.tab_gone(&id, &failed));
+        assert!(runner.tab_gone(&id, &pinned));
+        let live = Arc::new(Mutex::new(vec!["T1".to_string(), "T2".to_string()]));
+        let seen = live.clone();
+        runner.set_session_targets(move |_| seen.lock().unwrap().clone());
+        // The bound tab is still there: e.g. `tab t9` failed. An ordinary failure.
+        assert!(!runner.tab_gone(&id, &failed));
+        assert!(!runner.tab_gone(&id, &result(0, json!({ "success": true }))));
+        *live.lock().unwrap() = vec!["T2".to_string()];
+        assert!(runner.tab_gone(&id, &failed));
+        live.lock().unwrap().clear();
+        assert!(runner.tab_gone(&id, &failed));
+        let _ = std::fs::remove_file(target_file);
     }
 
     #[test]

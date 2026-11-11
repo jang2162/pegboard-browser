@@ -3,6 +3,8 @@
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use pegboard_protocol::SessionId;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub home: PathBuf,
@@ -15,6 +17,16 @@ pub struct Paths {
     pub state: PathBuf,
     /// agent-browser socket directory; kept short because of the unix socket path limit.
     pub ab_socket_dir: PathBuf,
+    /// HOME of the agent-browser processes, so they never share the user's `~/.agent-browser`.
+    pub ab_home: PathBuf,
+}
+
+impl Paths {
+    /// Directory of the files a session's commands write (screenshots, PDFs); also the
+    /// working directory of its agent-browser processes. See `ensure_session_files`.
+    pub fn session_files(&self, id: &SessionId) -> PathBuf {
+        self.home.join("sessions").join(&id.0).join("files")
+    }
 }
 
 /// `home` is `$PEGBOARD_HOME` or `~/Library/Application Support/Pegboard`.
@@ -38,6 +50,7 @@ pub fn paths_in(home: &Path) -> Paths {
         socket: home.join("pegboardd.sock"),
         state: home.join("state.json"),
         ab_socket_dir: PathBuf::from(format!("/tmp/pegboard-{uid}/ab")),
+        ab_home: home.join("agent-browser-home"),
         home,
     }
 }
@@ -60,6 +73,18 @@ pub fn ensure(paths: &Paths) -> std::io::Result<()> {
     ensure_socket_dir(&paths.ab_socket_dir)
 }
 
+/// Creates the session's files directory (`<home>/sessions/<id>/files`), each component a
+/// real directory owned by the current user with mode 0700, like `ensure_socket_dir`.
+pub fn ensure_session_files(paths: &Paths, id: &SessionId) -> std::io::Result<PathBuf> {
+    let files = paths.session_files(id);
+    let session = files.parent().unwrap_or(&paths.home);
+    let sessions = session.parent().unwrap_or(&paths.home);
+    for dir in [&paths.home, sessions, session, files.as_path()] {
+        ensure_owned_private_dir(dir)?;
+    }
+    Ok(files)
+}
+
 /// Creates `dir` and its parent (`/tmp/pegboard-<uid>` and its `ab`) when missing, and
 /// requires each of the two to be a real directory (never a symlink), owned by the current
 /// user, with mode 0700. Anything else is refused and left untouched: another local user
@@ -71,7 +96,9 @@ pub fn ensure_socket_dir(dir: &Path) -> std::io::Result<()> {
     ensure_owned_private_dir(dir)
 }
 
-fn ensure_owned_private_dir(dir: &Path) -> std::io::Result<()> {
+/// Creates `dir` (not its parents) when missing and requires it to be a real directory
+/// owned by the current user with mode 0700; anything else is refused and left untouched.
+pub fn ensure_owned_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::MetadataExt;
 
@@ -170,5 +197,23 @@ mod tests {
         std::fs::write(&file_parent, b"").unwrap();
         let e = ensure_socket_dir(&file_parent.join("ab")).unwrap_err();
         assert!(e.to_string().contains("not a directory"), "{e}");
+    }
+
+    #[test]
+    fn session_files_dir_is_private_and_not_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths_in(&tmp.path().join("home"));
+        std::fs::DirBuilder::new().mode(0o700).create(&p.home).unwrap();
+        let id = SessionId("s_abcdefgh".into());
+        let files = ensure_session_files(&p, &id).unwrap();
+        assert_eq!(files, p.home.join("sessions/s_abcdefgh/files"));
+        for dir in [&files, &p.home.join("sessions/s_abcdefgh"), &p.home.join("sessions")] {
+            assert_eq!(mode_of(dir), 0o700, "{dir:?}");
+        }
+        let other = SessionId("s_bbbbbbbb".into());
+        std::fs::DirBuilder::new().mode(0o700).create(p.home.join("sessions/s_bbbbbbbb")).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), p.home.join("sessions/s_bbbbbbbb/files")).unwrap();
+        let e = ensure_session_files(&p, &other).unwrap_err();
+        assert!(e.to_string().contains("symbolic link"), "{e}");
     }
 }

@@ -98,6 +98,10 @@ pub const ALLOWED_METHODS: &[&str] = &[
     "Page.getLayoutMetrics",
     "Page.handleJavaScriptDialog",
     "Page.printToPDF",
+    // Task 7 fix round: `a11y` and `vitals`. Both stay inside the session's page (an
+    // isolated JS world of its frame; a script for its next documents).
+    "Page.createIsolatedWorld",
+    "Page.addScriptToEvaluateOnNewDocument",
 ];
 
 const NOT_ALLOWED: &str = "not allowed in a pegboard session";

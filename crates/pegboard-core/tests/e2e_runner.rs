@@ -3,6 +3,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use pegboard_core::argv::{check, Checked};
 use pegboard_core::browser::Browser;
 use pegboard_core::cdp::page_targets;
 use pegboard_core::profiles::Profiles;
@@ -70,6 +71,8 @@ impl Harness {
             env.cfg.clone(),
         );
         let runner = Arc::new(Runner::new(env.paths.clone()).unwrap());
+        let scope = proxy.clone();
+        runner.set_session_targets(move |id| scope.targets(id));
         Harness {
             daemons: Daemons {
                 runner: runner.clone(),
@@ -703,6 +706,88 @@ async fn cookies_set_stays_in_the_agent_profile() {
     h.finish().await;
 }
 
+/// Files a command writes land in the session's private files directory, under the name
+/// the agent gave or one pegboard chose; nothing is written anywhere else.
+#[tokio::test]
+#[ignore]
+async fn screenshot_lands_in_the_session_files_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::start().await;
+    let (info, ep) = h.session("/counter").await;
+    let files = h.env.paths.session_files(&info.id);
+    let checked = |argv: &[&str]| match check(&s(argv), &files).unwrap() {
+        Checked::Run(argv) => argv,
+        other => panic!("{other:?}"),
+    };
+    let (runner, id, ep) = (&h.runner, &info.id, &ep);
+    let run = |argv: Vec<String>| async move { runner.exec(id, ep, &argv, 30_000).await.unwrap() };
+    let named = run(checked(&["screenshot", "named.png"])).await;
+    assert!(ok(&named), "{named:?}");
+    assert!(files.join("named.png").is_file());
+    let unnamed_argv = checked(&["screenshot"]);
+    let unnamed = run(unnamed_argv.clone()).await;
+    assert!(ok(&unnamed), "{unnamed:?}");
+    assert!(std::path::Path::new(&unnamed_argv[1]).is_file());
+    assert_eq!(
+        unnamed.output["data"]["path"],
+        json!(unnamed_argv[1]),
+        "{unnamed:?}"
+    );
+    let pdf = run(checked(&["pdf", "page.pdf"])).await;
+    assert!(ok(&pdf), "{pdf:?}");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&files), 0o700);
+    assert_eq!(mode(files.parent().unwrap()), 0o700);
+    let mut written: Vec<String> = std::fs::read_dir(&files)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    written.sort();
+    assert_eq!(written.len(), 3, "{written:?}");
+    assert!(
+        written.contains(&"named.png".to_string()) && written.contains(&"page.pdf".to_string())
+    );
+    // Nothing in agent-browser's own HOME or temp dir, nor in the test's working directory.
+    let tmp: Vec<_> = std::fs::read_dir(h.env.paths.ab_home.join("tmp"))
+        .unwrap()
+        .collect();
+    assert!(tmp.is_empty(), "{tmp:?}");
+    assert!(!std::path::Path::new("named.png").exists());
+    h.finish().await;
+}
+
+/// A wrong tab id (or another session's target) is an ordinary failure with the CLI's
+/// output kept; the session's own tab is fine.
+#[tokio::test]
+#[ignore]
+async fn wrong_tab_id_is_a_plain_failure_not_tab_gone() {
+    let h = Harness::start().await;
+    let (info, ep) = h.session("/counter").await;
+    let human = page_targets(&h.browser.conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.browser_context_id.as_deref() == Some(h.browser.human_context.as_str()))
+        .unwrap()
+        .target_id;
+    for tab in ["t9", human.as_str()] {
+        let r = h
+            .runner
+            .exec(&info.id, &ep, &s(&["tab", tab]), 30_000)
+            .await
+            .unwrap_or_else(|e| panic!("tab {tab}: {e:?}"));
+        assert_eq!(r.exit_code, 1, "{r:?}");
+        assert_eq!(r.output["success"], json!(false), "{r:?}");
+        assert!(
+            r.output["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{r:?}"
+        );
+    }
+    let url = h.exec(&info, &ep, &["get", "url"]).await;
+    assert_eq!(url.output["data"]["url"], json!(h.url("/counter")));
+    h.finish().await;
+}
+
 /// Not a gate: runs the commands an agent typically uses and prints, per command, whether
 /// it worked and which CDP methods the proxy refused meanwhile (the Task 7 compatibility
 /// table). Run with --nocapture.
@@ -711,9 +796,7 @@ async fn cookies_set_stays_in_the_agent_profile() {
 async fn compatibility_matrix() {
     let h = Harness::start().await;
     let (info, ep) = h.session("/form").await;
-    let out = tempfile::tempdir().unwrap();
-    let file = |name: &str| out.path().join(name).display().to_string();
-    std::fs::write(file("upload.txt"), "upload me").unwrap();
+    let files = h.env.paths.session_files(&info.id);
     let data = |html: &str| format!("data:text/html,{}", html.replace('#', "%23"));
     let upload_page = data(r#"<input id="f" type="file">"#);
     let download_page = data(r#"<a id="d" href="data:text/plain,hello" download="x.txt">get</a>"#);
@@ -722,13 +805,28 @@ async fn compatibility_matrix() {
     let frame_page = h.url("/frame");
     let mut rows = Vec::new();
     let mut refused_before = h.proxy.refused_methods();
+    // What Task 8 will do: `check`, then `new_tab` or `exec`.
     let run = |args: Vec<String>| {
         let h = &h;
         let info = &info;
         let ep = &ep;
+        let files = &files;
         async move {
             let t0 = Instant::now();
-            let r = h.runner.exec(&info.id, ep, &args, 20_000).await;
+            let r = match check(&args, files) {
+                Err(e) => Err(e),
+                Ok(Checked::TabNew { url }) => {
+                    h.manager
+                        .new_tab(&info.id, &url)
+                        .await
+                        .map(|t| CommandExecResult {
+                            exit_code: 0,
+                            output: json!({ "success": true, "data": { "targetId": t } }),
+                            stderr: String::new(),
+                        })
+                }
+                Ok(Checked::Run(argv)) => h.runner.exec(&info.id, ep, &argv, 20_000).await,
+            };
             (args, r, t0.elapsed())
         }
     };
@@ -744,53 +842,85 @@ async fn compatibility_matrix() {
         s(&["get", "url"]),
         s(&["get", "title"]),
         s(&["get", "text", "label"]),
+        s(&["get", "value", "#name"]),
+        s(&["get", "attr", "#name", "id"]),
+        s(&["get", "count", "input"]),
+        s(&["get", "box", "#name"]),
+        s(&["get", "styles", "#name"]),
         s(&["eval", "document.getElementById('name').value"]),
-        s(&["screenshot", &file("shot.png")]),
+        s(&["screenshot", "shot.png"]),
+        s(&["screenshot"]),
+        s(&["screenshot", "#name"]),
         s(&["scroll", "down"]),
         s(&["wait", "200"]),
+        s(&["wait", "#name", "--state", "visible"]),
+        s(&["wait", "--text", "Name"]),
+        s(&["wait", "--fn", "document.readyState === 'complete'"]),
+        s(&["wait", "--load", "load"]),
         s(&["open", &h.url("/counter")]),
         s(&["back"]),
         s(&["forward"]),
         s(&["reload"]),
         s(&["tab", "list"]),
         s(&["tab", "new", &h.url("/cookie/get")]),
+        s(&["tab", "list"]),
         s(&["tab", "t1"]),
         s(&["tab", "1"]),
         s(&["cookies"]),
         s(&["cookies", "set", "pegtest", "1"]),
-        s(&["cookies"]),
+        s(&["cookies", "get"]),
+        s(&["cookies", "clear"]),
         s(&["storage", "local"]),
+        s(&["storage", "local", "set", "k", "v"]),
+        s(&["storage", "local", "get", "k"]),
+        s(&["storage", "session", "clear"]),
         s(&["network", "requests"]),
-        s(&["pdf", &file("page.pdf")]),
+        s(&["network", "requests", "--filter", "counter"]),
+        s(&["pdf", "page.pdf"]),
         s(&["open", &upload_page]),
-        s(&["upload", "#f", &file("upload.txt")]),
-        s(&["eval", "document.getElementById('f').files.length"]),
+        s(&["upload", "#f", "upload.txt"]),
         s(&["open", &download_page]),
-        s(&["download", "#d", &file("x.txt")]),
+        s(&["download", "#d", "x.txt"]),
         s(&["open", &dialog_page]),
         s(&["click", "#c"]),
         s(&["dialog", "status"]),
         s(&["dialog", "accept"]),
         s(&["get", "title"]),
+        s(&["click", "#c"]),
+        s(&["dialog", "dismiss"]),
         s(&["open", &frame_page]),
         s(&["frame", "#fr"]),
         s(&["fill", "#name", "in frame"]),
         s(&["frame", "main"]),
-        // Beyond the required list.
         s(&["open", &h.url("/counter")]),
         s(&["dblclick", "#btn"]),
         s(&["focus", "#btn"]),
+        s(&["highlight", "#btn"]),
         s(&["keyboard", "type", "abc"]),
+        s(&["keyboard", "inserttext", "abc"]),
         s(&["get", "html", "h1"]),
         s(&["is", "visible", "#btn"]),
+        s(&["is", "enabled", "#btn"]),
         s(&["find", "role", "button", "click", "--name", "Add"]),
+        s(&["find", "nth", "0", "button", "hover"]),
         s(&["scrollintoview", "#btn"]),
         s(&["mouse", "move", "10", "10"]),
+        s(&["mouse", "down"]),
+        s(&["mouse", "up"]),
+        s(&["mouse", "wheel", "-50"]),
+        s(&["scroll", "up", "100"]),
         s(&["set", "viewport", "800", "600"]),
-        s(&["screenshot", "--full", &file("full.png")]),
+        s(&["set", "media", "dark"]),
+        s(&["set", "geo", "37.7", "-122.4"]),
+        s(&["set", "offline", "on"]),
+        s(&["set", "offline", "off"]),
+        s(&["screenshot", "--full", "full.png"]),
         s(&["console"]),
         s(&["errors"]),
+        s(&["a11y"]),
+        s(&["vitals"]),
         s(&["diff", "snapshot"]),
+        s(&["read", &h.url("/counter")]),
         s(&["tab", "close"]),
     ];
     for args in steps {
@@ -803,12 +933,19 @@ async fn compatibility_matrix() {
             .collect();
         refused_before = refused_now;
         let (status, detail) = match &r {
+            Ok(r) if ok(r) && args[0] == "tab" => (
+                "pass",
+                format!(
+                    "{} tabs",
+                    r.output["data"]["tabs"].as_array().map_or(0, Vec::len)
+                ),
+            ),
             Ok(r) if ok(r) => ("pass", String::new()),
             Ok(r) => ("fail", r.output["error"].to_string()),
+            Err(e) if e.code == codes::ARGV_REJECTED => ("rejected", e.message.clone()),
             Err(e) => ("error", format!("{}: {}", e.code, e.message)),
         };
         let mut shown = args.join(" ").replace(&h.fixture.origin, "");
-        shown = shown.replace(out.path().to_str().unwrap(), "<tmp>");
         if shown.len() > 60 {
             shown = format!("{}...", &shown[..57]);
         }
@@ -822,7 +959,7 @@ async fn compatibility_matrix() {
     }
     println!(
         "FILES {:?}",
-        std::fs::read_dir(out.path())
+        std::fs::read_dir(&files)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect::<Vec<_>>()

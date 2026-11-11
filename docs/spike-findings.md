@@ -124,14 +124,26 @@ Target.setDiscoverTargets, WebMCP.enable
 | `Page.printToPDF` | `pdf` | 그 페이지를 PDF로 그려 base64로 돌려준다. 스트림(`IO.read`)을 쓰지 않는 것을 확인 |
 | `DOM.getFrameOwner` | `frame` 뒤 `fill` 등 | 그 페이지 안 프레임의 소유 요소를 찾는다 |
 | `Page.getLayoutMetrics` | `screenshot --full` | 그 페이지의 크기만 읽는다 |
+| `Page.createIsolatedWorld` | `a11y` | 그 페이지 프레임 안에 격리된 JS 세계를 만든다 |
+| `Page.addScriptToEvaluateOnNewDocument` | `vitals` | 그 페이지의 다음 문서에 스크립트를 건다. `eval`로 이미 할 수 있는 것보다 넓지 않다 |
 
-**1단계에서 지원하지 않는 명령** (허용목록을 넓히지 않았다. README "아직 안 되는 것"에 옮겨 적는다)
+**1단계 명령 집합** (`crates/pegboard-core/src/argv.rs`의 `GRAMMAR`, 허용목록 문법). 첫 낱말은 아래 명령이어야 하고, 그 형태에 선언된 플래그와 인자만 받는다. 전역 플래그는 `screenshot --annotate` 하나만 받는다. 파일 인자는 경로 없는 이름만 받아 `<PEGBOARD_HOME>/sessions/<세션 id>/files/` 아래로 바꾼다. URL은 프록시와 같은 `normalize_url`로 판정하고 정규화한 문자열을 넘긴다.
+
+`open`, `back`, `forward`, `reload`, `snapshot`, `get url|title|text|html|value|attr|count|box|styles`, `is visible|enabled|checked`, `click`, `dblclick`, `hover`, `focus`, `check`, `uncheck`, `scrollintoview`, `highlight`, `fill`, `type`, `press`, `keyboard type|inserttext`, `select`, `scroll`, `drag`, `mouse move|down|up|wheel`, `find`, `wait`(`--download` 제외), `eval`, `screenshot`, `pdf`, `tab [list|new|close|<id>]`, `frame`, `dialog accept|dismiss|status`, `cookies [get|set]`, `storage local|session ...`, `console`, `errors`, `network requests`, `a11y`, `vitals`, `set viewport`
+
+**1단계에서 지원하지 않는 명령** (README "아직 안 되는 것"에 옮겨 적는다)
 
 | 명령 | 이유 |
 |---|---|
-| `upload` | `DOM.setFileInputFiles`는 브라우저가 로컬 파일을 직접 읽어 페이지에 넘긴다. 세션 엔드포인트만 가진 쪽이 사용자의 아무 파일이나 페이지로 빼낼 수 있어 세션 범위를 넘는다. `pegboard`가 경로를 판정하는 별도 경로가 필요하다 |
-| `download` | agent-browser 0.42.0이 `--cdp` 접속에서 스스로 거부한다("download is not supported over --cdp"). 저장 위치를 정하는 `Browser.setDownloadBehavior`도 브라우저 수준이라 막혀 있다 |
-| `tab <숫자>` | 0.42.0은 숫자 위치를 받지 않는다. `tab t1`처럼 탭 id를 쓴다 (프록시 문제 아님) |
+| `upload` | `DOM.setFileInputFiles`는 브라우저가 로컬 파일을 읽어 페이지에 넘긴다. 엔드포인트만 가진 쪽이 사용자의 파일을 빼낼 수 있다 |
+| `download`, `wait --download` | agent-browser가 `--cdp` 접속에서 스스로 거부하고, 저장 위치를 정하는 메서드는 브라우저 수준이다 |
+| `read`, `flow` | CLI가 프록시를 거치지 않고 직접 네트워크에 나가거나 사용자의 저장소를 쓴다 |
+| `inspect` | 인증 없는 루프백 DevTools 프록시를 열고 사용자의 기본 브라우저를 띄운다 |
+| `diff`, `network har`, `trace`, `profiler`, `cookies set --curl`, `webmcp` | 호출자가 고른 로컬 파일을 읽거나 아무 경로에나 쓴다 |
+| `network route`, `clipboard`, `react`, `pushstate` | 1단계 범위 밖. 허용목록에 없는 메서드나 페이지 밖 상태가 필요하다 |
+| `cookies clear`, `set media`, `set geo`, `set offline` | 허용하지 않은 메서드(`Network.clearBrowserCookies`, `Emulation.*`, `Network.emulateNetworkConditions`)가 필요하다 |
+| `session`, `close`, `connect`, `install`, `upgrade`, `record`, `stream`, `dashboard`, `mcp`, `chat`, `profiles`, `state`, `auth`, `plugin`, `doctor`, `skills`, `confirm`, `deny`, `batch` | `pegboard`가 맡는 것이거나 다른 명령을 감싸 문법 검사를 건너뛴다 |
+| `tab <숫자>` | 0.42.0이 숫자 위치를 받지 않는다. `tab t1`처럼 탭 id를 쓴다 |
 
 참고: `tab <id>` 전환은 `Page.bringToFront`를 보내고 거부당하지만 명령은 성공한다. `set viewport`는 `Browser.getWindowForTarget`을 거부당해도 성공한다. 두 메서드는 넣지 않았다.
 
