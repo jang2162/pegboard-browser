@@ -728,3 +728,48 @@ async fn client_turning_auto_attach_off_does_not_freeze_human_popup() {
     }
     s.shutdown().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn targets_entering_the_scope_are_reported_before_the_client_hears_of_them() {
+    let s = common::session_fixture().await;
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let log = seen.clone();
+    s.proxy.on_target_added(move |id, target| {
+        log.lock().unwrap().push((id.0.clone(), target.to_string()));
+    });
+    let c = common::client(&s.endpoint).await;
+    // A tab created through the client: reported by the time the client has its reply.
+    let t = create_tab(&c, json!({ "url": "about:blank" })).await;
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![(s.session.0.clone(), t.clone())]
+    );
+    // An adopted popup.
+    let ids = open_popup(&s, &c).await;
+    let popup = ids
+        .iter()
+        .find(|id| **id != s.first_target && **id != t)
+        .expect("popup listed")
+        .clone();
+    assert!(seen
+        .lock()
+        .unwrap()
+        .contains(&(s.session.0.clone(), popup.clone())));
+    // add_target reports only targets new to the scope; remove_target takes them out.
+    seen.lock().unwrap().clear();
+    let (_, other) = s.bridge.create_group("other", "red").await.unwrap();
+    assert!(s.proxy.add_target(&s.session, &other));
+    assert!(s.proxy.add_target(&s.session, &other));
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![(s.session.0.clone(), other.clone())]
+    );
+    assert!(listed(&c).await.contains(&other));
+    s.proxy.remove_target(&s.session, &other);
+    assert!(!s.proxy.targets(&s.session).contains(&other));
+    assert!(!listed(&c).await.contains(&other));
+    let unknown = pegboard_protocol::SessionId::generate();
+    assert!(!s.proxy.add_target(&unknown, &other));
+    s.shutdown().await;
+}

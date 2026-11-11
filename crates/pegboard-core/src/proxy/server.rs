@@ -114,18 +114,32 @@ pub struct Endpoint {
 }
 
 struct SessionEntry {
+    id: SessionId,
     token: String,
-    group: GroupId,
+    /// Chrome deletes a group with its last tab; the session can then move to a new one.
+    group: Mutex<GroupId>,
+    /// Bridge of the profile the session lives in, which creates its tabs; `None` means
+    /// the server's own bridge.
+    bridge: Option<Arc<Bridge>>,
     scope: Mutex<Scope>,
     /// Set to true when the session is unregistered; client connections then close.
     closed: watch::Sender<bool>,
 }
 
 impl SessionEntry {
-    fn new(token: String, context: &str, group: GroupId, targets: Vec<String>) -> SessionEntry {
+    fn new(
+        id: SessionId,
+        token: String,
+        context: &str,
+        group: GroupId,
+        bridge: Option<Arc<Bridge>>,
+        targets: Vec<String>,
+    ) -> SessionEntry {
         SessionEntry {
+            id,
             token,
-            group,
+            group: Mutex::new(group),
+            bridge,
             scope: Mutex::new(Scope {
                 context: context.to_string(),
                 targets: targets.into_iter().collect(),
@@ -138,10 +152,15 @@ impl SessionEntry {
 
 type Sessions = Mutex<HashMap<String, Arc<SessionEntry>>>;
 
+/// Called with the session and the target whenever a target enters a session scope.
+pub type TargetAdded = Arc<dyn Fn(&SessionId, &str) + Send + Sync>;
+
 struct Shared {
     upstream: Arc<dyn Upstream>,
+    /// Bridge for sessions registered without their own (`register`).
     bridge: Arc<Bridge>,
     sessions: Sessions,
+    on_target_added: Mutex<Option<TargetAdded>>,
     /// Client connections whose upstream is open.
     connections: Arc<AtomicUsize>,
     /// Test hook: delay before each bridge tab creation.
@@ -165,6 +184,7 @@ impl ProxyServer {
             upstream,
             bridge,
             sessions: Mutex::new(HashMap::new()),
+            on_target_added: Mutex::new(None),
             connections: Arc::new(AtomicUsize::new(0)),
             tab_delay_ms: AtomicU64::new(0),
         });
@@ -190,8 +210,9 @@ impl ProxyServer {
         })
     }
 
-    /// Registers a session scope. Targets and CDP sessions are tracked inside the server from then on.
-    /// Registering an id again replaces its scope and token and drops its old clients.
+    /// Registers a session scope whose tabs the server's own bridge creates. Targets and
+    /// CDP sessions are tracked inside the server from then on. Registering an id again
+    /// replaces its scope and token and drops its old clients.
     pub fn register(
         &self,
         id: &SessionId,
@@ -199,11 +220,37 @@ impl ProxyServer {
         group: GroupId,
         initial_targets: Vec<String>,
     ) -> Endpoint {
+        self.register_entry(id, context, group, None, initial_targets)
+    }
+
+    /// Like `register`, for a session whose tabs `bridge` creates (the bridge of the
+    /// profile `context` belongs to).
+    pub fn register_with_bridge(
+        &self,
+        id: &SessionId,
+        context: &str,
+        group: GroupId,
+        bridge: Arc<Bridge>,
+        initial_targets: Vec<String>,
+    ) -> Endpoint {
+        self.register_entry(id, context, group, Some(bridge), initial_targets)
+    }
+
+    fn register_entry(
+        &self,
+        id: &SessionId,
+        context: &str,
+        group: GroupId,
+        bridge: Option<Arc<Bridge>>,
+        initial_targets: Vec<String>,
+    ) -> Endpoint {
         let token = new_token();
         let entry = Arc::new(SessionEntry::new(
+            id.clone(),
             token.clone(),
             context,
             group,
+            bridge,
             initial_targets,
         ));
         let old = self
@@ -239,6 +286,47 @@ impl ProxyServer {
         targets
     }
 
+    /// Puts a target into the session's scope (the caller checked that it belongs there).
+    /// Returns false when the session is unknown. Calls the `on_target_added` callback
+    /// when the target is new to the scope.
+    pub fn add_target(&self, id: &SessionId, target_id: &str) -> bool {
+        let Some(entry) = self.shared.entry(id) else {
+            return false;
+        };
+        let added = entry
+            .scope
+            .lock()
+            .unwrap()
+            .targets
+            .insert(target_id.to_string());
+        if added {
+            self.shared.target_added(&entry, target_id);
+        }
+        true
+    }
+
+    /// Takes a target out of the session's scope (e.g. it was destroyed).
+    pub fn remove_target(&self, id: &SessionId, target_id: &str) {
+        if let Some(entry) = self.shared.entry(id) {
+            entry.scope.lock().unwrap().targets.remove(target_id);
+        }
+    }
+
+    /// Moves the session to another tab group (its old group was deleted with its last tab).
+    pub fn set_group(&self, id: &SessionId, group: GroupId) {
+        if let Some(entry) = self.shared.entry(id) {
+            *entry.group.lock().unwrap() = group;
+        }
+    }
+
+    /// Sets the callback run whenever a target enters a session scope: a tab created
+    /// through a client's `Target.createTarget`, an adopted popup, or `add_target`. It
+    /// runs after the scope was updated and before the client hears of the target, on the
+    /// connection's task, so it must not block.
+    pub fn on_target_added(&self, f: impl Fn(&SessionId, &str) + Send + Sync + 'static) {
+        *self.shared.on_target_added.lock().unwrap() = Some(Arc::new(f));
+    }
+
     pub fn port(&self) -> u16 {
         self.port
     }
@@ -254,6 +342,20 @@ impl ProxyServer {
     pub fn set_tab_creation_delay(&self, delay: Duration) {
         let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         self.shared.tab_delay_ms.store(ms, Ordering::Relaxed);
+    }
+}
+
+impl Shared {
+    fn entry(&self, id: &SessionId) -> Option<Arc<SessionEntry>> {
+        self.sessions.lock().unwrap().get(&id.0).cloned()
+    }
+
+    /// Must be called without the scope lock held.
+    fn target_added(&self, entry: &SessionEntry, target_id: &str) {
+        let callback = self.on_target_added.lock().unwrap().clone();
+        if let Some(f) = callback {
+            f(&entry.id, target_id);
+        }
     }
 }
 
@@ -424,8 +526,8 @@ async fn handle_socket(shared: Arc<Shared>, mut sock: TcpStream) -> Result<()> {
     let (client_tx, writer) = ClientSender::spawn(sink);
     let (tab_tx, tab_rx) = mpsc::unbounded_channel();
     let conn = ClientConn {
-        bridge: shared.bridge.clone(),
         tab_delay: Duration::from_millis(shared.tab_delay_ms.load(Ordering::Relaxed)),
+        shared: shared.clone(),
         entry,
         client_rx,
         client_tx,
@@ -534,8 +636,8 @@ struct TabCreated {
 }
 
 struct ClientConn {
-    bridge: Arc<Bridge>,
     tab_delay: Duration,
+    shared: Arc<Shared>,
     entry: Arc<SessionEntry>,
     client_rx: SplitStream<WebSocketStream<TcpStream>>,
     client_tx: ClientSender,
@@ -720,8 +822,12 @@ impl ClientConn {
             }
             ClientDecision::CreateTab { url } => {
                 self.tabs_in_flight += 1;
-                let bridge = self.bridge.clone();
-                let group = self.entry.group.clone();
+                let bridge = self
+                    .entry
+                    .bridge
+                    .clone()
+                    .unwrap_or_else(|| self.shared.bridge.clone());
+                let group = self.entry.group.lock().unwrap().clone();
                 let tx = self.tab_tx.clone();
                 let delay = self.tab_delay;
                 tokio::spawn(async move {
@@ -767,9 +873,9 @@ impl ClientConn {
         method: &str,
     ) -> Result<()> {
         msg["id"] = client.id.clone();
-        let decision = {
+        let (decision, adopted) = {
             let mut scope = self.entry.scope.lock().unwrap();
-            adopt_listed_popups(&msg, &mut scope);
+            let adopted = adopt_listed_popups(&msg, &mut scope);
             let decision = filter::browser_message(msg, Some(method), &scope);
             if let BrowserDecision::Forward(v) = &decision {
                 if method == "Target.attachToTarget" {
@@ -778,8 +884,11 @@ impl ClientConn {
                     }
                 }
             }
-            decision
+            (decision, adopted)
         };
+        for target_id in &adopted {
+            self.shared.target_added(&self.entry, target_id);
+        }
         match decision {
             BrowserDecision::Forward(v) | BrowserDecision::Adopt { forward: v, .. } => {
                 self.send_client(&v)
@@ -812,20 +921,26 @@ impl ClientConn {
         let auto_attached = auto_attached_session(&msg);
         let copy = (self.tabs_in_flight > 0 && is_target_event && event_context.is_some())
             .then(|| msg.clone());
-        let (decision, own_context) = {
+        let (decision, own_context, adopted) = {
             let mut scope = self.entry.scope.lock().unwrap();
             let own_context = event_context.as_deref() == Some(scope.context.as_str());
             let decision = filter::browser_message(msg, None, &scope);
+            let mut adopted = None;
             match &decision {
                 BrowserDecision::Forward(v) => track_event(v, &mut scope),
                 BrowserDecision::Adopt { target_id, forward } => {
-                    scope.targets.insert(target_id.clone());
+                    if scope.targets.insert(target_id.clone()) {
+                        adopted = Some(target_id.clone());
+                    }
                     track_event(forward, &mut scope);
                 }
                 BrowserDecision::Drop => {}
             }
-            (decision, own_context)
+            (decision, own_context, adopted)
         };
+        if let Some(target_id) = adopted {
+            self.shared.target_added(&self.entry, &target_id);
+        }
         match decision {
             BrowserDecision::Forward(v) | BrowserDecision::Adopt { forward: v, .. } => {
                 if let Some((session_id, target_id)) = auto_attached {
@@ -957,14 +1072,15 @@ impl ClientConn {
         let context = info
             .pointer("/result/targetInfo/browserContextId")
             .and_then(Value::as_str);
-        let in_context = {
+        let (in_context, added) = {
             let mut scope = self.entry.scope.lock().unwrap();
             let ok = context == Some(scope.context.as_str());
-            if ok {
-                scope.targets.insert(target_id.clone());
-            }
-            ok
+            let added = ok && scope.targets.insert(target_id.clone());
+            (ok, added)
         };
+        if added {
+            self.shared.target_added(&self.entry, &target_id);
+        }
         self.tabs_in_flight -= 1;
         if !in_context {
             self.forget_stash_if_idle().await?;
@@ -1025,10 +1141,11 @@ fn track_event(msg: &Value, scope: &mut Scope) {
 /// A `targetInfos` listing can show a popup of an own tab before (or without) a
 /// `Target.targetCreated` event on this connection, e.g. when the client never enabled
 /// target discovery. Such popups are adopted by the same rule as the event: the opener is
-/// in scope and the popup lives in the session's context.
-fn adopt_listed_popups(msg: &Value, scope: &mut Scope) {
+/// in scope and the popup lives in the session's context. Returns the adopted targets.
+fn adopt_listed_popups(msg: &Value, scope: &mut Scope) -> Vec<String> {
+    let mut adopted = Vec::new();
     let Some(infos) = msg.pointer("/result/targetInfos").and_then(Value::as_array) else {
-        return;
+        return adopted;
     };
     loop {
         let mut added = false;
@@ -1042,13 +1159,14 @@ fn adopt_listed_popups(msg: &Value, scope: &mut Scope) {
                     && !scope.targets.contains(id)
                 {
                     scope.targets.insert(id.to_string());
+                    adopted.push(id.to_string());
                     added = true;
                 }
             }
         }
         // A popup of a popup is adopted once its opener is.
         if !added {
-            break;
+            return adopted;
         }
     }
 }
@@ -1061,7 +1179,14 @@ mod tests {
     const ID: &str = "s_abcdefgh";
 
     fn sessions() -> Sessions {
-        let entry = SessionEntry::new(TOKEN.into(), "AGENT", GroupId(1), vec![]);
+        let entry = SessionEntry::new(
+            SessionId(ID.into()),
+            TOKEN.into(),
+            "AGENT",
+            GroupId(1),
+            None,
+            vec![],
+        );
         Mutex::new(HashMap::from([(ID.to_string(), Arc::new(entry))]))
     }
 
