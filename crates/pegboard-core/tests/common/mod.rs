@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 use std::path::PathBuf;
 
-use pegboard_core::browser::{find_chrome, BrowserConfig};
+use pegboard_core::browser::{find_chrome, Browser, BrowserConfig};
+use pegboard_core::cdp::{page_targets, CdpConn};
 use pegboard_core::paths::{paths_in, Paths};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -100,4 +101,36 @@ pub async fn fixture() -> Fixture {
         }
     });
     Fixture { origin, task }
+}
+
+/// Environment, fixture server and a launched browser. The browser is killed when dropped.
+pub async fn launched() -> (Env, Fixture, Browser) {
+    let e = env();
+    let f = fixture().await;
+    let b = Browser::launch(&e.paths, &e.cfg).await.unwrap();
+    (e, f, b)
+}
+
+/// Brings some page target of `context` to the front.
+pub async fn activate_any_target_in(conn: &CdpConn, context: &str) {
+    let t = page_targets(conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.browser_context_id.as_deref() == Some(context))
+        .expect("no page target in that context");
+    conn.send("Target.activateTarget", serde_json::json!({ "targetId": t.target_id }), None)
+        .await
+        .unwrap();
+}
+
+/// The browserContextId of a page target.
+pub async fn context_of(conn: &CdpConn, target_id: &str) -> String {
+    page_targets(conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.target_id == target_id)
+        .and_then(|t| t.browser_context_id)
+        .expect("target not found")
 }
