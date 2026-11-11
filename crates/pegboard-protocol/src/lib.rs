@@ -18,6 +18,8 @@ pub mod codes {
     pub const AGENT_BROWSER_MISSING: &str = "agent_browser_missing";
     pub const AGENT_BROWSER_VERSION: &str = "agent_browser_version";
     pub const BROWSER_FAILED: &str = "browser_failed";
+    /// A command did not finish within its time limit (it was stopped).
+    pub const TIMEOUT: &str = "timeout";
     pub const INTERNAL: &str = "internal";
 }
 

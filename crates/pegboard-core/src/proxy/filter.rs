@@ -91,6 +91,13 @@ pub const ALLOWED_METHODS: &[&str] = &[
     "Network.getCookies",
     "Network.setCookie",
     "Network.deleteCookies",
+    // Task 7: needed by agent-browser commands; each acts on the page of the CDP session
+    // it is sent on (or that page's browser context), never on other targets.
+    "DOM.getFrameOwner",
+    "Network.setCookies",
+    "Page.getLayoutMetrics",
+    "Page.handleJavaScriptDialog",
+    "Page.printToPDF",
 ];
 
 const NOT_ALLOWED: &str = "not allowed in a pegboard session";

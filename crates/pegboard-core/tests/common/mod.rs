@@ -66,6 +66,7 @@ document.getElementById('out').textContent = JSON.stringify({ cookie: document.c
         ),
         "/opener" => ("", page("opener", r#"<button id="open" onclick="window.open('/counter')">Open</button>"#)),
         "/form" => ("", page("form", r#"<label>Name <input id="name"></label> <label>Password <input id="pw" type="password"></label>"#)),
+        "/frame" => ("", page("frame", r#"<p>outer</p><iframe id="fr" src="/form"></iframe>"#)),
         "/writer" => ("", page("writer", "<p>writer</p><script>setInterval(() => localStorage.setItem('busy', String(Date.now())), 100);</script>")),
         _ => return None,
     })

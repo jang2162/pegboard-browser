@@ -115,6 +115,26 @@ Target.setDiscoverTargets, WebMCP.enable
 
 이 목록은 실험한 명령 범위의 것이다. 네트워크 가로채기, 쿠키, 다운로드 같은 명령은 돌리지 않았으므로 더 있다.
 
+**1단계 Task 7에서 덧붙인 메서드** (`crates/pegboard-core/src/proxy/filter.rs`의 `ALLOWED_METHODS`). 실제 세션에서 agent-browser 0.42.0을 돌려 프록시가 거부한 것 가운데, 보낸 CDP 세션의 페이지(또는 그 페이지의 브라우저 컨텍스트)에만 작용하는 것만 넣었다. 판정 근거는 `tests/e2e_runner.rs`의 `compatibility_matrix`.
+
+| 메서드 | 쓰는 명령 | 넣은 이유 |
+|---|---|---|
+| `Network.setCookies` | `cookies set` | 페이지 세션에서는 그 탭의 프로필 쿠키에만 쓴다. 이미 허용한 `Network.setCookie`의 여러 개 판. 브라우저 수준 호출은 규칙 5가 그대로 막는다. 사람 프로필에 안 새는 것을 `cookies_set_stays_in_the_agent_profile`로 확인 |
+| `Page.handleJavaScriptDialog` | `dialog accept`, `dialog dismiss` | 그 페이지에 뜬 대화상자에만 답한다. 막으면 `confirm`이 떠 있는 동안 탭의 다음 명령이 모두 멈춘다 |
+| `Page.printToPDF` | `pdf` | 그 페이지를 PDF로 그려 base64로 돌려준다. 스트림(`IO.read`)을 쓰지 않는 것을 확인 |
+| `DOM.getFrameOwner` | `frame` 뒤 `fill` 등 | 그 페이지 안 프레임의 소유 요소를 찾는다 |
+| `Page.getLayoutMetrics` | `screenshot --full` | 그 페이지의 크기만 읽는다 |
+
+**1단계에서 지원하지 않는 명령** (허용목록을 넓히지 않았다. README "아직 안 되는 것"에 옮겨 적는다)
+
+| 명령 | 이유 |
+|---|---|
+| `upload` | `DOM.setFileInputFiles`는 브라우저가 로컬 파일을 직접 읽어 페이지에 넘긴다. 세션 엔드포인트만 가진 쪽이 사용자의 아무 파일이나 페이지로 빼낼 수 있어 세션 범위를 넘는다. `pegboard`가 경로를 판정하는 별도 경로가 필요하다 |
+| `download` | agent-browser 0.42.0이 `--cdp` 접속에서 스스로 거부한다("download is not supported over --cdp"). 저장 위치를 정하는 `Browser.setDownloadBehavior`도 브라우저 수준이라 막혀 있다 |
+| `tab <숫자>` | 0.42.0은 숫자 위치를 받지 않는다. `tab t1`처럼 탭 id를 쓴다 (프록시 문제 아님) |
+
+참고: `tab <id>` 전환은 `Page.bringToFront`를 보내고 거부당하지만 명령은 성공한다. `set viewport`는 `Browser.getWindowForTarget`을 거부당해도 성공한다. 두 메서드는 넣지 않았다.
+
 ### A8. 동작 정책과 확인
 
 스크립트: `spikes/02b-policy.mjs`. `--cdp`로 붙은 세션에서 실험했다.
@@ -141,6 +161,8 @@ Target.setDiscoverTargets, WebMCP.enable
 | 시작부터 끄는 환경 변수 | 소스에서 `AGENT_BROWSER_STREAM_PORT`, `_QUALITY`, `_MAX_WIDTH`, `_MAX_HEIGHT`만 찾았다. 끄는 것은 못 찾았다 |
 
 **판정: 조건부.** 끌 수는 있지만 세션의 첫 명령부터 `stream disable`까지는 열려 있다. 같은 기기의 다른 프로세스가 그 사이에 접속해 화면을 보고 입력을 넣을 수 있다.
+
+1단계 Task 7에서 알게 된 것 [확인]: 스트림 서버는 데몬이 뜨자마자, 브라우저에 붙기 전에 열린다. `AGENT_BROWSER_STREAM_PORT`에 `off`, `-1`, `99999`를 줘도 무시되고 임의 포트가 열린다. 그래서 `Runner`는 데몬을 `--cdp` 없이 `stream disable`로 먼저 띄우고, 다음 명령에서야 세션 엔드포인트에 붙인다. 붙은 뒤에도 스트림은 꺼진 채다. 남는 노출은 브라우저가 연결되지 않은 데몬의 포트가 열려 있는 수십 ms(측정 약 60ms 시점에 한 번 관찰, `attach` 전체 약 130~180ms)이고, 그동안 보여 줄 화면도 넣을 입력 대상도 없다. 데몬이 죽었다 다시 뜨는 경우에도 같은 순서를 밟는다(`exec`가 데몬이 살아 있는지 매번 확인한다).
 
 ### A4, A5, A7. 탭그룹
 

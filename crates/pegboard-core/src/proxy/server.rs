@@ -6,7 +6,7 @@
 //! direction is parsed, judged by `filter` against the session's scope, and re-serialized.
 //! The scope (targets and CDP sessions) is maintained here from what passes the filter.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -162,6 +162,9 @@ struct Shared {
     connections: Arc<AtomicUsize>,
     /// Test hook: delay before each bridge tab creation.
     tab_delay_ms: AtomicU64,
+    /// Diagnostics: client requests the filter refused, counted per method. Never sent to
+    /// a client.
+    refused: Mutex<BTreeMap<String, u64>>,
 }
 
 /// One loopback listener serving every session's CDP endpoint.
@@ -183,6 +186,7 @@ impl ProxyServer {
             on_target_added: Mutex::new(None),
             connections: Arc::new(AtomicUsize::new(0)),
             tab_delay_ms: AtomicU64::new(0),
+            refused: Mutex::new(BTreeMap::new()),
         });
         let accepting = shared.clone();
         let accept = tokio::spawn(async move {
@@ -317,11 +321,30 @@ impl ProxyServer {
         let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         self.shared.tab_delay_ms.store(ms, Ordering::Relaxed);
     }
+
+    /// Diagnostics: how often the filter refused each method (all sessions) since the
+    /// server started. Only reachable from inside the daemon.
+    #[doc(hidden)]
+    pub fn refused_methods(&self) -> BTreeMap<String, u64> {
+        self.shared.refused.lock().unwrap().clone()
+    }
 }
 
 impl Shared {
     fn entry(&self, id: &SessionId) -> Option<Arc<SessionEntry>> {
         self.sessions.lock().unwrap().get(&id.0).cloned()
+    }
+
+    fn count_refused(&self, msg: &Value) {
+        let method = msg
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("<no method>");
+        // Bounded: a client sending made-up method names cannot grow the map without limit.
+        let mut refused = self.refused.lock().unwrap();
+        if refused.len() < 1024 || refused.contains_key(method) {
+            *refused.entry(method.to_string()).or_default() += 1;
+        }
     }
 
     /// Must be called without the scope lock held.
@@ -806,6 +829,7 @@ impl ClientConn {
             ClientDecision::ForwardRewritten(v) => v,
             ClientDecision::Reply(result) => return self.send_client(&reply(&client, Ok(result))),
             ClientDecision::Error { code, message } => {
+                self.shared.count_refused(&msg);
                 return self.send_client(&reply(&client, Err((code, message))));
             }
             ClientDecision::CreateTab { url } => {
