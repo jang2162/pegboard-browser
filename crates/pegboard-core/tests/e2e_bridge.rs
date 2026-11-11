@@ -61,3 +61,30 @@ async fn close_and_ungroup() {
     assert!(br.members(&g).await.unwrap().is_empty());
     b.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore]
+async fn bridge_refuses_targets_of_the_human_profile() {
+    let (e, _f, b) = common::launched().await;
+    let agent = b.open_profile_window(&e.paths, &e.cfg, "PegboardAgent").await.unwrap();
+    let br = Bridge::attach(&b.conn, &agent).await.unwrap();
+    let (g, _) = br.create_group("iso", "blue").await.unwrap();
+    let human = page_targets(&b.conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.browser_context_id.as_deref() == Some(b.human_context.as_str()))
+        .expect("no human page")
+        .target_id;
+    let closed = br.close_targets(&[human.clone()]).await;
+    eprintln!("close_targets on human target: {closed:?}");
+    assert!(closed.is_err());
+    let added = br.add_to_group(&g, &human).await;
+    eprintln!("add_to_group on human target: {added:?}");
+    assert!(added.is_err());
+    let after = page_targets(&b.conn).await.unwrap();
+    let t = after.iter().find(|t| t.target_id == human).expect("human target vanished");
+    assert_eq!(t.browser_context_id.as_deref(), Some(b.human_context.as_str()));
+    assert!(!br.members(&g).await.unwrap().contains(&human));
+    b.shutdown().await.unwrap();
+}

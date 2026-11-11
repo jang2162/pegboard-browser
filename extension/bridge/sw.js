@@ -15,6 +15,16 @@ async function targetIdOf(tabId) {
 async function tabIdOf(targetId) {
   const t = (await chrome.debugger.getTargets()).find((x) => x.type === 'page' && x.id === targetId);
   if (!t || t.tabId === undefined) throw new Error(`unknown target ${targetId}`);
+  // Defense in depth: the tab must be a real tab of a window owned by this profile.
+  const notMine = new Error(`target is not in this profile: ${targetId}`);
+  let tab;
+  try {
+    tab = await chrome.tabs.get(t.tabId);
+  } catch (_) {
+    throw notMine;
+  }
+  const windows = await chrome.windows.getAll();
+  if (!windows.some((w) => w.id === tab.windowId)) throw notMine;
   return t.tabId;
 }
 

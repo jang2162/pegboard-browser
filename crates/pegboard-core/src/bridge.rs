@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use crate::cdp::CdpConn;
 
 const WORKER_WAIT: Duration = Duration::from_secs(10);
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupId(pub i64);
@@ -45,15 +46,31 @@ async fn find_worker(conn: &CdpConn, context: &str, wait: Duration) -> Result<Op
 impl Bridge {
     /// Attaches to the bridge service worker that lives in `agent_context` and keeps that CDP session open.
     pub async fn attach(conn: &CdpConn, agent_context: &str) -> Result<Bridge> {
-        let target = find_worker(conn, agent_context, WORKER_WAIT)
-            .await?
-            .ok_or_else(|| anyhow!("bridge service worker for the agent profile did not appear within 10s"))?;
-        let session = conn.attach(&target).await?;
-        Ok(Bridge {
-            conn: conn.clone(),
-            agent_context: agent_context.to_string(),
-            session: Mutex::new(session),
-        })
+        let deadline = tokio::time::Instant::now() + WORKER_WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let target = find_worker(conn, agent_context, left).await?.ok_or_else(|| {
+                anyhow!("bridge service worker for the agent profile did not appear within 10s")
+            })?;
+            // A worker that is still starting (or being restarted) can accept a session
+            // yet never answer, so require one answered ping before trusting it.
+            if let Ok(session) = conn.attach(&target).await {
+                let ping = conn.evaluate(&session, "typeof self.peg");
+                if let Ok(Ok(v)) = tokio::time::timeout(PING_TIMEOUT, ping).await {
+                    if v == "object" {
+                        return Ok(Bridge {
+                            conn: conn.clone(),
+                            agent_context: agent_context.to_string(),
+                            session: Mutex::new(session),
+                        });
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("bridge service worker did not answer within 10s");
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
     }
 
     /// Calls `self.peg.<func>(...args)` in the worker; retries once after re-attaching when the session is gone.
