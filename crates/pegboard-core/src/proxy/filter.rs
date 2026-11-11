@@ -35,7 +35,10 @@ pub enum BrowserDecision {
     Forward(Value),
     Drop,
     /// A new target that belongs to the session (popup of an own tab).
-    Adopt { target_id: String, forward: Value },
+    Adopt {
+        target_id: String,
+        forward: Value,
+    },
 }
 
 /// The 23 methods agent-browser used in phase 0 plus the additions for phase 1.
@@ -102,22 +105,38 @@ const TARGET_ID_METHODS: &[&str] = &[
     "Target.closeTarget",
     "Target.getTargetInfo",
 ];
-/// Browser-level (no sessionId) calls that would reach beyond the agent's context.
 const URL_REFUSED: &str = "url scheme is not allowed in a pegboard session";
 
-/// Only http(s), data: and exactly about:blank may be opened or navigated to.
-/// Everything else (file:, chrome:, javascript:, extensions, ...) is refused.
-pub fn url_allowed(url: &str) -> bool {
-    let url = url.trim_start();
-    if url == "about:blank" {
-        return true;
+/// Judge and normalize a URL an agent wants to open or navigate to. Returns the
+/// string the browser must receive, or `None` when it is refused.
+///
+/// Only http(s) with a host, data: and exactly about:blank pass. Like Chrome,
+/// only leading/trailing characters <= 0x20 are trimmed (not Unicode
+/// whitespace), and control characters inside (tab, CR, LF) are refused rather
+/// than silently stripped. http(s) must literally contain "://" after the scheme.
+pub fn normalize_url(url: &str) -> Option<String> {
+    let trimmed = url.trim_matches(|c: char| c <= ' ');
+    if trimmed.chars().any(|c| c < ' ') {
+        return None;
     }
-    let Some((scheme, _)) = url.split_once(':') else {
-        return false;
-    };
-    ["http", "https", "data"].iter().any(|s| scheme.eq_ignore_ascii_case(s))
+    if trimmed == "about:blank" {
+        return Some("about:blank".into());
+    }
+    let parsed = url::Url::parse(trimmed).ok()?;
+    match parsed.scheme() {
+        "data" => Some(parsed.to_string()),
+        "http" | "https" => {
+            let rest = trimmed.get(parsed.scheme().len()..)?.strip_prefix("://")?;
+            if rest.starts_with(['/', '\\']) || parsed.host_str().is_none_or(str::is_empty) {
+                return None;
+            }
+            Some(parsed.to_string())
+        }
+        _ => None,
+    }
 }
 
+/// Browser-level (no sessionId) calls that would reach beyond the agent's context.
 const BROWSER_LEVEL_EXACT: &[&str] = &[
     "Browser.grantPermissions",
     "Browser.resetPermissions",
@@ -134,7 +153,10 @@ const TARGET_EVENTS: &[&str] = &[
 ];
 
 fn error(code: i64, message: impl Into<String>) -> ClientDecision {
-    ClientDecision::Error { code, message: message.into() }
+    ClientDecision::Error {
+        code,
+        message: message.into(),
+    }
 }
 
 /// Decide what to do with a message from the agent's client. Ordered rules.
@@ -152,11 +174,13 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
     // 1. Target.createTarget is never forwarded; only the url survives.
     if method == "Target.createTarget" {
         return match params.and_then(|p| p.get("url")) {
-            None => ClientDecision::CreateTab { url: "about:blank".into() },
-            Some(Value::String(url)) if url_allowed(url) => {
-                ClientDecision::CreateTab { url: url.clone() }
-            }
-            Some(Value::String(_)) => error(-32000, URL_REFUSED),
+            None => ClientDecision::CreateTab {
+                url: "about:blank".into(),
+            },
+            Some(Value::String(url)) => match normalize_url(url) {
+                Some(url) => ClientDecision::CreateTab { url },
+                None => error(-32000, URL_REFUSED),
+            },
             Some(_) => error(-32602, "Invalid params: url must be a string"),
         };
     }
@@ -202,7 +226,10 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
         || BROWSER_LEVEL_PREFIXES.iter().any(|p| method.starts_with(p))
     {
         // 5. Browser-level (no sessionId) calls on shared state.
-        return error(-32000, "browser-level call is not allowed; use a page session");
+        return error(
+            -32000,
+            "browser-level call is not allowed; use a page session",
+        );
     }
 
     // 6. Browser-level auto-attach must not make new tabs wait for a debugger.
@@ -217,19 +244,27 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
         return ClientDecision::ForwardRewritten(rewritten);
     }
 
-    // 7. Navigation targets must use an allowed URL scheme.
-    if method == "Page.navigate"
-        && !params
+    // 7. Navigation targets must use an allowed URL; the browser receives the
+    // normalized string that was judged, not the raw one.
+    if method == "Page.navigate" {
+        let Some(url) = params
             .and_then(|p| p.get("url"))
             .and_then(Value::as_str)
-            .is_some_and(url_allowed)
-    {
-        return error(-32000, URL_REFUSED);
+            .and_then(normalize_url)
+        else {
+            return error(-32000, URL_REFUSED);
+        };
+        let mut rewritten = msg.clone();
+        rewritten["params"]["url"] = Value::String(url);
+        return ClientDecision::ForwardRewritten(rewritten);
     }
 
     // 8. Allowlist.
     if !ALLOWED_METHODS.contains(&method) {
-        return error(-32601, format!("'{method}' is not allowed in a pegboard session"));
+        return error(
+            -32601,
+            format!("'{method}' is not allowed in a pegboard session"),
+        );
     }
 
     // 9. Everything else.
@@ -245,11 +280,26 @@ fn target_id_of(params: &Value) -> Option<&str> {
 
 /// Decide what to do with a message from the browser. `_request_method` (the
 /// request method for a response; unused now that filtering keys off the message). Ordered rules.
-pub fn browser_message(mut msg: Value, _request_method: Option<&str>, scope: &Scope) -> BrowserDecision {
+pub fn browser_message(
+    mut msg: Value,
+    _request_method: Option<&str>,
+    scope: &Scope,
+) -> BrowserDecision {
     let method = msg.get("method").and_then(Value::as_str).map(str::to_owned);
 
-    // 1. Any response carrying targetInfos: hide targets outside the session.
-    if method.is_none() && msg.pointer("/result/targetInfos").is_some_and(Value::is_array) {
+    // 1. Anything on a CDP session that is not this session's, whatever its body.
+    if let Some(sid) = msg.get("sessionId") {
+        if !sid.as_str().is_some_and(|s| scope.cdp_sessions.contains(s)) {
+            return BrowserDecision::Drop;
+        }
+    }
+
+    // 2. Any response carrying targetInfos: hide targets outside the session.
+    if method.is_none()
+        && msg
+            .pointer("/result/targetInfos")
+            .is_some_and(Value::is_array)
+    {
         if let Some(infos) = msg
             .pointer_mut("/result/targetInfos")
             .and_then(Value::as_array_mut)
@@ -266,42 +316,42 @@ pub fn browser_message(mut msg: Value, _request_method: Option<&str>, scope: &Sc
     if let Some(method) = method.as_deref() {
         let params = msg.get("params").unwrap_or(&Value::Null);
 
-        // 2. Popup of an own tab in the session's context is adopted.
+        // 3. Popup of an own tab in the session's context is adopted.
         if method == "Target.targetCreated" {
             let info = params.get("targetInfo");
             let opener = info.and_then(|i| i.get("openerId")).and_then(Value::as_str);
-            let context = info.and_then(|i| i.get("browserContextId")).and_then(Value::as_str);
+            let context = info
+                .and_then(|i| i.get("browserContextId"))
+                .and_then(Value::as_str);
             if let (Some(opener), Some(context), Some(target_id)) =
                 (opener, context, target_id_of(params))
             {
                 if scope.targets.contains(opener) && context == scope.context {
                     let target_id = target_id.to_owned();
-                    return BrowserDecision::Adopt { target_id, forward: msg };
+                    return BrowserDecision::Adopt {
+                        target_id,
+                        forward: msg,
+                    };
                 }
             }
         }
 
-        // 3. Child targets (iframe, worker) reported inside an own session envelope.
-        if matches!(method, "Target.attachedToTarget" | "Target.detachedFromTarget")
-            && msg
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .is_some_and(|s| scope.cdp_sessions.contains(s))
+        // 4. Child targets (iframe, worker) reported inside an own session envelope.
+        if matches!(
+            method,
+            "Target.attachedToTarget" | "Target.detachedFromTarget"
+        ) && msg
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|s| scope.cdp_sessions.contains(s))
         {
             return BrowserDecision::Forward(msg);
         }
 
-        // 4. Target events about foreign (or unidentifiable) targets.
+        // 5. Target events about foreign (or unidentifiable) targets.
         if TARGET_EVENTS.contains(&method)
             && !target_id_of(params).is_some_and(|id| scope.targets.contains(id))
         {
-            return BrowserDecision::Drop;
-        }
-    }
-
-    // 5. Anything on a CDP session that is not this session's.
-    if let Some(sid) = msg.get("sessionId") {
-        if !sid.as_str().is_some_and(|s| scope.cdp_sessions.contains(s)) {
             return BrowserDecision::Drop;
         }
     }
@@ -313,7 +363,6 @@ pub fn browser_message(mut msg: Value, _request_method: Option<&str>, scope: &Sc
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     fn scope() -> Scope {
         Scope {
@@ -333,15 +382,30 @@ mod tests {
     #[test]
     fn create_target_is_never_forwarded() {
         let m = json!({"method":"Target.createTarget","params":{"url":"https://a.test","browserContextId":"HUMAN"}});
-        assert_eq!(client_message(&m, &scope()), ClientDecision::CreateTab { url: "https://a.test".into() });
+        assert_eq!(
+            client_message(&m, &scope()),
+            ClientDecision::CreateTab {
+                url: "https://a.test/".into()
+            }
+        );
     }
 
     #[test]
     fn create_target_without_url_uses_blank() {
         let m = json!({"method":"Target.createTarget","params":{}});
-        assert_eq!(client_message(&m, &scope()), ClientDecision::CreateTab { url: "about:blank".into() });
+        assert_eq!(
+            client_message(&m, &scope()),
+            ClientDecision::CreateTab {
+                url: "about:blank".into()
+            }
+        );
         let m = json!({"method":"Target.createTarget"});
-        assert_eq!(client_message(&m, &scope()), ClientDecision::CreateTab { url: "about:blank".into() });
+        assert_eq!(
+            client_message(&m, &scope()),
+            ClientDecision::CreateTab {
+                url: "about:blank".into()
+            }
+        );
     }
 
     #[test]
@@ -397,8 +461,15 @@ mod tests {
 
     #[test]
     fn missing_or_malformed_method_is_refused() {
-        for m in [json!({"id":1}), json!({"id":1,"method":5}), json!({"id":1,"method":null})] {
-            assert!(matches!(client_message(&m, &scope()), ClientDecision::Error { .. }), "{m}");
+        for m in [
+            json!({"id":1}),
+            json!({"id":1,"method":5}),
+            json!({"id":1,"method":null}),
+        ] {
+            assert!(
+                matches!(client_message(&m, &scope()), ClientDecision::Error { .. }),
+                "{m}"
+            );
         }
     }
 
@@ -406,7 +477,10 @@ mod tests {
     fn non_object_params_are_refused() {
         for p in [json!("x"), json!([1]), json!(null), json!(3)] {
             let m = json!({"method":"Page.navigate","sessionId":"S1","params":p});
-            assert!(matches!(client_message(&m, &scope()), ClientDecision::Error { .. }), "{m}");
+            assert!(
+                matches!(client_message(&m, &scope()), ClientDecision::Error { .. }),
+                "{m}"
+            );
         }
     }
 
@@ -423,7 +497,10 @@ mod tests {
     #[test]
     fn unsolicited_response_is_forwarded_as_is() {
         let m = json!({"id":7,"result":{}});
-        assert_eq!(browser_message(m.clone(), None, &scope()), BrowserDecision::Forward(m));
+        assert_eq!(
+            browser_message(m.clone(), None, &scope()),
+            BrowserDecision::Forward(m)
+        );
     }
 
     #[test]
@@ -432,7 +509,10 @@ mod tests {
             "targetId":"T2","openerId":"T1","browserContextId":"AGENT"}}});
         assert_eq!(
             browser_message(m.clone(), None, &scope()),
-            BrowserDecision::Adopt { target_id: "T2".into(), forward: m }
+            BrowserDecision::Adopt {
+                target_id: "T2".into(),
+                forward: m
+            }
         );
     }
 
@@ -445,10 +525,17 @@ mod tests {
 
     #[test]
     fn foreign_target_events_are_dropped() {
-        let created = json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"H2"}}});
-        assert_eq!(browser_message(created, None, &scope()), BrowserDecision::Drop);
+        let created =
+            json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"H2"}}});
+        assert_eq!(
+            browser_message(created, None, &scope()),
+            BrowserDecision::Drop
+        );
         let destroyed = json!({"method":"Target.targetDestroyed","params":{"targetId":"H1"}});
-        assert_eq!(browser_message(destroyed, None, &scope()), BrowserDecision::Drop);
+        assert_eq!(
+            browser_message(destroyed, None, &scope()),
+            BrowserDecision::Drop
+        );
     }
 
     #[test]
@@ -457,7 +544,9 @@ mod tests {
         assert_eq!(browser_message(m, None, &scope()), BrowserDecision::Drop);
     }
 
-    fn sess_ok(d: &ClientDecision) { assert_eq!(*d, ClientDecision::Forward); }
+    fn sess_ok(d: &ClientDecision) {
+        assert_eq!(*d, ClientDecision::Forward);
+    }
 
     #[test]
     fn detach_from_foreign_session_is_refused() {
@@ -475,8 +564,14 @@ mod tests {
 
     #[test]
     fn detach_from_own_session_passes() {
-        sess_ok(&client_message(&json!({"method":"Target.detachFromTarget","params":{"sessionId":"S1"}}), &scope()));
-        sess_ok(&client_message(&json!({"method":"Target.detachFromTarget","params":{"targetId":"T1"}}), &scope()));
+        sess_ok(&client_message(
+            &json!({"method":"Target.detachFromTarget","params":{"sessionId":"S1"}}),
+            &scope(),
+        ));
+        sess_ok(&client_message(
+            &json!({"method":"Target.detachFromTarget","params":{"targetId":"T1"}}),
+            &scope(),
+        ));
     }
 
     #[test]
@@ -484,7 +579,9 @@ mod tests {
         let m = json!({"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}});
         assert_eq!(
             client_message(&m, &scope()),
-            ClientDecision::ForwardRewritten(json!({"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true}}))
+            ClientDecision::ForwardRewritten(
+                json!({"id":1,"method":"Target.setAutoAttach","params":{"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true}})
+            )
         );
     }
 
@@ -498,7 +595,10 @@ mod tests {
     fn child_target_events_of_own_session_are_forwarded() {
         for method in ["Target.attachedToTarget", "Target.detachedFromTarget"] {
             let m = json!({"method":method,"sessionId":"S1","params":{"targetInfo":{"targetId":"CHILD"}}});
-            assert_eq!(browser_message(m.clone(), None, &scope()), BrowserDecision::Forward(m));
+            assert_eq!(
+                browser_message(m.clone(), None, &scope()),
+                BrowserDecision::Forward(m)
+            );
         }
     }
 
@@ -516,7 +616,13 @@ mod tests {
 
     #[test]
     fn file_and_chrome_urls_are_refused_for_navigate_and_create() {
-        for url in ["file:///etc/passwd", "chrome://settings", "javascript:alert(1)", " FILE:///x", "chrome-extension://abc/x.html"] {
+        for url in [
+            "file:///etc/passwd",
+            "chrome://settings",
+            "javascript:alert(1)",
+            " FILE:///x",
+            "chrome-extension://abc/x.html",
+        ] {
             let nav = json!({"method":"Page.navigate","sessionId":"S1","params":{"url":url}});
             let create = json!({"method":"Target.createTarget","params":{"url":url}});
             for m in [nav, create] {
@@ -535,12 +641,100 @@ mod tests {
 
     #[test]
     fn http_https_data_and_blank_urls_pass() {
-        for url in ["http://a.test", "HTTPS://a.test/x", "data:text/html,hi", "about:blank", "  https://a.test"] {
-            assert!(url_allowed(url), "{url}");
+        for url in [
+            "http://a.test",
+            "HTTPS://a.test/x",
+            "data:text/html,hi",
+            "about:blank",
+            "  https://a.test",
+        ] {
+            assert!(normalize_url(url).is_some(), "{url}");
             let nav = json!({"method":"Page.navigate","sessionId":"S1","params":{"url":url}});
-            sess_ok(&client_message(&nav, &scope()));
+            assert!(
+                matches!(
+                    client_message(&nav, &scope()),
+                    ClientDecision::ForwardRewritten(_)
+                ),
+                "{url}"
+            );
         }
-        assert!(!url_allowed("about:srcdoc"));
+        assert_eq!(normalize_url("about:srcdoc"), None);
+    }
+
+    fn refused_both(url: &str) {
+        let nav = json!({"method":"Page.navigate","sessionId":"S1","params":{"url":url}});
+        let create = json!({"method":"Target.createTarget","params":{"url":url}});
+        for m in [nav, create] {
+            assert_eq!(err_code(&client_message(&m, &scope())), -32000, "{url:?}");
+        }
+    }
+
+    #[test]
+    fn unicode_whitespace_prefix_does_not_bypass_url_check() {
+        for url in [
+            "\u{a0}https:/../../sw.js",
+            "\u{3000}file:///etc/passwd",
+            "\u{2003}chrome://settings",
+        ] {
+            refused_both(url);
+        }
+    }
+
+    #[test]
+    fn urls_are_normalized_before_use() {
+        let create =
+            json!({"method":"Target.createTarget","params":{"url":"  HTTPS://Example.com/a b "}});
+        assert_eq!(
+            client_message(&create, &scope()),
+            ClientDecision::CreateTab {
+                url: "https://example.com/a%20b".into()
+            }
+        );
+        let nav = json!({"id":2,"method":"Page.navigate","sessionId":"S1","params":{"url":"  HTTPS://Example.com/a b ","frameId":"F"}});
+        assert_eq!(
+            client_message(&nav, &scope()),
+            ClientDecision::ForwardRewritten(
+                json!({"id":2,"method":"Page.navigate","sessionId":"S1","params":{"url":"https://example.com/a%20b","frameId":"F"}})
+            )
+        );
+    }
+
+    #[test]
+    fn scheme_less_and_relative_strings_are_refused() {
+        for url in [
+            "example.com",
+            "/x",
+            "//evil.test/x",
+            "https:/../../sw.js",
+            "https:sw.js",
+            "https:///x",
+        ] {
+            refused_both(url);
+        }
+    }
+
+    #[test]
+    fn embedded_tab_or_newline_is_refused() {
+        for url in [
+            "ht\ttps://a.test",
+            "https://a.test/\nx",
+            "https://a.test/\rx",
+        ] {
+            refused_both(url);
+        }
+    }
+
+    #[test]
+    fn foreign_session_response_with_target_infos_is_dropped() {
+        let m = json!({"id":3,"sessionId":"S9","result":{"targetInfos":[{"targetId":"T1"}]}});
+        assert_eq!(browser_message(m, None, &scope()), BrowserDecision::Drop);
+        let ok = json!({"id":3,"sessionId":"S1","result":{"targetInfos":[{"targetId":"H1"},{"targetId":"T1"}]}});
+        assert_eq!(
+            browser_message(ok, None, &scope()),
+            BrowserDecision::Forward(
+                json!({"id":3,"sessionId":"S1","result":{"targetInfos":[{"targetId":"T1"}]}})
+            )
+        );
     }
 
     #[test]
@@ -555,7 +749,10 @@ mod tests {
     #[test]
     fn response_for_foreign_session_is_dropped() {
         let m = json!({"id":3,"sessionId":"S9","result":{}});
-        assert_eq!(browser_message(m, Some("Page.enable"), &scope()), BrowserDecision::Drop);
+        assert_eq!(
+            browser_message(m, Some("Page.enable"), &scope()),
+            BrowserDecision::Drop
+        );
     }
 
     #[test]
