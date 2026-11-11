@@ -88,3 +88,27 @@ async fn bridge_refuses_targets_of_the_human_profile() {
     assert!(!br.members(&g).await.unwrap().contains(&human));
     b.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore]
+async fn bridge_refuses_relative_and_extension_urls() {
+    let (e, _f, b) = common::launched().await;
+    let agent = b.open_profile_window(&e.paths, &e.cfg, "PegboardAgent").await.unwrap();
+    let br = Bridge::attach(&b.conn, &agent).await.unwrap();
+    let (g, first) = br.create_group("urls", "blue").await.unwrap();
+    let pages_before = page_targets(&b.conn).await.unwrap().len();
+    for url in [
+        "sw.js",
+        "/sw.js",
+        "chrome-extension://x/sw.js",
+        "\u{a0}https:/../../sw.js",
+        "file:///etc/passwd",
+    ] {
+        let r = br.create_tab(&g, url).await;
+        eprintln!("create_tab({url:?}): {r:?}");
+        assert!(r.is_err(), "{url:?} was accepted");
+    }
+    assert_eq!(br.members(&g).await.unwrap(), vec![first]);
+    assert_eq!(page_targets(&b.conn).await.unwrap().len(), pages_before);
+    b.shutdown().await.unwrap();
+}

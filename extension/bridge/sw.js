@@ -28,6 +28,22 @@ async function tabIdOf(targetId) {
   return t.tabId;
 }
 
+// Only exactly about:blank and absolute http:, https: and data: URLs. chrome.tabs resolves a
+// relative string against this extension's origin, so nothing else may reach it.
+function allowedUrl(url) {
+  if (url === 'about:blank') return url;
+  const refused = new Error(`url not allowed: ${JSON.stringify(url)}`);
+  if (typeof url !== 'string') throw refused;
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (_) {
+    throw refused;
+  }
+  if (!['http:', 'https:', 'data:'].includes(parsed.protocol)) throw refused;
+  return parsed.href;
+}
+
 self.peg = {
   async createGroup(title, color) {
     const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
@@ -37,9 +53,10 @@ self.peg = {
   },
 
   async createTab(groupId, url) {
+    const target = allowedUrl(url);
     const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
     await chrome.tabs.group({ groupId, tabIds: [tab.id] });
-    if (url !== 'about:blank') await chrome.tabs.update(tab.id, { url });
+    if (target !== 'about:blank') await chrome.tabs.update(tab.id, { url: target });
     return { targetId: await targetIdOf(tab.id) };
   },
 
