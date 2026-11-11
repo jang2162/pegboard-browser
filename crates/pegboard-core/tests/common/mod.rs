@@ -73,7 +73,9 @@ document.getElementById('out').textContent = JSON.stringify({ cookie: document.c
 
 async fn serve(mut sock: tokio::net::TcpStream) {
     let mut buf = vec![0u8; 8192];
-    let Ok(n) = sock.read(&mut buf).await else { return };
+    let Ok(n) = sock.read(&mut buf).await else {
+        return;
+    };
     let req = String::from_utf8_lossy(&buf[..n]);
     let path = req
         .lines()
@@ -119,9 +121,13 @@ pub async fn activate_any_target_in(conn: &CdpConn, context: &str) {
         .into_iter()
         .find(|t| t.browser_context_id.as_deref() == Some(context))
         .expect("no page target in that context");
-    conn.send("Target.activateTarget", serde_json::json!({ "targetId": t.target_id }), None)
-        .await
-        .unwrap();
+    conn.send(
+        "Target.activateTarget",
+        serde_json::json!({ "targetId": t.target_id }),
+        None,
+    )
+    .await
+    .unwrap();
 }
 
 /// The browserContextId of a page target.
@@ -133,4 +139,89 @@ pub async fn context_of(conn: &CdpConn, target_id: &str) -> String {
         .find(|t| t.target_id == target_id)
         .and_then(|t| t.browser_context_id)
         .expect("target not found")
+}
+
+/// A browser with a human `/cookie/set` tab, an agent window, a bridge group and a proxy
+/// session registered for that group. The browser is killed when this is dropped (also on
+/// test failure); `shutdown` closes it gracefully.
+/// Fields drop in declaration order: the proxy and the browser go before the temp dir.
+pub struct SessionFixture {
+    pub proxy: pegboard_core::proxy::server::ProxyServer,
+    pub bridge: std::sync::Arc<pegboard_core::bridge::Bridge>,
+    pub browser: Browser,
+    pub fixture: Fixture,
+    pub env: Env,
+    pub session: pegboard_protocol::SessionId,
+    pub endpoint: pegboard_core::proxy::server::Endpoint,
+    pub agent_context: String,
+    pub group: pegboard_core::bridge::GroupId,
+    pub human_target: String,
+    pub first_target: String,
+}
+
+impl SessionFixture {
+    pub async fn shutdown(self) {
+        let SessionFixture { proxy, browser, .. } = self;
+        drop(proxy);
+        browser.shutdown().await.unwrap();
+    }
+}
+
+pub async fn session_fixture() -> SessionFixture {
+    use pegboard_core::bridge::Bridge;
+    use pegboard_core::proxy::server::{ProxyServer, WsUpstream};
+    use std::sync::Arc;
+
+    let (env, fixture, browser) = launched().await;
+    let human_target = page_targets(&browser.conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.browser_context_id.as_deref() == Some(browser.human_context.as_str()))
+        .expect("no human page")
+        .target_id;
+    let human_session = browser.conn.attach(&human_target).await.unwrap();
+    browser
+        .conn
+        .navigate(&human_session, &format!("{}/cookie/set", fixture.origin))
+        .await
+        .unwrap();
+    let agent_context = browser
+        .open_profile_window(&env.paths, &env.cfg, "PegboardAgent")
+        .await
+        .unwrap();
+    let bridge = Arc::new(Bridge::attach(&browser.conn, &agent_context).await.unwrap());
+    let (group, first_target) = bridge.create_group("proxy", "blue").await.unwrap();
+    let upstream = Arc::new(WsUpstream {
+        browser_ws_url: browser.ws_url.clone(),
+    });
+    let proxy = ProxyServer::start(upstream, bridge.clone()).await.unwrap();
+    let session = pegboard_protocol::SessionId::generate();
+    let endpoint = proxy.register(
+        &session,
+        &agent_context,
+        group.clone(),
+        vec![first_target.clone()],
+    );
+    SessionFixture {
+        env,
+        fixture,
+        browser,
+        bridge,
+        proxy,
+        session,
+        endpoint,
+        agent_context,
+        group,
+        human_target,
+        first_target,
+    }
+}
+
+/// A CDP client of a session endpoint, sending its token.
+pub async fn client(endpoint: &pegboard_core::proxy::server::Endpoint) -> CdpConn {
+    let auth = format!("Bearer {}", endpoint.token);
+    CdpConn::connect_with_headers(&endpoint.url, &[("Authorization", &auth)])
+        .await
+        .unwrap()
 }

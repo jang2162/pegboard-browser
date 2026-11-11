@@ -316,8 +316,10 @@ pub fn browser_message(
     if let Some(method) = method.as_deref() {
         let params = msg.get("params").unwrap_or(&Value::Null);
 
-        // 3. Popup of an own tab in the session's context is adopted.
-        if method == "Target.targetCreated" {
+        // 3. Popup of an own tab in the session's context is adopted, whether discovery
+        // (targetCreated) or browser-level auto-attach (attachedToTarget) reports it first.
+        let top_level = msg.get("sessionId").is_none();
+        if method == "Target.targetCreated" || (method == "Target.attachedToTarget" && top_level) {
             let info = params.get("targetInfo");
             let opener = info.and_then(|i| i.get("openerId")).and_then(Value::as_str);
             let context = info
@@ -348,7 +350,17 @@ pub fn browser_message(
             return BrowserDecision::Forward(msg);
         }
 
-        // 5. Target events about foreign (or unidentifiable) targets.
+        // 5. Relayed messages of a non-flat session must come from one of this session's.
+        if method == "Target.receivedMessageFromTarget"
+            && !params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_some_and(|s| scope.cdp_sessions.contains(s))
+        {
+            return BrowserDecision::Drop;
+        }
+
+        // 6. Target events about foreign (or unidentifiable) targets.
         if TARGET_EVENTS.contains(&method)
             && !target_id_of(params).is_some_and(|id| scope.targets.contains(id))
         {
@@ -356,7 +368,7 @@ pub fn browser_message(
         }
     }
 
-    // 6. Everything else (including responses to forwarded requests).
+    // 7. Everything else (including responses to forwarded requests).
     BrowserDecision::Forward(msg)
 }
 
@@ -517,6 +529,25 @@ mod tests {
     }
 
     #[test]
+    fn auto_attached_popup_of_own_tab_is_adopted() {
+        let m = json!({"method":"Target.attachedToTarget","params":{"sessionId":"S2","targetInfo":{
+            "targetId":"T2","openerId":"T1","browserContextId":"AGENT"},"waitingForDebugger":false}});
+        assert_eq!(
+            browser_message(m.clone(), None, &scope()),
+            BrowserDecision::Adopt {
+                target_id: "T2".into(),
+                forward: m
+            }
+        );
+        let foreign = json!({"method":"Target.attachedToTarget","params":{"sessionId":"S3","targetInfo":{
+            "targetId":"H2","openerId":"H1","browserContextId":"AGENT"}}});
+        assert_eq!(
+            browser_message(foreign, None, &scope()),
+            BrowserDecision::Drop
+        );
+    }
+
+    #[test]
     fn popup_in_other_context_is_dropped() {
         let m = json!({"method":"Target.targetCreated","params":{"targetInfo":{
             "targetId":"T2","openerId":"T1","browserContextId":"HUMAN"}}});
@@ -606,6 +637,26 @@ mod tests {
     fn attached_event_for_foreign_target_is_dropped() {
         let m = json!({"method":"Target.attachedToTarget","params":{"sessionId":"X","targetInfo":{"targetId":"H1"}}});
         assert_eq!(browser_message(m, None, &scope()), BrowserDecision::Drop);
+    }
+
+    #[test]
+    fn relayed_messages_of_foreign_non_flat_sessions_are_dropped() {
+        let foreign = json!({"method":"Target.receivedMessageFromTarget","params":{"sessionId":"X","message":"{}"}});
+        assert_eq!(
+            browser_message(foreign, None, &scope()),
+            BrowserDecision::Drop
+        );
+        let missing =
+            json!({"method":"Target.receivedMessageFromTarget","params":{"message":"{}"}});
+        assert_eq!(
+            browser_message(missing, None, &scope()),
+            BrowserDecision::Drop
+        );
+        let own = json!({"method":"Target.receivedMessageFromTarget","params":{"sessionId":"S1","message":"{}"}});
+        assert_eq!(
+            browser_message(own.clone(), None, &scope()),
+            BrowserDecision::Forward(own)
+        );
     }
 
     #[test]

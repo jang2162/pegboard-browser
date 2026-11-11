@@ -9,6 +9,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -21,7 +23,14 @@ pub struct CdpEvent {
     pub session_id: Option<String>,
 }
 
-type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>;
+/// Outstanding requests, and whether the reader has finished (no reply can arrive any more).
+#[derive(Default)]
+struct PendingState {
+    waiters: HashMap<u64, oneshot::Sender<Result<Value>>>,
+    closed: bool,
+}
+
+type Pending = Mutex<PendingState>;
 
 struct Inner {
     out: mpsc::UnboundedSender<Message>,
@@ -38,7 +47,21 @@ pub struct CdpConn {
 
 impl CdpConn {
     pub async fn connect(ws_url: &str) -> Result<CdpConn> {
-        let (ws, _) = tokio_tungstenite::connect_async(ws_url)
+        Self::connect_with_headers(ws_url, &[]).await
+    }
+
+    /// Connects sending extra HTTP headers with the upgrade request (e.g. `Authorization`).
+    pub async fn connect_with_headers(ws_url: &str, headers: &[(&str, &str)]) -> Result<CdpConn> {
+        let mut request = ws_url
+            .into_client_request()
+            .with_context(|| format!("invalid websocket url {ws_url}"))?;
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                HeaderName::from_bytes(name.as_bytes()).context("invalid header name")?,
+                HeaderValue::from_str(value).context("invalid header value")?,
+            );
+        }
+        let (ws, _) = tokio_tungstenite::connect_async(request)
             .await
             .with_context(|| format!("connecting to {ws_url}"))?;
         let (mut sink, mut stream) = ws.split();
@@ -46,7 +69,7 @@ impl CdpConn {
         let (events, _) = broadcast::channel(1024);
         let inner = Arc::new(Inner {
             out,
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingState::default()),
             next_id: AtomicU64::new(1),
             events,
         });
@@ -65,7 +88,7 @@ impl CdpConn {
                 let Message::Text(text) = msg else { continue };
                 let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
                 if let Some(id) = v.get("id").and_then(Value::as_u64) {
-                    let waiter = reader.pending.lock().unwrap().remove(&id);
+                    let waiter = reader.pending.lock().unwrap().waiters.remove(&id);
                     if let Some(tx) = waiter {
                         let result = match v.get("error") {
                             Some(e) => Err(anyhow!("CDP error: {e}")),
@@ -81,8 +104,12 @@ impl CdpConn {
                     });
                 }
             }
-            // Connection closed: fail every outstanding request.
-            let waiters: Vec<_> = reader.pending.lock().unwrap().drain().collect();
+            // Connection closed: fail every outstanding request, and every later one.
+            let waiters: Vec<_> = {
+                let mut pending = reader.pending.lock().unwrap();
+                pending.closed = true;
+                pending.waiters.drain().collect()
+            };
             for (_, tx) in waiters {
                 let _ = tx.send(Err(anyhow!("CDP connection closed")));
             }
@@ -103,16 +130,22 @@ impl CdpConn {
             msg["sessionId"] = json!(s);
         }
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().unwrap().insert(id, tx);
+        {
+            let mut pending = self.inner.pending.lock().unwrap();
+            if pending.closed {
+                bail!("CDP connection closed");
+            }
+            pending.waiters.insert(id, tx);
+        }
         if self.inner.out.send(Message::text(msg.to_string())).is_err() {
-            self.inner.pending.lock().unwrap().remove(&id);
+            self.inner.pending.lock().unwrap().waiters.remove(&id);
             bail!("CDP connection closed");
         }
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(result)) => result.with_context(|| format!("{method} failed")),
             Ok(Err(_)) => bail!("CDP connection closed during {method}"),
             Err(_) => {
-                self.inner.pending.lock().unwrap().remove(&id);
+                self.inner.pending.lock().unwrap().waiters.remove(&id);
                 bail!("{method} timed out after {}s", REQUEST_TIMEOUT.as_secs())
             }
         }

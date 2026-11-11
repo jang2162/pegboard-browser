@@ -16,6 +16,10 @@ libc = "0.2"
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 url = "2.5.8"
+async-trait = "0.1"
+httparse = "1"
+rand.workspace = true
+subtle = "2.6"
 
 [dev-dependencies]
 tempfile.workspace = true
