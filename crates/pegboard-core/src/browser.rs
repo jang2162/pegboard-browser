@@ -166,11 +166,23 @@ impl Browser {
         for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let now = page_targets(&self.conn).await?;
-            if let Some(t) = now.iter().find(|t| !before.contains(&t.target_id)) {
-                let ctx = t
-                    .browser_context_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("new page target has no browserContextId"))?;
+            // Accept only a context that is neither the human profile nor another known
+            // profile, so a tab the human opens meanwhile cannot be mistaken for this one.
+            let taken: Vec<String> = {
+                let map = self.profiles.lock().unwrap();
+                map.iter()
+                    .filter(|(k, _)| k.as_str() != profile_dir)
+                    .map(|(_, v)| v.clone())
+                    .collect()
+            };
+            let fresh = now.iter().find(|t| {
+                !before.contains(&t.target_id)
+                    && t.browser_context_id.as_ref().is_some_and(|c| {
+                        !c.is_empty() && *c != self.human_context && !taken.contains(c)
+                    })
+            });
+            if let Some(t) = fresh {
+                let ctx = t.browser_context_id.clone().unwrap();
                 self.profiles
                     .lock()
                     .unwrap()
