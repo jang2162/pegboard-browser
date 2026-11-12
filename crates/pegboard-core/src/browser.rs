@@ -64,7 +64,7 @@ pub struct Browser {
     pub ws_url: String,
     pub conn: CdpConn,
     pub human_context: String,
-    child: Child,
+    child: Mutex<Child>,
     /// profile directory -> browserContextId, for profiles whose window we opened.
     profiles: Mutex<HashMap<String, String>>,
 }
@@ -114,7 +114,7 @@ impl Browser {
             ws_url,
             conn,
             human_context,
-            child,
+            child: Mutex::new(child),
             profiles: Mutex::new(HashMap::from([(
                 HUMAN_PROFILE_DIR.to_string(),
                 String::new(),
@@ -193,17 +193,35 @@ impl Browser {
         bail!("no window appeared for profile {profile_dir}")
     }
 
-    /// `Browser.close`, then SIGKILL after 5 s.
-    pub async fn shutdown(mut self) -> Result<()> {
-        let _ = self.conn.send("Browser.close", json!({}), None).await;
-        match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
-            Ok(r) => {
-                r?;
-            }
-            Err(_) => {
-                self.child.kill().await?;
-            }
+    /// Whether the browser process has ended.
+    pub fn has_exited(&self) -> bool {
+        matches!(self.child.lock().unwrap().try_wait(), Ok(Some(_)) | Err(_))
+    }
+
+    /// `Browser.close`, then SIGKILL after 5 s. Does nothing when the browser has ended.
+    pub async fn close(&self) {
+        if self.has_exited() {
+            return;
         }
+        let _ = self.conn.send("Browser.close", json!({}), None).await;
+        for _ in 0..50 {
+            if self.has_exited() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = self.child.lock().unwrap().start_kill();
+        for _ in 0..20 {
+            if self.has_exited() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// `close`, for callers that own the browser.
+    pub async fn shutdown(self) -> Result<()> {
+        self.close().await;
         Ok(())
     }
 }

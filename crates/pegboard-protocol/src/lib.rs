@@ -11,6 +11,7 @@ pub mod codes {
     pub const INVALID_PARAMS: &str = "invalid_params";
     pub const UNKNOWN_METHOD: &str = "unknown_method";
     pub const SESSION_NOT_FOUND: &str = "session_not_found";
+    pub const RECORDING_NOT_FOUND: &str = "recording_not_found";
     pub const PROFILE_NOT_FOUND: &str = "profile_not_found";
     pub const PROFILE_IN_USE: &str = "profile_in_use";
     pub const ARGV_REJECTED: &str = "argv_rejected";

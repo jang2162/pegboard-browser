@@ -1,4 +1,5 @@
 pub mod actionlog;
+pub mod api;
 pub mod argv;
 pub mod bridge;
 pub mod browser;
@@ -8,4 +9,5 @@ pub mod paths;
 pub mod profiles;
 pub mod proxy;
 pub mod runner;
+pub mod service;
 pub mod session;

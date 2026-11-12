@@ -16,6 +16,8 @@ use crate::proxy::server::Endpoint;
 use crate::runner::{succeeded, Runner, DEFAULT_TIMEOUT_MS};
 use crate::session::SessionManager;
 
+pub use crate::service::Daemon;
+
 /// Time allowed for looking at what is focused after a command.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 

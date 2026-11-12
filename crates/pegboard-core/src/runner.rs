@@ -421,6 +421,28 @@ impl Runner {
         killed
     }
 
+    /// Stops the agent-browser daemons a pegboard that died left behind, and removes their
+    /// files. Only sessions that have a directory in this pegboard home are touched: the
+    /// socket directory is shared by every home of the user, so a `peg-*` daemon with no
+    /// directory here may belong to another running pegboard. Returns how many were found.
+    pub fn cleanup_leftovers(&self) -> usize {
+        let sessions = self.paths.home.join("sessions");
+        let Ok(entries) = std::fs::read_dir(&sessions) else {
+            return 0;
+        };
+        let mut found = 0;
+        for entry in entries.flatten() {
+            let Some(id) = entry.file_name().to_str().and_then(SessionId::parse) else {
+                continue;
+            };
+            found += 1;
+            self.kill_daemon(&id);
+            self.remove_daemon_files(&id);
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+        found
+    }
+
     fn daemon_file(&self, id: &SessionId, ext: &str) -> PathBuf {
         self.paths
             .ab_socket_dir
