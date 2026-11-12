@@ -9,14 +9,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use pegboard_core::actionlog::{ActionEntry, Manifest};
+use pegboard_core::actionlog::{valid_recording_id, ActionEntry, Manifest};
 use pegboard_core::api::{serve, Client};
 use pegboard_core::daemon::Daemon;
-use pegboard_core::paths::{ensure, paths, Paths};
+use pegboard_core::lock::DaemonLock;
+use pegboard_core::paths::{ensure_home, paths, socket_path_fits, Paths};
 use pegboard_core::runner::succeeded;
 use pegboard_protocol::{
     codes, BrowserStatus, CommandExecParams, CommandExecResult, ProfileInfo, RpcError,
-    SessionCloseParams, SessionCreateParams, SessionId, SessionInfo,
+    SessionCreateParams, SessionId, SessionInfo,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -125,6 +126,9 @@ enum RecordingCmd {
 fn main() {
     let cli = Cli::parse();
     let paths = paths();
+    if !socket_path_fits(&paths) {
+        usage("PEGBOARD_HOME is too long for a unix socket path");
+    }
     let code = match run(cli, &paths) {
         Ok(()) => 0,
         Err(e) => report(&e),
@@ -137,7 +141,7 @@ fn report(e: &RpcError) -> i32 {
     eprintln!("pegboard: {}: {}", e.code, e.message);
     match e.code.as_str() {
         codes::NOT_RUNNING => EXIT_NO_DAEMON,
-        codes::ARGV_REJECTED => EXIT_USAGE,
+        codes::ARGV_REJECTED | codes::INVALID_PARAMS => EXIT_USAGE,
         _ => EXIT_FAILURE,
     }
 }
@@ -153,6 +157,19 @@ fn error(code: &str, message: impl Into<String>) -> RpcError {
 fn usage(message: &str) -> ! {
     eprintln!("pegboard: {message}");
     std::process::exit(EXIT_USAGE)
+}
+
+/// A session as the user gives it: the id, and the token after a `.` when there is one.
+/// A wrong or missing token is for the daemon to refuse; a malformed id is a usage error.
+fn parse_handle(text: &str) -> (SessionId, Option<String>) {
+    let (id, token) = match text.split_once('.') {
+        Some((id, token)) => (id, Some(token.to_string())),
+        None => (text, None),
+    };
+    match SessionId::parse(id) {
+        Some(id) => (id, token),
+        None => usage(&format!("{id:?} is not a session id")),
+    }
 }
 
 fn call<P: Serialize, R: DeserializeOwned>(
@@ -253,11 +270,18 @@ fn session(paths: &Paths, command: SessionCmd, json: bool) -> Result<(), RpcErro
                 "session.create",
                 SessionCreateParams { name, url, profile },
             )?;
+            // The handle is `<id>.<token>`; this is the only place a token is printed.
+            let handle = format!("{}.{}", s.id.0, s.token.clone().unwrap_or_default());
             if json {
-                print_json(&s);
+                let mut v = serde_json::to_value(&s).unwrap_or_default();
+                if let Some(map) = v.as_object_mut() {
+                    map.remove("token");
+                    map.insert("handle".into(), Value::String(handle));
+                }
+                print_json(&v);
             } else {
-                // First line: the id, so `export PEGBOARD_SESSION=$(pegboard session create)` works.
-                println!("{}", s.id.0);
+                // First line: the handle, so `export PEGBOARD_SESSION=$(pegboard session create)` works.
+                println!("{handle}");
             }
         }
         SessionCmd::List => {
@@ -270,7 +294,12 @@ fn session(paths: &Paths, command: SessionCmd, json: bool) -> Result<(), RpcErro
             }
         }
         SessionCmd::Info { id } => {
-            let s: SessionInfo = call(paths, "session.info", json!({ "sessionId": id }))?;
+            let (id, token) = parse_handle(&id);
+            let s: SessionInfo = call(
+                paths,
+                "session.info",
+                json!({ "sessionId": id, "token": token }),
+            )?;
             if json {
                 print_json(&s);
             } else {
@@ -278,13 +307,11 @@ fn session(paths: &Paths, command: SessionCmd, json: bool) -> Result<(), RpcErro
             }
         }
         SessionCmd::Close { id, keep_tabs } => {
+            let (id, token) = parse_handle(&id);
             let s: SessionInfo = call(
                 paths,
                 "session.close",
-                SessionCloseParams {
-                    session_id: SessionId(id),
-                    keep_tabs,
-                },
+                json!({ "sessionId": id, "keepTabs": keep_tabs, "token": token }),
             )?;
             if json {
                 print_json(&s);
@@ -315,6 +342,9 @@ fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), Rpc
             }
         }
         RecordingCmd::Show { recording_id } => {
+            if !valid_recording_id(&recording_id) {
+                usage(&format!("{recording_id:?} is not a recording id"));
+            }
             let v: Value = call(paths, "recording.get", json!({ "recordingId": recording_id }))?;
             if json {
                 print_json(&v);
@@ -364,13 +394,15 @@ fn render_output(output: &Value) -> String {
 }
 
 fn agent_command(paths: &Paths, session: String, argv: Vec<String>, json: bool) -> Result<(), RpcError> {
+    let (session_id, token) = parse_handle(&session);
     let r: CommandExecResult = call(
         paths,
         "command.exec",
         CommandExecParams {
-            session_id: SessionId(session),
+            session_id,
             argv,
             timeout_ms: None,
+            token,
         },
     )?;
     if json {
@@ -403,45 +435,81 @@ fn io_failure(what: &str, e: impl std::fmt::Display) -> RpcError {
     error(codes::INTERNAL, format!("{what}: {e}"))
 }
 
+/// Whether some process holds the daemon lock (a daemon is running or starting).
+fn lock_is_held(paths: &Paths) -> bool {
+    matches!(DaemonLock::try_acquire(paths), Ok(None))
+}
+
+/// SIGTERM, then SIGKILL after 10 s, so the daemon can close its browser first.
+fn stop_child(child: &mut std::process::Child) {
+    // SAFETY: plain syscall on a child process of ours.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn browser_start(paths: &Paths) -> Result<(), RpcError> {
     if socket_answers(paths) {
         println!("already running");
         return Ok(());
     }
-    ensure(paths).map_err(|e| io_failure("creating the pegboard home", e))?;
+    ensure_home(paths).map_err(|e| io_failure("creating the pegboard home", e))?;
     let log_path = paths.home.join("daemon.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&log_path)
-        .map_err(|e| io_failure("opening daemon.log", e))?;
-    let exe = std::env::current_exe().map_err(|e| io_failure("finding the executable", e))?;
-    let mut child = Command::new(exe)
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().map_err(|e| io_failure("daemon.log", e))?)
-        .stderr(log)
-        // Its own process group, so a Ctrl-C in this terminal does not stop it.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| io_failure("starting the daemon", e))?;
+    // Someone else (another `browser start`) may be starting the daemon: then this one only
+    // waits for it.
+    let mut child = if lock_is_held(paths) {
+        None
+    } else {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)
+            .map_err(|e| io_failure("opening daemon.log", e))?;
+        let exe = std::env::current_exe().map_err(|e| io_failure("finding the executable", e))?;
+        Some(
+            Command::new(exe)
+                .arg("daemon")
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().map_err(|e| io_failure("daemon.log", e))?)
+                .stderr(log)
+                // Its own process group, so a Ctrl-C in this terminal does not stop it.
+                .process_group(0)
+                .spawn()
+                .map_err(|e| io_failure("starting the daemon", e))?,
+        )
+    };
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
-        // Not `Client::connect`: it deletes a socket that refuses connections, and a
-        // daemon that is just binding would lose its own.
+        // Not `Client::connect`: it must never touch the socket of a starting daemon.
         if socket_answers(paths) {
-            println!("started (daemon pid {})", child.id());
+            println!("started");
             return Ok(());
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(error(
-                codes::BROWSER_FAILED,
-                format!("the daemon exited ({status}); see {}", log_path.display()),
-            ));
+        if let Some(c) = child.as_mut() {
+            if let Ok(Some(status)) = c.try_wait() {
+                // It lost the race to another daemon, which is fine; otherwise it failed.
+                if lock_is_held(paths) {
+                    child = None;
+                } else {
+                    return Err(error(
+                        codes::BROWSER_FAILED,
+                        format!("the daemon exited ({status}); see {}", log_path.display()),
+                    ));
+                }
+            }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            if let Some(c) = child.as_mut() {
+                stop_child(c);
+            }
             return Err(error(
                 codes::BROWSER_FAILED,
                 format!("the daemon did not answer within 20 s; see {}", log_path.display()),
@@ -465,11 +533,25 @@ fn browser_stop(paths: &Paths) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// `pegboard daemon`: runs until `browser.stop`, SIGTERM/SIGINT or the browser's end.
+/// `pegboard daemon`: runs until `browser.stop`, SIGTERM/SIGINT or the browser's end. On
+/// every path the sessions close first, then the browser, then the socket goes, and the
+/// lock is released when the process exits.
 fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
-    if socket_answers(paths) {
-        return Err(error(codes::INTERNAL, "already running"));
-    }
+    ensure_home(paths).map_err(|e| io_failure("creating the pegboard home", e))?;
+    // Before anything is started or cleaned up, and held until the process ends.
+    // A short grace: a client probing the lock (see `lock_is_held`) holds it for an instant.
+    let mut tries = 0;
+    let _lock = loop {
+        match DaemonLock::try_acquire(paths) {
+            Ok(Some(lock)) => break lock,
+            Ok(None) if tries < 20 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => return Err(error(codes::INTERNAL, "already running")),
+            Err(e) => return Err(io_failure("taking the daemon lock", e)),
+        }
+    };
     let runtime = tokio::runtime::Runtime::new().map_err(|e| io_failure("starting the runtime", e))?;
     let pid_file = paths.home.join("daemon.pid");
     let result = runtime.block_on(async {
@@ -485,15 +567,24 @@ fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
             .open(&pid_file)?;
         writeln!(pid, "{}", std::process::id())?;
         eprintln!("pegboard: daemon {} serving {}", std::process::id(), paths.socket.display());
-        let served = tokio::select! {
-            r = serve(paths, daemon.clone()) => r,
-            _ = daemon.wait_stopped() => Ok(()),
-            _ = term.recv() => Ok(()),
-            _ = int.recv() => Ok(()),
+        // The server keeps answering (new sessions are refused) while the daemon shuts
+        // down; it is dropped, and its socket removed, only after that.
+        let stopper = async {
+            tokio::select! {
+                _ = daemon.wait_stopped() => {}
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            daemon.shutdown().await;
+            Ok(())
         };
-        // `serve` is dropped by now, so its socket file is gone.
-        daemon.shutdown().await;
-        served
+        tokio::select! {
+            r = serve(paths, daemon.clone()) => {
+                daemon.shutdown().await;
+                r
+            }
+            r = stopper => r,
+        }
     });
     let _ = std::fs::remove_file(&pid_file);
     result.map_err(|e: anyhow::Error| error(codes::INTERNAL, format!("{e:#}")))

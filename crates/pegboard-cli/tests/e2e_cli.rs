@@ -92,12 +92,21 @@ impl Drop for Home {
     fn drop(&mut self) {
         let _ = self.command(&["browser", "stop"]).output();
         if let Some(pid) = self.daemon_pid() {
-            // SAFETY: plain syscall; the pid came from our own daemon's pid file.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            // A stale pid file could name an unrelated process: only a `pegboard daemon`
+            // of this test binary is killed.
+            let cmd = Command::new("ps")
+                .args(["-o", "command=", "-p", &pid.to_string()])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if cmd == format!("{} daemon", bin()) {
+                // SAFETY: plain syscall on a verified pegboard daemon.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
         }
         // Only a browser that uses this home's profile directory.
         let _ = Command::new("pkill")
-            .arg("-f")
+            .args(["-f", "--"])
             .arg(format!("--user-data-dir={}", self.path().join("chrome").display()))
             .output();
     }
@@ -112,13 +121,36 @@ fn json(text: &str) -> Value {
     serde_json::from_str(text.trim()).unwrap_or_else(|e| panic!("not json ({e}): {text:?}"))
 }
 
-fn session_id(stdout: &str) -> String {
+fn base32(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+}
+
+/// Line 1 of `session create`: `<session id>.<token>`.
+fn session_handle(stdout: &str) -> String {
     let first = stdout.lines().next().unwrap_or("");
-    let ok = first.len() == 10
-        && first.starts_with("s_")
-        && first[2..].bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b));
-    assert!(ok, "first line is not a session id: {stdout:?}");
+    let ok = first.split_once('.').is_some_and(|(id, token)| {
+        id.len() == 10 && id.starts_with("s_") && base32(&id[2..]) && token.len() == 26 && base32(token)
+    });
+    assert!(ok, "first line is not a session handle: {stdout:?}");
     first.to_string()
+}
+
+fn id_of(handle: &str) -> &str {
+    handle.split('.').next().unwrap()
+}
+
+fn token_of(handle: &str) -> &str {
+    handle.split_once('.').unwrap().1
+}
+
+/// The `ps` lines of processes whose command line contains `needle`.
+fn processes(needle: &str) -> Vec<String> {
+    let out = Command::new("ps").args(["-axo", "pid,command"]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains(needle))
+        .map(String::from)
+        .collect()
 }
 
 #[test]
@@ -135,7 +167,7 @@ fn full_flow() {
     let url = format!("{origin}/counter");
     let (code, out, err) = home.run(&["session", "create", "--name", "조사", "--url", &url]);
     assert_eq!(code, 0, "{err}");
-    let sid = session_id(&out);
+    let sid = session_handle(&out);
 
     let (code, out, err) = home.run(&["--session", &sid, "snapshot", "-i"]);
     assert_eq!(code, 0, "{err}");
@@ -169,7 +201,7 @@ fn full_flow() {
     let (code, _, err) = home.run(&["session", "close", &sid]);
     assert_eq!(code, 0, "{err}");
     assert!(
-        !home.path().join("sessions").join(&sid).join("files").exists(),
+        !home.path().join("sessions").join(id_of(&sid)).join("files").exists(),
         "the session's files directory is deleted on close"
     );
     let (code, _, err) = home.run(&["--session", &sid, "snapshot"]);
@@ -190,15 +222,15 @@ fn rejected_flags_exit_2_and_are_logged() {
     assert_eq!(home.run(&["browser", "start"]).0, 0);
     let (code, out, err) = home.run(&["session", "create", "--url", &format!("{origin}/counter")]);
     assert_eq!(code, 0, "{err}");
-    let sid = session_id(&out);
+    let sid = session_handle(&out);
     let (code, _, err) = home.run(&["--session", &sid, "snapshot", "--cdp", "9222"]);
     assert_eq!(code, 2);
     assert!(err.contains("argv_rejected"), "{err}");
 
     // Ids from a request are validated before they name a file or a socket.
     let (code, _, err) = home.run(&["--session", "../escape", "snapshot"]);
-    assert_eq!(code, 1);
-    assert!(err.contains("invalid_params"), "{err}");
+    assert_eq!(code, 2);
+    assert!(err.contains("not a session id"), "{err}");
 
     let (_, out, _) = home.run(&["recording", "list", "--json"]);
     let rid = json(&out)[0]["recordingId"].as_str().unwrap().to_string();
@@ -288,4 +320,213 @@ fn leftovers_of_a_dead_pegboard_are_cleaned_on_start() {
     std::fs::create_dir_all(&left).unwrap();
     assert_eq!(home.run(&["browser", "start"]).0, 0);
     assert!(!home.path().join("sessions/s_aaaaaaaa").exists());
+}
+
+fn long_home(base: &Path) -> PathBuf {
+    base.join("a".repeat(100))
+}
+
+#[test]
+fn long_home_is_a_clear_usage_error() {
+    let home = Home::new();
+    let long = long_home(home.path());
+    let (code, _, err) = home.run_env(&[("PEGBOARD_HOME", long.to_str().unwrap())], &["session", "list"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("PEGBOARD_HOME is too long for a unix socket path"), "{err}");
+    assert!(!long.exists(), "nothing is created");
+}
+
+#[test]
+fn invalid_ids_exit_2() {
+    let home = Home::new();
+    for args in [
+        vec!["--session", "../x", "snapshot"],
+        vec!["--session", "s_short.tok", "snapshot"],
+        vec!["session", "info", "bad"],
+        vec!["session", "close", "s_UPPERCASE"],
+        vec!["recording", "show", "r_bad"],
+    ] {
+        let (code, _, err) = home.run(&args);
+        assert_eq!(code, 2, "{args:?}: {err}");
+    }
+}
+
+#[test]
+fn recording_id_traversal_is_rejected() {
+    let home = Home::new();
+    let (code, out, err) = home.run(&["recording", "show", "../../etc"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(out.is_empty());
+}
+
+#[test]
+fn stale_socket_is_removed_only_when_lock_is_free() {
+    use pegboard_core::api::Client;
+    use pegboard_core::lock::DaemonLock;
+    use pegboard_core::paths::paths_in;
+
+    let home = Home::new();
+    let paths = paths_in(home.path());
+    drop(std::os::unix::net::UnixListener::bind(&paths.socket).unwrap());
+    {
+        let _held = DaemonLock::try_acquire(&paths).unwrap().expect("lock is free");
+        let e = Client::connect(&paths).err().expect("not running");
+        assert_eq!(e.code, "not_running");
+        assert!(paths.socket.exists(), "a starting daemon's socket is not deleted");
+    }
+    let e = Client::connect(&paths).err().expect("not running");
+    assert_eq!(e.code, "not_running");
+    assert!(!paths.socket.exists(), "with the lock free the stale file goes");
+}
+
+#[test]
+fn second_daemon_refuses_when_lock_is_held() {
+    use pegboard_core::lock::DaemonLock;
+    use pegboard_core::paths::paths_in;
+
+    let home = Home::new();
+    let paths = paths_in(home.path());
+    let _held = DaemonLock::try_acquire(&paths).unwrap().expect("lock is free");
+    let started = Instant::now();
+    let (code, _, err) = home.run(&["daemon"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("already running"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!paths.chrome_udd.exists(), "no browser was launched");
+    assert!(!home.path().join("daemon.pid").exists());
+}
+
+#[test]
+#[ignore]
+fn session_handle_is_required() {
+    let origin = fixture();
+    let home = Home::new();
+    assert_eq!(home.run(&["browser", "start"]).0, 0);
+    let url = format!("{origin}/counter");
+    let (code, out, err) = home.run(&["session", "create", "--url", &url]);
+    assert_eq!(code, 0, "{err}");
+    let a = session_handle(&out);
+    let (code, out, err) = home.run(&["session", "create", "--url", &url]);
+    assert_eq!(code, 0, "{err}");
+    let b = session_handle(&out);
+
+    // Only the id, or the id with another session's token: the same as no such session.
+    let (code, _, err) = home.run(&["--session", id_of(&a), "snapshot"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("session_not_found"), "{err}");
+    let mixed = format!("{}.{}", id_of(&a), token_of(&b));
+    let (code, _, err) = home.run(&["--session", &mixed, "snapshot"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("session_not_found"), "{err}");
+    let (code, _, err) = home.run(&["session", "info", id_of(&b)]);
+    assert_eq!(code, 1);
+    assert!(err.contains("session_not_found"), "{err}");
+    let (code, _, err) = home.run(&["session", "close", id_of(&b)]);
+    assert_eq!(code, 1);
+    assert!(err.contains("session_not_found"), "{err}");
+    let (_, out, _) = home.run(&["session", "list", "--json"]);
+    let ids: Vec<String> = json(&out)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&id_of(&b).to_string()), "B is still listed: {ids:?}");
+
+    // With the right handles everything works.
+    let (code, out, err) = home.run(&["--session", &a, "get", "url"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("/counter"));
+    assert_eq!(home.run(&["session", "info", &b]).0, 0);
+    // No listing shows a token.
+    let (_, listed, _) = home.run(&["session", "list", "--json"]);
+    let (_, info, _) = home.run(&["session", "info", &b, "--json"]);
+    for text in [&listed, &info] {
+        assert!(!text.contains(token_of(&a)) && !text.contains(token_of(&b)), "{text}");
+    }
+    assert_eq!(home.run(&["session", "close", &b]).0, 0);
+    assert_eq!(home.run(&["session", "close", &a]).0, 0);
+
+    // The tokens are in memory only.
+    let mut files = vec![home.path().join("daemon.log")];
+    let mut stack = vec![home.path().join("recordings")];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            if e.path().is_dir() {
+                stack.push(e.path());
+            } else {
+                files.push(e.path());
+            }
+        }
+    }
+    for f in files {
+        let text = std::fs::read_to_string(&f).unwrap_or_default();
+        for h in [&a, &b] {
+            assert!(!text.contains(token_of(h)), "token in {}", f.display());
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn concurrent_browser_start_yields_one_daemon() {
+    let home = Home::new();
+    let children: Vec<_> = (0..2)
+        .map(|_| {
+            home.command(&["browser", "start"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let daemons = processes(&format!("{} daemon", bin()));
+    assert_eq!(daemons.len(), 1, "{daemons:?}");
+    let udd = format!("--user-data-dir={}", home.path().join("chrome").display());
+    let chromes: Vec<String> = processes(&udd)
+        .into_iter()
+        .filter(|l| !l.contains("--type="))
+        .collect();
+    assert_eq!(chromes.len(), 1, "{chromes:?}");
+}
+
+#[test]
+#[ignore]
+fn sigterm_closes_sessions_then_removes_socket() {
+    let origin = fixture();
+    let home = Home::new();
+    assert_eq!(home.run(&["browser", "start"]).0, 0);
+    let (code, out, err) = home.run(&["session", "create", "--url", &format!("{origin}/counter")]);
+    assert_eq!(code, 0, "{err}");
+    let handle = session_handle(&out);
+    // Makes the session's agent-browser daemon start.
+    assert_eq!(home.run(&["--session", &handle, "get", "url"]).0, 0);
+    let daemon = home.daemon_pid().expect("daemon.pid");
+    // SAFETY: the pid is this test's own daemon.
+    unsafe { libc::kill(daemon, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while alive(daemon) {
+        assert!(Instant::now() < deadline, "the daemon did not end");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(!home.path().join("pegboardd.sock").exists());
+    let udd = format!("--user-data-dir={}", home.path().join("chrome").display());
+    assert!(processes(&udd).is_empty(), "a browser of this home is left");
+    let pid_file = pegboard_core::paths::paths_in(home.path())
+        .ab_socket_dir
+        .join(format!("peg-{}.pid", id_of(&handle)));
+    if let Some(pid) = std::fs::read_to_string(pid_file).ok().and_then(|t| t.trim().parse().ok()) {
+        assert!(!alive(pid), "an agent-browser daemon is left");
+    }
+    let manifest = home
+        .path()
+        .join("recordings")
+        .join(format!("r_{}", &id_of(&handle)[2..]))
+        .join("manifest.json");
+    let m = json(&std::fs::read_to_string(manifest).unwrap());
+    assert!(m["endedAt"].is_string(), "recording is finalized: {m}");
 }

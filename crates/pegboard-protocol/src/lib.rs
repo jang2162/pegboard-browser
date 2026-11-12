@@ -85,6 +85,10 @@ pub struct SessionInfo {
     pub created_at: String,
     /// RFC 3339, UTC.
     pub last_activity_at: String,
+    /// Secret that authorizes commands in the session. Only the result of `session.create`
+    /// carries it, once; it is never in `session.list` or `session.info`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +118,9 @@ pub struct CommandExecParams {
     pub session_id: SessionId,
     pub argv: Vec<String>,
     pub timeout_ms: Option<u64>,
+    /// The session's token (see `SessionInfo::token`).
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +169,7 @@ mod tests {
             recording_id: "r_1".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_activity_at: "2026-01-01T00:00:00Z".into(),
+            token: None,
         }
     }
 
@@ -173,6 +181,14 @@ mod tests {
         assert!(SessionId::parse(&id.0).is_some());
         assert!(SessionId::parse("../x").is_none());
         assert!(SessionId::parse("s_UPPER123").is_none());
+    }
+
+    #[test]
+    fn token_is_left_out_unless_set() {
+        let mut info = sample_session_info();
+        assert!(serde_json::to_value(&info).unwrap().get("token").is_none());
+        info.token = Some("t".into());
+        assert_eq!(serde_json::to_value(&info).unwrap()["token"], "t");
     }
 
     #[test]

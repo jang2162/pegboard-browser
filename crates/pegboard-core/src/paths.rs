@@ -64,6 +64,20 @@ fn create_private(dir: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+/// Longest unix socket path the platform accepts (`sun_path` is 104 bytes on macOS, with the NUL).
+const MAX_SOCKET_PATH: usize = 103;
+
+/// Whether the API socket path fits in a unix socket address.
+pub fn socket_path_fits(paths: &Paths) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    paths.socket.as_os_str().as_bytes().len() <= MAX_SOCKET_PATH
+}
+
+/// Creates the home directory (0700) and nothing else.
+pub fn ensure_home(paths: &Paths) -> std::io::Result<()> {
+    create_private(&paths.home)
+}
+
 /// Create all directories with mode 0700. The agent-browser socket directory lives in the
 /// shared `/tmp`, so it is checked component by component (see `ensure_socket_dir`).
 pub fn ensure(paths: &Paths) -> std::io::Result<()> {

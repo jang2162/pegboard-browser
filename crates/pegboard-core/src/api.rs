@@ -8,14 +8,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdStream;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
+use async_trait::async_trait;
 use pegboard_protocol::{codes, Request, Response, RpcError, JSONRPC};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 
+use crate::lock::DaemonLock;
 use crate::paths::Paths;
 use crate::service::Daemon;
 
@@ -31,12 +35,43 @@ impl Drop for SocketFile {
     }
 }
 
-/// Serves the API until the future is dropped. Fails when a live daemon already owns the
-/// socket; a socket file nobody listens on is replaced.
-pub async fn serve(paths: &Paths, daemon: Arc<Daemon>) -> anyhow::Result<()> {
-    if StdStream::connect(&paths.socket).is_ok() {
-        bail!("already running (a daemon answers on {})", paths.socket.display());
+/// What `serve_with` needs from the thing it serves.
+#[async_trait]
+pub trait Handler: Send + Sync + 'static {
+    async fn handle(&self, req: Request) -> Response;
+    /// Called after the answer to a successful `browser.stop` was written.
+    fn request_stop(&self) {}
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServeOptions {
+    /// Connections served at once; a further one is accepted and closed at once.
+    pub max_connections: usize,
+    /// A connection that sends no complete request line within this time is closed. It
+    /// applies before each request, not while one is being handled.
+    pub idle_timeout: Duration,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        ServeOptions {
+            max_connections: 64,
+            idle_timeout: Duration::from_secs(10),
+        }
     }
+}
+
+/// Serves the API until the future is dropped; its socket file is removed then. The caller
+/// holds the daemon lock (`lock::DaemonLock`), so a socket file found here is stale.
+pub async fn serve(paths: &Paths, daemon: Arc<Daemon>) -> anyhow::Result<()> {
+    serve_with(paths, daemon, ServeOptions::default()).await
+}
+
+pub async fn serve_with(
+    paths: &Paths,
+    handler: Arc<dyn Handler>,
+    opts: ServeOptions,
+) -> anyhow::Result<()> {
     match std::fs::remove_file(&paths.socket) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -49,13 +84,30 @@ pub async fn serve(paths: &Paths, daemon: Arc<Daemon>) -> anyhow::Result<()> {
         .context("restricting the socket to its owner")?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
+    let slots = Arc::new(Semaphore::new(opts.max_connections));
     loop {
-        let (stream, _) = listener.accept().await?;
+        // An accept error (e.g. out of descriptors) must not end the server.
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                eprintln!("pegboard: accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         match stream.peer_cred() {
             Ok(cred) if cred.uid() == uid => {}
             _ => continue,
         }
-        tokio::spawn(connection(stream, daemon.clone()));
+        // Over the cap: dropping the stream closes it.
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            continue;
+        };
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            connection(stream, handler, opts.idle_timeout).await;
+            drop(permit);
+        });
     }
 }
 
@@ -72,15 +124,17 @@ fn error_response(id: u64, code: &str, message: impl Into<String>) -> Response {
     }
 }
 
-async fn connection(stream: UnixStream, daemon: Arc<Daemon>) {
+async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: Duration) {
     let (read, mut write) = stream.into_split();
     let mut read = tokio::io::BufReader::new(read);
     loop {
         let mut line = Vec::new();
         // Reads at most MAX_LINE + 1 bytes: one more means the line is too long.
-        match (&mut read).take(MAX_LINE + 1).read_until(b'\n', &mut line).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
+        let mut limited = (&mut read).take(MAX_LINE + 1);
+        let next = limited.read_until(b'\n', &mut line);
+        match tokio::time::timeout(idle_timeout, next).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+            Ok(Ok(_)) => {}
         }
         if line.len() as u64 > MAX_LINE {
             let r = error_response(0, codes::INVALID_PARAMS, "request line too long");
@@ -145,7 +199,8 @@ fn io_error(e: std::io::Error) -> RpcError {
 
 impl Client {
     /// `not_running` when no live daemon answers on the socket. A socket file that refuses
-    /// connections is left over from a dead daemon and is removed.
+    /// connections is removed when the daemon lock is free (the daemon is dead), and left
+    /// alone when it is held (a daemon is starting).
     pub fn connect(paths: &Paths) -> Result<Client, RpcError> {
         match StdStream::connect(&paths.socket) {
             Ok(stream) => Ok(Client {
@@ -153,7 +208,11 @@ impl Client {
                 next_id: 1,
             }),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                let _ = std::fs::remove_file(&paths.socket);
+                // Stale only if no daemon holds the lock: a daemon that is starting has
+                // its socket bound before it listens, and must keep it.
+                if let Ok(Some(_free)) = DaemonLock::try_acquire(paths) {
+                    let _ = std::fs::remove_file(&paths.socket);
+                }
                 Err(not_running())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(not_running()),
@@ -180,9 +239,26 @@ impl Client {
         };
         let mut line = serde_json::to_vec(&request).map_err(|e| io_error(e.into()))?;
         line.push(b'\n');
-        self.reader.get_mut().write_all(&line).map_err(io_error)?;
+        // A command may take its own time limit; everything else is quick.
+        let limit = if method == "command.exec" {
+            let ms = request.params["timeoutMs"].as_u64().unwrap_or(60_000);
+            Duration::from_millis(ms) + Duration::from_secs(15)
+        } else {
+            Duration::from_secs(60)
+        };
+        let stream = self.reader.get_mut();
+        stream.set_read_timeout(Some(limit)).map_err(io_error)?;
+        stream.write_all(&line).map_err(io_error)?;
         let mut answer = String::new();
-        if self.reader.read_line(&mut answer).map_err(io_error)? == 0 {
+        let read = self.reader.read_line(&mut answer);
+        if matches!(&read, Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)) {
+            return Err(RpcError {
+                code: codes::TIMEOUT.to_string(),
+                message: format!("the daemon did not answer {method} within {} s", limit.as_secs()),
+                data: None,
+            });
+        }
+        if read.map_err(io_error)? == 0 {
             return Err(RpcError {
                 code: codes::INTERNAL.to_string(),
                 message: "the daemon closed the connection".to_string(),

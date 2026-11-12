@@ -12,9 +12,11 @@ use pegboard_protocol::{
     codes, BrowserStatus, CommandExecParams, CommandExecResult, Request, Response, RpcError,
     SessionCloseParams, SessionCreateParams, SessionId, SessionInfo, JSONRPC,
 };
+use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use subtle::ConstantTimeEq;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
 use crate::actionlog::{self, valid_recording_id, ActionLog, Manifest};
@@ -32,6 +34,15 @@ const SESSION_CLOSE_LIMIT: Duration = Duration::from_secs(15);
 /// A session's action log. Holding the lock is what serializes the session's commands.
 type SessionLog = Arc<AsyncMutex<ActionLog>>;
 
+/// What the daemon keeps per open session.
+struct Slot {
+    log: SessionLog,
+    /// Authorizes commands in the session. In memory only: never on disk or in a log.
+    token: String,
+    /// A close is running.
+    closing: AtomicBool,
+}
+
 pub struct Daemon {
     paths: Paths,
     browser: Arc<Browser>,
@@ -40,7 +51,7 @@ pub struct Daemon {
     /// Kept alive for the daemon's lifetime (it serves the session endpoints).
     _proxy: Arc<ProxyServer>,
     chrome_version: String,
-    logs: Mutex<HashMap<SessionId, SessionLog>>,
+    slots: Mutex<HashMap<SessionId, Arc<Slot>>>,
     /// Set once shutdown begins; new sessions and commands are refused from then on.
     stopping: AtomicBool,
     shutdown_done: AsyncMutex<bool>,
@@ -102,6 +113,43 @@ struct NameParams {
 #[serde(rename_all = "camelCase")]
 struct SessionIdParams {
     session_id: SessionId,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloseParams {
+    session_id: SessionId,
+    #[serde(default)]
+    keep_tabs: bool,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// 16 random bytes from the OS generator as 26 lowercase base32 characters.
+fn new_token() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(26);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for b in bytes {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+fn no_session(id: &SessionId) -> RpcError {
+    rpc_error(codes::SESSION_NOT_FOUND, format!("no session {}", id.0))
 }
 
 #[derive(Deserialize)]
@@ -167,7 +215,7 @@ impl Daemon {
             runner,
             _proxy: proxy,
             chrome_version,
-            logs: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
             shutdown_done: AsyncMutex::new(false),
             stop,
@@ -240,10 +288,12 @@ impl Daemon {
             "session.list" => to_value(self.sessions.list()),
             "session.info" => {
                 let p: SessionIdParams = params(p)?;
-                to_value(self.sessions.info(&checked_session(&p.session_id)?)?)
+                let id = checked_session(&p.session_id)?;
+                self.authorize(&id, p.token.as_deref())?;
+                to_value(self.sessions.info(&id)?)
             }
             "session.close" => {
-                let p: SessionCloseParams = params(p)?;
+                let p: CloseParams = params(p)?;
                 to_value(self.close_session(p).await?)
             }
             "command.exec" => to_value(self.exec(params(p)?).await?),
@@ -316,8 +366,31 @@ impl Daemon {
             self.discard(&id, Some(log), true).await;
             return Err(e);
         }
-        self.logs.lock().unwrap().insert(id, log);
-        Ok(info)
+        let token = new_token();
+        let slot = Arc::new(Slot {
+            log: log.clone(),
+            token: token.clone(),
+            closing: AtomicBool::new(false),
+        });
+        // Checked under the lock `shutdown` drains with: a session is either drained by
+        // the shutdown or refused here, never left behind.
+        let refused = {
+            let mut slots = self.slots.lock().unwrap();
+            if self.stopping.load(Ordering::SeqCst) {
+                true
+            } else {
+                slots.insert(id.clone(), slot);
+                false
+            }
+        };
+        if refused {
+            self.discard(&id, Some(log), true).await;
+            return Err(rpc_error(codes::NOT_RUNNING, "pegboard is shutting down"));
+        }
+        Ok(SessionInfo {
+            token: Some(token),
+            ..info
+        })
     }
 
     /// Takes back a session whose creation failed after the session existed.
@@ -345,22 +418,47 @@ impl Daemon {
         }
     }
 
-    async fn close_session(&self, p: SessionCloseParams) -> Result<SessionInfo, RpcError> {
+    /// The session's slot, if `token` is its token. An unknown id, a missing token and a
+    /// wrong token are the same error, and the comparison takes the same time.
+    fn authorize(&self, id: &SessionId, token: Option<&str>) -> Result<Arc<Slot>, RpcError> {
+        let slot = self.slots.lock().unwrap().get(id).cloned();
+        let expected = slot.as_ref().map_or("", |s| s.token.as_str());
+        let same: bool = token
+            .unwrap_or("")
+            .as_bytes()
+            .ct_eq(expected.as_bytes())
+            .into();
+        match slot {
+            Some(slot) if same => Ok(slot),
+            _ => Err(no_session(id)),
+        }
+    }
+
+    async fn close_session(&self, p: CloseParams) -> Result<SessionInfo, RpcError> {
         let id = checked_session(&p.session_id)?;
+        let slot = self.authorize(&id, p.token.as_deref())?;
+        // One close at a time.
+        if slot.closing.swap(true, Ordering::SeqCst) {
+            return Err(no_session(&id));
+        }
         let p = SessionCloseParams {
             session_id: id.clone(),
-            ..p
+            keep_tabs: p.keep_tabs,
         };
         let me = self.me()?;
-        // The session leaves the table first, so a second close finds nothing.
-        let log = self.logs.lock().unwrap().remove(&id);
-        let Some(log) = log else {
-            return Err(rpc_error(
-                codes::SESSION_NOT_FOUND,
-                format!("no session {}", id.0),
-            ));
-        };
-        tokio::spawn(async move { me.finish_session(p, log, true).await })
+        let closed = tokio::spawn(async move {
+            let result = me.finish_session(p, slot.log.clone(), true).await;
+            // The session leaves the daemon's table once it is closed. If closing failed
+            // but the session manager still has it, it stays so that it can be closed
+            // again; otherwise it is gone (its recording is finalized) and so is the slot.
+            if result.is_ok() || me.sessions.info(&id).is_err() {
+                me.slots.lock().unwrap().remove(&id);
+            } else {
+                slot.closing.store(false, Ordering::SeqCst);
+            }
+            result
+        });
+        closed
             .await
             .map_err(|e| internal(format!("closing the session failed: {e}")))?
     }
@@ -391,15 +489,9 @@ impl Daemon {
     async fn exec(&self, p: CommandExecParams) -> Result<CommandExecResult, RpcError> {
         self.running()?;
         let id = checked_session(&p.session_id)?;
-        let log = self.logs.lock().unwrap().get(&id).cloned();
-        let Some(log) = log else {
-            return Err(rpc_error(
-                codes::SESSION_NOT_FOUND,
-                format!("no session {}", id.0),
-            ));
-        };
+        let slot = self.authorize(&id, p.token.as_deref())?;
         // One command at a time per session; other sessions are not held up.
-        let mut log = log.lock().await;
+        let mut log = slot.log.lock().await;
         let result = run_command(
             &self.sessions,
             &self.runner,
@@ -440,9 +532,10 @@ impl Daemon {
         }
         *done = true;
         self.stopping.store(true, Ordering::SeqCst);
-        let logs: Vec<(SessionId, SessionLog)> = self.logs.lock().unwrap().drain().collect();
+        let slots: Vec<(SessionId, Arc<Slot>)> = self.slots.lock().unwrap().drain().collect();
         let browser_alive = !self.browser.has_exited();
-        for (id, log) in logs {
+        for (id, slot) in slots {
+            let log = slot.log.clone();
             let p = SessionCloseParams {
                 session_id: id,
                 keep_tabs: false,
@@ -451,5 +544,16 @@ impl Daemon {
             let _ = tokio::time::timeout(SESSION_CLOSE_LIMIT, finish).await;
         }
         self.browser.close().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::api::Handler for Daemon {
+    async fn handle(&self, req: Request) -> Response {
+        Daemon::handle(self, req).await
+    }
+
+    fn request_stop(&self) {
+        Daemon::request_stop(self)
     }
 }

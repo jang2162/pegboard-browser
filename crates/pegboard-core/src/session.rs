@@ -236,6 +236,7 @@ impl SessionManager {
             recording_id: format!("r_{}", &id.0[2..]),
             created_at: created_at.clone(),
             last_activity_at: created_at,
+            token: None,
         };
         inner.table.lock().unwrap().records.insert(
             id.clone(),
