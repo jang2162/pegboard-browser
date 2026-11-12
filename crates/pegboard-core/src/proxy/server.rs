@@ -45,6 +45,11 @@ const MAX_QUEUED_TO_CLIENT: usize = 64 << 20;
 const SHUTDOWN_STEP: Duration = Duration::from_millis(500);
 const SHUTDOWN_DRAIN: Duration = Duration::from_millis(500);
 const CLIENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Closing a stray tab is verified: Chrome sometimes ignores a `Target.closeTarget` sent right
+/// after the tab was created (it replies success and the tab stays), so the close is repeated
+/// until the target is gone, for at most this long.
+const STRAY_CLOSE_BUDGET: Duration = Duration::from_secs(2);
+const STRAY_CLOSE_INTERVAL: Duration = Duration::from_millis(100);
 
 fn ws_config() -> WebSocketConfig {
     WebSocketConfig::default()
@@ -536,6 +541,7 @@ async fn handle_socket(shared: Arc<Shared>, mut sock: TcpStream) -> Result<()> {
     let (sink, client_rx) = client.split();
     let (client_tx, writer) = ClientSender::spawn(sink);
     let (tab_tx, tab_rx) = mpsc::unbounded_channel();
+    let (stray_tx, stray_rx) = mpsc::unbounded_channel();
     let conn = ClientConn {
         tab_delay: Duration::from_millis(shared.tab_delay_ms.load(Ordering::Relaxed)),
         shared: shared.clone(),
@@ -552,6 +558,8 @@ async fn handle_socket(shared: Arc<Shared>, mut sock: TcpStream) -> Result<()> {
         recovered: HashSet::new(),
         tab_tx,
         tab_rx,
+        stray_tx,
+        stray_rx,
     };
     conn.run(closed, writer).await;
     Ok(())
@@ -641,6 +649,72 @@ enum Pending {
     Recover,
 }
 
+/// Outcome of closing a tab that was created in another context.
+struct StrayClosed {
+    client: ClientRef,
+    target_id: String,
+    closed: bool,
+}
+
+/// One request on a dedicated browser connection; the reply with the same id, or `None` when
+/// the connection ends.
+async fn browser_request(
+    conn: &mut dyn UpstreamConn,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Option<Value> {
+    let msg = json!({ "id": id, "method": method, "params": params });
+    conn.send(msg.to_string()).await.ok()?;
+    loop {
+        let text = conn.recv().await?;
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            if v.get("id").and_then(Value::as_u64) == Some(id) {
+                return Some(v);
+            }
+        }
+    }
+}
+
+/// Closes `target_id` and verifies that it is gone, repeating the close every `interval`
+/// until `budget` is used up. Runs on its own browser connection (so the client connection's
+/// message loop is never blocked). True when the target no longer exists.
+async fn close_and_verify(
+    upstream: &dyn Upstream,
+    target_id: &str,
+    budget: Duration,
+    interval: Duration,
+) -> bool {
+    let work = async {
+        let mut conn = upstream.open().await.ok()?;
+        let mut id = 0u64;
+        loop {
+            id += 1;
+            // An error reply (for instance "no such target") is not a failure here: the
+            // target list below decides.
+            browser_request(
+                conn.as_mut(),
+                id,
+                "Target.closeTarget",
+                json!({ "targetId": target_id }),
+            )
+            .await?;
+            tokio::time::sleep(interval).await;
+            id += 1;
+            let list = browser_request(conn.as_mut(), id, "Target.getTargets", json!({})).await?;
+            let present = list
+                .pointer("/result/targetInfos")
+                .and_then(Value::as_array)?
+                .iter()
+                .any(|t| t["targetId"] == target_id);
+            if !present {
+                return Some(());
+            }
+        }
+    };
+    matches!(tokio::time::timeout(budget, work).await, Ok(Some(())))
+}
+
 struct TabCreated {
     client: ClientRef,
     result: Result<String>,
@@ -673,6 +747,8 @@ struct ClientConn {
     recovered: HashSet<String>,
     tab_tx: mpsc::UnboundedSender<TabCreated>,
     tab_rx: mpsc::UnboundedReceiver<TabCreated>,
+    stray_tx: mpsc::UnboundedSender<StrayClosed>,
+    stray_rx: mpsc::UnboundedReceiver<StrayClosed>,
 }
 
 fn reply(client: &ClientRef, body: Result<Value, (i64, String)>) -> Value {
@@ -704,6 +780,7 @@ impl ClientConn {
                     None => break,
                 },
                 Some(done) = self.tab_rx.recv() => self.on_tab_created(done).await,
+                Some(done) = self.stray_rx.recv() => self.on_stray_closed(done),
                 _ = tokio::time::sleep_until(stash_expiry.unwrap_or_else(Instant::now)),
                     if stash_expiry.is_some() => self.expire_stash().await,
             };
@@ -1070,6 +1147,19 @@ impl ClientConn {
         }
     }
 
+    fn on_stray_closed(&mut self, done: StrayClosed) -> Result<()> {
+        let mut message = "the new tab was not created in the session's profile".to_string();
+        if !done.closed {
+            message
+                .push_str(" and it could not be closed; a tab may remain open in another profile");
+            eprintln!(
+                "pegboard: a tab created outside the session's profile could not be closed: {}",
+                done.target_id
+            );
+        }
+        self.send_client(&reply(&done.client, Err((-32000, message))))
+    }
+
     /// The bridge created `target_id`; it joins the scope only if it lives in the session's context.
     async fn finish_tab(
         &mut self,
@@ -1092,14 +1182,24 @@ impl ClientConn {
         self.tabs_in_flight -= 1;
         if !in_context {
             self.forget_stash_if_idle().await?;
-            let close =
-                json!({ "method": "Target.closeTarget", "params": { "targetId": target_id } });
-            self.send_upstream(close, Pending::Internal).await?;
-            let err = (
-                -32000,
-                "the new tab was not created in the session's profile".to_string(),
-            );
-            return self.send_client(&reply(&client, Err(err)));
+            // The refusal is sent once the stray tab is verified closed.
+            let upstream = self.shared.upstream.clone();
+            let tx = self.stray_tx.clone();
+            tokio::spawn(async move {
+                let closed = close_and_verify(
+                    upstream.as_ref(),
+                    &target_id,
+                    STRAY_CLOSE_BUDGET,
+                    STRAY_CLOSE_INTERVAL,
+                )
+                .await;
+                let _ = tx.send(StrayClosed {
+                    client,
+                    target_id,
+                    closed,
+                });
+            });
+            return Ok(());
         }
         // Judge the stashed events again now that the tab is in scope, in arrival order,
         // before the reply (the order Chrome itself uses). Events still dropped are stashed
@@ -1182,6 +1282,91 @@ fn adopt_listed_popups(msg: &Value, scope: &mut Scope) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A browser stub that ignores the first `ignore` closeTarget requests (replying success,
+    /// like Chrome right after a tab was created) and then really removes the target.
+    struct StubBrowser {
+        ignore: usize,
+        closes: Arc<AtomicUsize>,
+        present: bool,
+    }
+
+    struct StubConn {
+        state: Arc<Mutex<StubBrowser>>,
+        replies: VecDeque<String>,
+    }
+
+    struct StubUpstream(Arc<Mutex<StubBrowser>>);
+
+    #[async_trait]
+    impl Upstream for StubUpstream {
+        async fn open(&self) -> Result<Box<dyn UpstreamConn>> {
+            Ok(Box::new(StubConn {
+                state: self.0.clone(),
+                replies: VecDeque::new(),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl UpstreamConn for StubConn {
+        async fn send(&mut self, text: String) -> Result<()> {
+            let v: Value = serde_json::from_str(&text)?;
+            let mut st = self.state.lock().unwrap();
+            let reply = match v["method"].as_str().unwrap() {
+                "Target.closeTarget" => {
+                    let n = st.closes.fetch_add(1, Ordering::SeqCst);
+                    if n >= st.ignore {
+                        st.present = false;
+                    }
+                    json!({ "id": v["id"], "result": { "success": true } })
+                }
+                _ => {
+                    let infos = if st.present {
+                        json!([{ "targetId": "T1" }, { "targetId": "other" }])
+                    } else {
+                        json!([{ "targetId": "other" }])
+                    };
+                    json!({ "id": v["id"], "result": { "targetInfos": infos } })
+                }
+            };
+            self.replies.push_back(reply.to_string());
+            Ok(())
+        }
+        async fn recv(&mut self) -> Option<String> {
+            self.replies.pop_front()
+        }
+    }
+
+    fn stub(ignore: usize) -> (StubUpstream, Arc<AtomicUsize>) {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let browser = StubBrowser {
+            ignore,
+            closes: closes.clone(),
+            present: true,
+        };
+        (StubUpstream(Arc::new(Mutex::new(browser))), closes)
+    }
+
+    #[tokio::test]
+    async fn stray_close_is_repeated_until_the_target_is_gone() {
+        let (up, closes) = stub(3);
+        let ms = Duration::from_millis(5);
+        assert!(close_and_verify(&up, "T1", Duration::from_secs(2), ms).await);
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            4,
+            "three ignored closes, then one that works"
+        );
+    }
+
+    #[tokio::test]
+    async fn stray_close_gives_up_after_the_budget() {
+        let (up, closes) = stub(usize::MAX);
+        let ms = Duration::from_millis(5);
+        assert!(!close_and_verify(&up, "T1", Duration::from_millis(100), ms).await);
+        assert!(closes.load(Ordering::SeqCst) >= 2, "it retried");
+    }
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const ID: &str = "s_abcdefgh";

@@ -172,12 +172,8 @@ async fn tab_created_in_another_context_is_refused() {
         format!("{err:#}").contains("not created in the session's profile"),
         "{err:#}"
     );
-    // The proxy asks the browser to close the stray tab, and the session never owned it.
-    // KNOWN GAP (reported, not asserted): Chrome ignores a `Target.closeTarget` sent right after
-    // the tab was created in about 40% of runs (measured with the bridge and the browser
-    // connection alone, no proxy involved; it replies success and the tab stays until a
-    // second closeTarget), so the proxy's single close is not reliable. The stray tab is
-    // reported and closed here so the test leaves nothing behind.
+    // The stray tab is gone (the proxy closes it and verifies, retrying), and the session
+    // never owned it. The error says nothing about a tab remaining.
     let mut stray = Vec::new();
     for _ in 0..30 {
         stray = page_targets(&s.browser.conn)
@@ -192,16 +188,11 @@ async fn tab_created_in_another_context_is_refused() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if !stray.is_empty() {
-        eprintln!("KNOWN GAP: the refused tab {stray:?} was not closed by the proxy's closeTarget");
-        for id in &stray {
-            let _ = s
-                .browser
-                .conn
-                .send("Target.closeTarget", json!({ "targetId": id }), None)
-                .await;
-        }
-    }
+    assert!(stray.is_empty(), "the refused tab was left open: {stray:?}");
+    assert!(
+        !format!("{err:#}").contains("could not be closed"),
+        "{err:#}"
+    );
     assert!(s.proxy.targets(&wrong).is_empty());
     s.shutdown().await;
 }
