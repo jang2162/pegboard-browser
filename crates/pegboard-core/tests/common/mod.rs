@@ -143,6 +143,33 @@ pub async fn activate_any_target_in(conn: &CdpConn, context: &str) {
     .unwrap();
 }
 
+/// Premise control for "the human window was the last active one": activates a human tab, then
+/// sends a context-less `Target.createTarget` straight to the browser (it lands in the profile of
+/// the last active window), closes that tab and returns the context it landed in. Equal to the
+/// human context when the premise holds. Measured on Chrome 157 while another application has the
+/// operating-system focus: it does not hold, so callers report that instead of faking it.
+pub async fn establish_human_active(conn: &CdpConn, human_context: &str) -> String {
+    activate_any_target_in(conn, human_context).await;
+    let r = conn
+        .send(
+            "Target.createTarget",
+            serde_json::json!({ "url": "about:blank" }),
+            None,
+        )
+        .await
+        .unwrap();
+    let id = r["targetId"].as_str().unwrap().to_string();
+    let context = context_of(conn, &id).await;
+    let _ = conn
+        .send(
+            "Target.closeTarget",
+            serde_json::json!({ "targetId": id }),
+            None,
+        )
+        .await;
+    context
+}
+
 /// The browserContextId of a page target.
 pub async fn context_of(conn: &CdpConn, target_id: &str) -> String {
     page_targets(conn)

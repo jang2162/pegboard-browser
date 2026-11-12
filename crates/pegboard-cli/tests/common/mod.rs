@@ -48,6 +48,13 @@ document.getElementById('out').textContent = JSON.stringify({ cookie: document.c
                 "<p>set</p><script>localStorage.setItem('spike', '1');</script>",
             ),
         ),
+        "/marker" => (
+            "",
+            page(
+                "marker",
+                "<p>marker</p><script>window.pageMarker = 'main';</script>",
+            ),
+        ),
         "/form" => (
             "",
             page(
@@ -390,6 +397,61 @@ impl Human {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("the human page did not open a tab");
+    }
+
+    /// Premise control for "the human window was the last active one": activates the human
+    /// tab, then sends a context-less `Target.createTarget` straight to the browser, which
+    /// puts the tab in the profile of the last active window. Returns the context that tab
+    /// landed in (it is closed again); equal to `self.context` when the premise holds.
+    /// Measured on Chrome 157 while another application has the operating-system focus: the
+    /// tab does NOT land in the human profile even after `Target.activateTarget` and
+    /// `Page.bringToFront` (minimizing the agent windows did not change it either), so over
+    /// CDP alone the premise cannot be created there; callers report that instead of faking it.
+    pub fn establish_human_active(&self, target: &str) -> String {
+        self.activate(target);
+        self.rt.block_on(async {
+            if let Ok(session) = self.conn.attach(target).await {
+                let _ = self
+                    .conn
+                    .send("Page.bringToFront", serde_json::json!({}), Some(&session))
+                    .await;
+                let _ = self
+                    .conn
+                    .send(
+                        "Target.detachFromTarget",
+                        serde_json::json!({ "sessionId": session }),
+                        None,
+                    )
+                    .await;
+            }
+        });
+        let r = self
+            .rt
+            .block_on(self.conn.send(
+                "Target.createTarget",
+                serde_json::json!({ "url": "about:blank" }),
+                None,
+            ))
+            .unwrap();
+        let id = r["targetId"].as_str().unwrap().to_string();
+        let context = self
+            .pages()
+            .into_iter()
+            .find(|t| t.target_id == id)
+            .and_then(|t| t.browser_context_id)
+            .expect("control tab not listed");
+        let _ = self.rt.block_on(self.conn.send(
+            "Target.closeTarget",
+            serde_json::json!({ "targetId": id }),
+            None,
+        ));
+        for _ in 0..50 {
+            if self.pages().iter().all(|t| t.target_id != id) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        context
     }
 
     /// Brings the target (and its window) to the front, as a person clicking it would.

@@ -1,4 +1,4 @@
-# 1단계 수동 확인 (M1~M7)
+# 1단계 수동 확인 (M1~M7, M8, M8b)
 
 0단계에서 사람 손이 필요해 하지 못한 확인들이다([spike-findings.md](./spike-findings.md)의 "미실시"). 자동 시험은 이 항목들을 대신하지 못한다. 이 문서의 모든 "실제 결과" 칸은 비어 있다. 사용자가 직접 수행하고 채운다. 결과가 나오면 spike-findings.md의 "미실시" 표와 [roadmap.md](./roadmap.md)의 1단계 상태를 그에 맞춰 고친다.
 
@@ -153,8 +153,26 @@ cat /tmp/pegboard-m-loop.log
 | 기대 결과 | 명령이 멈추지 않고 몇 초 안에 응답한다. 창이 없다는 명확한 오류로 끝나거나 새 창과 탭을 에이전트 프로필에 열어 계속한다. 사람 프로필 창에 탭이 생기면 실패다. `session close`는 성공한다 |
 | 실제 결과 | |
 
+### M8. 사람 창을 클릭해 앞으로 가져온 뒤 `tab new`
+
+| | |
+|---|---|
+| 목적 | 자동 시험 `new_tabs_always_open_in_the_agent_profile`(와 core의 `created_tab_lands_in_agent_profile_even_when_human_window_is_active`)는 "사람 창이 마지막으로 활성인 창"이라는 전제를 CDP만으로는 만들지 못한다. 컨텍스트를 지정하지 않은 `Target.createTarget`이 `Target.activateTarget`과 `Page.bringToFront` 뒤에도 사람 프로필이 아닌 곳에 생겼다(OS 포커스가 다른 앱에 있을 때, Chrome 157에서 측정). 실제 사람의 클릭으로 그 전제를 만들어 확인한다 |
+| 절차 | 1. 세션을 만든다. 2. 사람 창(에이전트 창이 아닌 쪽)의 탭 영역을 마우스로 직접 클릭해 활성 창으로 만든다. 3. 바로 `pegboard tab new http://127.0.0.1:8765/counter.html` 4. 사람 창에 탭이 생겼는지, 에이전트 창의 `m-check` 그룹에 생겼는지 본다. 5. `pegboard tab list` 6. 사람 창을 다시 클릭하고 `pegboard open http://127.0.0.1:8765/counter.html`, `pegboard tab new about:blank`를 반복한다 |
+| 기대 결과 | 새 탭은 항상 에이전트 창의 세션 그룹에 생기고 사람 창의 탭 수는 그대로다 |
+| 실제 결과 | |
+
+### M8b. 에이전트 동작 중 다른 앱에서 타이핑이 끊기지 않는지
+
+| | |
+|---|---|
+| 목적 | 운영체제 수준의 포커스 도둑질 확인. 자동 시험 `agent_actions_do_not_change_the_humans_active_tab`은 브라우저 안의 상태(사람 창의 활성 탭, `document.hasFocus()`)만 증명하고 맨 앞 앱이 바뀌는지는 증명하지 못한다 |
+| 절차 | 1. 세션을 만든다. 2. 텍스트 편집기를 앞에 두고 입력을 계속한다(또는 `yes` 같은 출력이 계속 나오는 터미널에 키를 계속 누른다). 3. 다른 터미널에서 반복 스크립트(`nohup /tmp/pegboard-m-loop.sh ...`)와 `pegboard open`, `fill`, `tab new`를 돌린다 4. 입력이 끊기거나 맨 앞 앱이 Chrome for Testing으로 바뀌는 순간이 있는지 본다 |
+| 기대 결과 | 입력이 끊기지 않고 맨 앞 앱이 바뀌지 않는다. 에이전트 창이 사람 창 앞으로 올라오지도 않는다 |
+| 실제 결과 | |
+
 ## 결과를 반영할 곳
 
 - [spike-findings.md](./spike-findings.md)의 "미실시" 표에서 화면 잠금, 다른 데스크톱 공간, 환경설정 누출, 다운로드 경로 행: 수행한 날짜와 결과를 적는다.
 - 새는 것이 나오면 [architecture.md](./architecture.md) 11절 "남는 위험"과 README의 "알려진 한계"에 한 줄씩 더한다.
-- 7개가 모두 끝나면 [roadmap.md](./roadmap.md)의 1단계 상태를 "완료"로 고친다.
+- M1~M7, M8, M8b가 모두 끝나면 [roadmap.md](./roadmap.md)의 1단계 상태를 "완료"로 고친다.

@@ -77,7 +77,7 @@ async fn close_and_ungroup() {
     let br = Bridge::attach(&b.conn, &agent).await.unwrap();
     let (g, first) = br.create_group("x", "blue").await.unwrap();
     let t = br.create_tab(&g, "about:blank").await.unwrap();
-    br.close_targets(&[t.clone()]).await.unwrap();
+    br.close_targets(std::slice::from_ref(&t)).await.unwrap();
     assert_eq!(br.members(&g).await.unwrap(), vec![first.clone()]);
     br.ungroup(&g).await.unwrap();
     assert!(br.members(&g).await.unwrap().is_empty());
@@ -101,7 +101,7 @@ async fn bridge_refuses_targets_of_the_human_profile() {
         .find(|t| t.browser_context_id.as_deref() == Some(b.human_context.as_str()))
         .expect("no human page")
         .target_id;
-    let closed = br.close_targets(&[human.clone()]).await;
+    let closed = br.close_targets(std::slice::from_ref(&human)).await;
     eprintln!("close_targets on human target: {closed:?}");
     assert!(closed.is_err());
     let added = br.add_to_group(&g, &human).await;

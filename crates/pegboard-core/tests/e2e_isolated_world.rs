@@ -4,7 +4,8 @@
 //! Can the caller of the `pegboard` CLI run its own script in such a world? No allowed command
 //! does: `eval`, `wait --fn` and the other script-taking forms use `Runtime.evaluate` in the
 //! page's main world (checked from the CLI side by `eval_runs_in_the_main_world_and_a11y_works`
-//! in the CLI isolation suite), and `a11y` runs a fixed script. A caller of the CLI therefore
+//! in the CLI isolation suite). `a11y` takes caller-supplied `--tags` and `-s` values and runs a
+//! script parameterised by them; how those values are embedded was not verified. A caller of the CLI therefore
 //! cannot reach this primitive. This test attacks it anyway at the proxy level, as a client
 //! that speaks raw CDP through its session endpoint would: it asks for a universal-access
 //! world and tries to read local files and the human profile from it.
@@ -42,6 +43,19 @@ async fn eval_in(
 #[ignore]
 async fn universal_access_isolated_world_cannot_escape() {
     let s = common::session_fixture().await;
+    // The human really holds the data that must not show up: asserted through the
+    // browser-level connection, not the session.
+    let human_session = s.browser.conn.attach(&s.human_target).await.unwrap();
+    let human_cookie = s
+        .browser
+        .conn
+        .evaluate(&human_session, "document.cookie")
+        .await
+        .unwrap();
+    assert!(
+        human_cookie.as_str().unwrap_or("").contains("spike=1"),
+        "the human tab has no cookie: {human_cookie}"
+    );
     let client = common::client(&s.endpoint).await;
     let session = client.attach(&s.first_target).await.unwrap();
     client
@@ -114,52 +128,44 @@ async fn universal_access_isolated_world_cannot_escape() {
         );
     }
 
-    // The world shares the page's DOM and so the agent profile's storage, never the human's:
-    // the human tab holds cookie `spike=1` and localStorage `spike` on the same origin.
-    let human = eval_in(
-        &client,
-        &session,
-        Some(ctx),
-        "(async () => { const o = {}; try { o.cookie = document.cookie; } catch (e) { o.cookie = 'ERR'; } try { o.ls = localStorage.getItem('spike'); } catch (e) { o.ls = 'ERR'; } return JSON.stringify(o); })()",
-    )
-    .await;
-    assert!(
-        !human.contains("spike=1"),
-        "human cookie visible in the world: {human}"
-    );
-    // Same-origin read with the world's credentials: the agent profile has no cookie either.
-    client
-        .navigate(&session, &format!("{}/cookie/get", s.fixture.origin))
-        .await
-        .unwrap();
-    let tree = client
-        .send("Page.getFrameTree", json!({}), Some(&session))
-        .await
-        .unwrap();
-    let frame_id = tree["frameTree"]["frame"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let world = client
-        .send(
-            "Page.createIsolatedWorld",
-            json!({ "frameId": frame_id, "worldName": "attack2", "grantUniveralAccess": true }),
-            Some(&session),
-        )
-        .await
-        .unwrap();
-    let ctx2 = world["executionContextId"].as_i64().unwrap();
-    let state = eval_in(
-        &client,
-        &session,
-        Some(ctx2),
-        "JSON.stringify({ cookie: document.cookie, ls: localStorage.getItem('spike') })",
-    )
-    .await;
+    // Control: the script really runs in the isolated world, not the main world. A global set
+    // by the main world is invisible in the world.
+    eval_in(&client, &session, None, "window.mainOnly = 1").await;
     assert_eq!(
-        state, r#"{"cookie":"","ls":null}"#,
-        "the world sees the human profile's data"
+        eval_in(&client, &session, None, "typeof window.mainOnly").await,
+        "number"
     );
+    assert_eq!(
+        eval_in(&client, &session, Some(ctx), "typeof window.mainOnly").await,
+        "undefined",
+        "the evaluation did not run in the isolated world"
+    );
+
+    // Real cross-origin read attempt: the page (localhost) embeds the fixture at 127.0.0.1
+    // (`/cookie/get`, whose script prints the cookie and localStorage it sees) and the
+    // universal-access world tries to read the other origin's document. Whatever it can read
+    // must be the agent profile's data, never the human's (the human tab holds cookie
+    // `spike=1` and localStorage `spike` on 127.0.0.1).
+    let frame_url = format!("{}/cookie/get", s.fixture.origin);
+    let load = format!(
+        "new Promise(res => {{ const f = document.createElement('iframe'); f.id = 'xo'; f.onload = () => res('loaded'); f.src = '{frame_url}'; document.body.appendChild(f); }})"
+    );
+    assert_eq!(eval_in(&client, &session, None, &load).await, "loaded");
+    let read = "(() => { try { const d = document.getElementById('xo').contentDocument; return d ? 'READ ' + d.body.innerText : 'NULL'; } catch (e) { return 'BLOCKED ' + e; } })()";
+    let from_world = eval_in(&client, &session, Some(ctx), read).await;
+    let from_main = eval_in(&client, &session, None, read).await;
+    println!("cross-origin iframe read: world = {from_world:?}, main world = {from_main:?}");
+    assert!(
+        !from_world.contains("spike"),
+        "the world read human-profile data: {from_world}"
+    );
+    if let Some(text) = from_world.strip_prefix("READ ") {
+        assert_eq!(
+            text.trim(),
+            r#"{"cookie":"","ls":null}"#,
+            "what the world read is not the agent profile's data"
+        );
+    }
 
     // The human tab is untouched and not among the targets the session can see.
     let listed = client

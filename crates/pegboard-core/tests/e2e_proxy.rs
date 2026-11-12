@@ -109,7 +109,13 @@ async fn cannot_attach_to_human_target() {
 async fn created_tab_lands_in_agent_profile_even_when_human_window_is_active() {
     let s = common::session_fixture().await;
     let c = common::client(&s.endpoint).await;
-    common::activate_any_target_in(&s.browser.conn, &s.browser.human_context).await;
+    let control = common::establish_human_active(&s.browser.conn, &s.browser.human_context).await;
+    if control != s.browser.human_context {
+        eprintln!(
+            "PREMISE NOT ESTABLISHED: a context-less createTarget landed in {control}, not the human \
+             profile, so the human window is not the browser's last active one (manual check M8)"
+        );
+    }
     let t = create_tab(
         &c,
         json!({ "url": format!("{}/counter", s.fixture.origin) }),

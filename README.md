@@ -6,7 +6,7 @@ AI 에이전트가 브라우저를 쓰되, 사람이 쓰는 브라우저 데이�
 
 ## 상태
 
-**1단계(로컬 MVP).** 순정 Chrome for Testing 위에서 동작한다. 설치해서 쓰는 브라우저가 아니고, Chromium 포크는 3단계 계획이다. macOS(arm64)에서만 동작한다. 자동 시험은 끝났고 사람이 손으로 해야 하는 확인 7개가 남아 있다([docs/phase1-manual-checks.md](docs/phase1-manual-checks.md)).
+**1단계(로컬 MVP).** 순정 Chrome for Testing 위에서 동작한다. 설치해서 쓰는 브라우저가 아니고, Chromium 포크는 3단계 계획이다. macOS(arm64)에서만 동작한다. 자동 시험은 끝났고 사람이 손으로 해야 하는 확인 9개(M1~M7, M8, M8b)가 남아 있다([docs/phase1-manual-checks.md](docs/phase1-manual-checks.md)).
 
 ## 준비
 
@@ -68,7 +68,10 @@ pegboard profile delete work                            # 열린 세션이 있�
 ## 아직 안 되는 것
 
 - MCP 서버, 화면 녹화(지금 기록은 동작 목록뿐이다), 동작 정책과 확인 요청, 원격 제어, 프로필 복사.
-- 1단계 허용목록에서 뺀 명령(각각 pegboard의 통제 밖에서 읽거나 쓰거나 가져온다): `read`, `flow`, `inspect`, `trace`, `profiler`, `webmcp`, `diff`, `network har`, `wait --download`, `upload`, `cookies clear`, `set media`, `set geo`, `set offline`, `batch`.
+- 1단계 허용목록에서 뺀 명령. 허용목록(`crates/pegboard-core/src/argv.rs`)에 없는 것은 모두 거부되며, 아래는 그중 알려 둘 만한 것이다.
+  - `cookies clear`, `set media`, `set geo`, `set offline`: 필요한 CDP 메서드(`Network.clearBrowserCookies`, 에뮬레이션·네트워크 조건 계열)를 프록시가 허용하지 않는다.
+  - `read`, `flow`, `diff`, `upload`, `download`, `network route`, `network har`, `trace`, `profiler`, `inspect`, `webmcp`, `clipboard`, `react`, `pushstate`, `wait --download`, `batch`: 세션 밖(로컬 파일, CLI 자체의 네트워크 접근, 인증 없는 DevTools 프록시)에 닿는다.
+  - `set credentials`, `set headers`: 인자에 비밀이 들어가거나 요청 전체에 영향을 준다. 허용목록에 없다.
 
 ## 알려진 한계
 

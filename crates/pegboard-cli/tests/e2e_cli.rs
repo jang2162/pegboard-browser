@@ -138,7 +138,7 @@ fn commands_without_daemon_exit_3() {
 fn stale_socket_is_cleaned_up() {
     let home = Home::new();
     let socket: PathBuf = home.path().join("pegboardd.sock");
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    stale_socket(&socket);
     assert!(socket.exists());
     let started = Instant::now();
     let (code, _, err) = home.run(&["session", "list"]);
@@ -233,6 +233,25 @@ fn recording_id_traversal_is_rejected() {
     assert!(out.is_empty());
 }
 
+/// Leaves a socket file nobody listens on. Cause of the flake this guards against (measured,
+/// 2 of 4 runs): macOS has no SOCK_CLOEXEC, so `UnixListener::bind` sets close-on-exec in a
+/// second step; another test thread that spawns a `pegboard` child between the two steps leaks
+/// the listener's descriptor into it, the "stale" socket keeps accepting connections until that
+/// child exits, and `Client::connect` returned Ok instead of `not_running`. Test-side only: the
+/// product code never binds and spawns concurrently like this. The helper retries until a
+/// connect is really refused.
+fn stale_socket(path: &Path) {
+    for _ in 0..100 {
+        let _ = std::fs::remove_file(path);
+        drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+        match std::os::unix::net::UnixStream::connect(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return,
+            _ => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    panic!("could not leave a stale socket at {}", path.display());
+}
+
 #[test]
 fn stale_socket_is_removed_only_when_lock_is_free() {
     use pegboard_core::api::Client;
@@ -241,7 +260,7 @@ fn stale_socket_is_removed_only_when_lock_is_free() {
 
     let home = Home::new();
     let paths = paths_in(home.path());
-    drop(std::os::unix::net::UnixListener::bind(&paths.socket).unwrap());
+    stale_socket(&paths.socket);
     {
         let _held = DaemonLock::try_acquire(&paths)
             .unwrap()
@@ -255,17 +274,22 @@ fn stale_socket_is_removed_only_when_lock_is_free() {
     }
     // A test thread that is forking a child holds a copy of the lock's descriptor for an
     // instant, so the free lock may take a moment to show.
+    let mut last_lock_free = false;
     for _ in 0..40 {
+        // Tell "the lock is still held" (a spawning test thread's copy of the descriptor)
+        // from "connect returned something else".
+        let lock_free = DaemonLock::try_acquire(&paths).unwrap().is_some();
         let e = Client::connect(&paths).err().expect("not running");
         assert_eq!(e.code, "not_running");
         if !paths.socket.exists() {
             break;
         }
+        last_lock_free = lock_free;
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
         !paths.socket.exists(),
-        "with the lock free the stale file goes"
+        "with the lock free the stale file goes (lock free at the last check: {last_lock_free})"
     );
 }
 
