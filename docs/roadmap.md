@@ -55,6 +55,8 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 
 ## 1단계. 로컬 MVP (포크 없음)
 
+**자동 시험 완료, 수동 확인 대기 (2026-11-12)**: 구현과 자동 시험은 끝났다. 사람 손이 필요한 확인 M1~M7(화면 잠금, 다른 데스크톱 공간, 디스플레이 절전, 설정 누출, 다운로드 경로, 탭그룹 사이 끌기, 창 닫기)은 아직 수행하지 않았다. 절차는 [phase1-manual-checks.md](./phase1-manual-checks.md). 7개가 끝나면 이 줄을 "완료"로 고친다.
+
 **목적**: 핵심 고리 하나를 끝까지 잇는다. 에이전트가 세션을 만들고, 탭그룹 안에서만 작업하고, 그 기록이 남는다.
 
 **구성**: 순정 Chromium(또는 Chrome for Testing) + 탭그룹용 작은 확장 프로그램 + `pegboard` 바이너리 + 동봉한 agent-browser. 이 단계에서는 `pegboardd`가 브라우저를 띄우는 부모가 된다.
@@ -72,12 +74,12 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 10. 세션 수명 처리: 세션을 붙인 직후 `stream disable`, 종료 때 `pegboardd`가 탭을 닫는다. 정책 판정은 `pegboardd`가 한다(2단계에서 확장).
 11. 0단계에서 못 한 확인: 화면 잠금과 다른 데스크톱 공간에서의 동작, 브라우저 설정과 다운로드 경로의 프로필 간 누출.
 
-**동작하는 것**
-- `pegboard session create --name "조사"`를 실행하면 에이전트 프로필의 창에 "조사" 탭그룹이 생긴다.
-- `pegboard --session s_x open ...`, `snapshot -i`, `click @e1`, `fill @e2 ...`가 그 탭그룹 안에서 동작한다.
-- 세션 두 개를 동시에 돌려도 서로의 탭이 보이지 않는다. 사람 프로필의 탭과 로그인 상태는 에이전트에게 닿지 않는다.
-- 세션에서 한 동작이 `actions.jsonl`에 남고 `pegboard recording show`로 읽을 수 있다.
-- `pegboard profile create work`로 프로필을 만들고 `session create --profile work`로 그 프로필의 창에서 세션을 연다. 기본 프로필과 로그인 상태가 섞이지 않는다.
+**동작하는 것** (각 줄 끝: 자동 시험 / 수동 확인 대기)
+- `pegboard session create --name "조사"`를 실행하면 에이전트 프로필의 창에 "조사" 탭그룹이 생긴다. → 자동 시험: `create_opens_group_in_agent_window`, `two_sessions_with_the_same_name_get_separate_groups`(e2e_session), `full_flow`(e2e_cli). 화면 잠금, 다른 공간, 절전 중의 동작은 수동 확인 M1~M3 대기.
+- `pegboard --session s_x open ...`, `snapshot -i`, `click @e1`, `fill @e2 ...`가 그 탭그룹 안에서 동작한다. → 자동 시험: `drives_the_session_tab`(e2e_runner), `full_flow`. 가려진 탭에서의 속도는 `hidden_session_tab_click_is_fast`, `session_tab_stays_responsive_when_hidden`.
+- 세션 두 개를 동시에 돌려도 서로의 탭이 보이지 않는다. 사람 프로필의 탭과 로그인 상태는 에이전트에게 닿지 않는다. → 자동 시험: 격리 시험 묶음 e2e_isolation의 `agent_cannot_list_or_switch_to_human_tabs`, `agent_cannot_read_human_cookies_or_storage`, `new_tabs_always_open_in_the_agent_profile`, `sessions_in_one_profile_share_cookies_but_not_tabs`, `agent_cannot_reach_other_sessions_tabs_by_id`, `session_cannot_use_another_sessions_handle`, `escape_flags_and_commands_are_refused`, `agent_does_not_steal_focus`, `stream_port_is_closed_for_every_session`, e2e_isolated_world의 `universal_access_isolated_world_cannot_escape`. 사람이 탭그룹 사이로 탭을 끄는 경우는 수동 확인 M6 대기.
+- 세션에서 한 동작이 `actions.jsonl`에 남고 `pegboard recording show`로 읽을 수 있다. → 자동 시험: `every_command_is_logged_with_url_and_outcome`, `password_text_never_reaches_the_log`와 가림 시험들(e2e_actionlog), `full_flow`.
+- `pegboard profile create work`로 프로필을 만들고 `session create --profile work`로 그 프로필의 창에서 세션을 연다. 기본 프로필과 로그인 상태가 섞이지 않는다. → 자동 시험: `named_profile_is_isolated_from_default`(e2e_session), `sessions_in_different_profiles_share_nothing`(e2e_isolation). 설정과 다운로드 경로의 누출은 수동 확인 M4, M5 대기.
 - macOS에서만.
 
 **아직 안 되는 것**: MCP, 화면 녹화, 정책, 사람이 평소 쓰는 브라우저로서의 사용(순정 Chromium이라), 원격.
