@@ -152,6 +152,9 @@ pub struct BrowserStatus {
     pub pid: Option<u32>,
     pub chrome_version: Option<String>,
     pub sessions: usize,
+    /// Shutdown has begun: the daemon still answers but is about to go away.
+    #[serde(default)]
+    pub stopping: bool,
 }
 
 #[cfg(test)]

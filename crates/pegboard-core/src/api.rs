@@ -41,6 +41,9 @@ pub trait Handler: Send + Sync + 'static {
     async fn handle(&self, req: Request) -> Response;
     /// Called after the answer to a successful `browser.stop` was written.
     fn request_stop(&self) {}
+    /// Called when the answer to `req` could not be written (the caller went away). The
+    /// handler decides which methods need cleaning up after.
+    async fn delivery_failed(&self, _req: &Request, _resp: &Response) {}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,8 +102,9 @@ pub async fn serve_with(
             Ok(cred) if cred.uid() == uid => {}
             _ => continue,
         }
-        // Over the cap: dropping the stream closes it.
         let Ok(permit) = slots.clone().try_acquire_owned() else {
+            // Over the cap: one error line, then the stream is dropped (closed).
+            tokio::spawn(refuse_busy(stream));
             continue;
         };
         let handler = handler.clone();
@@ -109,6 +113,12 @@ pub async fn serve_with(
             drop(permit);
         });
     }
+}
+
+async fn refuse_busy(stream: UnixStream) {
+    let (_, mut write) = stream.into_split();
+    let r = error_response(0, codes::INTERNAL, "pegboard is busy; try again");
+    let _ = tokio::time::timeout(Duration::from_secs(1), write_line(&mut write, &r)).await;
 }
 
 fn error_response(id: u64, code: &str, message: impl Into<String>) -> Response {
@@ -141,9 +151,10 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
             let _ = write_line(&mut write, &r).await;
             return;
         }
-        let (response, stop) = match serde_json::from_slice::<Request>(&line) {
+        let (response, stop, request) = match serde_json::from_slice::<Request>(&line) {
             Ok(req) => {
                 let (id, stop) = (req.id, req.method == "browser.stop");
+                let kept = req.clone();
                 let d = daemon.clone();
                 // A task of its own: a panic becomes an error, and the work finishes even
                 // if this connection goes away.
@@ -151,14 +162,24 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
                     .await
                     .unwrap_or_else(|_| error_response(id, codes::INTERNAL, "request failed"));
                 let stop = stop && r.error.is_none();
-                (r, stop)
+                (r, stop, Some(kept))
             }
             Err(e) => (
                 error_response(0, codes::INVALID_PARAMS, format!("not a request: {e}")),
                 false,
+                None,
             ),
         };
-        if write_line(&mut write, &response).await.is_err() {
+        // A caller that has gone shows as an end of stream; that counts as an answer that
+        // could not be delivered, like a failed write.
+        let gone = matches!(
+            futures_util::FutureExt::now_or_never(read.fill_buf()),
+            Some(Ok(buf)) if buf.is_empty()
+        );
+        if gone || write_line(&mut write, &response).await.is_err() {
+            if let Some(request) = request {
+                daemon.delivery_failed(&request, &response).await;
+            }
             return;
         }
         if stop {
@@ -240,11 +261,16 @@ impl Client {
         let mut line = serde_json::to_vec(&request).map_err(|e| io_error(e.into()))?;
         line.push(b'\n');
         // A command may take its own time limit; everything else is quick.
-        let limit = if method == "command.exec" {
-            let ms = request.params["timeoutMs"].as_u64().unwrap_or(60_000);
-            Duration::from_millis(ms) + Duration::from_secs(15)
-        } else {
-            Duration::from_secs(60)
+        let limit = match method {
+            "command.exec" => {
+                let ms = request.params["timeoutMs"].as_u64().unwrap_or(60_000);
+                Duration::from_millis(ms) + Duration::from_secs(15)
+            }
+            // A page load and the attach of agent-browser.
+            "session.create" => Duration::from_secs(180),
+            // Closes every session in turn.
+            "browser.stop" => Duration::from_secs(300),
+            _ => Duration::from_secs(60),
         };
         let stream = self.reader.get_mut();
         stream.set_read_timeout(Some(limit)).map_err(io_error)?;
@@ -254,7 +280,10 @@ impl Client {
         if matches!(&read, Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)) {
             return Err(RpcError {
                 code: codes::TIMEOUT.to_string(),
-                message: format!("the daemon did not answer {method} within {} s", limit.as_secs()),
+                message: format!(
+                    "the daemon did not answer {method} within {} s; the command may still be running",
+                    limit.as_secs()
+                ),
                 data: None,
             });
         }

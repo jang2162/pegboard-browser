@@ -315,6 +315,7 @@ impl Daemon {
             pid: Some(self.browser.pid),
             chrome_version: Some(self.chrome_version.clone()),
             sessions: self.sessions.list().len(),
+            stopping: self.stopping.load(Ordering::SeqCst),
         }
     }
 
@@ -410,6 +411,19 @@ impl Daemon {
     }
 
     /// The session's files directory goes with the session; the recording stays.
+    /// A session nobody was told about (nobody has its token) is closed again.
+    async fn discard_undelivered(&self, id: &SessionId) {
+        let slot = self.slots.lock().unwrap().remove(id);
+        let (Some(slot), Ok(me)) = (slot, self.me()) else {
+            return;
+        };
+        let p = SessionCloseParams {
+            session_id: id.clone(),
+            keep_tabs: false,
+        };
+        let _ = tokio::spawn(async move { me.finish_session(p, slot.log.clone(), true).await }).await;
+    }
+
     fn remove_files(&self, id: &SessionId) {
         let files = self.paths.session_files(id);
         let _ = std::fs::remove_dir_all(&files);
@@ -555,5 +569,17 @@ impl crate::api::Handler for Daemon {
 
     fn request_stop(&self) {
         Daemon::request_stop(self)
+    }
+
+    async fn delivery_failed(&self, req: &Request, resp: &Response) {
+        if req.method == "session.create" {
+            if let Some(info) = resp
+                .result
+                .clone()
+                .and_then(|r| serde_json::from_value::<SessionInfo>(r).ok())
+            {
+                self.discard_undelivered(&info.id).await;
+            }
+        }
     }
 }

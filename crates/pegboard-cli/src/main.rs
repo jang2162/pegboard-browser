@@ -198,7 +198,13 @@ fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
                 } else {
                     println!(
                         "{} pid {} chrome {} sessions {}",
-                        if s.running { "running" } else { "stopped" },
+                        if s.stopping {
+                            "stopping"
+                        } else if s.running {
+                            "running"
+                        } else {
+                            "stopped"
+                        },
                         s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
                         s.chrome_version.as_deref().unwrap_or("-"),
                         s.sessions
@@ -216,6 +222,9 @@ fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
                 .or_else(|| std::env::var("PEGBOARD_SESSION").ok())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| usage("no session: pass --session or set PEGBOARD_SESSION"));
+            if !id.split_once('.').is_some_and(|(_, token)| !token.is_empty()) {
+                usage("session handle must be <id>.<token> (the first line printed by `pegboard session create`)");
+            }
             agent_command(paths, id, argv, json)
         }
     }
@@ -455,43 +464,49 @@ fn stop_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+fn spawn_daemon(paths: &Paths) -> Result<std::process::Child, RpcError> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(paths.home.join("daemon.log"))
+        .map_err(|e| io_failure("opening daemon.log", e))?;
+    let exe = std::env::current_exe().map_err(|e| io_failure("finding the executable", e))?;
+    Command::new(exe)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().map_err(|e| io_failure("daemon.log", e))?)
+        .stderr(log)
+        // Its own process group, so a Ctrl-C in this terminal does not stop it.
+        .process_group(0)
+        .spawn()
+        .map_err(|e| io_failure("starting the daemon", e))
+}
+
+/// A daemon that answers and is not shutting down.
+fn daemon_is_usable(paths: &Paths) -> bool {
+    Client::connect(paths)
+        .and_then(|mut c| c.call::<_, BrowserStatus>("browser.status", json!({})))
+        .is_ok_and(|s| !s.stopping)
+}
+
 fn browser_start(paths: &Paths) -> Result<(), RpcError> {
-    if socket_answers(paths) {
-        println!("already running");
-        return Ok(());
-    }
     ensure_home(paths).map_err(|e| io_failure("creating the pegboard home", e))?;
     let log_path = paths.home.join("daemon.log");
-    // Someone else (another `browser start`) may be starting the daemon: then this one only
-    // waits for it.
-    let mut child = if lock_is_held(paths) {
-        None
-    } else {
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&log_path)
-            .map_err(|e| io_failure("opening daemon.log", e))?;
-        let exe = std::env::current_exe().map_err(|e| io_failure("finding the executable", e))?;
-        Some(
-            Command::new(exe)
-                .arg("daemon")
-                .stdin(Stdio::null())
-                .stdout(log.try_clone().map_err(|e| io_failure("daemon.log", e))?)
-                .stderr(log)
-                // Its own process group, so a Ctrl-C in this terminal does not stop it.
-                .process_group(0)
-                .spawn()
-                .map_err(|e| io_failure("starting the daemon", e))?,
-        )
-    };
     let deadline = Instant::now() + START_TIMEOUT;
+    let mut child: Option<std::process::Child> = None;
+    let mut spawned = false;
     loop {
-        // Not `Client::connect`: it must never touch the socket of a starting daemon.
         if socket_answers(paths) {
-            println!("started");
-            return Ok(());
+            // A daemon that is shutting down is waited out, then replaced.
+            if daemon_is_usable(paths) {
+                println!("{}", if spawned { "started" } else { "already running" });
+                return Ok(());
+            }
+        } else if !spawned && !lock_is_held(paths) {
+            // Nobody serves and nobody is starting (or the one that was has gone): start one.
+            child = Some(spawn_daemon(paths)?);
+            spawned = true;
         }
         if let Some(c) = child.as_mut() {
             if let Ok(Some(status)) = c.try_wait() {
@@ -540,13 +555,15 @@ fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
     ensure_home(paths).map_err(|e| io_failure("creating the pegboard home", e))?;
     // Before anything is started or cleaned up, and held until the process ends.
     // A short grace: a client probing the lock (see `lock_is_held`) holds it for an instant.
+    // It must stay short: a daemon that waits long could take over the lock from a daemon
+    // that is being stopped, and nobody would be left to stop it.
     let mut tries = 0;
     let _lock = loop {
         match DaemonLock::try_acquire(paths) {
             Ok(Some(lock)) => break lock,
-            Ok(None) if tries < 20 => {
+            Ok(None) if tries < 5 => {
                 tries += 1;
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => return Err(error(codes::INTERNAL, "already running")),
             Err(e) => return Err(io_failure("taking the daemon lock", e)),
