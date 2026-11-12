@@ -71,6 +71,12 @@ const root = document.getElementById('host').attachShadow({ mode: 'open' });
 root.innerHTML = '<input id="spw" type="password"> <input id="stext">';
 </script>"#)),
         "/form-iframe" => ("", page("form-iframe", r#"<p>outer</p><iframe id="fr" src="/form"></iframe>"#)),
+        "/form-submit" => ("", page("form-submit", r#"<form action="/counter" method="get"><input id="name" name="n"> <input id="pw" name="p" type="password"> <button type="submit">Go</button></form><script>
+// Submits as soon as the password is long enough, like a form that submits on Enter.
+const pw = document.getElementById('pw');
+pw.addEventListener('input', () => { if (pw.value.length >= 8) pw.form.submit(); });
+</script>"#)),
+        "/form-otp" => ("", page("form-otp", r#"<input id="otp" autocomplete="one-time-code" oninput="this.blur()"> <input id="plain" autocomplete="off" oninput="this.blur()">"#)),
         "/frame" => ("", page("frame", r#"<p>outer</p><iframe id="fr" src="/form"></iframe>"#)),
         "/writer" => ("", page("writer", "<p>writer</p><script>setInterval(() => localStorage.setItem('busy', String(Date.now())), 100);</script>")),
         _ => return None,

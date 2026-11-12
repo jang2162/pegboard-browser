@@ -486,3 +486,178 @@ async fn plain_input_inside_shadow_root_is_not_redacted() {
     assert_eq!(entries[1].args, s(&["keyboard", "type", "visible-text"]));
     h.finish().await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn failed_fill_into_password_field_is_redacted() {
+    let h = Harness::start().await;
+    let (info, _ep, mut log) = logged(&h, "/form").await;
+    // The element is not found: the command fails and the focus never moved.
+    let r = h
+        .run(&mut log, &info, &["fill", "#nope", "hunter2-secret"])
+        .await;
+    assert!(r.as_ref().map_or(true, |r| !ok(r)), "{r:?}");
+    // A reference that does not exist.
+    let r = h
+        .run(&mut log, &info, &["fill", "@e99", "hunter2-secret"])
+        .await;
+    assert!(r.as_ref().map_or(true, |r| !ok(r)), "{r:?}");
+    assert!(
+        !h.log_text(&info).contains("hunter2-secret"),
+        "{}",
+        h.log_text(&info)
+    );
+    let entries = h.entries(&info);
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e.redacted && !e.ok));
+    h.finish().await;
+}
+
+/// The form page went on to /counter (the submit is asynchronous).
+async fn submitted(h: &Harness, info: &SessionInfo) -> bool {
+    eventually(5, || async {
+        h.eval(&info.targets[0], "location.pathname").await == json!("/counter")
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore]
+async fn type_with_newline_that_submits_is_redacted() {
+    let h = Harness::start().await;
+    let (info, _ep, mut log) = logged(&h, "/form-submit").await;
+    let r = h
+        .run(&mut log, &info, &["type", "#pw", "hunter2-secret\n"])
+        .await
+        .unwrap();
+    assert!(ok(&r), "{r:?}");
+    assert!(!h.log_text(&info).contains("hunter2-secret"));
+    let entries = h.entries(&info);
+    assert!(entries[0].redacted);
+    assert!(submitted(&h, &info).await, "the form did not submit");
+    h.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn keyboard_type_into_focused_password_that_submits_is_redacted() {
+    let h = Harness::start().await;
+    let (info, _ep, mut log) = logged(&h, "/form-submit").await;
+    assert!(ok(&h
+        .run(&mut log, &info, &["click", "#pw"])
+        .await
+        .unwrap()));
+    let _ = h
+        .run(&mut log, &info, &["keyboard", "type", "hunter2-secret\n"])
+        .await;
+    assert!(!h.log_text(&info).contains("hunter2-secret"));
+    let entries = h.entries(&info);
+    assert!(entries[1].redacted);
+    assert!(submitted(&h, &info).await, "the form did not submit");
+    h.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn otp_field_that_blurs_is_redacted() {
+    let h = Harness::start().await;
+    let (info, _ep, mut log) = logged(&h, "/form-otp").await;
+    assert!(ok(&h
+        .run(&mut log, &info, &["click", "#otp"])
+        .await
+        .unwrap()));
+    assert!(ok(&h
+        .run(&mut log, &info, &["keyboard", "type", "424242"])
+        .await
+        .unwrap()));
+    // A field that is not marked, but blurs itself: only the checks before and after tell.
+    assert!(ok(&h
+        .run(&mut log, &info, &["fill", "#otp", "737373"])
+        .await
+        .unwrap()));
+    let text = h.log_text(&info);
+    assert!(
+        !text.contains("424242") && !text.contains("737373"),
+        "{text}"
+    );
+    h.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn press_key_by_key_into_password_is_redacted() {
+    let h = Harness::start().await;
+    let (info, _ep, mut log) = logged(&h, "/form").await;
+    assert!(ok(&h
+        .run(&mut log, &info, &["click", "#pw"])
+        .await
+        .unwrap()));
+    assert!(ok(&h.run(&mut log, &info, &["press", "h"]).await.unwrap()));
+    assert!(ok(&h.run(&mut log, &info, &["press", "u"]).await.unwrap()));
+    assert!(ok(&h
+        .run(&mut log, &info, &["press", "Tab"])
+        .await
+        .unwrap()));
+    let entries = h.entries(&info);
+    assert_eq!(entries[1].args, s(&["press", REDACTED]));
+    assert_eq!(entries[2].args, s(&["press", REDACTED]));
+    assert_eq!(entries[3].args, s(&["press", "Tab"]));
+    h.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn non_sensitive_text_is_still_logged() {
+    let h = Harness::start().await;
+    let (info, _ep, mut log) = logged(&h, "/form-submit").await;
+    assert!(ok(&h
+        .run(&mut log, &info, &["fill", "#name", "alice"])
+        .await
+        .unwrap()));
+    // Typed into a plain field, with a trailing newline: both checks pass, so the text is
+    // logged (this field does not submit the form; a submit would leave nothing focused
+    // on the new page, which also passes the check after the command).
+    assert!(ok(&h
+        .run(&mut log, &info, &["type", "#name", "bob\n"])
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}"))));
+    let entries = h.entries(&info);
+    assert_eq!(entries[0].args, s(&["fill", "#name", "alice"]));
+    assert!(!entries[0].redacted);
+    assert_eq!(entries[1].args, s(&["type", "#name", "bob\n"]));
+    assert!(!entries[1].redacted);
+    h.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn cookie_value_never_reaches_the_log() {
+    let h = Harness::start().await;
+    let (info, _ep, mut log) = logged(&h, "/form").await;
+    let r = h
+        .run(
+            &mut log,
+            &info,
+            &["cookies", "set", "sid", "cookie-secret-77"],
+        )
+        .await
+        .unwrap();
+    assert!(ok(&r), "{r:?}");
+    let _ = h
+        .run(
+            &mut log,
+            &info,
+            &["storage", "local", "set", "k", "storage-secret-88"],
+        )
+        .await;
+    let text = h.log_text(&info);
+    assert!(
+        !text.contains("cookie-secret-77") && !text.contains("storage-secret-88"),
+        "{text}"
+    );
+    assert_eq!(
+        h.entries(&info)[0].args,
+        s(&["cookies", "set", "sid", REDACTED])
+    );
+    h.finish().await;
+}

@@ -1,8 +1,10 @@
 //! The action log of a session: one JSON object per line in
 //! `<recordings>/<recording id>/actions.jsonl`, next to a `manifest.json`.
 //!
-//! What is written is the command line, never what a command returned, and never typed
-//! text that went into a sensitive field (see `SENSITIVE_FOCUS_JS` and `redact`). The
+//! What is written is the command line, never what a command returned. Typed text is kept
+//! only when it provably went into a harmless field (see `daemon::run_command`); secret
+//! values (`cookies set`, `storage set`) and the strings inside `eval` expressions are
+//! never kept. The
 //! session endpoint's token is not a field of anything here.
 
 use std::fs::{File, OpenOptions};
@@ -213,16 +215,13 @@ pub fn list(paths: &Paths) -> std::io::Result<Vec<Manifest>> {
     Ok(manifests)
 }
 
-/// Which argv positions hold typed text for a command, if any. The grammar of
-/// `argv::check` says where (`fill`, `type`, `select`, `find ... fill`, `keyboard type`,
-/// `keyboard inserttext`, and the answer of `dialog accept`).
+/// Which argv positions hold text the log may not keep as it is (typed text and secret
+/// values; `argv::text_at` tells them apart), if any.
 pub fn text_positions(argv: &[String]) -> Vec<usize> {
     argv::text_positions(argv)
 }
 
-/// The command line with those positions replaced by `REDACTED`.
-pub fn redact(argv: &[String]) -> Vec<String> {
-    let positions = text_positions(argv);
+fn mask(argv: &[String], positions: &[usize]) -> Vec<String> {
     argv.iter()
         .enumerate()
         .map(|(i, w)| {
@@ -235,14 +234,40 @@ pub fn redact(argv: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A JS expression evaluated in a tab right after a command; true when its focused
-/// element is sensitive: an `input[type=password]`, or an element whose `autocomplete`
-/// has `current-password`, `new-password`, `one-time-code`, `cc-number`, `cc-csc` or
-/// `cc-exp`. It follows the active element into open shadow roots and same-origin
-/// iframes. What it cannot look into (a cross-origin iframe has focus, or the nesting is
-/// implausibly deep) counts as sensitive.
+/// The command line with all those positions replaced by `REDACTED`.
+pub fn redact(argv: &[String]) -> Vec<String> {
+    mask(argv, &text_positions(argv))
+}
+
+/// `autocomplete` tokens of fields that hold secrets.
+pub const SENSITIVE_AUTOCOMPLETE: &[&str] = &[
+    "current-password",
+    "new-password",
+    "one-time-code",
+    "cc-number",
+    "cc-csc",
+    "cc-exp",
+    "cc-exp-month",
+    "cc-exp-year",
+];
+
+/// Whether an element with this `type` and `autocomplete` attribute holds secrets (the
+/// same rule as `SENSITIVE_FOCUS_JS`, for an element found by a selector).
+pub fn attrs_are_sensitive(input_type: Option<&str>, autocomplete: Option<&str>) -> bool {
+    input_type.is_some_and(|t| t.trim().eq_ignore_ascii_case("password"))
+        || autocomplete.is_some_and(|a| {
+            a.split_ascii_whitespace()
+                .any(|tok| SENSITIVE_AUTOCOMPLETE.contains(&tok.to_ascii_lowercase().as_str()))
+        })
+}
+
+/// A JS expression evaluated in a tab; true when its focused element is sensitive: an
+/// `input[type=password]`, or an element whose `autocomplete` has one of
+/// `SENSITIVE_AUTOCOMPLETE`. It follows the active element into open shadow roots and
+/// same-origin iframes. What it cannot look into (a cross-origin iframe has focus, or the
+/// nesting is implausibly deep) counts as sensitive.
 pub const SENSITIVE_FOCUS_JS: &str = r#"(() => {
-  const sensitive = ['current-password', 'new-password', 'one-time-code', 'cc-number', 'cc-csc', 'cc-exp'];
+  const sensitive = ['current-password', 'new-password', 'one-time-code', 'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year'];
   let el = document.activeElement;
   for (let depth = 0; el; depth++) {
     if (depth > 16) return true;
@@ -262,31 +287,68 @@ pub const SENSITIVE_FOCUS_JS: &str = r#"(() => {
   return tokens.some((t) => sensitive.includes(t));
 })()"#;
 
-/// The command line as written to the log: the caller's words, typed text replaced when
-/// `redacted`, and the expression of `eval` cut to `MAX_EVAL_CHARS` (its words joined).
+/// The expression with the contents of its string literals (single, double and backtick
+/// quoted, backslash escapes honoured) replaced by '…'. `None` when a literal is not
+/// closed (or the expression otherwise confuses this scan).
+pub fn mask_eval(expression: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = expression.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if !matches!(c, '\'' | '"' | '`') {
+            continue;
+        }
+        out.push('…');
+        let mut closed = false;
+        while let Some(d) = chars.next() {
+            if d == '\\' {
+                chars.next();
+            } else if d == c {
+                out.push(c);
+                closed = true;
+                break;
+            }
+        }
+        if !closed {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// The command line as written to the log: the caller's words with secret values replaced
+/// (and typed text too when `redacted`), and the expression of `eval` with its string
+/// literals masked and cut to `MAX_EVAL_CHARS` (its words joined).
 pub fn logged_args(argv: &[String], redacted: bool) -> Vec<String> {
-    let args = if redacted {
-        redact(argv)
+    let positions = if redacted {
+        text_positions(argv)
     } else {
-        argv.to_vec()
+        argv::text_at(argv).always
     };
+    let args = mask(argv, &positions);
     if args.first().map(String::as_str) == Some("eval") && args.len() > 1 {
-        return vec![
-            "eval".to_string(),
-            truncate_chars(&args[1..].join(" "), MAX_EVAL_CHARS),
-        ];
+        let expression = args[1..].join(" ");
+        let shown = match mask_eval(&expression) {
+            Some(masked) => truncate_chars(&masked, MAX_EVAL_CHARS),
+            None => format!("[eval {} chars]", expression.chars().count()),
+        };
+        return vec!["eval".to_string(), shown];
     }
     args
 }
 
-/// A command line the grammar refused cannot be read for typed text, so what follows a
-/// command that takes text is hidden altogether.
+/// A command line the grammar refused cannot be read for secrets. After a word that is not
+/// a command at all, and after a command that takes text or values, every word is hidden.
 pub fn rejected_args(argv: &[String]) -> Vec<String> {
-    const TAKES_TEXT: &[&str] = &["fill", "type", "keyboard", "find", "select", "dialog"];
+    const TAKES_TEXT: &[&str] = &[
+        "fill", "type", "keyboard", "find", "select", "dialog", "cookies", "storage", "press",
+    ];
     match argv.first() {
-        Some(first) if TAKES_TEXT.contains(&first.as_str()) => std::iter::once(first.clone())
-            .chain(argv[1..].iter().map(|_| REDACTED.to_string()))
-            .collect(),
+        Some(first) if !argv::is_known_command(first) || TAKES_TEXT.contains(&first.as_str()) => {
+            std::iter::once(first.clone())
+                .chain(argv[1..].iter().map(|_| REDACTED.to_string()))
+                .collect()
+        }
         _ => logged_args(argv, false),
     }
 }
@@ -505,5 +567,126 @@ mod tests {
                 "startedAt"
             ]
         );
+    }
+
+    #[test]
+    fn eval_string_literals_are_masked() {
+        let a = logged_args(
+            &s(vec![
+                "eval",
+                "document.querySelector('#pw').value='hunter2'",
+            ]),
+            false,
+        );
+        assert_eq!(a[1], "document.querySelector('…').value='…'");
+        assert!(!a[1].contains("hunter2") && !a[1].contains("#pw"));
+        assert_eq!(mask_eval(r#"f("a b", `c${d}`)"#).unwrap(), "f(\"…\", `…`)");
+        // An escaped quote does not end the literal.
+        assert_eq!(mask_eval(r"x = 'it\'s hunter2'; y").unwrap(), "x = '…'; y");
+        // Masked first, then cut.
+        let long = format!("{}'hunter2'", "x".repeat(300));
+        let a = logged_args(&s(vec!["eval", &long]), false);
+        assert_eq!(a[1].chars().count(), 200);
+        assert!(!a[1].contains("hunter2"));
+        // An unterminated literal: only the size is kept.
+        let a = logged_args(&s(vec!["eval", "x = 'hunter2"]), false);
+        assert_eq!(a, s(vec!["eval", "[eval 12 chars]"]));
+    }
+
+    #[test]
+    fn cookie_and_storage_values_are_always_redacted() {
+        let log = |v: Vec<&str>| logged_args(&s(v), false);
+        assert_eq!(
+            log(vec!["cookies", "set", "sid", "abc123"]),
+            s(vec!["cookies", "set", "sid", REDACTED])
+        );
+        assert_eq!(
+            log(vec![
+                "cookies",
+                "set",
+                "sid",
+                "abc123",
+                "--same-site",
+                "Lax",
+                "--secure"
+            ]),
+            s(vec![
+                "cookies",
+                "set",
+                "sid",
+                REDACTED,
+                "--same-site",
+                "Lax",
+                "--secure"
+            ])
+        );
+        assert_eq!(
+            log(vec!["storage", "local", "set", "k", "v"]),
+            s(vec!["storage", "local", "set", "k", REDACTED])
+        );
+        assert_eq!(
+            log(vec!["storage", "session", "set", "k", "v"]),
+            s(vec!["storage", "session", "set", "k", REDACTED])
+        );
+        assert_eq!(
+            log(vec!["storage", "local", "get", "k"]),
+            s(vec!["storage", "local", "get", "k"])
+        );
+        // Also when the command line is refused.
+        assert_eq!(
+            rejected_args(&s(vec!["cookies", "set", "sid", "abc123", "--bogus"])),
+            s(vec!["cookies", REDACTED, REDACTED, REDACTED, REDACTED])
+        );
+    }
+
+    #[test]
+    fn press_single_characters_count_as_typed_text() {
+        for k in ["a", "Z", "7", "Shift+a", "Space"] {
+            assert_eq!(argv::typed_positions(&s(vec!["press", k])), vec![1], "{k}");
+        }
+        for k in [
+            "Enter",
+            "Tab",
+            "ArrowDown",
+            "Control+a",
+            "Shift+Tab",
+            "Shift+Enter",
+        ] {
+            assert!(
+                argv::typed_positions(&s(vec!["press", k])).is_empty(),
+                "{k}"
+            );
+        }
+        assert_eq!(redact(&s(vec!["press", "h"])), s(vec!["press", REDACTED]));
+    }
+
+    #[test]
+    fn unknown_command_words_are_redacted() {
+        assert_eq!(
+            rejected_args(&s(vec!["fil", "#pw", "hunter2"])),
+            s(vec!["fil", REDACTED, REDACTED])
+        );
+        assert_eq!(
+            rejected_args(&s(vec!["Fill", "#pw", "hunter2"])),
+            s(vec!["Fill", REDACTED, REDACTED])
+        );
+    }
+
+    #[test]
+    fn autocomplete_tokens_include_card_expiry_parts() {
+        for token in SENSITIVE_AUTOCOMPLETE {
+            assert!(SENSITIVE_FOCUS_JS.contains(token), "{token}");
+            assert!(
+                attrs_are_sensitive(Some("text"), Some(&format!("section-x {token}"))),
+                "{token}"
+            );
+        }
+        for token in ["cc-exp-month", "cc-exp-year", "cc-exp"] {
+            assert!(SENSITIVE_AUTOCOMPLETE.contains(&token));
+        }
+        assert!(attrs_are_sensitive(Some("PassWord"), None));
+        assert!(attrs_are_sensitive(None, Some("  CC-Number\t")));
+        assert!(!attrs_are_sensitive(Some("text"), Some("email")));
+        assert!(!attrs_are_sensitive(None, None));
     }
 }

@@ -69,6 +69,9 @@ struct Flag {
 struct Arg {
     kind: Kind,
     required: bool,
+    /// The value is a secret (a cookie's or storage entry's value, a dialog's answer): the
+    /// action log never keeps it.
+    secret: bool,
 }
 
 /// What a form does with typed text, which the action log must never record.
@@ -79,8 +82,9 @@ enum TextUse {
     /// The words of the rest are typed into (or chosen in) the focused element; the log
     /// hides them when that element is sensitive.
     Typed,
-    /// The `Text` positional arguments are always hidden (a dialog's prompt answer).
-    Always,
+    /// A single key press: typed text when the key is one printable character (or
+    /// `Shift+` one); named keys and shortcuts are not.
+    Key,
 }
 
 /// One accepted form of a command.
@@ -104,6 +108,7 @@ const fn req(kind: Kind) -> Arg {
     Arg {
         kind,
         required: true,
+        secret: false,
     }
 }
 
@@ -111,6 +116,14 @@ const fn opt(kind: Kind) -> Arg {
     Arg {
         kind,
         required: false,
+        secret: false,
+    }
+}
+
+const fn secret(arg: Arg) -> Arg {
+    Arg {
+        secret: true,
+        ..arg
     }
 }
 
@@ -241,7 +254,7 @@ const GRAMMAR: &[Form] = &[
         flags: &[switch(&["--clear"]), value(&["--delay"], Number)],
         ..with_text(with_rest(form(&["type"], SEL), Text, true), TextUse::Typed)
     },
-    form(&["press"], &[req(Key)]),
+    with_text(form(&["press"], &[req(Key)]), TextUse::Key),
     with_text(
         with_rest(form(&["keyboard", "type"], &[]), Text, true),
         TextUse::Typed,
@@ -310,22 +323,28 @@ const GRAMMAR: &[Form] = &[
     form(&["tab", "new"], &[opt(Url)]),
     form(&["tab", "close"], &[opt(TabRef)]),
     form(&["frame"], SEL),
-    with_text(form(&["dialog", "accept"], &[opt(Text)]), TextUse::Always),
+    form(&["dialog", "accept"], &[secret(opt(Text))]),
     form(&["dialog", "dismiss"], &[]),
     form(&["dialog", "status"], &[]),
     form(&["cookies"], &[]),
     form(&["cookies", "get"], &[]),
     with_flags(
-        form(&["cookies", "set"], &[req(Text), req(Text)]),
+        form(&["cookies", "set"], &[req(Text), secret(req(Text))]),
         COOKIE_FLAGS,
     ),
     form(&["storage", "local"], &[opt(Text)]),
     form(&["storage", "local", "get"], &[opt(Text)]),
-    form(&["storage", "local", "set"], &[req(Text), req(Text)]),
+    form(
+        &["storage", "local", "set"],
+        &[req(Text), secret(req(Text))],
+    ),
     form(&["storage", "local", "clear"], &[]),
     form(&["storage", "session"], &[opt(Text)]),
     form(&["storage", "session", "get"], &[opt(Text)]),
-    form(&["storage", "session", "set"], &[req(Text), req(Text)]),
+    form(
+        &["storage", "session", "set"],
+        &[req(Text), secret(req(Text))],
+    ),
     form(&["storage", "session", "clear"], &[]),
     with_flags(form(&["console"], &[]), &[switch(&["--clear"])]),
     with_flags(form(&["errors"], &[]), &[switch(&["--clear"])]),
@@ -394,7 +413,7 @@ pub fn check(argv: &[String], files_dir: &Path) -> Result<Checked, RpcError> {
         };
         rejected(format!("'{what}' is not supported in pegboard phase 1"))
     })?;
-    let (words, _) = parse(form, &argv[form.words.len()..], files_dir)?;
+    let words = parse(form, &argv[form.words.len()..], files_dir)?.words;
     if form.words == ["tab", "new"] {
         let url = words
             .get(2)
@@ -405,23 +424,70 @@ pub fn check(argv: &[String], files_dir: &Path) -> Result<Checked, RpcError> {
     Ok(Checked::Run(words))
 }
 
-/// The positions in `argv` (a command line as the caller gave it) that hold typed text,
-/// as the grammar knows them: the words typed by `fill`, `type`, `keyboard type`,
-/// `keyboard inserttext`, `select` and `find ... fill`, and the answer of `dialog accept`.
-/// Empty for a command line the grammar does not accept.
-pub fn text_positions(argv: &[String]) -> Vec<usize> {
-    let Some(form) = form_of(argv) else {
-        return Vec::new();
-    };
-    // Only the shape matters here, so any absolute directory will do.
-    parse(form, &argv[form.words.len()..], Path::new("/"))
-        .map(|(_, positions)| positions)
-        .unwrap_or_default()
+/// Where the secret words of a command line are, by the grammar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextAt {
+    /// Words typed into (or chosen in) a page element: `fill`, `type`, `select`,
+    /// `keyboard type`, `keyboard inserttext`, `find ... fill`, `press` of one character.
+    /// They are logged only when the element they went to is known to be harmless.
+    pub typed: Vec<usize>,
+    /// Values that are never logged: the value of `cookies set` and `storage ... set`,
+    /// the answer of `dialog accept`.
+    pub always: Vec<usize>,
+    /// Where typed text goes.
+    pub destination: Option<TextDestination>,
 }
 
-/// Whether the typed text of this command line is hidden whatever element it went to.
-pub fn text_always_hidden(argv: &[String]) -> bool {
-    form_of(argv).is_some_and(|f| f.text == TextUse::Always)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextDestination {
+    /// The element this selector (or `@ref`) names.
+    Selector(String),
+    /// Whatever has the focus.
+    Focused,
+    /// A locator that cannot be asked about as a selector (`find ...`).
+    Unknown,
+}
+
+/// The positions in `argv` (a command line as the caller gave it) of text the log must not
+/// keep as it is, as the grammar knows them. Empty for a command line the grammar does not
+/// accept.
+pub fn text_at(argv: &[String]) -> TextAt {
+    let Some(form) = form_of(argv) else {
+        return TextAt::default();
+    };
+    // Only the shape matters here, so any absolute directory will do.
+    match parse(form, &argv[form.words.len()..], Path::new("/")) {
+        Ok(parsed) => parsed.text,
+        Err(_) => TextAt::default(),
+    }
+}
+
+/// Typed positions only (see `TextAt::typed`).
+pub fn typed_positions(argv: &[String]) -> Vec<usize> {
+    text_at(argv).typed
+}
+
+/// Typed and always-secret positions, ascending.
+pub fn text_positions(argv: &[String]) -> Vec<usize> {
+    let at = text_at(argv);
+    let mut all: Vec<usize> = at.typed.into_iter().chain(at.always).collect();
+    all.sort_unstable();
+    all
+}
+
+/// Whether `word` is a known first word of a command.
+pub fn is_known_command(word: &str) -> bool {
+    GRAMMAR.iter().any(|f| f.words[0] == word)
+}
+
+/// A `press` key that types a character: one character, or `Shift+` one, or Space.
+fn is_typed_key(key: &str) -> bool {
+    let single = |s: &str| s.chars().count() == 1;
+    let name = match key.split_once('+') {
+        Some((m, k)) if m.eq_ignore_ascii_case("shift") => k,
+        _ => key,
+    };
+    single(name) || name.eq_ignore_ascii_case("space")
 }
 
 fn form_of(argv: &[String]) -> Option<&'static Form> {
@@ -431,17 +497,20 @@ fn form_of(argv: &[String]) -> Option<&'static Form> {
         .max_by_key(|f| f.words.len())
 }
 
+struct Parsed {
+    words: Vec<String>,
+    text: TextAt,
+}
+
 /// Parses the words after the command against the form; returns the full command line and
-/// the positions of its typed text (the same indices in the input and the output: words are
-/// never added or dropped, except a default file name appended at the end).
-fn parse(
-    form: &Form,
-    words: &[String],
-    files_dir: &Path,
-) -> Result<(Vec<String>, Vec<usize>), RpcError> {
+/// the positions of its secret text (the same indices in the input and the output: words
+/// are never added or dropped, except a default file name appended at the end).
+fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Parsed, RpcError> {
     let name = form.words.join(" ");
     let mut out: Vec<String> = form.words.iter().map(|w| w.to_string()).collect();
-    let mut text_at = Vec::new();
+    let mut typed = Vec::new();
+    let mut always = Vec::new();
+    let mut selector_at = None;
     let mut next_arg = 0;
     let mut file_given = false;
     let mut rest = 0;
@@ -452,7 +521,7 @@ fn parse(
         i += 1;
         if literal {
             if form.text == TextUse::Typed {
-                text_at.push(out.len());
+                typed.push(out.len());
             }
             out.push(word.clone());
             rest += 1;
@@ -515,8 +584,14 @@ fn parse(
             next_arg += 1;
             match accept(arg.kind, word, files_dir) {
                 Ok(v) => {
-                    if form.text == TextUse::Always && matches!(arg.kind, Text) {
-                        text_at.push(out.len());
+                    if arg.secret {
+                        always.push(out.len());
+                    }
+                    if matches!(arg.kind, Selector) && selector_at.is_none() {
+                        selector_at = Some(out.len());
+                    }
+                    if form.text == TextUse::Key && is_typed_key(&v) {
+                        typed.push(out.len());
                     }
                     file_given |= matches!(arg.kind, File(_));
                     placed = Some(v);
@@ -535,7 +610,7 @@ fn parse(
             (None, Some(kind)) => {
                 rest += 1;
                 if form.text == TextUse::Typed {
-                    text_at.push(out.len());
+                    typed.push(out.len());
                 }
                 accept(kind, word, files_dir)
                     .map_err(|e| rejected(format!("invalid argument {word:?} for `{name}`: {e}")))?
@@ -563,7 +638,23 @@ fn parse(
         let file = files_dir.join(format!("shot-{millis}.{ext}"));
         out.push(file.display().to_string());
     }
-    Ok((out, text_at))
+    let destination = if typed.is_empty() {
+        None
+    } else if form.words[0] == "find" {
+        Some(TextDestination::Unknown)
+    } else if let Some(i) = selector_at {
+        Some(TextDestination::Selector(out[i].clone()))
+    } else {
+        Some(TextDestination::Focused)
+    };
+    Ok(Parsed {
+        words: out,
+        text: TextAt {
+            typed,
+            always,
+            destination,
+        },
+    })
 }
 
 fn kind_name(kind: Kind) -> &'static str {
@@ -996,11 +1087,32 @@ mod tests {
             }
         }
         assert!(typed >= 14, "only {typed} typing forms");
-        for f in GRAMMAR.iter().filter(|f| f.text == TextUse::Always) {
+        for f in GRAMMAR.iter().filter(|f| f.args.iter().any(|a| a.secret)) {
             let line = full_line(f, &[]);
-            assert_eq!(text_positions(&line), vec![line.len() - 1], "{line:?}");
-            assert!(text_always_hidden(&line));
+            let at = text_at(&line);
+            assert!(at.typed.is_empty(), "{line:?}");
+            assert_eq!(at.always, vec![line.len() - 1], "{line:?}");
         }
+        // Where typed text goes.
+        let at = |v: &[&str]| text_at(&s(v)).destination;
+        assert_eq!(
+            at(&["type", "--clear", "#pw", "x"]),
+            Some(TextDestination::Selector("#pw".into()))
+        );
+        assert_eq!(
+            at(&["fill", "@e3", "x"]),
+            Some(TextDestination::Selector("@e3".into()))
+        );
+        assert_eq!(
+            at(&["keyboard", "type", "x"]),
+            Some(TextDestination::Focused)
+        );
+        assert_eq!(at(&["press", "a"]), Some(TextDestination::Focused));
+        assert_eq!(
+            at(&["find", "label", "L", "fill", "x"]),
+            Some(TextDestination::Unknown)
+        );
+        assert_eq!(at(&["click", "#a"]), None);
     }
 
     /// A new form that takes free text must be classified: either its text is hidden, or it
@@ -1035,7 +1147,7 @@ mod tests {
                     .iter()
                     .any(|fl| matches!(fl.arity, Arity::Value(Text)));
             let name = f.words.join(" ");
-            if !free || f.text != TextUse::No {
+            if !free || f.text != TextUse::No || f.args.iter().any(|a| a.secret) {
                 continue;
             }
             // `find role` and the like take a query text first, but their rest (after the

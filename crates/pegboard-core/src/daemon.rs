@@ -7,16 +7,20 @@ use pegboard_protocol::{codes, CommandExecResult, RpcError, SessionId};
 use serde_json::Value;
 
 use crate::actionlog::{
-    logged_args, rejected_args, truncate_chars, ActionEntry, ActionLog, MAX_ERROR_CHARS, REDACTED,
-    SENSITIVE_FOCUS_JS,
+    attrs_are_sensitive, logged_args, rejected_args, truncate_chars, ActionEntry, ActionLog,
+    MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
 };
-use crate::argv::{self, Checked};
+use crate::argv::{self, Checked, TextDestination};
 use crate::paths::Paths;
-use crate::runner::{failure_text, succeeded, Runner, DEFAULT_TIMEOUT_MS};
+use crate::proxy::server::Endpoint;
+use crate::runner::{succeeded, Runner, DEFAULT_TIMEOUT_MS};
 use crate::session::SessionManager;
 
 /// Time allowed for looking at what is focused after a command.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Longest time (ms) for one `get attr` that looks at a typing destination.
+const PRE_CHECK_LIMIT_MS: u64 = 5_000;
 
 fn now() -> String {
     time::OffsetDateTime::now_utc()
@@ -78,11 +82,22 @@ async fn probe(sessions: &SessionManager, id: &SessionId) -> Probe {
 /// at the same time (the caller serializes them).
 ///
 /// `argv` goes through `argv::check` first; a refused one is logged (`ok: false`) and never
-/// reaches the runner. `tab new` is run through agent-browser like every other command. After a command that types
-/// text, every tab of the session is asked, on the daemon's own CDP connection, whether
-/// its focused element is sensitive; the typed text is not logged when it is, and also when
-/// that cannot be found out (the check fails or times out, the tab is gone, the command
-/// itself errored).
+/// reaches the runner. `tab new` is run through agent-browser like every other command.
+///
+/// What the log keeps of the command line:
+/// - Secret values (`cookies set` and `storage set` values, a dialog's answer) are never
+///   kept. The strings inside an `eval` expression are masked and the rest cut to 200
+///   characters.
+/// - Typed text (`fill`, `type`, `select`, `find ... fill`, `keyboard type`,
+///   `keyboard inserttext`, `press` of one character) is kept only when all of these hold:
+///   the destination was harmless before the command (a selector is asked about with
+///   `get attr <selector> type|autocomplete`; the focused element is looked at for the
+///   forms that name none; `find ...` cannot be asked about, so it never passes), the
+///   command succeeded, and afterwards no tab of the session has a sensitive or
+///   unreadable focused element. A check that fails, times out (2 s for a look at the
+///   focus, 5 s at most for a `get attr`) or cannot run hides the text.
+/// - A redacted entry carries no error text but its code; otherwise `error` is the CLI's
+///   own `error` string or pegboard's own error, never output.
 pub async fn run_command(
     sessions: &SessionManager,
     runner: &Runner,
@@ -141,7 +156,12 @@ pub async fn run_command_with_hook(
         Err(e) => {
             // The message names the offending word, which may be typed text.
             entry.args = rejected_args(argv);
-            entry.error = Some(format!("{}: command line refused", e.code));
+            entry.redacted = entry.args != argv;
+            entry.error = Some(if entry.redacted {
+                withheld(&e.code)
+            } else {
+                truncate_chars(&format!("{}: {}", e.code, e.message), MAX_ERROR_CHARS)
+            });
             entry.duration_ms = elapsed_ms(started);
             append(log, entry)?;
             return Err(e);
@@ -153,28 +173,39 @@ pub async fn run_command_with_hook(
     };
 
     runner.set_session_targets_provider(sessions.targets_fn());
-    let outcome = match sessions.endpoint(id) {
-        Ok(endpoint) => {
-            runner
-                .exec(
-                    id,
-                    &endpoint,
-                    &run_argv,
-                    timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-                )
-                .await
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let endpoint = sessions.endpoint(id);
+    let at = argv::text_at(argv);
+    let types_text = !at.typed.is_empty();
+
+    // Before: is what gets typed going somewhere harmless?
+    let harmless_before = if !types_text {
+        true
+    } else {
+        match (&at.destination, &endpoint) {
+            (Some(TextDestination::Selector(selector)), Ok(ep)) => {
+                selector_is_harmless(runner, id, ep, selector, timeout_ms).await
+            }
+            (Some(TextDestination::Focused), _) => {
+                let p = probe(sessions, id).await;
+                !p.failed && !p.sensitive
+            }
+            _ => false,
         }
-        Err(e) => Err(e),
+    };
+
+    let outcome = match &endpoint {
+        Ok(ep) => runner.exec(id, ep, &run_argv, timeout_ms).await,
+        Err(e) => Err(e.clone()),
     };
     after_exec.await;
 
-    let positions = argv::text_positions(argv);
-    let types_text = !positions.is_empty();
+    // After: the focus may have moved (a submit, a script that blurs); anything unclear
+    // hides the text.
     let probe = probe(sessions, id).await;
-    // Fail closed: typed text stays out of the log unless the focused element is known to
-    // be harmless.
-    let redacted = types_text
-        && (argv::text_always_hidden(argv) || outcome.is_err() || probe.failed || probe.sensitive);
+    let succeeded = matches!(&outcome, Ok(r) if succeeded(r));
+    let hide_typed =
+        types_text && !(harmless_before && succeeded && !probe.failed && !probe.sensitive);
 
     let bound = runner.bound_target(id);
     let tab = probe
@@ -187,30 +218,105 @@ pub async fn run_command_with_hook(
             None
         });
     entry.target_id = tab.map(|(t, _)| t.clone());
-    entry.url = tab.and_then(|(_, u)| u.clone());
-    entry.args = logged_args(argv, redacted);
-    entry.redacted = redacted;
+    entry.url = tab.and_then(|(_, u)| u.as_deref()).map(logged_url);
+    entry.args = logged_args(argv, hide_typed);
+    entry.redacted = hide_typed || !at.always.is_empty() || eval_masked(argv, &entry.args);
     entry.duration_ms = elapsed_ms(started);
-    let failure = match &outcome {
-        Ok(r) if succeeded(r) => None,
-        Ok(r) => Some(failure_text(r)),
-        Err(e) => Some(e.message.clone()),
-    };
-    entry.ok = failure.is_none();
-    entry.error = failure.map(|text| {
-        let mut text = text;
-        if redacted {
-            for &i in &positions {
-                if let Some(word) = argv.get(i).filter(|w| !w.is_empty()) {
-                    text = text.replace(word.as_str(), REDACTED);
-                }
-            }
-        }
-        truncate_chars(&text, MAX_ERROR_CHARS)
-    });
+    entry.ok = succeeded;
+    entry.error = error_text(entry.redacted, &outcome);
     append(log, entry)?;
     sessions.touch(id);
     outcome
+}
+
+/// An `eval` whose logged expression is not the one given (strings masked, or cut).
+fn eval_masked(argv: &[String], logged: &[String]) -> bool {
+    argv.first().map(String::as_str) == Some("eval")
+        && argv.len() > 1
+        && logged.get(1) != Some(&argv[1..].join(" "))
+}
+
+/// A URL as logged: without query and fragment (a GET form puts typed values there), and
+/// a `data:` URL only by its scheme.
+fn logged_url(url: &str) -> String {
+    if url.starts_with("data:") {
+        return "data:".to_string();
+    }
+    url.split(['?', '#']).next().unwrap_or_default().to_string()
+}
+
+fn withheld(code: &str) -> String {
+    format!("{code}: details withheld (entry redacted)")
+}
+
+/// The `error` of an entry for a command that did not succeed.
+fn error_text(redacted: bool, outcome: &Result<CommandExecResult, RpcError>) -> Option<String> {
+    match outcome {
+        Ok(r) if succeeded(r) => None,
+        Ok(r) if redacted => {
+            let code = r
+                .output
+                .get("code")
+                .and_then(Value::as_str)
+                .filter(|c| {
+                    c.len() <= 40 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                })
+                .unwrap_or("command_failed");
+            Some(withheld(code))
+        }
+        Ok(r) => Some(
+            r.output
+                .get("error")
+                .and_then(Value::as_str)
+                .map(|e| truncate_chars(e, MAX_ERROR_CHARS))
+                .unwrap_or_else(|| "command failed".to_string()),
+        ),
+        Err(e) if redacted => Some(withheld(&e.code)),
+        Err(e) => Some(truncate_chars(
+            &format!("{}: {}", e.code, e.message),
+            MAX_ERROR_CHARS,
+        )),
+    }
+}
+
+/// Asks the CLI for the `type` and `autocomplete` attributes of the element `selector`
+/// names. Harmless only when both calls succeed and neither marks a secret field. These
+/// calls are internal: they are not logged and do not pass the caller-facing grammar.
+async fn selector_is_harmless(
+    runner: &Runner,
+    id: &SessionId,
+    endpoint: &Endpoint,
+    selector: &str,
+    timeout_ms: u64,
+) -> bool {
+    let mut values = Vec::new();
+    for attr in ["type", "autocomplete"] {
+        let argv: Vec<String> = ["get", "attr", selector, attr]
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
+        match runner
+            .exec(id, endpoint, &argv, timeout_ms.min(PRE_CHECK_LIMIT_MS))
+            .await
+        {
+            Ok(r) if succeeded(&r) => match attribute_value(&r.output) {
+                Some(v) => values.push(v),
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    !attrs_are_sensitive(values[0].as_deref(), values[1].as_deref())
+}
+
+/// The attribute value in the output of `get attr`: `Some(None)` when the element has no
+/// such attribute, `None` when the output is not understood.
+fn attribute_value(output: &Value) -> Option<Option<String>> {
+    match output.pointer("/data/value")? {
+        Value::Null => Some(None),
+        Value::String(s) => Some(Some(s.clone())),
+        _ => None,
+    }
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -223,4 +329,59 @@ fn append(log: &mut ActionLog, entry: ActionEntry) -> Result<(), RpcError> {
         message: format!("could not write the action log: {e}"),
         data: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn failed(output: Value) -> Result<CommandExecResult, RpcError> {
+        Ok(CommandExecResult {
+            exit_code: 1,
+            output,
+            stderr: "stderr says hunter2".into(),
+        })
+    }
+
+    #[test]
+    fn redacted_entries_withhold_error_text() {
+        let out = failed(
+            json!({"success": false, "error": "no element for hunter2", "code": "not_found"}),
+        );
+        assert_eq!(
+            error_text(true, &out).unwrap(),
+            "not_found: details withheld (entry redacted)"
+        );
+        let e: Result<CommandExecResult, RpcError> = Err(RpcError {
+            code: codes::TIMEOUT.into(),
+            message: "hunter2 timed out".into(),
+            data: None,
+        });
+        assert_eq!(
+            error_text(true, &e).unwrap(),
+            "timeout: details withheld (entry redacted)"
+        );
+        // Not redacted: only the CLI's own `error` string or pegboard's own error.
+        assert_eq!(error_text(false, &out).unwrap(), "no element for hunter2");
+        assert_eq!(error_text(false, &e).unwrap(), "timeout: hunter2 timed out");
+        let no_string = failed(json!({"success": false, "error": {"x": 1}, "stdout": "leak"}));
+        assert_eq!(error_text(false, &no_string).unwrap(), "command failed");
+        let none = failed(json!({"success": false}));
+        assert_eq!(error_text(false, &none).unwrap(), "command failed");
+        let fine = Ok(CommandExecResult {
+            exit_code: 0,
+            output: json!({"success": true}),
+            stderr: String::new(),
+        });
+        assert!(error_text(false, &fine).is_none() && error_text(true, &fine).is_none());
+    }
+
+    #[test]
+    fn logged_urls_drop_query_fragment_and_data() {
+        assert_eq!(logged_url("http://a.test/x?p=secret#f"), "http://a.test/x");
+        assert_eq!(logged_url("http://a.test/x#t"), "http://a.test/x");
+        assert_eq!(logged_url("data:text/html,secret"), "data:");
+        assert_eq!(logged_url("about:blank"), "about:blank");
+    }
 }
