@@ -4,6 +4,40 @@
 
 수행자가 하는 일은 명령 붙여넣기, 화면 조작(잠금, 공간 이동, 디스플레이 끄기, 창 닫기), 결과 기록이다. 기대 결과와 다르면 그 자체가 발견이므로 숨기지 말고 칸에 그대로 적는다.
 
+## 한눈에 보기
+
+| # | 확인하는 것 | 화면 조작 | 데스크톱을 조작하는 에이전트가 할 수 있나 |
+|---|---|---|---|
+| M1 | 화면 잠금 중 자동화 | 잠그기, 풀기 | 일부. 반복 실행과 잠그기는 되지만 잠금 해제(암호)는 사람이 한다 |
+| M2 | 다른 데스크톱 공간 | 창을 다른 Space로 옮기기 | 일부. Mission Control 끌기는 에이전트에게 불안정하다. 사람이 창만 옮겨 주면 나머지는 된다 |
+| M3 | 디스플레이 절전 | 화면 끄기, 켜기 | 된다(`pmset displaysleepnow`, 깨우기는 `caffeinate -u -t 1`). 깨울 때 암호를 묻는 설정이면 사람이 푼다 |
+| M4 | 브라우저 설정 누출 | 설정 화면 클릭 | 된다 |
+| M5 | 다운로드 경로 | 없음 | 된다. 명령과 `ls`뿐이라 데스크톱 조작도 필요 없다 |
+| M6 | 탭을 다른 그룹으로 끌기 | 탭 끌어다 놓기 | 된다. 끌기가 제대로 됐는지 화면으로 확인한 뒤 진행한다 |
+| M7 | 에이전트 창 닫기 | 창 닫기 | 된다 |
+| M8 | 사람 창 클릭 뒤 `tab new` | 사람 창 클릭 | 된다. 에이전트의 클릭도 운영체제 수준의 클릭이다 |
+| M8b | 맨 앞 앱이 바뀌지 않는지 | 다른 앱에서 타이핑 | 된다. 아래의 맨 앞 앱 기록 명령을 쓰면 눈으로 보는 것보다 정확하다 |
+
+에이전트에게 맡길 때 지킬 것:
+
+- 여기서 말하는 에이전트는 화면을 보고 마우스와 키보드를 움직이는 도구(컴퓨터 사용)를 가진 에이전트다. pegboard 세션으로 브라우저만 조종하는 에이전트는 이 확인을 할 수 없다. macOS의 손쉬운 사용과 화면 기록 권한이 필요하다.
+- 에이전트가 한 항목은 "실제 결과" 칸에 "에이전트 수행"이라고 적고, 판단 근거(명령 출력, 화면에서 본 것)를 함께 남긴다.
+- 화면이 잠긴 동안 에이전트는 화면을 보지도 조작하지도 못한다. M1은 사람이 잠금을 풀어 준 뒤에 에이전트가 로그를 읽는다.
+- 에이전트가 다른 계정이 로그인된 브라우저를 건드리지 않게, 이 확인은 시험용 `PEGBOARD_HOME`의 Chrome for Testing 창에서만 한다.
+
+권장 순서: M5(조작 없음) → M4 → M7 → M8 → M8b → M6 → M3 → M2 → M1. 뒤로 갈수록 사람 손이 더 필요하다.
+
+## 새 기기에서 시작할 때
+
+macOS arm64, Rust stable, git이 필요하다. 저장소를 받은 뒤 한 번만 한다.
+
+```bash
+git clone <저장소 주소> pegboard-browser && cd pegboard-browser   # main에 1단계가 들어 있다
+scripts/fetch-agent-browser.sh                    # agent-browser 0.42.0을 받아 체크섬을 확인한다
+vendor/agent-browser/agent-browser install        # Chrome for Testing을 받는다
+cargo test --workspace                            # 브라우저 없이 도는 시험이 통과하는지 본다
+```
+
 ## 준비 (한 번만)
 
 저장소 루트에서 실행한다.
@@ -158,7 +192,7 @@ cat /tmp/pegboard-m-loop.log
 | | |
 |---|---|
 | 목적 | 자동 시험 `new_tabs_always_open_in_the_agent_profile`(와 core의 `created_tab_lands_in_agent_profile_even_when_human_window_is_active`)는 "사람 창이 마지막으로 활성인 창"이라는 전제를 만든 뒤 탭을 만든다. 전제는 컨텍스트 없는 `Target.createTarget`이 사람 프로필에 생기는지로 확인한다. `Target.activateTarget`만으로는 전제가 만들어지지 않았고(OS 포커스가 다른 앱에 있을 때, Chrome 157), Chrome을 시험 홈의 user-data-dir로 다시 실행해 새 사람 창을 여는 방식으로 만들었다. 이 항목은 실제 사람의 클릭으로 같은 확인을 한다 |
-| 절차 | 1. 세션을 만든다. 2. 사람 창(에이전트 창이 아닌 쪽)의 탭 영역을 마우스로 직접 클릭해 활성 창으로 만든다. 3. 바로 `pegboard tab new https://example.com` 4. 사람 창에 탭이 생겼는지, 에이전트 창의 세션 그룹에 생겼는지 본다. 5. `pegboard tab list` 6. 사람 창을 다시 클릭하고 `pegboard tab new about:blank`를 반복한다 |
+| 절차 | 1. 세션을 만든다. 2. 사람 창(에이전트 창이 아닌 쪽)의 탭 영역을 마우스로 직접 클릭해 활성 창으로 만든다. 3. 바로 `pegboard tab new http://127.0.0.1:8765/counter.html` 4. 사람 창에 탭이 생겼는지, 에이전트 창의 세션 그룹에 생겼는지 본다. 5. `pegboard tab list` 6. 사람 창을 다시 클릭하고 `pegboard tab new about:blank`를 반복한다 |
 | 기대 결과 | 새 탭은 항상 에이전트 창의 세션 그룹에 생기고 사람 창의 탭 수는 그대로다 |
 | 실제 결과 | |
 
@@ -167,7 +201,7 @@ cat /tmp/pegboard-m-loop.log
 | | |
 |---|---|
 | 목적 | 운영체제 수준의 포커스 도둑질 확인. 자동 시험 `agent_actions_do_not_change_the_humans_active_tab`은 브라우저 안의 상태(사람 창의 활성 탭, `document.hasFocus()`)만 증명하고 맨 앞 앱이 바뀌는지는 증명하지 못한다 |
-| 절차 | 1. 세션을 만든다(위 "세션을 만들 때"와 같은 방식으로 `PEGBOARD_SESSION`을 설정). 2. 텍스트 편집기나 메모 앱을 맨 앞에 두고 그 글상자에 글자를 계속 입력한다(멈추지 않고). 3. 입력을 계속하는 동안 다른 터미널 창에서 아래를 붙여넣어 실행한다(약 1분). 4. 입력이 끊기거나 맨 앞 앱이 Chrome for Testing으로 바뀌는 순간이 있었는지 본다 |
+| 절차 | 1. 세션을 만든다(위 "세션을 만들 때"와 같은 방식으로 `PEGBOARD_SESSION`을 설정). 2. 텍스트 편집기나 메모 앱을 맨 앞에 두고 그 글상자에 글자를 계속 입력한다(멈추지 않고). 3. 입력을 계속하는 동안 다른 터미널 창에서 아래를 붙여넣어 실행한다(약 1분). 4. 입력이 끊기거나 맨 앞 앱이 Chrome for Testing으로 바뀌는 순간이 있었는지 본다. 눈으로 보는 대신 아래의 맨 앞 앱 기록 명령을 먼저 띄워 두면 바뀐 순간이 파일에 남는다 |
 | 기대 결과 | 입력이 끊기지 않고 맨 앞 앱이 바뀌지 않는다. 에이전트 창이 사람 창 앞으로 올라오지도 않는다 |
 | 실제 결과 | |
 
@@ -176,11 +210,19 @@ for i in $(seq 1 20); do
   pegboard open 'data:text/html,<input id=t><button id=b>go</button>' >/dev/null
   pegboard fill '#t' "agent $i" >/dev/null
   pegboard click '#b' >/dev/null
-  pegboard tab new https://example.com >/dev/null
+  pegboard tab new http://127.0.0.1:8765/counter.html >/dev/null
   pegboard tab close >/dev/null
   sleep 2
 done
 echo done
+```
+
+맨 앞 앱 기록(위 반복을 돌리기 전에 다른 터미널에서 띄운다. 0.2초마다 맨 앞 앱 이름을 적고, 반복이 끝나면 Control+C로 멈춘다):
+
+```bash
+while true; do echo "$(date +%T) $(lsappinfo info -only name "$(lsappinfo front)" | head -1)"; sleep 0.2; done > /tmp/pegboard-front.log
+# 끝난 뒤: 맨 앞이었던 앱의 종류와 횟수. 타이핑하던 앱 하나만 나와야 한다.
+cut -d' ' -f2- /tmp/pegboard-front.log | sort | uniq -c
 ```
 
 ## 결과를 반영할 곳

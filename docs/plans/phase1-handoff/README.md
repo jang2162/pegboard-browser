@@ -1,7 +1,7 @@
 # 1단계 인계 문서
 
 - 작성일: 2026-11-12 (처음 작성 2026-11-11)
-- 브랜치: `phase1-local-mvp` (main에서 갈라짐, 아직 병합하지 않음)
+- 브랜치: `phase1-local-mvp`를 2026-11-13에 main으로 병합했다. 남은 것은 수동 확인 9가지([../../phase1-manual-checks.md](../../phase1-manual-checks.md))다
 - 계획: [../2026-11-11-phase1-local-mvp.md](../2026-11-11-phase1-local-mvp.md)
 - 이 폴더: `ledger.md`는 진행 원장(판정, 미룬 항목 전부), `task-N-report.md`는 작업별 구현 보고서다.
 
@@ -34,7 +34,7 @@
 ```bash
 git clone https://github.com/<소유자>/pegboard-browser
 cd pegboard-browser
-git checkout phase1-local-mvp
+git checkout main
 
 # agent-browser 0.42.0 바이너리를 받아 체크섬을 대조한다
 scripts/fetch-agent-browser.sh

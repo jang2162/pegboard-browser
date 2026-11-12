@@ -6,7 +6,7 @@ AI 에이전트가 브라우저를 쓰되, 사람이 쓰는 브라우저 데이�
 
 ## 상태
 
-**1단계(로컬 MVP).** 순정 Chrome for Testing 위에서 동작한다. 설치해서 쓰는 브라우저가 아니고, Chromium 포크는 3단계 계획이다. macOS(arm64)에서만 동작한다. 자동 시험은 끝났고 사람이 손으로 해야 하는 확인 9개(M1~M7, M8, M8b)가 남아 있다([docs/phase1-manual-checks.md](docs/phase1-manual-checks.md)).
+**1단계(로컬 MVP).** 순정 Chrome for Testing 위에서 동작한다. 설치해서 쓰는 브라우저가 아니고, Chromium 포크는 3단계 계획이다. macOS(arm64)에서만 동작한다. 자동 시험은 끝났고 손으로 해야 하는 확인 9개(M1~M7, M8, M8b)가 남아 있다. 대부분은 데스크톱을 조작하는 에이전트에게 맡길 수 있다([docs/phase1-manual-checks.md](docs/phase1-manual-checks.md)).
 
 ## 준비
 
