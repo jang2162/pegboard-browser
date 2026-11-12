@@ -522,6 +522,12 @@ fn is_typed_key(key: &str) -> bool {
     !(NAMED.contains(last) || shortcut)
 }
 
+/// Whether `word` is the first word of some command form (a word the log may show for a
+/// refused command line; any other first word may be a secret, e.g. a session handle).
+pub fn is_command_word(word: &str) -> bool {
+    GRAMMAR.iter().any(|f| f.words[0] == word)
+}
+
 fn form_of(argv: &[String]) -> Option<&'static Form> {
     GRAMMAR
         .iter()

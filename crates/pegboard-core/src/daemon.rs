@@ -7,8 +7,8 @@ use pegboard_protocol::{codes, CommandExecResult, RpcError, SessionId};
 use serde_json::Value;
 
 use crate::actionlog::{
-    attrs_are_sensitive, logged_args, rejected_args, truncate_chars, url_for_log, ActionEntry,
-    ActionLog, MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
+    attrs_are_sensitive, logged_args, rejected_args, rejected_command, truncate_chars, url_for_log,
+    ActionEntry, ActionLog, MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
 };
 use crate::argv::{self, Checked, TextDestination};
 use crate::paths::Paths;
@@ -157,6 +157,7 @@ pub async fn run_command_with_hook(
         Ok(checked) => checked,
         Err(e) => {
             // The message names the offending word, which may be typed text.
+            entry.command = rejected_command(argv);
             entry.args = rejected_args(argv);
             entry.redacted = true;
             entry.error = Some(withheld(&e.code));

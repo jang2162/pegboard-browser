@@ -69,6 +69,34 @@ fn internal(message: impl Into<String>) -> RpcError {
     rpc_error(codes::INTERNAL, message)
 }
 
+/// Longest a command may be given.
+const MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// `timeout_ms` of `command.exec`: when given, 1 to `MAX_TIMEOUT_MS`.
+fn checked_timeout(timeout_ms: Option<u64>) -> Result<(), RpcError> {
+    match timeout_ms {
+        Some(ms) if ms == 0 || ms > MAX_TIMEOUT_MS => Err(invalid(format!(
+            "timeoutMs must be between 1 and {MAX_TIMEOUT_MS}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The session's log, locked for one command. Once the session's close has begun nothing
+/// is logged any more, so nothing runs either.
+async fn begin_command<'a>(
+    slot: &'a Slot,
+    id: &SessionId,
+) -> Result<tokio::sync::MutexGuard<'a, ActionLog>, RpcError> {
+    let log = slot.log.lock().await;
+    // Checked after the lock: `finish_session` takes the same lock to finalize the recording
+    // once `closing` is set, so a command that gets here first is logged before that.
+    if slot.closing.load(Ordering::SeqCst) {
+        return Err(no_session(id));
+    }
+    Ok(log)
+}
+
 fn invalid(message: impl Into<String>) -> RpcError {
     rpc_error(codes::INVALID_PARAMS, message)
 }
@@ -515,8 +543,9 @@ impl Daemon {
         self.running()?;
         let id = checked_session(&p.session_id)?;
         let slot = self.authorize(&id, p.token.as_deref())?;
+        checked_timeout(p.timeout_ms)?;
         // One command at a time per session; other sessions are not held up.
-        let mut log = slot.log.lock().await;
+        let mut log = begin_command(&slot, &id).await?;
         let result = run_command(
             &self.sessions,
             &self.runner,
@@ -592,5 +621,62 @@ impl crate::api::Handler for Daemon {
                 self.discard_undelivered(&info.id).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_timeout_is_bounded() {
+        assert!(checked_timeout(None).is_ok());
+        assert!(checked_timeout(Some(1)).is_ok());
+        assert!(checked_timeout(Some(600_000)).is_ok());
+        for bad in [0, 600_001, u64::MAX] {
+            let e = checked_timeout(Some(bad)).unwrap_err();
+            assert_eq!(e.code, codes::INVALID_PARAMS, "{bad}");
+        }
+    }
+
+    fn slot(dir: &std::path::Path) -> Slot {
+        let paths = crate::paths::paths_in(dir);
+        let manifest = Manifest::new(
+            "r_abcdefgh",
+            "s_abcdefgh",
+            "demo",
+            "default",
+            "2026-01-01T00:00:00Z",
+            "157",
+            "0.42.0",
+        );
+        Slot {
+            log: Arc::new(AsyncMutex::new(ActionLog::open(&paths, manifest).unwrap())),
+            token: "t".into(),
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_command_starts_once_the_session_is_closing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = slot(tmp.path());
+        let id = SessionId("s_abcdefgh".into());
+        assert!(begin_command(&slot, &id).await.is_ok());
+        slot.closing.store(true, Ordering::SeqCst);
+        let e = begin_command(&slot, &id).await.err().expect("refused");
+        assert_eq!(e.code, codes::SESSION_NOT_FOUND);
+        // A command that waited for the log while the close began is refused too.
+        slot.closing.store(false, Ordering::SeqCst);
+        let held = slot.log.lock().await;
+        let waiting = begin_command(&slot, &id);
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        slot.closing.store(true, Ordering::SeqCst);
+        drop(held);
+        assert_eq!(
+            waiting.await.err().expect("refused").code,
+            codes::SESSION_NOT_FOUND
+        );
     }
 }

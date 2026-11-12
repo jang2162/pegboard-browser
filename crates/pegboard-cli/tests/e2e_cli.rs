@@ -584,3 +584,58 @@ fn undelivered_session_create_is_cleaned_up() {
         std::thread::sleep(Duration::from_millis(500));
     }
 }
+
+#[test]
+#[ignore]
+fn handle_in_command_position_never_reaches_the_log() {
+    let origin = fixture();
+    let home = Home::new();
+    assert_eq!(home.run(&["browser", "start"]).0, 0);
+    let (code, out, err) = home.run(&["session", "create", "--url", &format!("{origin}/counter")]);
+    assert_eq!(code, 0, "{err}");
+    let handle = session_handle(&out);
+
+    // The handle typed where the command goes: the command is refused, and its first word
+    // (the handle) must not be logged.
+    let (code, _, err) = home.run_env(&[("PEGBOARD_SESSION", &handle)], &[&handle, "snapshot"]);
+    // (The refusal message names the word to the caller who typed it; the log never does.)
+    assert_eq!(code, 2, "{err}");
+    // Positive control: the same session logs an accepted command.
+    assert_eq!(
+        home.run_env(&[("PEGBOARD_SESSION", &handle)], &["get", "url"])
+            .0,
+        0
+    );
+
+    let (_, out, _) = home.run(&["recording", "list", "--json"]);
+    let rid = json(&out)[0]["recordingId"].as_str().unwrap().to_string();
+    let (code, shown, _) = home.run(&["recording", "show", &rid]);
+    assert_eq!(code, 0);
+    let (_, shown_json, _) = home.run(&["recording", "show", &rid, "--json"]);
+    assert!(
+        json(&shown_json)["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["ok"] == false),
+        "the refused command is logged"
+    );
+    for text in [&shown, &shown_json] {
+        assert!(!text.contains(token_of(&handle)), "{text}");
+    }
+    let mut stack = vec![home.path().join("recordings")];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            if e.path().is_dir() {
+                stack.push(e.path());
+            } else {
+                let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+                assert!(
+                    !text.contains(token_of(&handle)),
+                    "token in {}",
+                    e.path().display()
+                );
+            }
+        }
+    }
+}

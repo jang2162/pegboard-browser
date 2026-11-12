@@ -384,18 +384,29 @@ pub fn logged_args(argv: &[String], redacted: bool) -> Vec<String> {
 }
 
 /// A command line the grammar refused cannot be read for secrets (it may be anything,
-/// anywhere): only its first word is kept.
+/// anywhere): only its first word is kept, and only when it is a command word of the
+/// grammar. Any other first word may be a secret (a session handle typed in the command
+/// position, say) and is replaced like the rest.
 pub fn rejected_args(argv: &[String]) -> Vec<String> {
     argv.iter()
         .enumerate()
         .map(|(i, w)| {
-            if i == 0 {
+            if i == 0 && argv::is_command_word(w) {
                 w.clone()
             } else {
                 REDACTED.to_string()
             }
         })
         .collect()
+}
+
+/// The `command` field of a refused command line's entry: the same first-word rule.
+pub fn rejected_command(argv: &[String]) -> String {
+    match argv.first() {
+        Some(w) if argv::is_command_word(w) => w.clone(),
+        Some(_) => REDACTED.to_string(),
+        None => String::new(),
+    }
 }
 
 pub fn truncate_chars(s: &str, max: usize) -> String {
@@ -521,7 +532,6 @@ mod tests {
             vec!["set", "credentials", "admin", "hunter2"],
             vec!["set", "headers", r#"{"Authorization":"Bearer s3cret"}"#],
             vec!["network", "route", "https://a.test", "--body", "s3cret"],
-            vec!["fil", "#pw", "x"],
             vec!["click", "#a", "--bogus"],
         ] {
             let args = rejected_args(&s(argv.clone()));
@@ -863,15 +873,25 @@ mod tests {
     }
 
     #[test]
-    fn unknown_command_words_are_redacted() {
-        assert_eq!(
-            rejected_args(&s(vec!["fil", "#pw", "hunter2"])),
-            s(vec!["fil", REDACTED, REDACTED])
-        );
-        assert_eq!(
-            rejected_args(&s(vec!["Fill", "#pw", "hunter2"])),
-            s(vec!["Fill", REDACTED, REDACTED])
-        );
+    fn rejected_unknown_first_word_is_redacted() {
+        // A session handle typed where the command goes, and a random word: neither is a
+        // command word, so neither is logged.
+        let handle = "s_abcdefgh.abcdefghijklmnopqrstuvwxyz";
+        for word in [handle, "hunter2", "fil", "Fill"] {
+            let argv = s(vec![word, "#pw", "x"]);
+            assert_eq!(
+                rejected_args(&argv),
+                s(vec![REDACTED, REDACTED, REDACTED]),
+                "{word}"
+            );
+            assert_eq!(rejected_command(&argv), REDACTED, "{word}");
+        }
+        // A known command with bad arguments keeps its name.
+        let argv = s(vec!["click", "#a", "--bogus"]);
+        assert_eq!(rejected_args(&argv), s(vec!["click", REDACTED, REDACTED]));
+        assert_eq!(rejected_command(&argv), "click");
+        assert!(rejected_args(&[]).is_empty());
+        assert_eq!(rejected_command(&[]), "");
     }
 
     #[test]
