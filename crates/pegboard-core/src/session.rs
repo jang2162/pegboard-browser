@@ -186,6 +186,12 @@ impl SessionManager {
                 });
             }
         });
+        let weak = Arc::downgrade(&inner);
+        inner.proxy.on_group_changed(move |id, group| {
+            if let Some(inner) = weak.upgrade() {
+                inner.record_group(id, group);
+            }
+        });
         let watcher = tokio::spawn(watch(Arc::downgrade(&inner), events));
         SessionManager { inner, watcher }
     }
@@ -225,6 +231,7 @@ impl SessionManager {
             runtime.bridge.clone(),
             vec![first.clone()],
         );
+        inner.proxy.set_group_style(&id, &title, color);
         let created_at = now();
         let info = SessionInfo {
             id: id.clone(),
@@ -347,27 +354,32 @@ impl SessionManager {
         Ok(ready(&table, id)?.endpoint.clone())
     }
 
-    /// Opens a new tab in the session group. Used to recover after the last tab was closed by hand.
+    /// Opens a new tab in the session group. When Chrome deleted the group together with its
+    /// last tab, the bridge starts a new one and the session moves to it.
     pub async fn new_tab(&self, id: &SessionId, url: &str) -> Result<String, RpcError> {
         let inner = &self.inner;
-        let (bridge, group, context) = {
+        let (bridge, group, context, title, color) = {
             let table = inner.table.lock().unwrap();
             let r = ready(&table, id)?;
-            (r.bridge.clone(), r.group.clone(), r.context.clone())
+            let (title, color) = group_style(r);
+            (
+                r.bridge.clone(),
+                r.group.clone(),
+                r.context.clone(),
+                title,
+                color,
+            )
         };
         let url = checked_url(url)?;
-        let (target, navigate) = match bridge.create_tab(&group, &url).await {
-            Ok(target) => (target, false),
-            // Chrome deleted the group together with its last tab: start a new one.
-            Err(_) if bridge.members(&group).await.is_ok_and(|m| m.is_empty()) => {
-                (inner.regroup(id, &bridge).await?, url != "about:blank")
-            }
-            Err(e) => return Err(browser_failed(e)),
-        };
+        let (target, moved) = bridge
+            .create_tab(&group, &url, &title, color)
+            .await
+            .map_err(browser_failed)?;
+        if let Some(group) = moved {
+            inner.record_group(id, &group);
+            inner.proxy.set_group(id, group);
+        }
         let added = async {
-            if navigate {
-                open_url(&inner.browser.conn, &target, &url).await?;
-            }
             require_context(&inner.browser.conn, &target, &context).await?;
             inner.ensure_focus(&target).await.map_err(browser_failed)?;
             if !inner.proxy.add_target(id, &target) {
@@ -536,6 +548,12 @@ async fn require_context(conn: &CdpConn, target: &str, context: &str) -> Result<
     }
 }
 
+/// Title and colour of the session's tab group.
+fn group_style(r: &SessionRecord) -> (String, &'static str) {
+    let color = group_color(usize::try_from(r.seq).unwrap_or(0));
+    (group_title(Some(&r.info.name), &r.info.id), color)
+}
+
 fn ready<'a>(table: &'a Table, id: &SessionId) -> Result<&'a SessionRecord, RpcError> {
     table
         .records
@@ -654,35 +672,14 @@ impl Inner {
         }
     }
 
-    /// Gives the session a new tab group (with one blank tab) in place of a deleted one.
-    async fn regroup(&self, id: &SessionId, bridge: &Bridge) -> Result<String, RpcError> {
-        let (title, color) = {
-            let table = self.table.lock().unwrap();
-            let r = ready(&table, id)?;
-            let color = group_color(usize::try_from(r.seq).unwrap_or(0));
-            (group_title(Some(&r.info.name), id), color)
-        };
-        let (group, target) = bridge
-            .create_group(&title, color)
-            .await
-            .map_err(browser_failed)?;
-        let moved = {
-            let mut table = self.table.lock().unwrap();
-            match table.records.get_mut(id).filter(|r| r.ready) {
-                Some(r) => {
-                    r.group = group.clone();
-                    r.info.tab_group_id = group.0;
-                    true
-                }
-                None => false,
-            }
-        };
-        if !moved {
-            let _ = bridge.close_targets(&[target]).await;
-            return Err(not_found(id));
+    /// The session lives in `group` from now on (its old group was deleted with its last
+    /// tab): `session info` and closing the session use the new one.
+    fn record_group(&self, id: &SessionId, group: &GroupId) {
+        let mut table = self.table.lock().unwrap();
+        if let Some(r) = table.records.get_mut(id) {
+            r.group = group.clone();
+            r.info.tab_group_id = group.0;
         }
-        self.proxy.set_group(id, group);
-        Ok(target)
     }
 
     /// Ends focus emulation on a tab that stays open but leaves the session.
@@ -907,16 +904,40 @@ async fn open_url(conn: &CdpConn, target: &str, url: &str) -> Result<(), RpcErro
     r
 }
 
+const CLOSE_BUDGET: Duration = Duration::from_secs(2);
+const CLOSE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Runs `attempt` until it succeeds, pausing `interval` between tries, for at most `budget`.
+/// The last error is returned when the budget is used up (`attempt` runs at least once).
+async fn retry_within<F, Fut>(
+    budget: Duration,
+    interval: Duration,
+    mut attempt: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(e) if tokio::time::Instant::now() + interval >= deadline => return Err(e),
+            Err(_) => tokio::time::sleep(interval).await,
+        }
+    }
+}
+
 /// Closes the tabs that still exist. The bridge refuses a whole call when one id is
-/// unknown, and a tab can disappear at any moment, so the live set is read right before
-/// and the call is retried once.
+/// unknown, and a tab can disappear at any moment (or be too new for the bridge's target
+/// list), so the live set is read before every try and the call is retried for up to
+/// `CLOSE_BUDGET`. A tab that still cannot be closed is named (id only) on stderr.
 async fn close_tabs(
     conn: &CdpConn,
     bridge: &Bridge,
     targets: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
-    let mut last = Ok(());
-    for _ in 0..2 {
+    let result = retry_within(CLOSE_BUDGET, CLOSE_INTERVAL, || async {
         let live: HashSet<String> = page_targets(conn)
             .await?
             .into_iter()
@@ -930,12 +951,19 @@ async fn close_tabs(
         if open.is_empty() {
             return Ok(());
         }
-        last = bridge.close_targets(&open).await;
-        if last.is_ok() {
-            return Ok(());
+        bridge.close_targets(&open).await
+    })
+    .await;
+    if result.is_err() {
+        let left: HashSet<String> = page_targets(conn)
+            .await
+            .map(|p| p.into_iter().map(|t| t.target_id).collect())
+            .unwrap_or_else(|_| targets.iter().cloned().collect());
+        for t in targets.iter().filter(|t| left.contains(*t)) {
+            eprintln!("pegboard: could not close tab {t}");
         }
     }
-    last
+    result
 }
 
 #[cfg(test)]
@@ -953,6 +981,34 @@ mod tests {
         assert_eq!(long.chars().count(), 60);
         assert!(long.ends_with('…'));
         assert_eq!(group_title(Some(&"a".repeat(60)), &id), "a".repeat(60));
+    }
+
+    #[tokio::test]
+    async fn retry_within_retries_until_success_and_gives_up_after_the_budget() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let r = retry_within(
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            || async {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    anyhow::bail!("unknown target")
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let started = std::time::Instant::now();
+        let r = retry_within(
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+            || async { anyhow::bail!("still unknown") },
+        )
+        .await;
+        assert!(r.unwrap_err().to_string().contains("still unknown"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

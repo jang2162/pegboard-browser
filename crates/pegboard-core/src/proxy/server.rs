@@ -123,6 +123,8 @@ struct SessionEntry {
     token: String,
     /// Chrome deletes a group with its last tab; the session can then move to a new one.
     group: Mutex<GroupId>,
+    /// Title and colour a new group gets when the old one is gone (see `Bridge::create_tab`).
+    style: Mutex<(String, String)>,
     /// Bridge of the profile the session lives in; it creates the session's tabs.
     bridge: Arc<Bridge>,
     scope: Mutex<Scope>,
@@ -143,6 +145,7 @@ impl SessionEntry {
             id,
             token,
             group: Mutex::new(group),
+            style: Mutex::new((String::new(), "grey".to_string())),
             bridge,
             scope: Mutex::new(Scope {
                 context: context.to_string(),
@@ -159,10 +162,15 @@ type Sessions = Mutex<HashMap<String, Arc<SessionEntry>>>;
 /// Called with the session and the target whenever a target enters a session scope.
 pub type TargetAdded = Arc<dyn Fn(&SessionId, &str) + Send + Sync>;
 
+/// Called with the session and its new tab group when the bridge had to start a new group
+/// for a tab a client created.
+pub type GroupChanged = Arc<dyn Fn(&SessionId, &GroupId) + Send + Sync>;
+
 struct Shared {
     upstream: Arc<dyn Upstream>,
     sessions: Sessions,
     on_target_added: Mutex<Option<TargetAdded>>,
+    on_group_changed: Mutex<Option<GroupChanged>>,
     /// Client connections whose upstream is open.
     connections: Arc<AtomicUsize>,
     /// Test hook: delay before each bridge tab creation.
@@ -189,6 +197,7 @@ impl ProxyServer {
             upstream,
             sessions: Mutex::new(HashMap::new()),
             on_target_added: Mutex::new(None),
+            on_group_changed: Mutex::new(None),
             connections: Arc::new(AtomicUsize::new(0)),
             tab_delay_ms: AtomicU64::new(0),
             refused: Mutex::new(BTreeMap::new()),
@@ -300,6 +309,19 @@ impl ProxyServer {
         if let Some(entry) = self.shared.entry(id) {
             *entry.group.lock().unwrap() = group;
         }
+    }
+
+    /// Title and colour for a group the bridge has to start in place of a deleted one.
+    pub fn set_group_style(&self, id: &SessionId, title: &str, color: &str) {
+        if let Some(entry) = self.shared.entry(id) {
+            *entry.style.lock().unwrap() = (title.to_string(), color.to_string());
+        }
+    }
+
+    /// Sets the callback run when a client's tab creation moved the session to a new group.
+    /// It runs on the connection's task, so it must not block.
+    pub fn on_group_changed(&self, f: impl Fn(&SessionId, &GroupId) + Send + Sync + 'static) {
+        *self.shared.on_group_changed.lock().unwrap() = Some(Arc::new(f));
     }
 
     /// Sets the callback run whenever a target enters a session scope: a tab created
@@ -717,7 +739,7 @@ async fn close_and_verify(
 
 struct TabCreated {
     client: ClientRef,
-    result: Result<String>,
+    result: Result<(String, Option<GroupId>)>,
 }
 
 struct ClientConn {
@@ -913,11 +935,12 @@ impl ClientConn {
                 self.tabs_in_flight += 1;
                 let bridge = self.entry.bridge.clone();
                 let group = self.entry.group.lock().unwrap().clone();
+                let (title, color) = self.entry.style.lock().unwrap().clone();
                 let tx = self.tab_tx.clone();
                 let delay = self.tab_delay;
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let result = bridge.create_tab(&group, &url).await;
+                    let result = bridge.create_tab(&group, &url, &title, &color).await;
                     let _ = tx.send(TabCreated { client, result });
                 });
                 return Ok(());
@@ -1130,7 +1153,14 @@ impl ClientConn {
 
     async fn on_tab_created(&mut self, done: TabCreated) -> Result<()> {
         match done.result {
-            Ok(target_id) => {
+            Ok((target_id, moved)) => {
+                if let Some(group) = moved {
+                    *self.entry.group.lock().unwrap() = group.clone();
+                    let callback = self.shared.on_group_changed.lock().unwrap().clone();
+                    if let Some(f) = callback {
+                        f(&self.entry.id, &group);
+                    }
+                }
                 let check = json!({ "method": "Target.getTargetInfo", "params": { "targetId": target_id } });
                 let pending = Pending::VerifyTab {
                     client: done.client,

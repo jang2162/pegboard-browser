@@ -660,3 +660,115 @@ fn eval_runs_in_the_main_world_and_a11y_works() {
     assert_eq!(json(&out)["result"], 42, "{out}");
     rig.ok(&rig.a, &["a11y"]);
 }
+
+/// The person closes the session's only tab; the session must be able to make tabs again.
+/// (The agent cannot do this through the CLI: agent-browser refuses `tab close` on the last
+/// tab. The agent-side path, a CDP client closing its own last tab through the session
+/// endpoint, is `session_recovers_after_agent_closes_its_last_tab` in pegboard-core.)
+#[test]
+#[ignore]
+fn session_recovers_after_human_closes_its_last_tab() {
+    let rig = Rig::new();
+    let first = rig.tabs(&rig.a);
+    assert_eq!(first.len(), 1, "{first:?}");
+    let ctx = rig
+        .human
+        .pages()
+        .into_iter()
+        .find(|t| t.target_id == first[0].0)
+        .and_then(|t| t.browser_context_id)
+        .unwrap();
+    // Tabs without a group before the test (the window's own blank tab): not the orphans
+    // this test looks for.
+    let ungrouped = |rig: &Rig| -> Vec<i64> {
+        rig.human.agent_tab_state(&ctx)["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["groupId"] == -1)
+            .map(|t| t["id"].as_i64().unwrap())
+            .collect()
+    };
+    let ungrouped_before = ungrouped(&rig);
+
+    rig.human.close_target(&first[0].0);
+    // The daemon notices (the session lists no tab) and the session is still open.
+    let mut empty = false;
+    for _ in 0..50 {
+        let (code, info, _) = rig.home.run(&["session", "info", &rig.a, "--json"]);
+        if code == 0 && !info.contains(&first[0].0) {
+            empty = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        empty,
+        "session info still lists the closed tab: {:?}",
+        rig.home.run(&["session", "info", &rig.a])
+    );
+
+    let out = rig.ok(&rig.a, &["tab", "new", &rig.url("/counter")]);
+    eprintln!("tab new: {out}");
+    let tabs = rig.tabs(&rig.a);
+    eprintln!("tab list after recovery: {tabs:?}; closed {}", first[0].0);
+    let live: Vec<_> = tabs.iter().filter(|t| t.1.contains("/counter")).collect();
+    assert_eq!(live.len(), 1, "{tabs:?}");
+    let new = live[0].0.clone();
+    let page = rig
+        .human
+        .pages()
+        .into_iter()
+        .find(|t| t.target_id == new)
+        .expect("the new tab is a live page");
+    assert_eq!(page.browser_context_id.as_deref(), Some(ctx.as_str()));
+
+    // Chrome's own view: the tab sits in a group titled with the session's name, and
+    // nothing new is left without a group.
+    let state = rig.human.agent_tab_state(&ctx);
+    let group_of_a: Vec<&Value> = state["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["title"] == "a")
+        .collect();
+    assert_eq!(group_of_a.len(), 1, "{state}");
+    let gid = group_of_a[0]["id"].as_i64().unwrap();
+    let in_group: Vec<&Value> = state["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["groupId"] == gid)
+        .collect();
+    assert_eq!(in_group.len(), 1, "{state}");
+    assert!(in_group[0]["url"].as_str().unwrap().contains("/counter"));
+    assert_eq!(in_group[0]["windowId"], group_of_a[0]["windowId"]);
+    for t in state["tabs"].as_array().unwrap() {
+        if t["groupId"] == -1 {
+            assert!(
+                ungrouped_before.contains(&t["id"].as_i64().unwrap()),
+                "orphan tab without a group: {state}"
+            );
+        }
+    }
+
+    // `session info` shows it, and the session works.
+    let (code, info, err) = rig.home.run(&["session", "info", &rig.a, "--json"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(info.contains(&new), "{info}");
+    let snap = rig.ok(&rig.a, &["snapshot"]);
+    assert!(!snap.is_empty());
+
+    // Closing the session closes that tab.
+    let (code, _, err) = rig.home.run(&["session", "close", &rig.a]);
+    assert_eq!(code, 0, "{err}");
+    let mut gone = false;
+    for _ in 0..50 {
+        if rig.human.pages().iter().all(|t| t.target_id != new) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(gone, "closing the session left its recovered tab open");
+}

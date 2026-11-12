@@ -111,11 +111,24 @@ impl Bridge {
         Ok((GroupId(group_id(&r)?), target_id(&r)?))
     }
 
-    pub async fn create_tab(&self, group: &GroupId, url: &str) -> Result<String> {
+    /// Makes a tab in `group`. When Chrome already deleted the group (it goes with its last
+    /// tab) the worker starts a new one with `title` and `color` and the group id is returned
+    /// with the target.
+    pub async fn create_tab(
+        &self,
+        group: &GroupId,
+        url: &str,
+        title: &str,
+        color: &str,
+    ) -> Result<(String, Option<GroupId>)> {
         let r = self
-            .call("createTab", &[json!(group.0), json!(url)])
+            .call(
+                "createTab",
+                &[json!(group.0), json!(url), json!(title), json!(color)],
+            )
             .await?;
-        target_id(&r)
+        let moved = r["newGroupId"].as_i64().map(GroupId);
+        Ok((target_id(&r)?, moved))
     }
 
     pub async fn add_to_group(&self, group: &GroupId, target_id: &str) -> Result<()> {

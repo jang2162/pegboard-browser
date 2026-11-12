@@ -287,9 +287,10 @@ async fn close_removes_tabs_and_keep_tabs_leaves_them() {
     // A tab in the group that the proxy does not know about is closed too.
     let stray = h
         .bridge
-        .create_tab(&GroupId(a.tab_group_id), "about:blank")
+        .create_tab(&GroupId(a.tab_group_id), "about:blank", "a", "blue")
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let closed = h
         .manager
         .close(SessionCloseParams {
@@ -400,6 +401,79 @@ async fn manually_closed_tab_is_reported_and_recoverable() {
             .code,
         codes::SESSION_NOT_FOUND
     );
+    h.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn session_recovers_after_agent_closes_its_last_tab() {
+    let h = Harness::start(&[]).await;
+    let info = h
+        .manager
+        .create(params(Some("recover"), None, None))
+        .await
+        .unwrap();
+    let first = info.targets[0].clone();
+    let ctx = common::context_of(&h.browser.conn, &first).await;
+    // The agent's own CDP client closes the session's only tab through the proxy.
+    let c = common::client(&h.manager.endpoint(&info.id).unwrap()).await;
+    c.send("Target.closeTarget", json!({ "targetId": first }), None)
+        .await
+        .unwrap();
+    let emptied = eventually(2, || async {
+        h.manager.info(&info.id).unwrap().targets.is_empty()
+    })
+    .await;
+    assert!(emptied, "{:?}", h.manager.info(&info.id));
+
+    // Through the proxy, as any CDP client would: the first tab creation after that works.
+    let r = c
+        .send(
+            "Target.createTarget",
+            json!({ "url": h.url("/form") }),
+            None,
+        )
+        .await
+        .unwrap();
+    let t = r["targetId"].as_str().unwrap().to_string();
+    assert_eq!(common::context_of(&h.browser.conn, &t).await, ctx);
+    let now = h.manager.info(&info.id).unwrap();
+    assert_ne!(
+        now.tab_group_id, info.tab_group_id,
+        "still the deleted group"
+    );
+    assert_eq!(now.targets, vec![t.clone()]);
+    let members = h.bridge.members(&GroupId(now.tab_group_id)).await.unwrap();
+    assert_eq!(members, vec![t.clone()]);
+    // The one after that joins the same new group.
+    let r = c
+        .send("Target.createTarget", json!({ "url": "about:blank" }), None)
+        .await
+        .unwrap();
+    let t2 = r["targetId"].as_str().unwrap().to_string();
+    let mut members = h.bridge.members(&GroupId(now.tab_group_id)).await.unwrap();
+    members.sort();
+    let mut expected = vec![t.clone(), t2.clone()];
+    expected.sort();
+    assert_eq!(members, expected);
+    assert_eq!(h.manager.info(&info.id).unwrap().targets, expected);
+    // Closing the session closes both (after focus emulation settled on the new tabs, so the
+    // close does not race the manager's own attach to a tab that is about to go).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    h.manager
+        .close(SessionCloseParams {
+            session_id: info.id.clone(),
+            keep_tabs: false,
+        })
+        .await
+        .unwrap();
+    let gone = eventually(2, || async {
+        let live = live_targets(&h.browser).await;
+        !live.contains(&t) && !live.contains(&t2)
+    })
+    .await;
+    assert!(gone, "the recovered session's tabs are still open");
+    drop(c);
     h.shutdown().await;
 }
 

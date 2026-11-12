@@ -507,6 +507,66 @@ impl Human {
         context
     }
 
+    /// Closes a tab the way a person does: through the browser-level connection.
+    pub fn close_target(&self, target: &str) {
+        self.rt
+            .block_on(self.conn.send(
+                "Target.closeTarget",
+                serde_json::json!({ "targetId": target }),
+                None,
+            ))
+            .unwrap();
+        for _ in 0..50 {
+            if self.pages().iter().all(|t| t.target_id != target) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("tab {target} did not close");
+    }
+
+    /// Tab groups and tabs of the agent profile `context` as Chrome itself reports them: evaluated in
+    /// the bridge extension's service worker (test-only knowledge, like the debugging port).
+    /// `{"groups": [{id, title, windowId}], "tabs": [{id, groupId, windowId, url}]}`; a tab
+    /// with `groupId` -1 is ungrouped.
+    pub fn agent_tab_state(&self, context: &str) -> Value {
+        let expr = "(async () => JSON.stringify({ \
+            groups: (await chrome.tabGroups.query({})).map(g => ({id: g.id, title: g.title, windowId: g.windowId})), \
+            tabs: (await chrome.tabs.query({})).map(t => ({id: t.id, groupId: t.groupId, windowId: t.windowId, url: t.url})) }))()";
+        let text = self.rt.block_on(async {
+            let r = self
+                .conn
+                .send("Target.getTargets", serde_json::json!({}), None)
+                .await
+                .unwrap();
+            let worker = r["targetInfos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| {
+                    t["type"] == "service_worker"
+                        && t["browserContextId"].as_str() == Some(context)
+                        && t["url"].as_str().is_some_and(|u| u.ends_with("/sw.js"))
+                })
+                .expect("bridge worker of the profile")["targetId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let session = self.conn.attach(&worker).await.unwrap();
+            let v = self.conn.evaluate(&session, expr).await.unwrap();
+            let _ = self
+                .conn
+                .send(
+                    "Target.detachFromTarget",
+                    serde_json::json!({ "sessionId": session }),
+                    None,
+                )
+                .await;
+            v
+        });
+        serde_json::from_str(text.as_str().expect("state text")).unwrap()
+    }
+
     /// Brings the target (and its window) to the front, as a person clicking it would.
     pub fn activate(&self, target: &str) {
         self.rt

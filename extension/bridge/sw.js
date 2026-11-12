@@ -52,12 +52,40 @@ self.peg = {
     return { groupId, targetId: await targetIdOf(tab.id) };
   },
 
-  async createTab(groupId, url) {
+  // Chrome deletes a tab group together with its last tab. When the requested group is gone,
+  // the new tab starts a new group in its own window with the session's title and colour, and
+  // the reply carries that group's id as `newGroupId`. Whatever else goes wrong, the tab made
+  // here is removed again: it never stays behind outside the group it was made for.
+  async createTab(groupId, url, title, color) {
     const target = allowedUrl(url);
     const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
-    await chrome.tabs.group({ groupId, tabIds: [tab.id] });
-    if (target !== 'about:blank') await chrome.tabs.update(tab.id, { url: target });
-    return { targetId: await targetIdOf(tab.id) };
+    try {
+      let newGroupId;
+      try {
+        await chrome.tabs.group({ groupId, tabIds: [tab.id] });
+      } catch (e) {
+        let exists = true;
+        try {
+          await chrome.tabGroups.get(groupId);
+        } catch (_) {
+          exists = false;
+        }
+        if (exists) throw e;
+        newGroupId = await chrome.tabs.group({ tabIds: [tab.id] });
+        await chrome.tabGroups.update(newGroupId, { title, color });
+      }
+      if (target !== 'about:blank') await chrome.tabs.update(tab.id, { url: target });
+      const reply = { targetId: await targetIdOf(tab.id) };
+      if (newGroupId !== undefined) reply.newGroupId = newGroupId;
+      return reply;
+    } catch (e) {
+      try {
+        await chrome.tabs.remove(tab.id);
+      } catch (_) {
+        // already gone
+      }
+      throw e;
+    }
   },
 
   async addToGroup(groupId, targetId) {
