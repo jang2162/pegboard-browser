@@ -288,12 +288,17 @@ pub const SENSITIVE_FOCUS_JS: &str = r#"(() => {
 })()"#;
 
 /// The expression with the contents of its string literals (single, double and backtick
-/// quoted, backslash escapes honoured) replaced by '…'. `None` when a literal is not
-/// closed (or the expression otherwise confuses this scan).
+/// quoted, backslash escapes honoured) replaced by '…'. Fail closed: `None` when a literal
+/// is not closed, when a `/` occurs outside a literal (a comment or a regular expression
+/// literal can hide a quote from this scan; a division is collateral), or when a template
+/// literal has a `${` substitution (it may nest literals).
 pub fn mask_eval(expression: &str) -> Option<String> {
     let mut out = String::new();
-    let mut chars = expression.chars();
+    let mut chars = expression.chars().peekable();
     while let Some(c) = chars.next() {
+        if c == '/' {
+            return None;
+        }
         out.push(c);
         if !matches!(c, '\'' | '"' | '`') {
             continue;
@@ -307,6 +312,8 @@ pub fn mask_eval(expression: &str) -> Option<String> {
                 out.push(c);
                 closed = true;
                 break;
+            } else if c == '`' && d == '$' && chars.peek() == Some(&'{') {
+                return None;
             }
         }
         if !closed {
@@ -316,41 +323,79 @@ pub fn mask_eval(expression: &str) -> Option<String> {
     Some(out)
 }
 
+/// An expression as logged: its literals masked and the rest cut to `MAX_EVAL_CHARS`, or
+/// only its size when it cannot be masked reliably.
+fn masked_expression(expression: &str) -> String {
+    match mask_eval(expression) {
+        Some(masked) => truncate_chars(&masked, MAX_EVAL_CHARS),
+        None => format!("[eval {} chars]", expression.chars().count()),
+    }
+}
+
+/// A URL as logged: without userinfo, query and fragment; a `data:` URL only by its scheme.
+/// `None` when it does not parse.
+pub fn sanitize_url(url: &str) -> Option<String> {
+    if url.trim_start().to_ascii_lowercase().starts_with("data:") {
+        return Some("data:".to_string());
+    }
+    let mut parsed = url::Url::parse(url.trim()).ok()?;
+    if parsed.cannot_be_a_base() {
+        // about:blank and the like carry no userinfo, but may carry a query.
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        return Some(parsed.to_string());
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+/// `sanitize_url`, or `REDACTED` for a string in a URL position that does not parse.
+pub fn url_for_log(url: &str) -> String {
+    sanitize_url(url).unwrap_or_else(|| REDACTED.to_string())
+}
+
 /// The command line as written to the log: the caller's words with secret values replaced
-/// (and typed text too when `redacted`), and the expression of `eval` with its string
-/// literals masked and cut to `MAX_EVAL_CHARS` (its words joined).
+/// (and typed text too when `redacted`), URLs without userinfo, query and fragment, and the
+/// expression of `eval` (its words joined) or `wait --fn` with string literals masked and
+/// cut to `MAX_EVAL_CHARS` (see `mask_eval`).
 pub fn logged_args(argv: &[String], redacted: bool) -> Vec<String> {
+    let at = argv::text_at(argv);
     let positions = if redacted {
         text_positions(argv)
     } else {
-        argv::text_at(argv).always
+        at.always.clone()
     };
-    let args = mask(argv, &positions);
+    let mut args = mask(argv, &positions);
     if args.first().map(String::as_str) == Some("eval") && args.len() > 1 {
-        let expression = args[1..].join(" ");
-        let shown = match mask_eval(&expression) {
-            Some(masked) => truncate_chars(&masked, MAX_EVAL_CHARS),
-            None => format!("[eval {} chars]", expression.chars().count()),
-        };
-        return vec!["eval".to_string(), shown];
+        return vec!["eval".to_string(), masked_expression(&args[1..].join(" "))];
+    }
+    for &i in &at.urls {
+        if args[i] != REDACTED {
+            args[i] = url_for_log(&args[i]);
+        }
+    }
+    for &i in &at.expr {
+        args[i] = masked_expression(&args[i]);
     }
     args
 }
 
-/// A command line the grammar refused cannot be read for secrets. After a word that is not
-/// a command at all, and after a command that takes text or values, every word is hidden.
+/// A command line the grammar refused cannot be read for secrets (it may be anything,
+/// anywhere): only its first word is kept.
 pub fn rejected_args(argv: &[String]) -> Vec<String> {
-    const TAKES_TEXT: &[&str] = &[
-        "fill", "type", "keyboard", "find", "select", "dialog", "cookies", "storage", "press",
-    ];
-    match argv.first() {
-        Some(first) if !argv::is_known_command(first) || TAKES_TEXT.contains(&first.as_str()) => {
-            std::iter::once(first.clone())
-                .chain(argv[1..].iter().map(|_| REDACTED.to_string()))
-                .collect()
-        }
-        _ => logged_args(argv, false),
-    }
+    argv.iter()
+        .enumerate()
+        .map(|(i, w)| {
+            if i == 0 {
+                w.clone()
+            } else {
+                REDACTED.to_string()
+            }
+        })
+        .collect()
 }
 
 pub fn truncate_chars(s: &str, max: usize) -> String {
@@ -466,7 +511,113 @@ mod tests {
         );
         assert_eq!(
             rejected_args(&s(vec!["open", "file:///x"])),
-            s(vec!["open", "file:///x"])
+            s(vec!["open", REDACTED])
+        );
+    }
+
+    #[test]
+    fn every_rejected_argv_is_fully_redacted() {
+        for argv in [
+            vec!["set", "credentials", "admin", "hunter2"],
+            vec!["set", "headers", r#"{"Authorization":"Bearer s3cret"}"#],
+            vec!["network", "route", "https://a.test", "--body", "s3cret"],
+            vec!["fil", "#pw", "x"],
+            vec!["click", "#a", "--bogus"],
+        ] {
+            let args = rejected_args(&s(argv.clone()));
+            assert_eq!(args[0], argv[0]);
+            assert_eq!(args.len(), argv.len());
+            assert!(args[1..].iter().all(|a| a == REDACTED), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn eval_mask_fails_closed_on_slash_and_template_substitution() {
+        let n = |e: &str| format!("[eval {} chars]", e.chars().count());
+        for e in [
+            "// it's the pw box\ndocument.querySelector('#pw').value = 'hunter2' // don't log",
+            "`${`hunter2`}`",
+            "x.split(/'/); y = 'hunter2'; z = /'/",
+            "a / b",
+            "/* ' */ 'hunter2'",
+        ] {
+            assert_eq!(
+                logged_args(&s(vec!["eval", e]), false),
+                s(vec!["eval", &n(e)]),
+                "{e}"
+            );
+        }
+        assert_eq!(mask_eval("document.title").unwrap(), "document.title");
+        assert_eq!(mask_eval("q('#a').value='x'").unwrap(), "q('…').value='…'");
+        assert_eq!(mask_eval(r"`a\${b}`").unwrap(), "`…`");
+    }
+
+    #[test]
+    fn wait_fn_expression_is_masked() {
+        assert_eq!(
+            logged_args(&s(vec!["wait", "--fn", "window.t === 'hunter2'"]), false),
+            s(vec!["wait", "--fn", "window.t === '…'"])
+        );
+        assert_eq!(
+            logged_args(&s(vec!["wait", "--fn", "a / 'hunter2'"]), false),
+            s(vec!["wait", "--fn", "[eval 13 chars]"])
+        );
+        assert_eq!(
+            logged_args(&s(vec!["wait", "--timeout", "10"]), false),
+            s(vec!["wait", "--timeout", "10"])
+        );
+    }
+
+    #[test]
+    fn url_sanitizer_drops_userinfo_query_fragment_and_data_body() {
+        assert_eq!(
+            sanitize_url("https://admin:hunter2@a.test/p?t=abc#f").unwrap(),
+            "https://a.test/p"
+        );
+        assert_eq!(
+            sanitize_url("http://u@a.test:8080/x").unwrap(),
+            "http://a.test:8080/x"
+        );
+        assert_eq!(sanitize_url("data:text/html,secret").unwrap(), "data:");
+        assert_eq!(sanitize_url("about:blank").unwrap(), "about:blank");
+        assert!(sanitize_url("not a url").is_none());
+        assert_eq!(url_for_log("not a url"), REDACTED);
+        assert_eq!(url_for_log("http://a.test/x?p=1"), "http://a.test/x");
+    }
+
+    #[test]
+    fn url_arguments_are_sanitized_in_args() {
+        assert_eq!(
+            logged_args(
+                &s(vec!["open", "https://admin:hunter2@a.test/p?t=abc#f"]),
+                false
+            ),
+            s(vec!["open", "https://a.test/p"])
+        );
+        assert_eq!(
+            logged_args(&s(vec!["tab", "new", "data:text/html,secret"]), false),
+            s(vec!["tab", "new", "data:"])
+        );
+        assert_eq!(
+            logged_args(
+                &s(vec![
+                    "cookies",
+                    "set",
+                    "n",
+                    "v",
+                    "--url",
+                    "https://a.test/p?x=1"
+                ]),
+                false
+            ),
+            s(vec![
+                "cookies",
+                "set",
+                "n",
+                REDACTED,
+                "--url",
+                "https://a.test/p"
+            ])
         );
     }
 
@@ -580,7 +731,7 @@ mod tests {
         );
         assert_eq!(a[1], "document.querySelector('…').value='…'");
         assert!(!a[1].contains("hunter2") && !a[1].contains("#pw"));
-        assert_eq!(mask_eval(r#"f("a b", `c${d}`)"#).unwrap(), "f(\"…\", `…`)");
+        assert_eq!(mask_eval(r#"f("a b", `c`)"#).unwrap(), "f(\"…\", `…`)");
         // An escaped quote does not end the literal.
         assert_eq!(mask_eval(r"x = 'it\'s hunter2'; y").unwrap(), "x = '…'; y");
         // Masked first, then cut.
@@ -641,7 +792,7 @@ mod tests {
 
     #[test]
     fn press_single_characters_count_as_typed_text() {
-        for k in ["a", "Z", "7", "Shift+a", "Space"] {
+        for k in ["a", "Z", "7", "Shift+a"] {
             assert_eq!(argv::typed_positions(&s(vec!["press", k])), vec![1], "{k}");
         }
         for k in [
@@ -658,6 +809,57 @@ mod tests {
             );
         }
         assert_eq!(redact(&s(vec!["press", "h"])), s(vec!["press", REDACTED]));
+    }
+
+    #[test]
+    fn press_named_keys_only_are_not_typed_text() {
+        let typed = |k: &str| !argv::typed_positions(&s(vec!["press", k])).is_empty();
+        for k in [
+            "a",
+            "Shift+a",
+            "a+Shift",
+            "Shift+Shift+a",
+            "KeyA",
+            "Digit1",
+            "Alt+a",
+            "Space",
+            "Shift+Space",
+            "Control+Shift",
+            "Alt+Control",
+            "Control+ab",
+            "enter",
+            "f1",
+            "F13",
+        ] {
+            assert!(typed(k), "{k} must count as typed text");
+        }
+        for k in [
+            "Enter",
+            "Tab",
+            "Escape",
+            "Backspace",
+            "Delete",
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Insert",
+            "F1",
+            "F12",
+            "Shift+Tab",
+            "Shift+Enter",
+            "Control+a",
+            "Meta+a",
+            "Control+Alt+a",
+            "Control+Shift+7",
+            "Alt+ArrowLeft",
+        ] {
+            assert!(!typed(k), "{k} must not count as typed text");
+        }
     }
 
     #[test]

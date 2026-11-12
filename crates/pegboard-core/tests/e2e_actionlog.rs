@@ -570,7 +570,7 @@ async fn otp_field_that_blurs_is_redacted() {
         .run(&mut log, &info, &["keyboard", "type", "424242"])
         .await
         .unwrap()));
-    // A field that is not marked, but blurs itself: only the checks before and after tell.
+    // The same field through `fill`: the checks before and after both see it as sensitive.
     assert!(ok(&h
         .run(&mut log, &info, &["fill", "#otp", "737373"])
         .await
@@ -659,5 +659,52 @@ async fn cookie_value_never_reaches_the_log() {
         h.entries(&info)[0].args,
         s(&["cookies", "set", "sid", REDACTED])
     );
+    h.finish().await;
+}
+
+/// A password field with no autocomplete that blurs itself on input: after the fill nothing
+/// is focused, so only the check of the selector's `type` before the command can tell.
+#[tokio::test]
+#[ignore]
+async fn fill_into_password_that_blurs_on_input_is_redacted() {
+    let h = Harness::start().await;
+    let (info, _ep, mut log) = logged(&h, "/form-blur").await;
+    let r = h
+        .run(&mut log, &info, &["fill", "#pw", "hunter2-secret"])
+        .await
+        .unwrap();
+    assert!(ok(&r), "{r:?}");
+    assert!(!h.log_text(&info).contains("hunter2-secret"));
+    let entries = h.entries(&info);
+    assert!(entries[0].redacted);
+    assert_eq!(entries[0].args, s(&["fill", "#pw", REDACTED]));
+    h.finish().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn rejected_set_credentials_never_reaches_the_log() {
+    let h = Harness::start().await;
+    let (info, _ep, mut log) = logged(&h, "/form").await;
+    for argv in [
+        &["set", "credentials", "admin", "hunter2-secret"][..],
+        &[
+            "set",
+            "headers",
+            r#"{"Authorization":"Bearer hunter2-secret"}"#,
+        ],
+    ] {
+        let e = h.run(&mut log, &info, argv).await.unwrap_err();
+        assert_eq!(e.code, codes::ARGV_REJECTED);
+    }
+    let text = h.log_text(&info);
+    assert!(
+        !text.contains("hunter2-secret") && !text.contains("admin"),
+        "{text}"
+    );
+    let entries = h.entries(&info);
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e.redacted && !e.ok));
+    assert_eq!(entries[0].args, s(&["set", REDACTED, REDACTED, REDACTED]));
     h.finish().await;
 }

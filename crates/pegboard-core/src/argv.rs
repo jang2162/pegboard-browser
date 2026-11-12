@@ -38,6 +38,8 @@ enum Kind {
     ShotSelector,
     /// One word of free text.
     Text,
+    /// A JavaScript expression: free text that the log masks like `eval`'s.
+    Expr,
     /// Judged and normalized like the proxy does (`normalize_url`).
     Url,
     /// A key or combination such as `Enter` or `Control+a`.
@@ -206,7 +208,7 @@ const WAIT_FLAGS: &[Flag] = &[
         &["--load"],
         Choice(&["load", "domcontentloaded", "networkidle"]),
     ),
-    value(&["--fn"], Text),
+    value(&["--fn"], Expr),
     value(&["--timeout"], Number),
 ];
 
@@ -434,6 +436,10 @@ pub struct TextAt {
     /// Values that are never logged: the value of `cookies set` and `storage ... set`,
     /// the answer of `dialog accept`.
     pub always: Vec<usize>,
+    /// Words that are URLs (the log keeps them without userinfo, query and fragment).
+    pub urls: Vec<usize>,
+    /// Words that are JavaScript expressions other than `eval`'s (`wait --fn`).
+    pub expr: Vec<usize>,
     /// Where typed text goes.
     pub destination: Option<TextDestination>,
 }
@@ -475,19 +481,45 @@ pub fn text_positions(argv: &[String]) -> Vec<usize> {
     all
 }
 
-/// Whether `word` is a known first word of a command.
-pub fn is_known_command(word: &str) -> bool {
-    GRAMMAR.iter().any(|f| f.words[0] == word)
-}
-
-/// A `press` key that types a character: one character, or `Shift+` one, or Space.
+/// A `press` key that is not typed text: a named key (`Enter`, `Tab`, arrows, `F1`..`F12`,
+/// ...) possibly with modifiers, or a single letter or digit with `Control` or `Meta`.
+/// Anything else the grammar accepts (`a`, `Shift+a`, `KeyA`, `Space`, `Alt+a`, ...) may
+/// put a character into the page.
 fn is_typed_key(key: &str) -> bool {
-    let single = |s: &str| s.chars().count() == 1;
-    let name = match key.split_once('+') {
-        Some((m, k)) if m.eq_ignore_ascii_case("shift") => k,
-        _ => key,
-    };
-    single(name) || name.eq_ignore_ascii_case("space")
+    const NAMED: &[&str] = &[
+        "Enter",
+        "Tab",
+        "Escape",
+        "Backspace",
+        "Delete",
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "Insert",
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+    ];
+    let parts: Vec<&str> = key.split('+').collect();
+    let (last, earlier) = parts.split_last().expect("split yields one part at least");
+    let shortcut = last.len() == 1
+        && last.bytes().all(|b| b.is_ascii_alphanumeric())
+        && earlier.iter().any(|m| *m == "Control" || *m == "Meta");
+    !(NAMED.contains(last) || shortcut)
 }
 
 fn form_of(argv: &[String]) -> Option<&'static Form> {
@@ -510,6 +542,8 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Parsed, RpcE
     let mut out: Vec<String> = form.words.iter().map(|w| w.to_string()).collect();
     let mut typed = Vec::new();
     let mut always = Vec::new();
+    let mut urls = Vec::new();
+    let mut expr = Vec::new();
     let mut selector_at = None;
     let mut next_arg = 0;
     let mut file_given = false;
@@ -570,6 +604,11 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Parsed, RpcE
                             "invalid value {v:?} for '{word}' in `{name}`: {why}"
                         ))
                     })?;
+                    match kind {
+                        Url => urls.push(out.len()),
+                        Expr => expr.push(out.len()),
+                        _ => {}
+                    }
                     out.push(v);
                 }
             }
@@ -586,6 +625,9 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Parsed, RpcE
                 Ok(v) => {
                     if arg.secret {
                         always.push(out.len());
+                    }
+                    if matches!(arg.kind, Url) {
+                        urls.push(out.len());
                     }
                     if matches!(arg.kind, Selector) && selector_at.is_none() {
                         selector_at = Some(out.len());
@@ -652,6 +694,8 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Parsed, RpcE
         text: TextAt {
             typed,
             always,
+            urls,
+            expr,
             destination,
         },
     })
@@ -661,6 +705,7 @@ fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Selector | ShotSelector => "selector",
         Text => "text",
+        Expr => "expression",
         Url => "url",
         Key => "key",
         Number => "number",
@@ -703,7 +748,7 @@ fn accept(kind: Kind, w: &str, files_dir: &Path) -> Result<String, String> {
             !w.is_empty() && !is_image_name(w),
             "not a selector, and not a bare .png/.jpg/.jpeg file name",
         ),
-        Text => Ok(w.to_string()),
+        Text | Expr => Ok(w.to_string()),
         Url => normalize_url(w)
             .ok_or_else(|| "only http(s) URLs with a host, data: URLs and about:blank".into()),
         Key => ok(
@@ -1051,7 +1096,7 @@ mod tests {
     fn sample(kind: Kind) -> String {
         match kind {
             Selector | ShotSelector => "#a".into(),
-            Text => "q".into(),
+            Text | Expr => "q".into(),
             Url => "https://a.test/".into(),
             Key => "Enter".into(),
             Number => "1".into(),

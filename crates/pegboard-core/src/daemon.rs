@@ -7,8 +7,8 @@ use pegboard_protocol::{codes, CommandExecResult, RpcError, SessionId};
 use serde_json::Value;
 
 use crate::actionlog::{
-    attrs_are_sensitive, logged_args, rejected_args, truncate_chars, ActionEntry, ActionLog,
-    MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
+    attrs_are_sensitive, logged_args, rejected_args, truncate_chars, url_for_log, ActionEntry,
+    ActionLog, MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
 };
 use crate::argv::{self, Checked, TextDestination};
 use crate::paths::Paths;
@@ -156,12 +156,8 @@ pub async fn run_command_with_hook(
         Err(e) => {
             // The message names the offending word, which may be typed text.
             entry.args = rejected_args(argv);
-            entry.redacted = entry.args != argv;
-            entry.error = Some(if entry.redacted {
-                withheld(&e.code)
-            } else {
-                truncate_chars(&format!("{}: {}", e.code, e.message), MAX_ERROR_CHARS)
-            });
+            entry.redacted = true;
+            entry.error = Some(withheld(&e.code));
             entry.duration_ms = elapsed_ms(started);
             append(log, entry)?;
             return Err(e);
@@ -218,12 +214,13 @@ pub async fn run_command_with_hook(
             None
         });
     entry.target_id = tab.map(|(t, _)| t.clone());
-    entry.url = tab.and_then(|(_, u)| u.as_deref()).map(logged_url);
+    entry.url = tab.and_then(|(_, u)| u.as_deref()).map(url_for_log);
     entry.args = logged_args(argv, hide_typed);
     entry.redacted = hide_typed || !at.always.is_empty() || eval_masked(argv, &entry.args);
     entry.duration_ms = elapsed_ms(started);
     entry.ok = succeeded;
-    entry.error = error_text(entry.redacted, &outcome);
+    // An expression's error can quote page values (a JSON parse error shows the text).
+    entry.error = error_text(entry.redacted, is_expression_command(argv), &outcome);
     append(log, entry)?;
     sessions.touch(id);
     outcome
@@ -236,24 +233,26 @@ fn eval_masked(argv: &[String], logged: &[String]) -> bool {
         && logged.get(1) != Some(&argv[1..].join(" "))
 }
 
-/// A URL as logged: without query and fragment (a GET form puts typed values there), and
-/// a `data:` URL only by its scheme.
-fn logged_url(url: &str) -> String {
-    if url.starts_with("data:") {
-        return "data:".to_string();
-    }
-    url.split(['?', '#']).next().unwrap_or_default().to_string()
-}
-
 fn withheld(code: &str) -> String {
     format!("{code}: details withheld (entry redacted)")
 }
 
-/// The `error` of an entry for a command that did not succeed.
-fn error_text(redacted: bool, outcome: &Result<CommandExecResult, RpcError>) -> Option<String> {
+/// `eval` and `wait --fn`: commands whose errors may quote values of the page.
+fn is_expression_command(argv: &[String]) -> bool {
+    argv.first().map(String::as_str) == Some("eval") || !argv::text_at(argv).expr.is_empty()
+}
+
+/// The `error` of an entry for a command that did not succeed. A redacted entry, and an
+/// expression command, say only their code. Otherwise a pegboard error is its code alone
+/// (its message may carry the CLI's output) and a CLI failure its own `error` string.
+fn error_text(
+    redacted: bool,
+    expression: bool,
+    outcome: &Result<CommandExecResult, RpcError>,
+) -> Option<String> {
     match outcome {
         Ok(r) if succeeded(r) => None,
-        Ok(r) if redacted => {
+        Ok(r) => {
             let code = r
                 .output
                 .get("code")
@@ -262,20 +261,20 @@ fn error_text(redacted: bool, outcome: &Result<CommandExecResult, RpcError>) -> 
                     c.len() <= 40 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 })
                 .unwrap_or("command_failed");
-            Some(withheld(code))
+            Some(if redacted {
+                withheld(code)
+            } else if expression {
+                format!("{code}: details withheld")
+            } else {
+                r.output
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(|e| truncate_chars(e, MAX_ERROR_CHARS))
+                    .unwrap_or_else(|| "command failed".to_string())
+            })
         }
-        Ok(r) => Some(
-            r.output
-                .get("error")
-                .and_then(Value::as_str)
-                .map(|e| truncate_chars(e, MAX_ERROR_CHARS))
-                .unwrap_or_else(|| "command failed".to_string()),
-        ),
         Err(e) if redacted => Some(withheld(&e.code)),
-        Err(e) => Some(truncate_chars(
-            &format!("{}: {}", e.code, e.message),
-            MAX_ERROR_CHARS,
-        )),
+        Err(e) => Some(e.code.clone()),
     }
 }
 
@@ -290,13 +289,24 @@ async fn selector_is_harmless(
     timeout_ms: u64,
 ) -> bool {
     let mut values = Vec::new();
+    // One budget for both calls.
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(PRE_CHECK_LIMIT_MS));
     for attr in ["type", "autocomplete"] {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
         let argv: Vec<String> = ["get", "attr", selector, attr]
             .iter()
             .map(|w| w.to_string())
             .collect();
         match runner
-            .exec(id, endpoint, &argv, timeout_ms.min(PRE_CHECK_LIMIT_MS))
+            .exec(
+                id,
+                endpoint,
+                &argv,
+                u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1),
+            )
             .await
         {
             Ok(r) if succeeded(&r) => match attribute_value(&r.output) {
@@ -350,38 +360,66 @@ mod tests {
             json!({"success": false, "error": "no element for hunter2", "code": "not_found"}),
         );
         assert_eq!(
-            error_text(true, &out).unwrap(),
+            error_text(true, false, &out).unwrap(),
             "not_found: details withheld (entry redacted)"
         );
-        let e: Result<CommandExecResult, RpcError> = Err(RpcError {
+        assert_eq!(
+            error_text(true, false, &rpc_err()).unwrap(),
+            "timeout: details withheld (entry redacted)"
+        );
+    }
+
+    fn rpc_err() -> Result<CommandExecResult, RpcError> {
+        Err(RpcError {
             code: codes::TIMEOUT.into(),
             message: "hunter2 timed out".into(),
             data: None,
-        });
+        })
+    }
+
+    #[test]
+    fn log_error_rules() {
+        // A pegboard error: the code only.
+        assert_eq!(error_text(false, false, &rpc_err()).unwrap(), "timeout");
+        // A CLI failure: its own error string, cut to 200 characters.
+        let out =
+            failed(json!({"success": false, "error": "no element for #x", "code": "not_found"}));
+        assert_eq!(error_text(false, false, &out).unwrap(), "no element for #x");
+        let long = failed(json!({"success": false, "error": "e".repeat(500)}));
         assert_eq!(
-            error_text(true, &e).unwrap(),
-            "timeout: details withheld (entry redacted)"
+            error_text(false, false, &long).unwrap().chars().count(),
+            200
         );
-        // Not redacted: only the CLI's own `error` string or pegboard's own error.
-        assert_eq!(error_text(false, &out).unwrap(), "no element for hunter2");
-        assert_eq!(error_text(false, &e).unwrap(), "timeout: hunter2 timed out");
+        // eval and `wait --fn` can quote page values: withheld.
+        assert_eq!(
+            error_text(false, true, &out).unwrap(),
+            "not_found: details withheld"
+        );
         let no_string = failed(json!({"success": false, "error": {"x": 1}, "stdout": "leak"}));
-        assert_eq!(error_text(false, &no_string).unwrap(), "command failed");
+        assert_eq!(
+            error_text(false, false, &no_string).unwrap(),
+            "command failed"
+        );
         let none = failed(json!({"success": false}));
-        assert_eq!(error_text(false, &none).unwrap(), "command failed");
+        assert_eq!(error_text(false, false, &none).unwrap(), "command failed");
         let fine = Ok(CommandExecResult {
             exit_code: 0,
             output: json!({"success": true}),
             stderr: String::new(),
         });
-        assert!(error_text(false, &fine).is_none() && error_text(true, &fine).is_none());
+        assert!(
+            error_text(false, false, &fine).is_none() && error_text(true, false, &fine).is_none()
+        );
     }
 
     #[test]
-    fn logged_urls_drop_query_fragment_and_data() {
-        assert_eq!(logged_url("http://a.test/x?p=secret#f"), "http://a.test/x");
-        assert_eq!(logged_url("http://a.test/x#t"), "http://a.test/x");
-        assert_eq!(logged_url("data:text/html,secret"), "data:");
-        assert_eq!(logged_url("about:blank"), "about:blank");
+    fn expression_commands_are_found() {
+        let a = |v: &[&str]| {
+            is_expression_command(&v.iter().map(|w| w.to_string()).collect::<Vec<_>>())
+        };
+        assert!(a(&["eval", "1"]));
+        assert!(a(&["wait", "--fn", "x"]));
+        assert!(!a(&["wait", "#a"]));
+        assert!(!a(&["click", "#a"]));
     }
 }

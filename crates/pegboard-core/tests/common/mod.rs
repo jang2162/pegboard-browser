@@ -76,7 +76,8 @@ root.innerHTML = '<input id="spw" type="password"> <input id="stext">';
 const pw = document.getElementById('pw');
 pw.addEventListener('input', () => { if (pw.value.length >= 8) pw.form.submit(); });
 </script>"#)),
-        "/form-otp" => ("", page("form-otp", r#"<input id="otp" autocomplete="one-time-code" oninput="this.blur()"> <input id="plain" autocomplete="off" oninput="this.blur()">"#)),
+        "/form-otp" => ("", page("form-otp", r#"<input id="otp" autocomplete="one-time-code" oninput="this.blur()">"#)),
+        "/form-blur" => ("", page("form-blur", r#"<input id="pw" type="password" oninput="this.blur()">"#)),
         "/frame" => ("", page("frame", r#"<p>outer</p><iframe id="fr" src="/form"></iframe>"#)),
         "/writer" => ("", page("writer", "<p>writer</p><script>setInterval(() => localStorage.setItem('busy', String(Date.now())), 100);</script>")),
         _ => return None,
