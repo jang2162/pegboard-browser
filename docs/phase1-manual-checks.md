@@ -139,9 +139,9 @@ cat /tmp/pegboard-m-loop.log
 
 | | |
 |---|---|
-| 목적 | 사람이 에이전트 창 안에서 탭을 다른 세션의 그룹으로 옮겼을 때 세션 소속이 설계대로 바뀌는지(6절: 소속이 바뀐다) |
+| 목적 | 사람이 에이전트 창 안에서 탭을 다른 세션의 그룹으로 옮겼을 때 1단계의 동작이 그대로인지: 소속은 탭을 따라가지 그룹을 따라가지 않는다(세션의 범위는 타깃 ID로 정해진다). 그룹을 따라 소속을 바꾸는 것은 2단계에서 정한다 |
 | 절차 | 1. 세션 A와 B를 만든다(각각 핸들을 `A`, `B` 변수에 담는다): `A=$(pegboard session create --name A --url http://127.0.0.1:8765/counter.html \| head -1)`, B도 같게. 2. 에이전트 창에서 A 그룹의 탭을 B 그룹으로 끌어다 놓는다. 3. `pegboard session info "$A"`, `pegboard session info "$B"` 4. `PEGBOARD_SESSION="$A" pegboard tab list` 와 `PEGBOARD_SESSION="$B" pegboard tab list` |
-| 기대 결과 | 옮긴 탭이 B의 `tab list`와 B의 타깃 목록에 나타나고 A에서는 사라진다. A가 옮겨진 탭을 계속 조종하거나, 두 세션에 모두 보이면 실패다 |
+| 기대 결과 | 옮긴 탭은 계속 A의 것이다. A의 `tab list`와 `session info "$A"`에 그대로 남고 A가 계속 조종할 수 있다. B의 `tab list`와 `session info "$B"`에는 나타나지 않는다. 그 탭이 B의 그룹 안에 있으므로 `pegboard session close "$B"`를 하면 B의 그룹 구성원으로서 함께 닫힌다(A는 그 탭을 잃는다). B가 그 탭을 조종하거나 보면 실패다(격리 위반). 위 동작이 아니면(예: A의 목록에서 사라짐) 코드와 문서가 어긋난 것이니 기록한다 |
 | 실제 결과 | |
 
 ### M7. 에이전트 창 닫기
