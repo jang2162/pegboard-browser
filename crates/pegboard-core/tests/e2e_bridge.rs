@@ -9,13 +9,26 @@ use pegboard_core::cdp::page_targets;
 #[ignore]
 async fn group_and_tabs_land_in_agent_profile() {
     let (e, f, b) = common::launched().await;
-    let agent = b.open_profile_window(&e.paths, &e.cfg, "PegboardAgent").await.unwrap();
+    let agent = b
+        .open_profile_window(&e.paths, &e.cfg, "PegboardAgent")
+        .await
+        .unwrap();
     let br = Bridge::attach(&b.conn, &agent).await.unwrap();
     let (g, first) = br.create_group("조사", "blue").await.unwrap();
-    let second = br.create_tab(&g, &format!("{}/counter", f.origin)).await.unwrap();
+    let second = br
+        .create_tab(&g, &format!("{}/counter", f.origin))
+        .await
+        .unwrap();
     let all = page_targets(&b.conn).await.unwrap();
     for id in [&first, &second] {
-        assert_eq!(all.iter().find(|t| &t.target_id == id).unwrap().browser_context_id.as_deref(), Some(agent.as_str()));
+        assert_eq!(
+            all.iter()
+                .find(|t| &t.target_id == id)
+                .unwrap()
+                .browser_context_id
+                .as_deref(),
+            Some(agent.as_str())
+        );
     }
     let m = br.members(&g).await.unwrap();
     assert!(m.contains(&first) && m.contains(&second));
@@ -26,7 +39,10 @@ async fn group_and_tabs_land_in_agent_profile() {
 #[ignore]
 async fn create_tab_ignores_which_window_was_last_active() {
     let (e, _f, b) = common::launched().await;
-    let agent = b.open_profile_window(&e.paths, &e.cfg, "PegboardAgent").await.unwrap();
+    let agent = b
+        .open_profile_window(&e.paths, &e.cfg, "PegboardAgent")
+        .await
+        .unwrap();
     let br = Bridge::attach(&b.conn, &agent).await.unwrap();
     let (g, _) = br.create_group("a", "red").await.unwrap();
     common::activate_any_target_in(&b.conn, &b.human_context).await;
@@ -39,7 +55,10 @@ async fn create_tab_ignores_which_window_was_last_active() {
 #[ignore]
 async fn bridge_still_answers_after_two_minutes_idle() {
     let (e, _f, b) = common::launched().await;
-    let agent = b.open_profile_window(&e.paths, &e.cfg, "PegboardAgent").await.unwrap();
+    let agent = b
+        .open_profile_window(&e.paths, &e.cfg, "PegboardAgent")
+        .await
+        .unwrap();
     let br = Bridge::attach(&b.conn, &agent).await.unwrap();
     let (g, first) = br.create_group("idle", "grey").await.unwrap();
     tokio::time::sleep(Duration::from_secs(120)).await;
@@ -51,7 +70,10 @@ async fn bridge_still_answers_after_two_minutes_idle() {
 #[ignore]
 async fn close_and_ungroup() {
     let (e, _f, b) = common::launched().await;
-    let agent = b.open_profile_window(&e.paths, &e.cfg, "PegboardAgent").await.unwrap();
+    let agent = b
+        .open_profile_window(&e.paths, &e.cfg, "PegboardAgent")
+        .await
+        .unwrap();
     let br = Bridge::attach(&b.conn, &agent).await.unwrap();
     let (g, first) = br.create_group("x", "blue").await.unwrap();
     let t = br.create_tab(&g, "about:blank").await.unwrap();
@@ -66,7 +88,10 @@ async fn close_and_ungroup() {
 #[ignore]
 async fn bridge_refuses_targets_of_the_human_profile() {
     let (e, _f, b) = common::launched().await;
-    let agent = b.open_profile_window(&e.paths, &e.cfg, "PegboardAgent").await.unwrap();
+    let agent = b
+        .open_profile_window(&e.paths, &e.cfg, "PegboardAgent")
+        .await
+        .unwrap();
     let br = Bridge::attach(&b.conn, &agent).await.unwrap();
     let (g, _) = br.create_group("iso", "blue").await.unwrap();
     let human = page_targets(&b.conn)
@@ -83,8 +108,14 @@ async fn bridge_refuses_targets_of_the_human_profile() {
     eprintln!("add_to_group on human target: {added:?}");
     assert!(added.is_err());
     let after = page_targets(&b.conn).await.unwrap();
-    let t = after.iter().find(|t| t.target_id == human).expect("human target vanished");
-    assert_eq!(t.browser_context_id.as_deref(), Some(b.human_context.as_str()));
+    let t = after
+        .iter()
+        .find(|t| t.target_id == human)
+        .expect("human target vanished");
+    assert_eq!(
+        t.browser_context_id.as_deref(),
+        Some(b.human_context.as_str())
+    );
     assert!(!br.members(&g).await.unwrap().contains(&human));
     b.shutdown().await.unwrap();
 }
@@ -93,7 +124,10 @@ async fn bridge_refuses_targets_of_the_human_profile() {
 #[ignore]
 async fn bridge_refuses_relative_and_extension_urls() {
     let (e, _f, b) = common::launched().await;
-    let agent = b.open_profile_window(&e.paths, &e.cfg, "PegboardAgent").await.unwrap();
+    let agent = b
+        .open_profile_window(&e.paths, &e.cfg, "PegboardAgent")
+        .await
+        .unwrap();
     let br = Bridge::attach(&b.conn, &agent).await.unwrap();
     let (g, first) = br.create_group("urls", "blue").await.unwrap();
     let pages_before = page_targets(&b.conn).await.unwrap().len();

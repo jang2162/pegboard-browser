@@ -86,7 +86,9 @@ impl CdpConn {
         tokio::spawn(async move {
             while let Some(Ok(msg)) = stream.next().await {
                 let Message::Text(text) = msg else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
                 if let Some(id) = v.get("id").and_then(Value::as_u64) {
                     let waiter = reader.pending.lock().unwrap().waiters.remove(&id);
                     if let Some(tx) = waiter {
@@ -189,7 +191,8 @@ impl CdpConn {
     pub async fn navigate(&self, session_id: &str, url: &str) -> Result<()> {
         // Subscribe before navigating so the load event cannot be missed.
         let mut events = self.events();
-        self.send("Page.enable", json!({}), Some(session_id)).await?;
+        self.send("Page.enable", json!({}), Some(session_id))
+            .await?;
         let r = self
             .send("Page.navigate", json!({ "url": url }), Some(session_id))
             .await?;

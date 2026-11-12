@@ -222,7 +222,10 @@ fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
                 .or_else(|| std::env::var("PEGBOARD_SESSION").ok())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| usage("no session: pass --session or set PEGBOARD_SESSION"));
-            if !id.split_once('.').is_some_and(|(_, token)| !token.is_empty()) {
+            if !id
+                .split_once('.')
+                .is_some_and(|(_, token)| !token.is_empty())
+            {
                 usage("session handle must be <id>.<token> (the first line printed by `pegboard session create`)");
             }
             agent_command(paths, id, argv, json)
@@ -354,7 +357,11 @@ fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), Rpc
             if !valid_recording_id(&recording_id) {
                 usage(&format!("{recording_id:?} is not a recording id"));
             }
-            let v: Value = call(paths, "recording.get", json!({ "recordingId": recording_id }))?;
+            let v: Value = call(
+                paths,
+                "recording.get",
+                json!({ "recordingId": recording_id }),
+            )?;
             if json {
                 print_json(&v);
                 return Ok(());
@@ -372,7 +379,10 @@ fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), Rpc
                     (false, Some(e)) => format!("failed: {e}"),
                     (false, None) => "failed".to_string(),
                 };
-                println!("{}  {}  {}  {}  {}ms", a.seq, a.ts, words, result, a.duration_ms);
+                println!(
+                    "{}  {}  {}  {}  {}ms",
+                    a.seq, a.ts, words, result, a.duration_ms
+                );
             }
         }
     }
@@ -402,7 +412,12 @@ fn render_output(output: &Value) -> String {
     }
 }
 
-fn agent_command(paths: &Paths, session: String, argv: Vec<String>, json: bool) -> Result<(), RpcError> {
+fn agent_command(
+    paths: &Paths,
+    session: String,
+    argv: Vec<String>,
+    json: bool,
+) -> Result<(), RpcError> {
     let (session_id, token) = parse_handle(&session);
     let r: CommandExecResult = call(
         paths,
@@ -500,7 +515,14 @@ fn browser_start(paths: &Paths) -> Result<(), RpcError> {
         if socket_answers(paths) {
             // A daemon that is shutting down is waited out, then replaced.
             if daemon_is_usable(paths) {
-                println!("{}", if spawned { "started" } else { "already running" });
+                println!(
+                    "{}",
+                    if spawned {
+                        "started"
+                    } else {
+                        "already running"
+                    }
+                );
                 return Ok(());
             }
         } else if !spawned && !lock_is_held(paths) {
@@ -527,7 +549,10 @@ fn browser_start(paths: &Paths) -> Result<(), RpcError> {
             }
             return Err(error(
                 codes::BROWSER_FAILED,
-                format!("the daemon did not answer within 20 s; see {}", log_path.display()),
+                format!(
+                    "the daemon did not answer within 20 s; see {}",
+                    log_path.display()
+                ),
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -569,7 +594,8 @@ fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
             Err(e) => return Err(io_failure("taking the daemon lock", e)),
         }
     };
-    let runtime = tokio::runtime::Runtime::new().map_err(|e| io_failure("starting the runtime", e))?;
+    let runtime =
+        tokio::runtime::Runtime::new().map_err(|e| io_failure("starting the runtime", e))?;
     let pid_file = paths.home.join("daemon.pid");
     let result = runtime.block_on(async {
         use tokio::signal::unix::{signal, SignalKind};
@@ -583,7 +609,11 @@ fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
             .mode(0o600)
             .open(&pid_file)?;
         writeln!(pid, "{}", std::process::id())?;
-        eprintln!("pegboard: daemon {} serving {}", std::process::id(), paths.socket.display());
+        eprintln!(
+            "pegboard: daemon {} serving {}",
+            std::process::id(),
+            paths.socket.display()
+        );
         // The server keeps answering (new sessions are refused) while the daemon shuts
         // down; it is dropped, and its socket removed, only after that.
         let stopper = async {

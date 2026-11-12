@@ -71,7 +71,11 @@ impl Home {
     }
 
     fn run_env(&self, env: &[(&str, &str)], args: &[&str]) -> (i32, String, String) {
-        let out = self.command(args).envs(env.iter().copied()).output().unwrap();
+        let out = self
+            .command(args)
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -80,7 +84,12 @@ impl Home {
     }
 
     /// Like `run_env`, but killed (and the test failed) after `limit` seconds.
-    fn run_limited(&self, env: &[(&str, &str)], args: &[&str], limit: u64) -> (i32, String, String) {
+    fn run_limited(
+        &self,
+        env: &[(&str, &str)],
+        args: &[&str],
+        limit: u64,
+    ) -> (i32, String, String) {
         let mut child = self
             .command(args)
             .envs(env.iter().copied())
@@ -136,7 +145,10 @@ impl Drop for Home {
         // Only a browser that uses this home's profile directory.
         let _ = Command::new("pkill")
             .args(["-f", "--"])
-            .arg(format!("--user-data-dir={}", self.path().join("chrome").display()))
+            .arg(format!(
+                "--user-data-dir={}",
+                self.path().join("chrome").display()
+            ))
             .output();
     }
 }
@@ -151,14 +163,19 @@ fn json(text: &str) -> Value {
 }
 
 fn base32(s: &str) -> bool {
-    s.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+    s.bytes()
+        .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
 }
 
 /// Line 1 of `session create`: `<session id>.<token>`.
 fn session_handle(stdout: &str) -> String {
     let first = stdout.lines().next().unwrap_or("");
     let ok = first.split_once('.').is_some_and(|(id, token)| {
-        id.len() == 10 && id.starts_with("s_") && base32(&id[2..]) && token.len() == 26 && base32(token)
+        id.len() == 10
+            && id.starts_with("s_")
+            && base32(&id[2..])
+            && token.len() == 26
+            && base32(token)
     });
     assert!(ok, "first line is not a session handle: {stdout:?}");
     first.to_string()
@@ -174,7 +191,10 @@ fn token_of(handle: &str) -> &str {
 
 /// The `ps` lines of processes whose command line contains `needle`.
 fn processes(needle: &str) -> Vec<String> {
-    let out = Command::new("ps").args(["-axo", "pid,command"]).output().unwrap();
+    let out = Command::new("ps")
+        .args(["-axo", "pid,command"])
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| l.contains(needle))
@@ -224,13 +244,21 @@ fn full_flow() {
     let (code, out, _) = home.run(&["recording", "show", &rid]);
     assert_eq!(code, 0);
     for word in ["snapshot", "click", "get"] {
-        assert!(out.lines().any(|l| l.contains(word)), "no {word} line in:\n{out}");
+        assert!(
+            out.lines().any(|l| l.contains(word)),
+            "no {word} line in:\n{out}"
+        );
     }
 
     let (code, _, err) = home.run(&["session", "close", &sid]);
     assert_eq!(code, 0, "{err}");
     assert!(
-        !home.path().join("sessions").join(id_of(&sid)).join("files").exists(),
+        !home
+            .path()
+            .join("sessions")
+            .join(id_of(&sid))
+            .join("files")
+            .exists(),
         "the session's files directory is deleted on close"
     );
     let (code, _, err) = home.run(&["--session", &sid, "snapshot"]);
@@ -284,7 +312,10 @@ fn missing_session_is_a_usage_error_without_daemon() {
     let home = Home::new();
     let (code, _, err) = home.run(&["snapshot"]);
     assert_eq!(code, 2, "{err}");
-    assert!(err.contains("no session: pass --session or set PEGBOARD_SESSION"), "{err}");
+    assert!(
+        err.contains("no session: pass --session or set PEGBOARD_SESSION"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -359,9 +390,15 @@ fn long_home(base: &Path) -> PathBuf {
 fn long_home_is_a_clear_usage_error() {
     let home = Home::new();
     let long = long_home(home.path());
-    let (code, _, err) = home.run_env(&[("PEGBOARD_HOME", long.to_str().unwrap())], &["session", "list"]);
+    let (code, _, err) = home.run_env(
+        &[("PEGBOARD_HOME", long.to_str().unwrap())],
+        &["session", "list"],
+    );
     assert_eq!(code, 2, "{err}");
-    assert!(err.contains("PEGBOARD_HOME is too long for a unix socket path"), "{err}");
+    assert!(
+        err.contains("PEGBOARD_HOME is too long for a unix socket path"),
+        "{err}"
+    );
     assert!(!long.exists(), "nothing is created");
 }
 
@@ -398,10 +435,15 @@ fn stale_socket_is_removed_only_when_lock_is_free() {
     let paths = paths_in(home.path());
     drop(std::os::unix::net::UnixListener::bind(&paths.socket).unwrap());
     {
-        let _held = DaemonLock::try_acquire(&paths).unwrap().expect("lock is free");
+        let _held = DaemonLock::try_acquire(&paths)
+            .unwrap()
+            .expect("lock is free");
         let e = Client::connect(&paths).err().expect("not running");
         assert_eq!(e.code, "not_running");
-        assert!(paths.socket.exists(), "a starting daemon's socket is not deleted");
+        assert!(
+            paths.socket.exists(),
+            "a starting daemon's socket is not deleted"
+        );
     }
     // A test thread that is forking a child holds a copy of the lock's descriptor for an
     // instant, so the free lock may take a moment to show.
@@ -413,7 +455,10 @@ fn stale_socket_is_removed_only_when_lock_is_free() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!paths.socket.exists(), "with the lock free the stale file goes");
+    assert!(
+        !paths.socket.exists(),
+        "with the lock free the stale file goes"
+    );
 }
 
 #[test]
@@ -423,10 +468,16 @@ fn second_daemon_refuses_when_lock_is_held() {
 
     let home = Home::new();
     let paths = paths_in(home.path());
-    let _held = DaemonLock::try_acquire(&paths).unwrap().expect("lock is free");
+    let _held = DaemonLock::try_acquire(&paths)
+        .unwrap()
+        .expect("lock is free");
     let started = Instant::now();
     // No browser can start even if the lock check regresses, and the run has a hard limit.
-    let (code, _, err) = home.run_limited(&[("PEGBOARD_CHROME", "/nonexistent/chrome")], &["daemon"], 10);
+    let (code, _, err) = home.run_limited(
+        &[("PEGBOARD_CHROME", "/nonexistent/chrome")],
+        &["daemon"],
+        10,
+    );
     assert_ne!(code, 0);
     assert!(err.contains("already running"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(5));
@@ -470,7 +521,10 @@ fn session_handle_is_required() {
         .iter()
         .map(|s| s["id"].as_str().unwrap().to_string())
         .collect();
-    assert!(ids.contains(&id_of(&b).to_string()), "B is still listed: {ids:?}");
+    assert!(
+        ids.contains(&id_of(&b).to_string()),
+        "B is still listed: {ids:?}"
+    );
 
     // With the right handles everything works.
     let (code, out, err) = home.run(&["--session", &a, "get", "url"]);
@@ -481,7 +535,10 @@ fn session_handle_is_required() {
     let (_, listed, _) = home.run(&["session", "list", "--json"]);
     let (_, info, _) = home.run(&["session", "info", &b, "--json"]);
     for text in [&listed, &info] {
-        assert!(!text.contains(token_of(&a)) && !text.contains(token_of(&b)), "{text}");
+        assert!(
+            !text.contains(token_of(&a)) && !text.contains(token_of(&b)),
+            "{text}"
+        );
     }
     assert_eq!(home.run(&["session", "close", &b]).0, 0);
     assert_eq!(home.run(&["session", "close", &a]).0, 0);
@@ -521,7 +578,11 @@ fn concurrent_browser_start_yields_one_daemon() {
         .collect();
     for child in children {
         let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     // The daemon that lost the lock retries it for about a second before it gives up.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -564,7 +625,10 @@ fn sigterm_closes_sessions_then_removes_socket() {
     let pid_file = pegboard_core::paths::paths_in(home.path())
         .ab_socket_dir
         .join(format!("peg-{}.pid", id_of(&handle)));
-    if let Some(pid) = std::fs::read_to_string(pid_file).ok().and_then(|t| t.trim().parse().ok()) {
+    if let Some(pid) = std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+    {
         assert!(!alive(pid), "an agent-browser daemon is left");
     }
     let manifest = home
@@ -596,7 +660,9 @@ fn waiting_start_spawns_when_lock_is_released() {
 
     let home = Home::new();
     let paths = paths_in(home.path());
-    let held = DaemonLock::try_acquire(&paths).unwrap().expect("lock is free");
+    let held = DaemonLock::try_acquire(&paths)
+        .unwrap()
+        .expect("lock is free");
     let child = home
         .command(&["browser", "start"])
         .env("PEGBOARD_CHROME", "/nonexistent/chrome")
@@ -611,7 +677,11 @@ fn waiting_start_spawns_when_lock_is_released() {
     let out = child.wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
-    assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
     assert!(err.contains("the daemon exited"), "{err}");
     assert!(!err.contains("did not answer"), "{err}");
 }
@@ -624,7 +694,11 @@ fn browser_start_waits_out_a_stopping_daemon() {
     let first = home.daemon_pid().expect("daemon.pid");
     let (_, out, _) = home.run(&["browser", "status", "--json"]);
     assert_eq!(json(&out)["stopping"], false);
-    let mut stop = home.command(&["browser", "stop"]).stdout(Stdio::null()).spawn().unwrap();
+    let mut stop = home
+        .command(&["browser", "stop"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
     // Let the stop begin.
     std::thread::sleep(Duration::from_millis(100));
     let (code, _, err) = home.run(&["browser", "start"]);
@@ -647,7 +721,14 @@ fn undelivered_session_create_is_cleaned_up() {
     assert_eq!(home.run(&["profile", "create", "solo"]).0, 0);
     // Creation takes a page load: the CLI is killed while the daemon is still working.
     let mut child = home
-        .command(&["session", "create", "--profile", "solo", "--url", &format!("{origin}/counter")])
+        .command(&[
+            "session",
+            "create",
+            "--profile",
+            "solo",
+            "--url",
+            &format!("{origin}/counter"),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -663,7 +744,10 @@ fn undelivered_session_create_is_cleaned_up() {
         if empty && code == 0 {
             break;
         }
-        assert!(Instant::now() < deadline, "the abandoned session was not discarded");
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned session was not discarded"
+        );
         std::thread::sleep(Duration::from_millis(500));
     }
 }

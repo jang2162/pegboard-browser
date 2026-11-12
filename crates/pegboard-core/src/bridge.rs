@@ -29,9 +29,9 @@ async fn find_worker(conn: &CdpConn, context: &str, wait: Duration) -> Result<Op
         let found = r["targetInfos"].as_array().into_iter().flatten().find(|t| {
             t["type"] == "service_worker"
                 && t["browserContextId"].as_str() == Some(context)
-                && t["url"].as_str().is_some_and(|u| {
-                    u.starts_with("chrome-extension://") && u.ends_with("/sw.js")
-                })
+                && t["url"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("chrome-extension://") && u.ends_with("/sw.js"))
         });
         if let Some(t) = found {
             return Ok(t["targetId"].as_str().map(String::from));
@@ -49,9 +49,11 @@ impl Bridge {
         let deadline = tokio::time::Instant::now() + WORKER_WAIT;
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let target = find_worker(conn, agent_context, left).await?.ok_or_else(|| {
-                anyhow!("bridge service worker for the agent profile did not appear within 10s")
-            })?;
+            let target = find_worker(conn, agent_context, left)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("bridge service worker for the agent profile did not appear within 10s")
+                })?;
             // A worker that is still starting (or being restarted) can accept a session
             // yet never answer, so require one answered ping before trusting it.
             if let Ok(session) = conn.attach(&target).await {
@@ -76,7 +78,11 @@ impl Bridge {
     /// Calls `self.peg.<func>(...args)` in the worker; retries once after re-attaching when the session is gone.
     async fn call(&self, func: &str, args: &[Value]) -> Result<Value> {
         // Arguments are serialized as JSON, never spliced in as raw text.
-        let args = args.iter().map(Value::to_string).collect::<Vec<_>>().join(",");
+        let args = args
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let expr = format!("(async () => JSON.stringify(await self.peg.{func}({args})))()");
         let mut session = self.session.lock().await;
         let first = self.conn.evaluate(&session, &expr).await;
@@ -84,28 +90,37 @@ impl Bridge {
             Err(e) if is_session_gone(&e) => {
                 let target = find_worker(&self.conn, &self.agent_context, Duration::ZERO)
                     .await?
-                    .ok_or_else(|| anyhow!("bridge_asleep: the bridge service worker is not running"))?;
+                    .ok_or_else(|| {
+                        anyhow!("bridge_asleep: the bridge service worker is not running")
+                    })?;
                 *session = self.conn.attach(&target).await?;
                 self.conn.evaluate(&session, &expr).await?
             }
             other => other?,
         };
-        let text = out.as_str().ok_or_else(|| anyhow!("bridge call {func} returned no value"))?;
+        let text = out
+            .as_str()
+            .ok_or_else(|| anyhow!("bridge call {func} returned no value"))?;
         serde_json::from_str(text).with_context(|| format!("parsing bridge reply of {func}"))
     }
 
     pub async fn create_group(&self, title: &str, color: &str) -> Result<(GroupId, String)> {
-        let r = self.call("createGroup", &[json!(title), json!(color)]).await?;
+        let r = self
+            .call("createGroup", &[json!(title), json!(color)])
+            .await?;
         Ok((GroupId(group_id(&r)?), target_id(&r)?))
     }
 
     pub async fn create_tab(&self, group: &GroupId, url: &str) -> Result<String> {
-        let r = self.call("createTab", &[json!(group.0), json!(url)]).await?;
+        let r = self
+            .call("createTab", &[json!(group.0), json!(url)])
+            .await?;
         target_id(&r)
     }
 
     pub async fn add_to_group(&self, group: &GroupId, target_id: &str) -> Result<()> {
-        self.call("addToGroup", &[json!(group.0), json!(target_id)]).await?;
+        self.call("addToGroup", &[json!(group.0), json!(target_id)])
+            .await?;
         Ok(())
     }
 
@@ -136,7 +151,9 @@ fn is_session_gone(e: &anyhow::Error) -> bool {
 }
 
 fn group_id(r: &Value) -> Result<i64> {
-    r["groupId"].as_i64().ok_or_else(|| anyhow!("reply has no groupId"))
+    r["groupId"]
+        .as_i64()
+        .ok_or_else(|| anyhow!("reply has no groupId"))
 }
 
 fn target_id(r: &Value) -> Result<String> {

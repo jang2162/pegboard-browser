@@ -319,9 +319,13 @@ async fn two_sessions_do_not_see_each_other() {
     let s = common::session_fixture().await;
     let (g2, t2) = s.bridge.create_group("second", "red").await.unwrap();
     let id2 = pegboard_protocol::SessionId::generate();
-    let ep2 = s
-        .proxy
-        .register(&id2, &s.agent_context, g2, s.bridge.clone(), vec![t2.clone()]);
+    let ep2 = s.proxy.register(
+        &id2,
+        &s.agent_context,
+        g2,
+        s.bridge.clone(),
+        vec![t2.clone()],
+    );
     let a = common::client(&s.endpoint).await;
     let b = common::client(&ep2).await;
     assert_eq!(listed(&a).await, vec![s.first_target.clone()]);

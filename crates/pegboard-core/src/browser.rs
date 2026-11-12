@@ -40,13 +40,16 @@ pub fn find_chrome() -> Result<PathBuf> {
     // Version numbers compare numerically, not lexicographically.
     dirs.sort_by_key(|p| version_key(p));
     for dir in dirs.iter().rev() {
-        let bin = dir
-            .join("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing");
+        let bin =
+            dir.join("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing");
         if bin.exists() {
             return Ok(bin);
         }
     }
-    bail!("no Chrome found under {}; set PEGBOARD_CHROME", root.display())
+    bail!(
+        "no Chrome found under {}; set PEGBOARD_CHROME",
+        root.display()
+    )
 }
 
 fn version_key(p: &std::path::Path) -> Vec<u64> {
@@ -88,7 +91,9 @@ impl Browser {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting {}", cfg.chrome.display()))?;
-        let pid = child.id().ok_or_else(|| anyhow!("chrome exited immediately"))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| anyhow!("chrome exited immediately"))?;
 
         let ws_url = match wait_for_ws_url(&port_file, &mut child).await {
             Ok(u) => u,
@@ -135,7 +140,10 @@ impl Browser {
         let known = self.profiles.lock().unwrap().get(profile_dir).cloned();
         if let Some(ctx) = known {
             let live = page_targets(&self.conn).await?;
-            if live.iter().any(|t| t.browser_context_id.as_deref() == Some(&ctx)) {
+            if live
+                .iter()
+                .any(|t| t.browser_context_id.as_deref() == Some(&ctx))
+            {
                 return Ok(ctx);
             }
         }

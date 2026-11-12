@@ -189,7 +189,10 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
     }
 }
 
-async fn write_line(write: &mut tokio::net::unix::OwnedWriteHalf, r: &Response) -> std::io::Result<()> {
+async fn write_line(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    r: &Response,
+) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec(r).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
     write.write_all(&bytes).await?;
@@ -277,7 +280,8 @@ impl Client {
         stream.write_all(&line).map_err(io_error)?;
         let mut answer = String::new();
         let read = self.reader.read_line(&mut answer);
-        if matches!(&read, Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)) {
+        if matches!(&read, Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+        {
             return Err(RpcError {
                 code: codes::TIMEOUT.to_string(),
                 message: format!(

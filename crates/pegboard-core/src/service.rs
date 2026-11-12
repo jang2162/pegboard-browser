@@ -80,7 +80,11 @@ pub fn find_extension() -> anyhow::Result<PathBuf> {
     if let Some(p) = std::env::var_os("PEGBOARD_EXTENSION") {
         candidates.push(PathBuf::from(p));
     } else {
-        if let Some(dir) = std::env::current_exe().ok().as_deref().and_then(|p| p.parent()) {
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(|p| p.parent())
+        {
             candidates.push(dir.join("extension/bridge"));
         }
         candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extension/bridge"));
@@ -94,7 +98,11 @@ pub fn find_extension() -> anyhow::Result<PathBuf> {
 
 /// Parses the params of a request; a missing `params` is treated as an empty object.
 fn params<T: DeserializeOwned>(value: &Value) -> Result<T, RpcError> {
-    let value = if value.is_null() { json!({}) } else { value.clone() };
+    let value = if value.is_null() {
+        json!({})
+    } else {
+        value.clone()
+    };
     serde_json::from_value(value).map_err(|e| invalid(format!("bad params: {e}")))
 }
 
@@ -167,9 +175,8 @@ impl Daemon {
     pub async fn start(paths: Paths) -> anyhow::Result<Arc<Daemon>> {
         ensure(&paths)?;
         // First, so a missing or wrong agent-browser fails before a window opens.
-        let runner = Arc::new(
-            Runner::new(paths.clone()).map_err(|e| anyhow!("{}: {}", e.code, e.message))?,
-        );
+        let runner =
+            Arc::new(Runner::new(paths.clone()).map_err(|e| anyhow!("{}: {}", e.code, e.message))?);
         runner.cleanup_leftovers();
         let cfg = BrowserConfig {
             chrome: find_chrome()?,
@@ -204,7 +211,8 @@ impl Daemon {
             .await?,
         );
         let profiles = Profiles::load(&paths)?;
-        let sessions = SessionManager::new(browser.clone(), proxy.clone(), profiles, paths.clone(), cfg);
+        let sessions =
+            SessionManager::new(browser.clone(), proxy.clone(), profiles, paths.clone(), cfg);
         // Once, here: it is what lets the runner tell `tab_gone` from other failures.
         runner.set_session_targets_provider(sessions.targets_fn());
         let (stop, _) = watch::channel(false);
@@ -297,7 +305,9 @@ impl Daemon {
                 to_value(self.close_session(p).await?)
             }
             "command.exec" => to_value(self.exec(params(p)?).await?),
-            "recording.list" => to_value(actionlog::list(&self.paths).map_err(|e| internal(e.to_string()))?),
+            "recording.list" => {
+                to_value(actionlog::list(&self.paths).map_err(|e| internal(e.to_string()))?)
+            }
             "recording.get" => {
                 let p: RecordingParams = params(p)?;
                 self.recording(&p.recording_id)
@@ -421,7 +431,8 @@ impl Daemon {
             session_id: id.clone(),
             keep_tabs: false,
         };
-        let _ = tokio::spawn(async move { me.finish_session(p, slot.log.clone(), true).await }).await;
+        let _ =
+            tokio::spawn(async move { me.finish_session(p, slot.log.clone(), true).await }).await;
     }
 
     fn remove_files(&self, id: &SessionId) {

@@ -181,7 +181,10 @@ mod tests {
     fn symlinked_socket_dir_components_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let elsewhere = tmp.path().join("elsewhere");
-        std::fs::DirBuilder::new().mode(0o700).create(&elsewhere).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&elsewhere)
+            .unwrap();
         // The parent is a symlink.
         let link = tmp.path().join("pegboard-a");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
@@ -189,7 +192,10 @@ mod tests {
         assert!(e.to_string().contains("symbolic link"), "{e}");
         // The leaf is a symlink.
         let parent = tmp.path().join("pegboard-b");
-        std::fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&parent)
+            .unwrap();
         std::os::unix::fs::symlink(&elsewhere, parent.join("ab")).unwrap();
         let e = ensure_socket_dir(&parent.join("ab")).unwrap_err();
         assert!(e.to_string().contains("symbolic link"), "{e}");
@@ -199,13 +205,20 @@ mod tests {
     fn loose_or_non_directory_socket_dir_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("pegboard-c");
-        std::fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&parent)
+            .unwrap();
         let leaf = parent.join("ab");
         std::fs::DirBuilder::new().create(&leaf).unwrap();
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
         let e = ensure_socket_dir(&leaf).unwrap_err();
         assert!(e.to_string().contains("0755"), "{e}");
-        assert_eq!(mode_of(&leaf), 0o755, "a refused directory is left as it was");
+        assert_eq!(
+            mode_of(&leaf),
+            0o755,
+            "a refused directory is left as it was"
+        );
 
         let file_parent = tmp.path().join("pegboard-d");
         std::fs::write(&file_parent, b"").unwrap();
@@ -217,15 +230,25 @@ mod tests {
     fn session_files_dir_is_private_and_not_a_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths_in(&tmp.path().join("home"));
-        std::fs::DirBuilder::new().mode(0o700).create(&p.home).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&p.home)
+            .unwrap();
         let id = SessionId("s_abcdefgh".into());
         let files = ensure_session_files(&p, &id).unwrap();
         assert_eq!(files, p.home.join("sessions/s_abcdefgh/files"));
-        for dir in [&files, &p.home.join("sessions/s_abcdefgh"), &p.home.join("sessions")] {
+        for dir in [
+            &files,
+            &p.home.join("sessions/s_abcdefgh"),
+            &p.home.join("sessions"),
+        ] {
             assert_eq!(mode_of(dir), 0o700, "{dir:?}");
         }
         let other = SessionId("s_bbbbbbbb".into());
-        std::fs::DirBuilder::new().mode(0o700).create(p.home.join("sessions/s_bbbbbbbb")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(p.home.join("sessions/s_bbbbbbbb"))
+            .unwrap();
         std::os::unix::fs::symlink(tmp.path(), p.home.join("sessions/s_bbbbbbbb/files")).unwrap();
         let e = ensure_session_files(&p, &other).unwrap_err();
         assert!(e.to_string().contains("symbolic link"), "{e}");
