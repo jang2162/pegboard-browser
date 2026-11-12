@@ -72,12 +72,10 @@ async fn accept_survives_many_idle_connections() {
     // Every idle connection was closed by the server (end of stream, not a timeout).
     for mut c in idle {
         let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-        let buf = [0u8; 1];
         // A refused connection gets one error line first; then the stream ends.
         let mut rest = Vec::new();
         c.read_to_end(&mut rest).unwrap();
         assert!(rest.iter().filter(|b| **b == b'\n').count() <= 1);
-        let _ = buf;
     }
     let p = paths.clone();
     let answer: Value = tokio::task::spawn_blocking(move || {

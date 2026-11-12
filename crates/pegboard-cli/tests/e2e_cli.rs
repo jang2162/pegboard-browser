@@ -272,8 +272,9 @@ fn stale_socket_is_removed_only_when_lock_is_free() {
             "a starting daemon's socket is not deleted"
         );
     }
-    // A test thread that is forking a child holds a copy of the lock's descriptor for an
-    // instant, so the free lock may take a moment to show.
+    // The stale socket may still be held open by a concurrently spawned child that inherited
+    // the listener descriptor (macOS sets close-on-exec in a second step); it goes when that
+    // child exits, so the removal may take a moment to show.
     let mut last_lock_free = false;
     for _ in 0..40 {
         // Tell "the lock is still held" (a spawning test thread's copy of the descriptor)

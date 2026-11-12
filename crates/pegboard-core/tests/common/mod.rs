@@ -143,13 +143,29 @@ pub async fn activate_any_target_in(conn: &CdpConn, context: &str) {
     .unwrap();
 }
 
-/// Premise control for "the human window was the last active one": activates a human tab, then
-/// sends a context-less `Target.createTarget` straight to the browser (it lands in the profile of
-/// the last active window), closes that tab and returns the context it landed in. Equal to the
-/// human context when the premise holds. Measured on Chrome 157 while another application has the
-/// operating-system focus: it does not hold, so callers report that instead of faking it.
-pub async fn establish_human_active(conn: &CdpConn, human_context: &str) -> String {
+/// Premise control for "the human window was the last active one": activates the human tab
+/// (`Target.activateTarget`, `Page.bringToFront`), sends a context-less `Target.createTarget`
+/// straight to the browser (it lands in the profile of the last active window), waits for that
+/// tab to close again and returns the context it landed in. Equal to the human context when the
+/// premise holds.
+pub async fn establish_human_active(
+    conn: &CdpConn,
+    human_context: &str,
+    human_target: &str,
+) -> String {
     activate_any_target_in(conn, human_context).await;
+    if let Ok(session) = conn.attach(human_target).await {
+        let _ = conn
+            .send("Page.bringToFront", serde_json::json!({}), Some(&session))
+            .await;
+        let _ = conn
+            .send(
+                "Target.detachFromTarget",
+                serde_json::json!({ "sessionId": session }),
+                None,
+            )
+            .await;
+    }
     let r = conn
         .send(
             "Target.createTarget",
@@ -167,7 +183,73 @@ pub async fn establish_human_active(conn: &CdpConn, human_context: &str) -> Stri
             None,
         )
         .await;
+    for _ in 0..50 {
+        if page_targets(conn)
+            .await
+            .unwrap()
+            .iter()
+            .all(|t| t.target_id != id)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     context
+}
+
+/// Makes the human window the browser's last active one if it can: runs the control and, when
+/// it fails, re-invokes Chrome with this home's user-data-dir (a person starting Chrome again:
+/// the running browser opens a new human window and the new process exits), then runs the
+/// control again. Returns whether the premise now holds.
+pub async fn establish_human_premise(
+    env: &Env,
+    conn: &CdpConn,
+    human_context: &str,
+    human_target: &str,
+) -> bool {
+    if establish_human_active(conn, human_context, human_target).await == human_context {
+        return true;
+    }
+    let before: Vec<String> = page_targets(conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.target_id)
+        .collect();
+    let status = tokio::process::Command::new(&env.cfg.chrome)
+        .arg(format!(
+            "--user-data-dir={}",
+            env.paths.chrome_udd.display()
+        ))
+        .arg("--profile-directory=Default")
+        .arg("--no-first-run")
+        .arg("--new-window")
+        .arg("about:blank")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success(), "re-invoking Chrome failed: {status}");
+    let mut window = None;
+    for _ in 0..50 {
+        window = page_targets(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| {
+                !before.contains(&t.target_id)
+                    && t.browser_context_id.as_deref() == Some(human_context)
+            })
+            .map(|t| t.target_id);
+        if window.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let window = window.expect("re-invoking Chrome did not open a human window");
+    establish_human_active(conn, human_context, &window).await == human_context
 }
 
 /// The browserContextId of a page target.

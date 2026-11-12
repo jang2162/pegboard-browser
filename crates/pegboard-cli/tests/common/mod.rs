@@ -268,6 +268,9 @@ pub struct Human {
     pub context: String,
     /// The tab the human had open when the browser started.
     pub target: String,
+    home: std::path::PathBuf,
+    /// Human-profile tabs this helper opened itself (extra windows made by `establish_premise`).
+    pub extra: std::cell::RefCell<Vec<String>>,
 }
 
 impl Human {
@@ -295,6 +298,8 @@ impl Human {
         Human {
             rt,
             conn,
+            home: home.path().to_path_buf(),
+            extra: Default::default(),
             context: pages[0]
                 .browser_context_id
                 .clone()
@@ -399,14 +404,62 @@ impl Human {
         panic!("the human page did not open a tab");
     }
 
+    /// Opens a new window of the human profile the way a person starting Chrome again would: the
+    /// Chrome executable is re-invoked with this home's user-data-dir (never any other), which
+    /// hands the request to the running browser and exits. Returns the new tab's target id.
+    pub fn open_human_window_via_chrome(&self) -> String {
+        let before: Vec<String> = self.pages().into_iter().map(|t| t.target_id).collect();
+        let chrome = pegboard_core::browser::find_chrome().expect("chrome");
+        let status = Command::new(chrome)
+            .arg(format!(
+                "--user-data-dir={}",
+                self.home.join("chrome").display()
+            ))
+            .arg("--profile-directory=Default")
+            .arg("--no-first-run")
+            .arg("--new-window")
+            .arg("about:blank")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "re-invoking Chrome failed: {status}");
+        for _ in 0..50 {
+            let new = self
+                .human_pages()
+                .into_iter()
+                .map(|t| t.target_id)
+                .find(|id| !before.contains(id));
+            if let Some(id) = new {
+                self.extra.borrow_mut().push(id.clone());
+                return id;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("re-invoking Chrome did not open a human window");
+    }
+
+    /// Tries to make the human window the browser's last active one (see
+    /// `establish_human_active`); when the control says it is not, re-invokes Chrome for a new
+    /// human window and runs the control again. True when the control now lands in the human
+    /// profile.
+    pub fn establish_premise(&self) -> bool {
+        if self.establish_human_active(&self.target) == self.context {
+            return true;
+        }
+        let window = self.open_human_window_via_chrome();
+        self.establish_human_active(&window) == self.context
+    }
+
     /// Premise control for "the human window was the last active one": activates the human
     /// tab, then sends a context-less `Target.createTarget` straight to the browser, which
     /// puts the tab in the profile of the last active window. Returns the context that tab
     /// landed in (it is closed again); equal to `self.context` when the premise holds.
-    /// Measured on Chrome 157 while another application has the operating-system focus: the
-    /// tab does NOT land in the human profile even after `Target.activateTarget` and
-    /// `Page.bringToFront` (minimizing the agent windows did not change it either), so over
-    /// CDP alone the premise cannot be created there; callers report that instead of faking it.
+    /// Measured on Chrome 157 while another application has the operating-system focus: after
+    /// `Target.activateTarget` and `Page.bringToFront` alone (and after minimizing the agent
+    /// windows) the control tab still lands in the agent profile; after `establish_premise`
+    /// re-invokes Chrome for a new human window it lands in the human profile.
     pub fn establish_human_active(&self, target: &str) -> String {
         self.activate(target);
         self.rt.block_on(async {

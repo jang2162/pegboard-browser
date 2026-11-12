@@ -157,8 +157,8 @@ cat /tmp/pegboard-m-loop.log
 
 | | |
 |---|---|
-| 목적 | 자동 시험 `new_tabs_always_open_in_the_agent_profile`(와 core의 `created_tab_lands_in_agent_profile_even_when_human_window_is_active`)는 "사람 창이 마지막으로 활성인 창"이라는 전제를 CDP만으로는 만들지 못한다. 컨텍스트를 지정하지 않은 `Target.createTarget`이 `Target.activateTarget`과 `Page.bringToFront` 뒤에도 사람 프로필이 아닌 곳에 생겼다(OS 포커스가 다른 앱에 있을 때, Chrome 157에서 측정). 실제 사람의 클릭으로 그 전제를 만들어 확인한다 |
-| 절차 | 1. 세션을 만든다. 2. 사람 창(에이전트 창이 아닌 쪽)의 탭 영역을 마우스로 직접 클릭해 활성 창으로 만든다. 3. 바로 `pegboard tab new http://127.0.0.1:8765/counter.html` 4. 사람 창에 탭이 생겼는지, 에이전트 창의 `m-check` 그룹에 생겼는지 본다. 5. `pegboard tab list` 6. 사람 창을 다시 클릭하고 `pegboard open http://127.0.0.1:8765/counter.html`, `pegboard tab new about:blank`를 반복한다 |
+| 목적 | 자동 시험 `new_tabs_always_open_in_the_agent_profile`(와 core의 `created_tab_lands_in_agent_profile_even_when_human_window_is_active`)는 "사람 창이 마지막으로 활성인 창"이라는 전제를 만든 뒤 탭을 만든다. 전제는 컨텍스트 없는 `Target.createTarget`이 사람 프로필에 생기는지로 확인한다. `Target.activateTarget`만으로는 전제가 만들어지지 않았고(OS 포커스가 다른 앱에 있을 때, Chrome 157), Chrome을 시험 홈의 user-data-dir로 다시 실행해 새 사람 창을 여는 방식으로 만들었다. 이 항목은 실제 사람의 클릭으로 같은 확인을 한다 |
+| 절차 | 1. 세션을 만든다. 2. 사람 창(에이전트 창이 아닌 쪽)의 탭 영역을 마우스로 직접 클릭해 활성 창으로 만든다. 3. 바로 `pegboard tab new https://example.com` 4. 사람 창에 탭이 생겼는지, 에이전트 창의 세션 그룹에 생겼는지 본다. 5. `pegboard tab list` 6. 사람 창을 다시 클릭하고 `pegboard tab new about:blank`를 반복한다 |
 | 기대 결과 | 새 탭은 항상 에이전트 창의 세션 그룹에 생기고 사람 창의 탭 수는 그대로다 |
 | 실제 결과 | |
 
@@ -167,9 +167,21 @@ cat /tmp/pegboard-m-loop.log
 | | |
 |---|---|
 | 목적 | 운영체제 수준의 포커스 도둑질 확인. 자동 시험 `agent_actions_do_not_change_the_humans_active_tab`은 브라우저 안의 상태(사람 창의 활성 탭, `document.hasFocus()`)만 증명하고 맨 앞 앱이 바뀌는지는 증명하지 못한다 |
-| 절차 | 1. 세션을 만든다. 2. 텍스트 편집기를 앞에 두고 입력을 계속한다(또는 `yes` 같은 출력이 계속 나오는 터미널에 키를 계속 누른다). 3. 다른 터미널에서 반복 스크립트(`nohup /tmp/pegboard-m-loop.sh ...`)와 `pegboard open`, `fill`, `tab new`를 돌린다 4. 입력이 끊기거나 맨 앞 앱이 Chrome for Testing으로 바뀌는 순간이 있는지 본다 |
+| 절차 | 1. 세션을 만든다(위 "세션을 만들 때"와 같은 방식으로 `PEGBOARD_SESSION`을 설정). 2. 텍스트 편집기나 메모 앱을 맨 앞에 두고 그 글상자에 글자를 계속 입력한다(멈추지 않고). 3. 입력을 계속하는 동안 다른 터미널 창에서 아래를 붙여넣어 실행한다(약 1분). 4. 입력이 끊기거나 맨 앞 앱이 Chrome for Testing으로 바뀌는 순간이 있었는지 본다 |
 | 기대 결과 | 입력이 끊기지 않고 맨 앞 앱이 바뀌지 않는다. 에이전트 창이 사람 창 앞으로 올라오지도 않는다 |
 | 실제 결과 | |
+
+```bash
+for i in $(seq 1 20); do
+  pegboard open 'data:text/html,<input id=t><button id=b>go</button>' >/dev/null
+  pegboard fill '#t' "agent $i" >/dev/null
+  pegboard click '#b' >/dev/null
+  pegboard tab new https://example.com >/dev/null
+  pegboard tab close >/dev/null
+  sleep 2
+done
+echo done
+```
 
 ## 결과를 반영할 곳
 

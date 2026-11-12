@@ -5,8 +5,9 @@
 //! does: `eval`, `wait --fn` and the other script-taking forms use `Runtime.evaluate` in the
 //! page's main world (checked from the CLI side by `eval_runs_in_the_main_world_and_a11y_works`
 //! in the CLI isolation suite). `a11y` takes caller-supplied `--tags` and `-s` values and runs a
-//! script parameterised by them; how those values are embedded was not verified. A caller of the CLI therefore
-//! cannot reach this primitive. This test attacks it anyway at the proxy level, as a client
+//! script parameterised by them; how those values are embedded was not verified, and what an
+//! escape could reach is bounded by what this test shows. This test attacks the primitive at the
+//! proxy level, as a client
 //! that speaks raw CDP through its session endpoint would: it asks for a universal-access
 //! world and tries to read local files and the human profile from it.
 
@@ -141,7 +142,8 @@ async fn universal_access_isolated_world_cannot_escape() {
         "the evaluation did not run in the isolated world"
     );
 
-    // Real cross-origin read attempt: the page (localhost) embeds the fixture at 127.0.0.1
+    // Regression watch (currently NULL in both worlds because the frame is out-of-process, so
+    // it distinguishes nothing today): the page (localhost) embeds the fixture at 127.0.0.1
     // (`/cookie/get`, whose script prints the cookie and localStorage it sees) and the
     // universal-access world tries to read the other origin's document. Whatever it can read
     // must be the agent profile's data, never the human's (the human tab holds cookie
@@ -166,6 +168,46 @@ async fn universal_access_isolated_world_cannot_escape() {
             "what the world read is not the agent profile's data"
         );
     }
+
+    // Same-origin storage check, the assertion that fails if the session were in the human
+    // context: on a 127.0.0.1 page of the session the universal-access world reads the
+    // cookie and localStorage; the human tab holds `spike=1` on that very origin.
+    client
+        .navigate(&session, &format!("{}/cookie/get", s.fixture.origin))
+        .await
+        .unwrap();
+    let tree = client
+        .send("Page.getFrameTree", json!({}), Some(&session))
+        .await
+        .unwrap();
+    let frame_id = tree["frameTree"]["frame"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let world = client
+        .send(
+            "Page.createIsolatedWorld",
+            json!({ "frameId": frame_id, "worldName": "attack2", "grantUniveralAccess": true }),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    let ctx2 = world["executionContextId"].as_i64().unwrap();
+    let state = eval_in(
+        &client,
+        &session,
+        Some(ctx2),
+        "JSON.stringify({ cookie: document.cookie, ls: localStorage.getItem('spike') })",
+    )
+    .await;
+    assert!(
+        !state.contains("spike=1"),
+        "the world sees the human cookie: {state}"
+    );
+    assert_eq!(
+        state, r#"{"cookie":"","ls":null}"#,
+        "the world sees the human profile's data"
+    );
 
     // The human tab is untouched and not among the targets the session can see.
     let listed = client

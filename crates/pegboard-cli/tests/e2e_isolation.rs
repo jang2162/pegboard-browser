@@ -233,14 +233,12 @@ fn new_tabs_always_open_in_the_agent_profile() {
         (&rig.c, &c_ctx, "/form"),
         (&rig.a, &a_ctx, "/form"),
     ] {
-        let control = rig.human.establish_human_active(&rig.human.target);
-        if control == rig.human.context {
+        if rig.human.establish_premise() {
             premise_held += 1;
         } else {
             eprintln!(
-                "PREMISE NOT ESTABLISHED: after activating the human tab a context-less createTarget landed \
-                 in {control}, not the human profile; the human window is not the browser's last active one \
-                 (see manual check M8)"
+                "PREMISE NOT ESTABLISHED: even after re-invoking Chrome for a new human window a \
+                 context-less createTarget did not land in the human profile (see manual check M8)"
             );
         }
         let before = ids(handle);
@@ -272,10 +270,14 @@ fn new_tabs_always_open_in_the_agent_profile() {
             .map(|t| t.target_id.clone())
             .collect()
     };
+    let mut expected_human = vec![rig.human.target.clone()];
+    expected_human.extend(rig.human.extra.borrow().iter().cloned());
+    let mut got_human = in_ctx(&rig.human.context);
+    got_human.sort();
+    expected_human.sort();
     assert_eq!(
-        in_ctx(&rig.human.context),
-        vec![rig.human.target.clone()],
-        "a tab appeared in the human profile"
+        got_human, expected_human,
+        "a tab appeared in the human profile besides the windows the helper opened"
     );
     let default_ctx = in_ctx(&a_ctx);
     let work_ctx = in_ctx(&c_ctx);

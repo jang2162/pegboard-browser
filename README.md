@@ -70,7 +70,8 @@ pegboard profile delete work                            # 열린 세션이 있�
 - MCP 서버, 화면 녹화(지금 기록은 동작 목록뿐이다), 동작 정책과 확인 요청, 원격 제어, 프로필 복사.
 - 1단계 허용목록에서 뺀 명령. 허용목록(`crates/pegboard-core/src/argv.rs`)에 없는 것은 모두 거부되며, 아래는 그중 알려 둘 만한 것이다.
   - `cookies clear`, `set media`, `set geo`, `set offline`: 필요한 CDP 메서드(`Network.clearBrowserCookies`, 에뮬레이션·네트워크 조건 계열)를 프록시가 허용하지 않는다.
-  - `read`, `flow`, `diff`, `upload`, `download`, `network route`, `network har`, `trace`, `profiler`, `inspect`, `webmcp`, `clipboard`, `react`, `pushstate`, `wait --download`, `batch`: 세션 밖(로컬 파일, CLI 자체의 네트워크 접근, 인증 없는 DevTools 프록시)에 닿는다.
+  - `read`, `flow`, `diff`, `upload`, `download`, `network route`, `network har`, `trace`, `profiler`, `inspect`, `webmcp`, `clipboard`, `react`, `pushstate`, `wait --download`: 세션 밖(로컬 파일, CLI 자체의 네트워크 접근, 인증 없는 DevTools 프록시)에 닿는다.
+  - `batch`: 명령 여러 개를 묶어 한 번에 보내므로 명령별 필터를 지나치게 된다.
   - `set credentials`, `set headers`: 인자에 비밀이 들어가거나 요청 전체에 영향을 준다. 허용목록에 없다.
 
 ## 알려진 한계
@@ -93,6 +94,8 @@ cargo test --workspace                                               # 브라우
 cargo test -p pegboard-cli --test e2e_isolation -- --ignored --test-threads=1   # 격리 시험 묶음
 cargo test --workspace -- --ignored --test-threads=1                 # 실제 브라우저를 띄우는 전체 시험 (몇 분, 창이 뜬다)
 ```
+
+격리 시험 묶음의 `agent_actions_do_not_change_the_humans_active_tab`은 시험용 브라우저 창이 완전히 가려지거나, 최소화되거나, 다른 Space에 있거나, 화면이 잠긴 상태면 "cannot determine"으로 실패한다(활성 탭을 `visibilityState`로 판정하기 때문이다). 시험 중에는 그 창을 가리지 않는다.
 
 실제 브라우저를 띄우는 시험은 `#[ignore]`가 붙어 있고, 임시 `PEGBOARD_HOME`에서 돌며 끝나면 브라우저를 정리한다. 격리 시험 묶음(`crates/pegboard-cli/tests/e2e_isolation.rs`)은 CLI만으로 에이전트가 할 수 있는 일을 시도해 사람 프로필과 다른 세션의 탭에 닿지 못함을 확인한다. 이후 모든 단계에서 유지한다. 손으로 하는 확인은 [docs/phase1-manual-checks.md](docs/phase1-manual-checks.md).
 
