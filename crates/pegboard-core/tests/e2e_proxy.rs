@@ -849,3 +849,63 @@ async fn targets_entering_the_scope_are_reported_before_the_client_hears_of_them
     assert!(!s.proxy.add_target(&unknown, &other));
     s.shutdown().await;
 }
+
+/// A session client cannot lift the deny policy the daemon puts on the profile: every
+/// download-control call is refused, and a download afterwards still writes no file.
+#[tokio::test]
+#[ignore]
+async fn agent_cannot_reenable_downloads() {
+    let s = common::session_fixture().await;
+    let probe = common::DownloadProbe::new();
+    let dir = tempfile::tempdir().unwrap();
+    let c = common::client(&s.endpoint).await;
+    let session = c.attach(&s.first_target).await.unwrap();
+    let allow = |extra: Value| {
+        let mut p = json!({ "behavior": "allow", "downloadPath": dir.path() });
+        p.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        p
+    };
+    let attempts = [
+        ("Browser.setDownloadBehavior", allow(json!({})), None),
+        (
+            "Browser.setDownloadBehavior",
+            allow(json!({ "browserContextId": s.agent_context })),
+            None,
+        ),
+        (
+            "Browser.setDownloadBehavior",
+            allow(json!({ "browserContextId": s.agent_context })),
+            Some(session.as_str()),
+        ),
+        (
+            "Page.setDownloadBehavior",
+            allow(json!({})),
+            Some(session.as_str()),
+        ),
+        ("Browser.cancelDownload", json!({ "guid": "x" }), None),
+    ];
+    for (method, params, sid) in attempts {
+        let r = c.send(method, params, sid).await;
+        assert!(r.is_err(), "{method} (session {sid:?}) was accepted: {r:?}");
+    }
+
+    for path in [
+        format!("/dl/{}", probe.token),
+        format!("/zip/{}.zip", probe.token),
+    ] {
+        c.send(
+            "Page.navigate",
+            json!({ "url": format!("{}{path}", s.fixture.origin) }),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    }
+    let leaked = probe.in_real_downloads();
+    assert!(leaked.is_empty(), "a download was saved: {leaked:?}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    s.shutdown().await;
+}

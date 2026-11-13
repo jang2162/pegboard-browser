@@ -1,6 +1,6 @@
 //! Launch and supervise the headed Chrome that pegboard drives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -70,6 +70,11 @@ pub struct Browser {
     child: Mutex<Child>,
     /// profile directory -> browserContextId, for profiles whose window we opened.
     profiles: Mutex<HashMap<String, String>>,
+    /// Agent browser contexts that carry the download deny policy (see `deny_downloads`).
+    denied: Mutex<HashSet<String>>,
+    /// One long-lived connection per agent context that holds its deny policy (see
+    /// `deny_downloads`). Kept for the life of the browser.
+    deny_conns: Mutex<HashMap<String, CdpConn>>,
 }
 
 impl Browser {
@@ -124,6 +129,8 @@ impl Browser {
                 HUMAN_PROFILE_DIR.to_string(),
                 String::new(),
             )])),
+            denied: Mutex::new(HashSet::new()),
+            deny_conns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -144,8 +151,12 @@ impl Browser {
                 .iter()
                 .any(|t| t.browser_context_id.as_deref() == Some(&ctx))
             {
+                // Normally applied already; retried when an earlier attempt failed.
+                self.deny_downloads(&ctx).await?;
                 return Ok(ctx);
             }
+            // The context is gone (Chrome unloaded the profile): its policy went with it.
+            self.denied.lock().unwrap().remove(&ctx);
         }
         let before: Vec<String> = page_targets(&self.conn)
             .await?
@@ -195,10 +206,71 @@ impl Browser {
                     .lock()
                     .unwrap()
                     .insert(profile_dir.to_string(), ctx.clone());
+                self.denied.lock().unwrap().remove(&ctx);
+                self.deny_downloads(&ctx).await?;
                 return Ok(ctx);
             }
         }
         bail!("no window appeared for profile {profile_dir}")
+    }
+
+    /// Denies every download in the agent profile `context`: phase 1 gives agents no download
+    /// folder, and without a policy Chrome saves into the macOS user's `~/Downloads` without
+    /// asking. Measured on Chrome for Testing 157:
+    /// - Chrome drops the policy when the connection that set it closes, so it is set on a
+    ///   connection this browser keeps for its whole life. Other clients (the session
+    ///   proxy's) coming and going, new tabs, popups and the human profile becoming the active
+    ///   one do not affect it.
+    /// - A connection holds the policy of one context only: setting it for a second context on
+    ///   the same connection silently lifts it from the first. So each agent context gets its
+    ///   own connection (`deny_conns`), not `self.conn`.
+    /// - Chrome resolves `browserContextId` only for the profile that is the browser's default
+    ///   context at that moment (the last active one) and answers "Failed to find browser
+    ///   context" for any other, so a profile whose window was just opened is retried briefly.
+    ///
+    /// Never called for the human context, and never without a context id: without one the
+    /// call would hit the default context, which can be the human's. An error leaves the
+    /// profile unprotected, so the caller must not use it.
+    async fn deny_downloads(&self, context: &str) -> Result<()> {
+        if context.is_empty() || context == self.human_context {
+            bail!("refusing to set a download policy on the human or an unknown context");
+        }
+        if self.denied.lock().unwrap().contains(context) {
+            return Ok(());
+        }
+        let existing = self.deny_conns.lock().unwrap().get(context).cloned();
+        let conn = match existing {
+            Some(conn) => conn,
+            None => {
+                let conn = CdpConn::connect(&self.ws_url).await?;
+                self.deny_conns
+                    .lock()
+                    .unwrap()
+                    .insert(context.to_string(), conn.clone());
+                conn
+            }
+        };
+        let mut last = None;
+        for _ in 0..20 {
+            let sent = conn
+                .send(
+                    "Browser.setDownloadBehavior",
+                    json!({ "behavior": "deny", "browserContextId": context }),
+                    None,
+                )
+                .await;
+            match sent {
+                Ok(_) => {
+                    self.denied.lock().unwrap().insert(context.to_string());
+                    return Ok(());
+                }
+                Err(e) => last = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Err(last
+            .unwrap()
+            .context("could not block downloads in the agent profile"))
     }
 
     /// Whether the browser process has ended.

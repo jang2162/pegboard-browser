@@ -458,6 +458,27 @@ mod tests {
         }
     }
 
+    /// The daemon denies downloads in agent profiles; a client must not be able to lift that.
+    #[test]
+    fn download_control_is_refused_with_and_without_a_session() {
+        for method in [
+            "Browser.setDownloadBehavior",
+            "Page.setDownloadBehavior",
+            "Browser.cancelDownload",
+        ] {
+            for m in [
+                json!({"method":method,"params":{"behavior":"allow","downloadPath":"/tmp"}}),
+                json!({"method":method,"params":{"behavior":"allow","browserContextId":"C1"}}),
+                json!({"method":method,"sessionId":"S1","params":{"behavior":"allow"}}),
+            ] {
+                assert!(
+                    matches!(client_message(&m, &scope()), ClientDecision::Error { .. }),
+                    "{m}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn page_level_cookies_pass() {
         let m = json!({"method":"Network.getCookies","sessionId":"S1"});

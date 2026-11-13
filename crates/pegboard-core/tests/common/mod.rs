@@ -84,6 +84,68 @@ pw.addEventListener('input', () => { if (pw.value.length >= 8) pw.form.submit();
     })
 }
 
+/// `/dl/<name>` is served as an attachment named `<name>`, `/zip/<name>` as a plain zip.
+fn download_route(path: &str) -> Option<(String, String)> {
+    if let Some(name) = path.strip_prefix("/dl/") {
+        return Some((
+            format!(
+                "content-type: application/octet-stream\r\ncontent-disposition: attachment; filename=\"{name}\"\r\n"
+            ),
+            "pegboard download test".into(),
+        ));
+    }
+    if path.starts_with("/zip/") {
+        return Some((
+            "content-type: application/zip\r\n".into(),
+            "pegboard download test".into(),
+        ));
+    }
+    None
+}
+
+/// A file name no other run uses, and a read-only look at the real `~/Downloads`, where a
+/// browser started by a test saves a download that nothing redirects (the browser cannot be
+/// given another `HOME`). Only entries of `~/Downloads` whose name contains the token are
+/// ever removed, on drop, so a failing test cleans up what it caused.
+pub struct DownloadProbe {
+    pub token: String,
+    downloads: PathBuf,
+}
+
+impl DownloadProbe {
+    pub fn new() -> DownloadProbe {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::var_os("HOME").expect("HOME");
+        DownloadProbe {
+            token: format!("pegdl-{}-{nanos:x}", std::process::id()),
+            downloads: PathBuf::from(home).join("Downloads"),
+        }
+    }
+
+    /// Entries of the real `~/Downloads` carrying the token.
+    pub fn in_real_downloads(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(&self.downloads)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().contains(&self.token))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for DownloadProbe {
+    fn drop(&mut self) {
+        for path in self.in_real_downloads() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 async fn serve(mut sock: tokio::net::TcpStream) {
     let mut buf = vec![0u8; 8192];
     let Ok(n) = sock.read(&mut buf).await else {
@@ -96,12 +158,16 @@ async fn serve(mut sock: tokio::net::TcpStream) {
         .and_then(|l| l.split(' ').nth(1))
         .and_then(|p| p.split('?').next())
         .unwrap_or("/");
-    let resp = match route(path) {
-        Some((headers, body)) => format!(
+    let resp = match (download_route(path), route(path)) {
+        (Some((headers, body)), _) => format!(
+            "HTTP/1.1 200 OK\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+        (None, Some((headers, body))) => format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         ),
-        None => "HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\nconnection: close\r\n\r\nnot found".to_string(),
+        (None, None) => "HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\nconnection: close\r\n\r\nnot found".to_string(),
     };
     let _ = sock.write_all(resp.as_bytes()).await;
     let _ = sock.shutdown().await;

@@ -772,3 +772,157 @@ fn session_recovers_after_human_closes_its_last_tab() {
     }
     assert!(gone, "closing the session left its recovered tab open");
 }
+
+impl Rig {
+    /// Opens the download fixture page as `handle`, clicks its attachment link and its plain zip
+    /// link, and returns after the browser had time to save something. Each click must return
+    /// within 10 s; exit code and message are printed (the agent-visible outcome).
+    fn click_download_links(&self, handle: &str, probe: &DownloadProbe) {
+        self.ok(
+            handle,
+            &["open", &self.url(&format!("/dlpage/{}", probe.token))],
+        );
+        for selector in ["#att", "#zip"] {
+            let started = std::time::Instant::now();
+            let (code, out, err) = self.ab(handle, &["click", selector]);
+            let took = started.elapsed();
+            eprintln!("click {selector}: exit {code} in {took:?}; out {out:?}; err {err:?}");
+            assert!(
+                took < Duration::from_secs(10),
+                "click {selector} took {took:?}"
+            );
+        }
+        // Chrome saves a download within a moment of the click.
+        std::thread::sleep(Duration::from_secs(4));
+    }
+
+    /// Nothing carrying the probe's token exists in the real `~/Downloads` or anywhere under
+    /// the test's pegboard home (session files, profile directories).
+    fn assert_no_download_written(&self, probe: &DownloadProbe) {
+        let in_downloads = probe.in_real_downloads();
+        assert!(
+            in_downloads.is_empty(),
+            "a download was saved to ~/Downloads: {in_downloads:?}"
+        );
+        let in_home = probe.find_under(self.home.path());
+        assert!(
+            in_home.is_empty(),
+            "a download was saved under the pegboard home: {in_home:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn agent_download_writes_no_file() {
+    let rig = Rig::new();
+    for (handle, profile) in [(&rig.a, "default"), (&rig.c, "work")] {
+        let probe = DownloadProbe::new();
+        eprintln!("profile {profile}, token {}", probe.token);
+        rig.click_download_links(handle, &probe);
+        rig.assert_no_download_written(&probe);
+    }
+}
+
+#[test]
+#[ignore]
+fn download_policy_survives_reconnects() {
+    let rig = Rig::new();
+    let probe = DownloadProbe::new();
+    // Every command attaches agent-browser to the proxy and detaches again.
+    for _ in 0..3 {
+        rig.ok(&rig.a, &["tab", "list"]);
+        rig.ok(&rig.a, &["open", &rig.url("/counter")]);
+    }
+    rig.click_download_links(&rig.a, &probe);
+    rig.assert_no_download_written(&probe);
+
+    // A new tab of the same session.
+    let probe = DownloadProbe::new();
+    rig.ok(
+        &rig.a,
+        &["tab", "new", &rig.url(&format!("/dlpage/{}", probe.token))],
+    );
+    for selector in ["#att", "#zip"] {
+        rig.ab(&rig.a, &["click", selector]);
+    }
+    std::thread::sleep(Duration::from_secs(4));
+    rig.assert_no_download_written(&probe);
+
+    // Closing the session ends its proxy connections; a later session of the same profile
+    // is still covered.
+    let (code, _, err) = rig.home.run(&["session", "close", &rig.a]);
+    assert_eq!(code, 0, "{err}");
+    let (code, out, err) = rig.home.run(&["session", "create", "--name", "again"]);
+    assert_eq!(code, 0, "{err}");
+    let again = session_handle(&out);
+    let probe = DownloadProbe::new();
+    rig.click_download_links(&again, &probe);
+    rig.assert_no_download_written(&probe);
+
+    // The named profile, after its first session closed and a new one opened.
+    let (code, _, err) = rig.home.run(&["session", "close", &rig.c]);
+    assert_eq!(code, 0, "{err}");
+    let (code, out, err) =
+        rig.home
+            .run(&["session", "create", "--name", "c2", "--profile", "work"]);
+    assert_eq!(code, 0, "{err}");
+    let c2 = session_handle(&out);
+    let probe = DownloadProbe::new();
+    rig.click_download_links(&c2, &probe);
+    rig.assert_no_download_written(&probe);
+}
+
+/// The human profile keeps Chrome's normal download behaviour: nothing pegboard does denies it.
+/// The human's own connection sets the download folder for the human context only (a temp
+/// directory, so the real `~/Downloads` is never written) and a download completes there.
+#[test]
+#[ignore]
+fn human_downloads_still_work() {
+    let rig = Rig::new();
+    let probe = DownloadProbe::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut events = rig.human.events();
+    // Chrome resolves a browserContextId only for the profile that is the browser's default
+    // context (the last active one), so the human window must be the active one.
+    assert!(
+        rig.human.establish_premise(),
+        "could not make the human window the active one"
+    );
+    rig.human
+        .send(
+            "Browser.setDownloadBehavior",
+            serde_json::json!({
+                "behavior": "allow",
+                "downloadPath": dir.path(),
+                "browserContextId": rig.human.context,
+                "eventsEnabled": true,
+            }),
+        )
+        .unwrap();
+    // A download navigation fires no load event, so the page itself starts it.
+    rig.human.evaluate(
+        &rig.human.target,
+        &format!(
+            "location.href = '{}'; 1",
+            rig.url(&format!("/dl/{}", probe.token))
+        ),
+    );
+    let done = loop {
+        let Some(p) = rig.human.wait_event(
+            &mut events,
+            "Browser.downloadProgress",
+            Duration::from_secs(15),
+        ) else {
+            panic!("no download progress in the human profile");
+        };
+        match p["state"].as_str() {
+            Some("completed") => break p,
+            Some("canceled") => panic!("the human's download was canceled: {p}"),
+            _ => {}
+        }
+    };
+    eprintln!("human download: {done}");
+    assert!(dir.path().join(&probe.token).exists());
+    assert!(probe.in_real_downloads().is_empty());
+}

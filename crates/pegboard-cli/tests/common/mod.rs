@@ -66,6 +66,103 @@ document.getElementById('out').textContent = JSON.stringify({ cookie: document.c
     })
 }
 
+/// Download fixtures keyed by a file name chosen by the test (see `DownloadProbe`):
+/// `/dlpage/<name>` links to `/dl/<name>` (served as an attachment) and to `/zip/<name>.zip`
+/// (a plain zip link without `Content-Disposition`, as in manual check M5). Returns the full
+/// header block (content type included) and the body.
+fn download_route(path: &str) -> Option<(String, String)> {
+    if let Some(name) = path.strip_prefix("/dlpage/") {
+        let body = page(
+            "download",
+            &format!(
+                r#"<a id="att" href="/dl/{name}">attachment</a> <a id="zip" href="/zip/{name}.zip">zip</a>"#
+            ),
+        );
+        return Some(("content-type: text/html\r\n".into(), body));
+    }
+    if let Some(name) = path.strip_prefix("/dl/") {
+        return Some((
+            format!(
+                "content-type: application/octet-stream\r\ncontent-disposition: attachment; filename=\"{name}\"\r\n"
+            ),
+            "pegboard download test".into(),
+        ));
+    }
+    if path.starts_with("/zip/") {
+        return Some((
+            "content-type: application/zip\r\n".into(),
+            "pegboard download test".into(),
+        ));
+    }
+    None
+}
+
+/// A file name no other run uses, and a read-only look at the real `~/Downloads` (where a
+/// browser started by a test saves a download that nothing redirects; the product's browser
+/// cannot be given another `HOME`, measured on Chrome for Testing 157). Only entries of
+/// `~/Downloads` whose name contains the token are ever removed (on drop, so a failing test
+/// cleans up what it caused).
+pub struct DownloadProbe {
+    pub token: String,
+    downloads: std::path::PathBuf,
+}
+
+impl DownloadProbe {
+    pub fn new() -> DownloadProbe {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::var_os("HOME").expect("HOME");
+        DownloadProbe {
+            token: format!("pegdl-{}-{nanos:x}", std::process::id()),
+            downloads: Path::new(&home).join("Downloads"),
+        }
+    }
+
+    /// Paths under `root` (recursively, not following symlinks) whose file name contains the token.
+    pub fn find_under(&self, root: &Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_name().to_string_lossy().contains(&self.token) {
+                    found.push(path.clone());
+                }
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// Entries of the real `~/Downloads` carrying the token (not recursive).
+    pub fn in_real_downloads(&self) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&self.downloads)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().contains(&self.token))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for DownloadProbe {
+    fn drop(&mut self) {
+        for path in self.in_real_downloads() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Serves the fixture pages on a loopback port for as long as the test process lives.
 pub fn fixture() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -83,12 +180,16 @@ pub fn fixture() -> String {
                     .and_then(|l| l.split(' ').nth(1))
                     .and_then(|p| p.split('?').next())
                     .unwrap_or("/");
-                let resp = match route(path) {
-                    Some((headers, body)) => format!(
+                let resp = match (download_route(path), route(path)) {
+                    (Some((headers, body)), _) => format!(
+                        "HTTP/1.1 200 OK\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    ),
+                    (None, Some((headers, body))) => format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     ),
-                    None => "HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\nconnection: close\r\n\r\nnot found"
+                    (None, None) => "HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\nconnection: close\r\n\r\nnot found"
                         .to_string(),
                 };
                 let _ = stream.write_all(resp.as_bytes());
@@ -306,6 +407,39 @@ impl Human {
                 .expect("browserContextId"),
             target: pages[0].target_id.clone(),
         }
+    }
+
+    /// A CDP command straight to the browser, as the human's own connection.
+    pub fn send(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.rt.block_on(self.conn.send(method, params, None))
+    }
+
+    /// A subscription to the events this connection receives.
+    pub fn events(&self) -> tokio::sync::broadcast::Receiver<pegboard_core::cdp::CdpEvent> {
+        self.conn.events()
+    }
+
+    /// Waits up to `limit` for an event with this method on `events`.
+    pub fn wait_event(
+        &self,
+        events: &mut tokio::sync::broadcast::Receiver<pegboard_core::cdp::CdpEvent>,
+        method: &str,
+        limit: Duration,
+    ) -> Option<Value> {
+        self.rt.block_on(async {
+            tokio::time::timeout(limit, async {
+                loop {
+                    match events.recv().await {
+                        Ok(e) if e.method == method => return Some(e.params),
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => return None,
+                    }
+                }
+            })
+            .await
+            .ok()
+            .flatten()
+        })
     }
 
     pub fn pages(&self) -> Vec<pegboard_core::cdp::TargetInfo> {
