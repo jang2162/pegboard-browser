@@ -91,13 +91,29 @@ pub fn judge_resolved(
     if loopback && own_ports.contains(&port) {
         return Verdict::Deny(OWN_PORT);
     }
-    // A listed name is open wherever it resolves, except that a private address still needs
-    // `allow_private_network` (and loopback is closed by `no_localhost`).
+    // With an allow-list, a listed name that resolves to loopback is open only when the list
+    // also opens loopback (a loopback name or address is listed): a listed public name
+    // pointed at 127.0.0.1 is DNS rebinding. A private address still needs
+    // `allow_private_network`.
     let list = &policy.allow_domains;
-    if !list.is_empty() && !is_listed(&target_of_host(host), list) {
-        return Verdict::Deny(NOT_LISTED);
+    if !list.is_empty() {
+        if !is_listed(&target_of_host(host), list) {
+            return Verdict::Deny(NOT_LISTED);
+        }
+        if loopback && !list_opens_loopback(list) {
+            return Verdict::Deny(LOOPBACK);
+        }
     }
     judge_class(loopback, is_private(ip), policy)
+}
+
+/// Whether an allow-list opens loopback: it names `localhost` or a `*.localhost` name, or a
+/// loopback address.
+fn list_opens_loopback(list: &[String]) -> bool {
+    list.iter().any(|entry| match target_of_host(entry) {
+        Target::Name(n) => is_loopback_name(&n),
+        Target::Ip(ip) => is_loopback(ip),
+    })
 }
 
 /// Rules 4 and 5.
@@ -377,8 +393,14 @@ mod tests {
         assert_eq!(judge("93.184.216.34", 443, &default), Allow);
         let listed = list(&["public.example"]);
         assert_eq!(judge("10.0.0.5", 80, &listed), Deny(PRIVATE));
-        assert_eq!(judge("127.0.0.1", 80, &listed), Allow);
+        assert_eq!(judge("127.0.0.1", 80, &listed), Deny(LOOPBACK));
+        assert_eq!(judge("0.0.0.0", 80, &listed), Deny(LOOPBACK));
         assert_eq!(judge("127.0.0.1", 9333, &listed), Deny(OWN_PORT));
+        for opens in ["localhost", "a.localhost", "127.0.0.1", "::1"] {
+            let both = list(&["public.example", opens]);
+            assert_eq!(judge("127.0.0.1", 80, &both), Allow, "{opens}");
+            assert_eq!(judge("127.0.0.1", 9222, &both), Deny(OWN_PORT), "{opens}");
+        }
         assert_eq!(judge("93.184.216.34", 443, &listed), Allow);
         assert_eq!(
             judge_resolved(ip("93.184.216.34"), 443, "other.example", &listed, PORTS),
