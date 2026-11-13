@@ -1033,6 +1033,11 @@ fn client_learns_that_a_tab_it_knew_was_closed_by_the_human() {
         let cdp_session = attached["sessionId"].as_str().unwrap().to_string();
         assert!(listed(&c).await.contains(&second));
 
+        // The daemon's watcher takes a closed target out of the scope as soon as it hears of
+        // it, and which of it and this connection hears first is a race. Do the watcher's
+        // part first, so the destroy event always finds the target outside the scope and
+        // only the told-targets rule can pass it on.
+        h.proxy.remove_target(&info.id, &second);
         human_closes(&h.browser, &second).await;
 
         let (mut destroyed, mut detached) = (false, false);
