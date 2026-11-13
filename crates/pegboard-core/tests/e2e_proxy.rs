@@ -997,3 +997,115 @@ fn agent_cannot_reenable_downloads() {
         s.shutdown().await;
     });
 }
+
+/// Closes a tab the way the human does: not through the session's connection.
+async fn human_closes(b: &pegboard_core::browser::Browser, target: &str) {
+    b.conn
+        .send("Target.closeTarget", json!({ "targetId": target }), None)
+        .await
+        .unwrap();
+}
+
+#[test]
+#[ignore]
+fn client_learns_that_a_tab_it_knew_was_closed_by_the_human() {
+    common::run(async {
+        let h = common::Harness::start();
+        let (info, ep) = h.create("/counter").await;
+        let c = common::client(&ep).await;
+        let mut events = c.events();
+        c.send(
+            "Target.setDiscoverTargets",
+            json!({ "discover": true }),
+            None,
+        )
+        .await
+        .unwrap();
+        let second = create_tab(&c, json!({ "url": "about:blank" })).await;
+        let attached = c
+            .send(
+                "Target.attachToTarget",
+                json!({ "targetId": second, "flatten": true }),
+                None,
+            )
+            .await
+            .unwrap();
+        let cdp_session = attached["sessionId"].as_str().unwrap().to_string();
+        assert!(listed(&c).await.contains(&second));
+
+        human_closes(&h.browser, &second).await;
+
+        let (mut destroyed, mut detached) = (false, false);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !(destroyed && detached) && tokio::time::Instant::now() < deadline {
+            let Ok(Ok(e)) = tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+            else {
+                continue;
+            };
+            destroyed |= e.method == "Target.targetDestroyed" && e.params["targetId"] == second;
+            detached |=
+                e.method == "Target.detachedFromTarget" && e.params["sessionId"] == cdp_session;
+        }
+        assert!(destroyed, "no Target.targetDestroyed for the closed tab");
+        assert!(detached, "no Target.detachedFromTarget for its CDP session");
+        assert_eq!(listed(&c).await, vec![info.targets[0].clone()]);
+        h.finish().await;
+    });
+}
+
+#[test]
+#[ignore]
+fn client_never_hears_about_targets_it_did_not_know() {
+    common::run(async {
+        let h = common::Harness::start();
+        let (_a, a_ep) = h.create("/counter").await;
+        let (b, _b_ep) = h.create("/counter").await;
+        let c = common::client(&a_ep).await;
+        let mut events = c.events();
+        c.send(
+            "Target.setDiscoverTargets",
+            json!({ "discover": true }),
+            None,
+        )
+        .await
+        .unwrap();
+        // Another session's tab and a tab of the human's, both closed by the human.
+        let human = h
+            .browser
+            .conn
+            .send("Target.createTarget", json!({ "url": "about:blank" }), None)
+            .await
+            .unwrap()["targetId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        human_closes(&h.browser, &human).await;
+        human_closes(&h.browser, &b.targets[0]).await;
+        // A tab of this session, closed the same way, is reported: the test can hear.
+        let own = create_tab(&c, json!({ "url": "about:blank" })).await;
+        human_closes(&h.browser, &own).await;
+        let mut own_heard = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(e)) = tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+            else {
+                continue;
+            };
+            let about = e.params["targetId"]
+                .as_str()
+                .or_else(|| e.params["targetInfo"]["targetId"].as_str())
+                .unwrap_or_default();
+            assert!(
+                about != human && about != b.targets[0],
+                "heard {} about a target it did not know",
+                e.method
+            );
+            own_heard |= e.method == "Target.targetDestroyed" && about == own;
+        }
+        assert!(
+            own_heard,
+            "no Target.targetDestroyed for the client's own tab"
+        );
+        h.finish().await;
+    });
+}
