@@ -26,6 +26,9 @@ pub const MAX_EVAL_CHARS: usize = 200;
 /// Longest error text (in characters) kept in the log.
 pub const MAX_ERROR_CHARS: usize = 200;
 
+/// Longest line (with its newline) `ActionLog::append` writes.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
 const MANIFEST_FORMAT: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,8 +141,7 @@ impl ActionLog {
     /// Writes the entry as one line, numbering it (`seq` is overwritten), and flushes.
     pub fn append(&mut self, mut entry: ActionEntry) -> std::io::Result<()> {
         entry.seq = self.next_seq;
-        let mut line = serde_json::to_vec(&entry).map_err(std::io::Error::other)?;
-        line.push(b'\n');
+        let line = capped_line(&mut entry)?;
         self.actions.write_all(&line)?;
         self.actions.flush()?;
         self.next_seq += 1;
@@ -167,6 +169,39 @@ impl ActionLog {
         file.write_all(&serde_json::to_vec_pretty(&self.manifest).map_err(std::io::Error::other)?)?;
         file.flush()?;
         std::fs::rename(&tmp, self.dir.join("manifest.json"))
+    }
+}
+
+/// The entry as one line of at most `MAX_LINE_BYTES`. Words are redacted before they get
+/// here; when the line is still too long the longest word (an argument, the command or the
+/// URL) is replaced by `[<n> bytes]` until it fits. A redaction marker and a word no longer
+/// than its replacement are left alone, so the cap never puts content where a marker was.
+fn capped_line(entry: &mut ActionEntry) -> std::io::Result<Vec<u8>> {
+    loop {
+        let mut line = serde_json::to_vec(&*entry).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        if line.len() <= MAX_LINE_BYTES {
+            return Ok(line);
+        }
+        let mut words: Vec<&mut String> = entry.args.iter_mut().collect();
+        words.push(&mut entry.command);
+        if let Some(url) = entry.url.as_mut() {
+            words.push(url);
+        }
+        let longest = words
+            .into_iter()
+            .filter(|w| w.as_str() != REDACTED)
+            .max_by_key(|w| w.len());
+        match longest {
+            Some(word) if word.len() > format!("[{} bytes]", word.len()).len() => {
+                *word = format!("[{} bytes]", word.len());
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "an action entry cannot be cut to the line limit",
+                ))
+            }
+        }
     }
 }
 
@@ -910,5 +945,59 @@ mod tests {
         assert!(attrs_are_sensitive(None, Some("  CC-Number\t")));
         assert!(!attrs_are_sensitive(Some("text"), Some("email")));
         assert!(!attrs_are_sensitive(None, None));
+    }
+
+    #[test]
+    fn a_log_line_never_exceeds_64_kib() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        let mut log = ActionLog::open(&paths, manifest("r_abcdefgh")).unwrap();
+        let huge = "x".repeat(64 * 1024);
+        let mut args: Vec<String> = (0..4).map(|_| huge.clone()).collect();
+        args.push("short".to_string());
+        args.push(REDACTED.to_string());
+        // Characters that JSON escapes (six bytes each) must count too.
+        args.push("\u{1}".repeat(30_000));
+        let mut e = entry("fill", args);
+        e.url = Some(huge.clone());
+        log.append(e).unwrap();
+        log.append(entry("click", s(vec!["@e1"]))).unwrap();
+        let text = std::fs::read_to_string(tmp.path().join("recordings/r_abcdefgh/actions.jsonl"))
+            .unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].len() + 1 <= MAX_LINE_BYTES, "{}", lines[0].len());
+        let got: ActionEntry = serde_json::from_str(lines[0]).unwrap();
+        // The words that had to go are named by their size; a redaction marker and short
+        // words stay as they are, and nothing of an over-long word is kept.
+        assert!(got.args.iter().any(|a| a == "short"));
+        assert!(got.args.iter().any(|a| a == REDACTED));
+        assert!(got.args.iter().all(|a| !a.contains("xxxx")));
+        assert!(got.args.iter().any(|a| a == "[65536 bytes]"));
+        // A line that fits is untouched.
+        let ok: ActionEntry = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(ok.args, vec!["@e1"]);
+    }
+
+    #[test]
+    fn a_redaction_marker_is_never_replaced_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        let mut log = ActionLog::open(&paths, manifest("r_abcdefgh")).unwrap();
+        let args: Vec<String> = (0..256)
+            .map(|i| {
+                if i % 2 == 0 {
+                    REDACTED.to_string()
+                } else {
+                    "y".repeat(2000)
+                }
+            })
+            .collect();
+        log.append(entry("fill", args)).unwrap();
+        let text = std::fs::read_to_string(tmp.path().join("recordings/r_abcdefgh/actions.jsonl"))
+            .unwrap();
+        assert!(text.len() <= MAX_LINE_BYTES);
+        let got: ActionEntry = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(got.args.iter().filter(|a| *a == REDACTED).count(), 128);
     }
 }
