@@ -511,12 +511,7 @@ impl SessionManager {
         let Ok(pages) = page_targets(&inner.browser.conn).await else {
             return;
         };
-        let blank: BTreeSet<String> = pages
-            .into_iter()
-            .filter(|t| own.contains(&t.target_id) && t.target_id != keep)
-            .filter(|t| t.url == "about:blank")
-            .map(|t| t.target_id)
-            .collect();
+        let blank = blank_to_close(&pages, &own, keep);
         if !blank.is_empty() {
             let _ = close_tabs(&inner.browser.conn, &bridge, &blank).await;
         }
@@ -979,6 +974,26 @@ fn strays(members: Vec<String>, others: &HashSet<String>) -> Vec<String> {
         .collect()
 }
 
+/// Which of the session's tabs `close_blank_tabs_except` closes: nothing unless `keep` is a
+/// live tab of the session; otherwise its blank tabs that no page opened (a popup still
+/// loading about:blank has an opener and stays).
+fn blank_to_close(
+    pages: &[crate::cdp::TargetInfo],
+    own: &HashSet<String>,
+    keep: &str,
+) -> BTreeSet<String> {
+    let keep_alive = own.contains(keep) && pages.iter().any(|t| t.target_id == keep);
+    if !keep_alive {
+        return BTreeSet::new();
+    }
+    pages
+        .iter()
+        .filter(|t| own.contains(&t.target_id) && t.target_id != keep)
+        .filter(|t| t.url == "about:blank" && t.opener_id.is_none())
+        .map(|t| t.target_id.clone())
+        .collect()
+}
+
 const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 const CLOSE_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -1084,6 +1099,37 @@ mod tests {
         .await;
         assert!(r.unwrap_err().to_string().contains("still unknown"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    fn page(id: &str, url: &str, opener: Option<&str>) -> crate::cdp::TargetInfo {
+        crate::cdp::TargetInfo {
+            target_id: id.into(),
+            kind: "page".into(),
+            url: url.into(),
+            browser_context_id: None,
+            opener_id: opener.map(String::from),
+        }
+    }
+
+    #[test]
+    fn blank_cleanup_keeps_the_bound_tab_popups_and_foreign_tabs() {
+        let pages = vec![
+            page("keep", "http://a.test/", None),
+            page("blank", "about:blank", None),
+            page("popup", "about:blank", Some("keep")),
+            page("page", "http://b.test/", None),
+            page("foreign", "about:blank", None),
+        ];
+        let own: HashSet<String> = ["keep", "blank", "popup", "page"].map(String::from).into();
+        assert_eq!(
+            blank_to_close(&pages, &own, "keep"),
+            BTreeSet::from(["blank".to_string()])
+        );
+        // The bound tab is not in the session, or not alive: nothing is closed.
+        assert!(blank_to_close(&pages, &own, "foreign").is_empty());
+        assert!(blank_to_close(&pages, &own, "gone").is_empty());
+        let own_gone: HashSet<String> = ["gone", "blank"].map(String::from).into();
+        assert!(blank_to_close(&pages, &own_gone, "gone").is_empty());
     }
 
     #[test]

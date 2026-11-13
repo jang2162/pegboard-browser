@@ -450,8 +450,13 @@ impl Told {
         };
         match msg.get("method").and_then(Value::as_str) {
             Some("Target.targetDestroyed") => has(&self.targets, "targetId"),
+            // One that names a session is about that session only.
             Some("Target.detachedFromTarget") => {
-                has(&self.sessions, "sessionId") || has(&self.targets, "targetId")
+                if params.get("sessionId").is_some() {
+                    has(&self.sessions, "sessionId")
+                } else {
+                    has(&self.targets, "targetId")
+                }
             }
             _ => false,
         }
@@ -967,6 +972,24 @@ mod tests {
         assert_eq!(
             browser_message_told(destroyed, None, &scope(), &told),
             BrowserDecision::Drop
+        );
+    }
+
+    #[test]
+    fn detached_with_a_session_id_needs_the_session_to_be_known() {
+        let detached = json!({"method":"Target.detachedFromTarget","params":{"sessionId":"SZ","targetId":"GONE"}});
+        let mut told = Told::default();
+        told.on_sent(
+            &json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"GONE"}}}),
+        );
+        assert_eq!(
+            browser_message_told(detached.clone(), None, &scope(), &told),
+            BrowserDecision::Drop
+        );
+        told.on_sent(&json!({"id":1,"result":{"sessionId":"SZ"}}));
+        assert_eq!(
+            browser_message_told(detached.clone(), None, &scope(), &told),
+            BrowserDecision::Forward(detached)
         );
     }
 

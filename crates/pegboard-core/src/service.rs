@@ -382,6 +382,10 @@ impl Daemon {
             .map(|(id, slot)| (id.clone(), slot.clone()))
             .collect();
         for (id, slot) in due {
+            // Shutdown may have begun while an earlier session was closing.
+            if self.stopping.load(Ordering::SeqCst) {
+                return;
+            }
             if matches!(self.sessions.policy(&id), Ok(p) if p.no_expire) {
                 continue;
             }
