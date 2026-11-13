@@ -326,8 +326,10 @@ impl SessionManager {
         Ok(self.inner.info_of(record))
     }
 
-    /// Closes the session's tabs (also tabs in its group the proxy never saw), or with
-    /// `keep_tabs` only ungroups them, and drops its endpoint.
+    /// Closes the session's own tabs (the targets in its proxy scope) and the tabs in its
+    /// group that no session owns (a tab the human opened inside it); with `keep_tabs` only
+    /// takes those out of the group. A tab in the group that is in another session's scope
+    /// is left alone, grouped where it is. Drops the endpoint.
     pub async fn close(&self, p: SessionCloseParams) -> Result<SessionInfo, RpcError> {
         let inner = &self.inner;
         let id = &p.session_id;
@@ -341,10 +343,26 @@ impl SessionManager {
         // Clients go first, so an agent cannot make new tabs while the old ones close.
         inner.proxy.unregister(id);
         if let Ok(members) = record.bridge.members(&record.group).await {
-            targets.extend(members);
+            let others: HashSet<String> = inner
+                .scopes()
+                .iter()
+                .flat_map(|(other, _)| inner.proxy.targets(other))
+                .collect();
+            targets.extend(strays(members, &others));
         }
         let result = if p.keep_tabs {
-            record.bridge.ungroup(&record.group).await
+            // The bridge refuses a whole call when one id is unknown (a tab the human closed).
+            match page_targets(&inner.browser.conn).await {
+                Ok(live) => {
+                    let tabs: Vec<String> = live
+                        .into_iter()
+                        .map(|t| t.target_id)
+                        .filter(|t| targets.contains(t))
+                        .collect();
+                    record.bridge.ungroup_targets(&tabs).await
+                }
+                Err(e) => Err(e),
+            }
         } else {
             close_tabs(&inner.browser.conn, &record.bridge, &targets).await
         };
@@ -925,6 +943,15 @@ async fn open_url(conn: &CdpConn, target: &str, url: &str) -> Result<(), RpcErro
     r
 }
 
+/// The tabs of a session's group that no other session owns: what closing the session takes
+/// besides its own tabs.
+fn strays(members: Vec<String>, others: &HashSet<String>) -> Vec<String> {
+    members
+        .into_iter()
+        .filter(|m| !others.contains(m))
+        .collect()
+}
+
 const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 const CLOSE_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -1030,6 +1057,17 @@ mod tests {
         .await;
         assert!(r.unwrap_err().to_string().contains("still unknown"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn closing_leaves_the_group_tabs_of_other_sessions() {
+        let others: HashSet<String> = ["theirs".to_string()].into();
+        let members = vec![
+            "mine".to_string(),
+            "theirs".to_string(),
+            "human".to_string(),
+        ];
+        assert_eq!(strays(members, &others), vec!["mine", "human"]);
     }
 
     #[test]

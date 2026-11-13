@@ -111,6 +111,14 @@ self.peg = {
     return {};
   },
 
+  // Takes these tabs out of their groups (whatever group each is in); other tabs stay.
+  async ungroupTargets(targetIds) {
+    const tabIds = [];
+    for (const id of targetIds) tabIds.push(await tabIdOf(id));
+    if (tabIds.length) await chrome.tabs.ungroup(tabIds);
+    return {};
+  },
+
   async ungroup(groupId) {
     const tabs = await chrome.tabs.query({ groupId });
     if (tabs.length) await chrome.tabs.ungroup(tabs.map((t) => t.id));

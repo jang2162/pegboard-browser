@@ -397,6 +397,112 @@ fn close_removes_tabs_and_keep_tabs_leaves_them() {
     });
 }
 
+/// Session `a` has a second tab that is moved into the group of session `b` (as the human
+/// can by dragging it). Returns (a, b, the moved tab).
+async fn a_tab_of_a_in_the_group_of_b(h: &T) -> (SessionInfo, SessionInfo, String) {
+    let bridge = h.bridge().await;
+    let a = h.make(params(Some("a"), None, None)).await;
+    let b = h.make(params(Some("b"), None, None)).await;
+    let moved = h.manager.new_tab(&a.id, &h.url("/form")).await.unwrap();
+    bridge
+        .add_to_group(&GroupId(b.tab_group_id), &moved)
+        .await
+        .unwrap();
+    let members = bridge.members(&GroupId(b.tab_group_id)).await.unwrap();
+    assert!(members.contains(&moved) && members.contains(&b.targets[0]));
+    assert!(h.proxy.targets(&a.id).contains(&moved));
+    (a, b, moved)
+}
+
+#[test]
+#[ignore]
+fn closing_a_session_leaves_another_sessions_tab_that_sits_in_its_group() {
+    common::run(async {
+        let h = T::start().await;
+        let bridge = h.bridge().await;
+        let (a, b, moved) = a_tab_of_a_in_the_group_of_b(&h).await;
+        h.manager
+            .close(SessionCloseParams {
+                session_id: b.id.clone(),
+                keep_tabs: false,
+            })
+            .await
+            .unwrap();
+        let own_gone = eventually(2, || async {
+            !live_targets(&h.browser).await.contains(&b.targets[0])
+        })
+        .await;
+        assert!(own_gone, "the closed session's own tab is still open");
+        // The other session's tab is still open, still in A's scope, and still grouped where
+        // it was.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(live_targets(&h.browser).await.contains(&moved));
+        assert!(h.proxy.targets(&a.id).contains(&moved));
+        assert_eq!(
+            bridge.members(&GroupId(b.tab_group_id)).await.unwrap(),
+            vec![moved.clone()]
+        );
+        h.finish().await;
+    });
+}
+
+#[test]
+#[ignore]
+fn keep_tabs_does_not_ungroup_another_sessions_tab() {
+    common::run(async {
+        let h = T::start().await;
+        let bridge = h.bridge().await;
+        let (_a, b, moved) = a_tab_of_a_in_the_group_of_b(&h).await;
+        h.manager
+            .close(SessionCloseParams {
+                session_id: b.id.clone(),
+                keep_tabs: true,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let live = live_targets(&h.browser).await;
+        assert!(live.contains(&b.targets[0]) && live.contains(&moved));
+        // B's own tab left the group; A's tab is still in it.
+        assert_eq!(
+            bridge.members(&GroupId(b.tab_group_id)).await.unwrap(),
+            vec![moved.clone()]
+        );
+        h.finish().await;
+    });
+}
+
+#[test]
+#[ignore]
+fn closing_a_session_closes_stray_tabs_in_its_group() {
+    common::run(async {
+        let h = T::start().await;
+        let bridge = h.bridge().await;
+        let (_a, b, moved) = a_tab_of_a_in_the_group_of_b(&h).await;
+        // A tab the human opened inside B's group: in no session's scope.
+        let stray = bridge
+            .create_tab(&GroupId(b.tab_group_id), "about:blank", "b", "blue")
+            .await
+            .unwrap()
+            .0;
+        h.manager
+            .close(SessionCloseParams {
+                session_id: b.id.clone(),
+                keep_tabs: false,
+            })
+            .await
+            .unwrap();
+        let gone = eventually(2, || async {
+            let live = live_targets(&h.browser).await;
+            !live.contains(&b.targets[0]) && !live.contains(&stray)
+        })
+        .await;
+        assert!(gone, "the stray or the session's own tab is still open");
+        assert!(live_targets(&h.browser).await.contains(&moved));
+        h.finish().await;
+    });
+}
+
 #[test]
 #[ignore]
 fn manually_closed_tab_is_reported_and_recoverable() {

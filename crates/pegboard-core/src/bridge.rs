@@ -213,6 +213,12 @@ impl Bridge {
         Ok(())
     }
 
+    /// Takes the tabs out of their groups; no other tab is touched.
+    pub async fn ungroup_targets(&self, target_ids: &[String]) -> Result<()> {
+        self.call("ungroupTargets", &[json!(target_ids)]).await?;
+        Ok(())
+    }
+
     pub async fn ungroup(&self, group: &GroupId) -> Result<()> {
         self.call("ungroup", &[json!(group.0)]).await?;
         Ok(())
