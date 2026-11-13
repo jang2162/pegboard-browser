@@ -1,4 +1,5 @@
 pub mod actionlog;
+pub mod address;
 pub mod api;
 pub mod argv;
 pub mod bridge;
