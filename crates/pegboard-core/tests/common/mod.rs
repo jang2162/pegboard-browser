@@ -473,6 +473,7 @@ pub struct Shared {
     pub proxy: Arc<ProxyServer>,
     pub manager: SessionManager,
     pub runner: Arc<Runner>,
+    agent: tokio::sync::OnceCell<(String, Arc<pegboard_core::bridge::Bridge>)>,
 }
 
 /// The binary's browser, started on first use. Call it from inside `run` or a plain test.
@@ -515,7 +516,28 @@ impl Shared {
             proxy,
             manager,
             runner,
+            agent: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The `PegboardAgent` profile's context and a bridge to its extension, opened on first
+    /// use and kept for the binary's life (for suites that talk to the bridge and the proxy
+    /// directly instead of through the session manager).
+    pub async fn agent(&self) -> (String, Arc<pegboard_core::bridge::Bridge>) {
+        self.agent
+            .get_or_init(|| async {
+                let ctx = self
+                    .browser
+                    .open_profile_window(&self.env.paths, &self.env.cfg, "PegboardAgent")
+                    .await
+                    .unwrap();
+                let bridge = pegboard_core::bridge::Bridge::attach(&self.browser.conn, &ctx)
+                    .await
+                    .unwrap();
+                (ctx, Arc::new(bridge))
+            })
+            .await
+            .clone()
     }
 
     pub fn url(&self, path: &str) -> String {
@@ -767,5 +789,158 @@ where
             return false;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ---- page scopes: leave the shared browser with the tabs it had ----
+
+/// The page targets that existed when a test began; `finish` closes every other page target
+/// (the test's own tabs, popups and human tabs), so the next test starts from the same state.
+pub struct PageScope {
+    before: std::collections::HashSet<String>,
+}
+
+impl PageScope {
+    pub async fn begin(conn: &CdpConn) -> PageScope {
+        PageScope {
+            before: page_targets(conn)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|t| t.target_id)
+                .collect(),
+        }
+    }
+
+    pub async fn finish(self, conn: &CdpConn) {
+        for _ in 0..50 {
+            let stray: Vec<String> = page_targets(conn)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|t| t.target_id)
+                .filter(|id| !self.before.contains(id))
+                .collect();
+            if stray.is_empty() {
+                return;
+            }
+            for id in stray {
+                let _ = conn
+                    .send("Target.closeTarget", json!({ "targetId": id }), None)
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("tabs of the test are still open after 5 s");
+    }
+}
+
+/// The agent profile's context and bridge of the shared browser, with a page scope.
+pub struct AgentScope {
+    pub sh: &'static Shared,
+    pub agent: String,
+    pub bridge: Arc<pegboard_core::bridge::Bridge>,
+    scope: PageScope,
+}
+
+impl AgentScope {
+    pub async fn start() -> AgentScope {
+        let sh = shared();
+        let (agent, bridge) = sh.agent().await;
+        let scope = PageScope::begin(&sh.browser.conn).await;
+        AgentScope {
+            sh,
+            agent,
+            bridge,
+            scope,
+        }
+    }
+
+    pub async fn finish(self) {
+        self.scope.finish(&self.sh.browser.conn).await;
+    }
+}
+
+/// Like `SessionFixture`, but on the shared browser: a human page, an agent window, a new
+/// bridge group and a proxy of its own (so connection counts and refusals are the test's)
+/// with one session registered. No cookie is planted in the human profile. `shutdown` closes
+/// every tab the test made and sends the human tab back to `about:blank`.
+pub struct SharedSessionFixture {
+    pub proxy: pegboard_core::proxy::server::ProxyServer,
+    pub bridge: Arc<pegboard_core::bridge::Bridge>,
+    pub browser: Arc<Browser>,
+    pub fixture: &'static Fixture,
+    pub env: &'static Env,
+    pub session: pegboard_protocol::SessionId,
+    pub endpoint: pegboard_core::proxy::server::Endpoint,
+    pub agent_context: String,
+    pub group: pegboard_core::bridge::GroupId,
+    pub human_target: String,
+    pub first_target: String,
+    scope: PageScope,
+}
+
+impl SharedSessionFixture {
+    pub async fn shutdown(self) {
+        let SharedSessionFixture {
+            proxy,
+            browser,
+            human_target,
+            scope,
+            ..
+        } = self;
+        drop(proxy);
+        scope.finish(&browser.conn).await;
+        if let Ok(session) = browser.conn.attach(&human_target).await {
+            let _ = browser.conn.navigate(&session, "about:blank").await;
+        }
+    }
+}
+
+pub async fn shared_session_fixture() -> SharedSessionFixture {
+    let sh = shared();
+    let (agent_context, bridge) = sh.agent().await;
+    let browser = sh.browser.clone();
+    let scope = PageScope::begin(&browser.conn).await;
+    let human_target = page_targets(&browser.conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.browser_context_id.as_deref() == Some(browser.human_context.as_str()))
+        .expect("no human page")
+        .target_id;
+    // An http page in the human profile (a cookie-free one), as a person would have open.
+    let human_session = browser.conn.attach(&human_target).await.unwrap();
+    browser
+        .conn
+        .navigate(&human_session, &format!("{}/form", sh.fixture.origin))
+        .await
+        .unwrap();
+    let (group, first_target) = bridge.create_group("proxy", "blue").await.unwrap();
+    let upstream = Arc::new(WsUpstream {
+        browser_ws_url: browser.ws_url.clone(),
+    });
+    let proxy = ProxyServer::start(upstream).await.unwrap();
+    let session = pegboard_protocol::SessionId::generate();
+    let endpoint = proxy.register(
+        &session,
+        &agent_context,
+        group.clone(),
+        bridge.clone(),
+        vec![first_target.clone()],
+    );
+    SharedSessionFixture {
+        proxy,
+        bridge,
+        browser,
+        fixture: &sh.fixture,
+        env: &sh.env,
+        session,
+        endpoint,
+        agent_context,
+        group,
+        human_target,
+        first_target,
+        scope,
     }
 }
