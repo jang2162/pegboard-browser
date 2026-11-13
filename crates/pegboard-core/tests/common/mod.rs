@@ -146,6 +146,114 @@ impl Drop for DownloadProbe {
     }
 }
 
+/// A name the guard resolves to a public address while the shared browser reaches the
+/// fixture server under it (both are set up by `Shared::start`): pages "from a public
+/// address" that the guard serves again with its CSP.
+pub const PUBLIC_NAME: &str = "public.test";
+
+/// Size of the `/big` page and of what `/bomb` decodes to: over the guard's 16 MiB limit.
+pub const OVERSIZED: usize = 20 << 20;
+
+fn crc32(crc: u32, bytes: &[u8]) -> u32 {
+    let mut c = !crc;
+    for &b in bytes {
+        c ^= u32::from(b);
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xedb8_8320
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+/// A gzip body of about 130 KB that decodes to `OVERSIZED` bytes of HTML: one deflate block
+/// with fixed Huffman codes, a short literal prefix, then copies of length 258 at distance 1.
+fn gzip_bomb() -> &'static [u8] {
+    static BOMB: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    BOMB.get_or_init(|| {
+        struct Bits {
+            out: Vec<u8>,
+            acc: u32,
+            n: u32,
+        }
+        impl Bits {
+            fn lsb(&mut self, value: u32, count: u32) {
+                for i in 0..count {
+                    self.acc |= ((value >> i) & 1) << self.n;
+                    self.n += 1;
+                    if self.n == 8 {
+                        self.out.push(self.acc as u8);
+                        self.acc = 0;
+                        self.n = 0;
+                    }
+                }
+            }
+            /// A Huffman code, most significant bit first.
+            fn code(&mut self, code: u32, len: u32) {
+                for i in (0..len).rev() {
+                    self.lsb((code >> i) & 1, 1);
+                }
+            }
+        }
+        let prefix = b"<!doctype html><title>bomb</title><p>a";
+        let copies = (OVERSIZED - prefix.len()) / 258 + 1;
+        let mut bits = Bits {
+            out: Vec::new(),
+            acc: 0,
+            n: 0,
+        };
+        bits.lsb(1, 1); // last block
+        bits.lsb(1, 2); // fixed Huffman
+        for &b in prefix {
+            // literals 0..=143: 8-bit codes from 0x30
+            bits.code(0x30 + u32::from(b), 8);
+        }
+        for _ in 0..copies {
+            bits.code(0b1100_0101, 8); // length code 285 (258), no extra bits
+            bits.code(0, 5); // distance code 0 (1)
+        }
+        bits.code(0, 7); // end of block
+        if bits.n > 0 {
+            bits.out.push(bits.acc as u8);
+        }
+        let total = prefix.len() + copies * 258;
+        let mut crc = crc32(0, prefix);
+        let chunk = vec![b'a'; 258];
+        for _ in 0..copies {
+            crc = crc32(crc, &chunk);
+        }
+        let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+        gz.extend_from_slice(&bits.out);
+        gz.extend_from_slice(&crc.to_le_bytes());
+        gz.extend_from_slice(&(total as u32).to_le_bytes());
+        gz
+    })
+}
+
+/// `/big`: an HTML page of `OVERSIZED` bytes with its length declared. `/bomb`: the same
+/// size once decoded, sent gzip-compressed with the compressed length declared.
+fn oversized_route(path: &str) -> Option<Vec<u8>> {
+    let (headers, body): (&str, Vec<u8>) = match path {
+        "/big" => {
+            let mut body = b"<!doctype html><title>big</title><p>".to_vec();
+            body.resize(OVERSIZED, b'a');
+            ("", body)
+        }
+        "/bomb" => ("content-encoding: gzip\r\n", gzip_bomb().to_vec()),
+        _ => return None,
+    };
+    let mut out = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
 async fn serve(mut sock: tokio::net::TcpStream) {
     let mut buf = vec![0u8; 8192];
     let Ok(n) = sock.read(&mut buf).await else {
@@ -158,6 +266,11 @@ async fn serve(mut sock: tokio::net::TcpStream) {
         .and_then(|l| l.split(' ').nth(1))
         .and_then(|p| p.split('?').next())
         .unwrap_or("/");
+    if let Some(bytes) = oversized_route(path) {
+        let _ = sock.write_all(&bytes).await;
+        let _ = sock.shutdown().await;
+        return;
+    }
     let resp = match (download_route(path), route(path)) {
         (Some((headers, body)), _) => format!(
             "HTTP/1.1 200 OK\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -515,6 +628,18 @@ pub fn shared() -> &'static Shared {
 
 impl Shared {
     async fn start() -> Shared {
+        // Read by the browser launched below and by the session manager's guard (same
+        // process): `PUBLIC_NAME` is a public address to the guard and the fixture server to
+        // the browser; test hooks are on.
+        std::env::set_var(
+            "PEGBOARD_TEST_HOST_RULES",
+            format!("MAP {PUBLIC_NAME} 93.184.216.34"),
+        );
+        std::env::set_var(
+            "PEGBOARD_TEST_BROWSER_HOST_RULES",
+            format!("MAP {PUBLIC_NAME} 127.0.0.1"),
+        );
+        std::env::set_var("PEGBOARD_TEST_HOOKS", "1");
         let env = env();
         let fixture = fixture().await;
         let browser = Arc::new(Browser::launch(&env.paths, &env.cfg).await.unwrap());

@@ -380,15 +380,15 @@ pub fn host_rules() -> String {
         .unwrap_or_else(|| "10.255.255.1".to_string());
     format!(
         "MAP {PRIVATE_NAME} {private}, MAP {PUBLIC_LOOKING_NAME} {private}, \
-         MAP {LISTED_NAME} 127.0.0.1, MAP {UNLISTED_NAME} 127.0.0.1"
+         MAP {LISTED_NAME} 127.0.0.1, MAP {UNLISTED_NAME} 127.0.0.1, \
+         MAP {PUBLIC_NAME} 93.184.216.34"
     )
 }
 
-/// A real public name (IANA's reserved example domain). The daemon resolves it through DNS to
-/// its public address, while the shared browser connects to 127.0.0.1 under it
-/// (`browser_only_host_rules`): pages "from a public address" served by a local test server.
-/// Tests that use it need working DNS.
-pub const PUBLIC_NAME: &str = "example.net";
+/// A name the daemon resolves to a public address (`host_rules`) while the shared browser
+/// connects to 127.0.0.1 under it (`browser_only_host_rules`, which Chrome applies first):
+/// pages "from a public address" served by a local test server.
+pub const PUBLIC_NAME: &str = "public.test";
 
 /// Host resolver rules given to the browser only (`PEGBOARD_TEST_BROWSER_HOST_RULES`).
 pub fn browser_only_host_rules() -> String {

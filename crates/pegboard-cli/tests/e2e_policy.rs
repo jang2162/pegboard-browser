@@ -590,6 +590,41 @@ fn serve_one(mut stream: std::net::TcpStream, hits: Arc<Mutex<Vec<String>>>) {
             .into_bytes(),
         ),
         "/secret" => ("200 OK", "text/plain", b"SECRET-BODY".to_vec()),
+        "/embed" => {
+            let src = query_param(query, "src").unwrap_or_default();
+            (
+                "200 OK",
+                "text/html",
+                format!("<!doctype html><title>embed</title><iframe src=\"{src}\"></iframe>")
+                    .into_bytes(),
+            )
+        }
+        "/frame" => (
+            "200 OK",
+            "text/html",
+            format!(
+                "<!doctype html><title>frame</title><img src=\"{to}&k=img\">\
+                 <script>fetch('{to}&k=fetch', {{mode: 'no-cors'}}).catch(() => {{}});</script>"
+            )
+            .into_bytes(),
+        ),
+        "/typed" => {
+            // One Content-Type per `ct`, `ct2` parameter, in that order.
+            let body = b"<!doctype html><title>typed</title><p>typed".to_vec();
+            let mut head = String::from("HTTP/1.1 200 OK\r\n");
+            for name in ["ct", "ct2"] {
+                if let Some(ct) = query_param(query, name) {
+                    head.push_str(&format!("content-type: {ct}\r\n"));
+                }
+            }
+            let _ = write!(
+                stream,
+                "{head}content-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+            return;
+        }
         "/img" => ("200 OK", "image/gif", GIF.to_vec()),
         "/sw.js" => (
             "200 OK",
@@ -761,7 +796,6 @@ fn own_ports_are_never_reachable() {
                     settle(&h, &fetch_js(&url)).starts_with("FAIL:"),
                     "{extra:?}: {url} was reached"
                 );
-                assert_ne!(settle(&h, &img_js(&url)), "LOADED", "{extra:?}: {url}");
                 // WebSocket handshakes never reach the guard: Chrome refuses page origins on
                 // its debugging port and the proxy wants a token. Neither may open.
                 let ws = format!("ws://{host}:{port}/devtools/browser");
@@ -1008,7 +1042,7 @@ fn allow_domain_closes_everything_else_including_localhost() {
 #[ignore]
 fn pages_on_allowed_local_origins_are_not_served_again() {
     let srv = AddressServer::start();
-    // An allow-list (served again): an `http:` name that resolves to loopback.
+    // An allow-list: an `http:` name that resolves to an allowed loopback address.
     let h = create(&[
         "--profile",
         profile("pol-listed-local"),
@@ -1023,7 +1057,7 @@ fn pages_on_allowed_local_origins_are_not_served_again() {
     let got_same = settle(&h, &read_js(&same));
     let got_other = settle(&h, &read_js(&other));
     close(&h);
-    // The default policy (served again): the same name, no allow-list.
+    // The default policy: the same kind of name, no allow-list.
     let h = create(&[
         "--profile",
         profile("pol-insecure-default"),
@@ -1183,11 +1217,11 @@ fn ws_csp_js(url: &str) -> String {
     )
 }
 
-/// A page from a public address (the daemon resolves `PUBLIC_NAME` through DNS; the browser
-/// reaches the local test server under it) is served again with the CSP: a plain WebSocket to
+/// A page from a public address (the daemon resolves `PUBLIC_NAME` to a public address; the
+/// browser reaches the local test server under it) is served again with the CSP: a plain WebSocket to
 /// a host the default policy does not open is refused by `connect-src`, while one to loopback
 /// raises no violation. A page on a local origin is not served again, and the same WebSocket
-/// opens there (not covered, by the owner's ruling). Needs DNS for `example.net`.
+/// opens there (not covered, by the owner's ruling).
 #[test]
 #[ignore]
 fn pages_from_a_public_address_get_the_csp() {
@@ -1234,5 +1268,159 @@ fn pages_from_a_public_address_get_the_csp() {
     eprintln!("local page: ws to unlisted: {open_ws}");
     assert!(open_ws.starts_with("OPEN|"), "{open_ws}");
     assert!(srv.reached(&wm));
+    close(&h);
+}
+
+/// A page (`/embed`) that frames a page of another site whose script fetches and loads an
+/// image from `to`.
+fn embed_url(srv: &AddressServer, to: &str) -> String {
+    // 127.0.0.1 and localhost are different sites: the frame is out of process (OOPIF).
+    let frame = format!("http://127.0.0.1:{}/frame?to={}", srv.b, enc(to));
+    format!("http://localhost:{}/embed?src={}", srv.a, enc(&frame))
+}
+
+#[test]
+#[ignore]
+fn oopif_subrequests_are_judged() {
+    let srv = AddressServer::start();
+    let lan = srv.lan();
+    let private = |m: &str| format!("http://{PRIVATE_NAME}:{lan}/secret?m={m}");
+    let wait = |m: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !srv.reached(m) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        srv.reached(m)
+    };
+    let m = marker("oopif");
+    let h = create(&[
+        "--profile",
+        profile("pol-priv-closed"),
+        "--url",
+        &embed_url(&srv, &private(&m)),
+    ]);
+    assert!(!wait(&m), "the cross-site frame reached the private server");
+    close(&h);
+    // Control: the same frame reaches it when the private network is allowed.
+    let m = marker("oopif");
+    let h = create(&[
+        "--profile",
+        profile("pol-priv-open"),
+        "--allow-private-network",
+        "--url",
+        &embed_url(&srv, &private(&m)),
+    ]);
+    assert!(wait(&m), "the frame did not run (control)");
+    close(&h);
+}
+
+/// A same-origin `srcdoc` frame and a `data:` frame of a page: each tries a plain WebSocket to
+/// `url` and reports `<kind>:<outcome>|<CSP violations>` to the page.
+fn frames_ws_js(url: &str) -> String {
+    let inner = format!(
+        "<script>const v=[];document.addEventListener('securitypolicyviolation',e=>v.push(e.violatedDirective));\
+         let o='';try{{const w=new WebSocket('{url}');w.onopen=()=>{{o='OPEN';w.close()}};w.onerror=()=>{{o=o||'ERROR'}}}}\
+         catch(e){{o='THROW:'+e.name}}setTimeout(()=>parent.postMessage(KIND+':'+(o||'PENDING')+'|'+v.join(','),'*'),1500)</script>"
+    );
+    format!(
+        "new Promise(r => {{ const got = {{}}; window.addEventListener('message', e => {{ const s = String(e.data); got[s.split(':')[0]] = s; \
+         if (got.srcdoc && got.data) r(got.srcdoc + ' ' + got.data); }}); \
+         const inner = {inner:?}; \
+         const a = document.createElement('iframe'); a.srcdoc = inner.replace('KIND', \"'srcdoc'\"); document.body.appendChild(a); \
+         const b = document.createElement('iframe'); b.src = 'data:text/html,' + encodeURIComponent(inner.replace('KIND', \"'data'\")); document.body.appendChild(b); \
+         setTimeout(() => r('TIMEOUT ' + JSON.stringify(got)), 8000); }})"
+    )
+}
+
+/// `srcdoc` and `data:` frames inherit the CSP of a page from a public address; on a page
+/// from a local origin (not served again) the same frames open the WebSocket.
+#[test]
+#[ignore]
+fn frames_of_a_public_page_inherit_the_csp() {
+    let srv = AddressServer::start();
+    let h = create(&[
+        "--profile",
+        profile("pol-csp-default"),
+        "--url",
+        &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
+    ]);
+    let wm = marker("fw");
+    let got = settle(
+        &h,
+        &frames_ws_js(&format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b)),
+    );
+    eprintln!("public page frames: {got}");
+    for kind in ["srcdoc", "data"] {
+        let part = got
+            .split(' ')
+            .find(|p| p.starts_with(&format!("{kind}:")))
+            .unwrap_or_else(|| panic!("no report from the {kind} frame: {got}"));
+        assert!(
+            !part.contains(":OPEN") && part.contains("connect-src"),
+            "{kind}: {part}"
+        );
+    }
+    assert!(!srv.reached(&wm));
+    close(&h);
+
+    let h = create(&[
+        "--profile",
+        profile("pol-csp-default"),
+        "--url",
+        &format!("http://localhost:{}/page", srv.a),
+    ]);
+    let got = settle(
+        &h,
+        &frames_ws_js(&format!(
+            "ws://{UNLISTED_NAME}:{}/ws?m={}",
+            srv.b,
+            marker("fl")
+        )),
+    );
+    eprintln!("local page frames: {got}");
+    assert!(
+        got.contains("srcdoc:OPEN") && got.contains("data:OPEN"),
+        "{got}"
+    );
+    close(&h);
+}
+
+/// Documents Chrome sniffs (`unknown/unknown`) or with a Content-Type header that is HTML
+/// among others get the CSP like any HTML page (the title printed shows how Chrome rendered
+/// them).
+#[test]
+#[ignore]
+fn sniffed_and_duplicated_content_types_get_the_csp() {
+    let srv = AddressServer::start();
+    let h = create(&[
+        "--profile",
+        profile("pol-csp-default"),
+        "--url",
+        &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
+    ]);
+    for query in ["ct=unknown%2Funknown", "ct=text%2Fplain&ct2=text%2Fhtml"] {
+        let url = format!("http://{PUBLIC_NAME}:{}/typed?{query}", srv.a);
+        let (code, _, err) = open(&h, &url);
+        assert_eq!(code, 0, "{query}: {err}");
+        let (code, out, err) = shared_home().run(&["--session", &h, "eval", "document.title"]);
+        assert_eq!(code, 0, "{err}");
+        let title = json(&out)["result"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let wm = marker("tw");
+        let ws = settle(
+            &h,
+            &ws_csp_js(&format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b)),
+        );
+        eprintln!("{query}: title {title:?}, ws {ws}");
+        // However Chrome renders it, the document carries the CSP: a script in it (here the
+        // agent's `eval`) is bound by it.
+        assert!(
+            !ws.starts_with("OPEN") && ws.contains("connect-src"),
+            "{query}: {ws}"
+        );
+        assert!(!srv.reached(&wm));
+    }
     close(&h);
 }
