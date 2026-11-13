@@ -620,7 +620,7 @@ fn guard_leftovers(env: &Env) {
 pub struct Harness {
     pub sh: &'static Shared,
     pub daemons: Daemons,
-    sessions: Mutex<Vec<SessionId>>,
+    pub sessions: Mutex<Vec<SessionId>>,
 }
 
 impl std::ops::Deref for Harness {
