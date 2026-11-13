@@ -207,6 +207,7 @@ impl SessionManager {
     pub async fn create(&self, p: SessionCreateParams) -> Result<SessionInfo, RpcError> {
         let inner = &self.inner;
         policy::validate(&p.policy)?;
+        policy::check_upload_dir_outside_home(&p.policy, &inner.paths.home)?;
         let session_policy = policy::normalized(&p.policy);
         let profile = p.profile.as_deref().unwrap_or(DEFAULT_PROFILE).to_string();
         let reservation = self.reserve(&profile).await?;

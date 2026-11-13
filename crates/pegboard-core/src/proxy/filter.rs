@@ -294,13 +294,20 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
         else {
             return error(-32602, "Invalid params: files must be an array of strings");
         };
-        if !files
+        // The browser gets the real paths that were judged, not the strings that were sent.
+        let Some(real) = files
             .iter()
-            .all(|f| crate::upload::path_allowed(Path::new(f), &scope.upload_dirs))
-        {
+            .map(|f| crate::upload::allowed_real_path(Path::new(f), &scope.upload_dirs))
+            .collect::<Option<Vec<_>>>()
+        else {
             return error(-32000, "a file outside the session's upload directories");
-        }
-        return ClientDecision::Forward;
+        };
+        let mut rewritten = msg.clone();
+        rewritten["params"]["files"] = json!(real
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>());
+        return ClientDecision::ForwardRewritten(rewritten);
     }
 
     // 8. Allowlist.
@@ -555,12 +562,24 @@ mod tests {
 
         sc.upload_dirs = vec![up.clone(), files.clone()];
         for ok in [up.join("a.txt"), files.join("a.txt")] {
+            let m = set_files(path(ok.clone()));
             assert_eq!(
-                client_message(&set_files(path(ok.clone())), &sc),
-                ClientDecision::Forward,
+                client_message(&m, &sc),
+                ClientDecision::ForwardRewritten(m.clone()),
                 "{ok:?}"
             );
         }
+        // What is forwarded is the real path that was judged.
+        let m = set_files(path(up.join("../up/a.txt")));
+        assert_eq!(
+            client_message(&m, &sc),
+            ClientDecision::ForwardRewritten(set_files(path(up.join("a.txt"))))
+        );
+        // Not in a subdirectory of a directory.
+        std::fs::create_dir(up.join("sub")).unwrap();
+        std::fs::write(up.join("sub/b.txt"), "b").unwrap();
+        let m = set_files(path(up.join("sub/b.txt")));
+        assert_eq!(err_code(&client_message(&m, &sc)), -32000);
         for bad in [
             out.join("a.txt"),
             up.join("link"),
@@ -579,9 +598,10 @@ mod tests {
         ]));
         assert_eq!(err_code(&client_message(&m, &sc)), -32000);
         // Clearing the input needs no file.
+        let m = set_files(json!([]));
         assert_eq!(
-            client_message(&set_files(json!([])), &sc),
-            ClientDecision::Forward
+            client_message(&m, &sc),
+            ClientDecision::ForwardRewritten(m.clone())
         );
         // Malformed: files missing, not an array, not strings; no CDP session.
         for files in [json!(null), json!("x"), json!([1]), json!({"a":1})] {

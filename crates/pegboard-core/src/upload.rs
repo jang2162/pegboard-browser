@@ -15,21 +15,28 @@ pub fn resolve(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     })
 }
 
-/// Whether `path` is an absolute path to a regular file whose real path (symbolic links
-/// followed) is inside the real path of one of `dirs`.
+/// Whether `path` is an absolute path to a regular file directly inside one of `dirs`
+/// (symbolic links followed on both sides).
 pub fn path_allowed(path: &Path, dirs: &[PathBuf]) -> bool {
+    allowed_real_path(path, dirs).is_some()
+}
+
+/// The real path (symbolic links followed) of `path` when `path_allowed` holds: the string
+/// the browser should be given, so that the file judged is the file it opens. A file in a
+/// subdirectory is not allowed: names are bare, so the daemon never produces one.
+pub fn allowed_real_path(path: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
     if !path.is_absolute() {
-        return false;
+        return None;
     }
-    let Ok(real) = path.canonicalize() else {
-        return false;
-    };
+    let real = path.canonicalize().ok()?;
     if !std::fs::metadata(&real).is_ok_and(|m| m.is_file()) {
-        return false;
+        return None;
     }
+    let parent = real.parent()?;
     dirs.iter()
         .filter_map(|d| d.canonicalize().ok())
-        .any(|d| real.starts_with(&d) && real != d)
+        .any(|d| parent == d)
+        .then_some(real)
 }
 
 #[cfg(test)]
@@ -126,6 +133,24 @@ mod tests {
         assert!(!path_allowed(&r.upload.join("link"), &d));
         assert!(!path_allowed(&r.upload.join("sub"), &d));
         assert!(!path_allowed(&r.upload.join("missing"), &d));
+        // Directly inside only: a file deeper down is not allowed.
+        std::fs::create_dir_all(r.upload.join("sub/deep")).unwrap();
+        std::fs::write(r.upload.join("sub/deep/x"), "x").unwrap();
+        std::fs::write(r.upload.join("sub/y"), "y").unwrap();
+        assert!(!path_allowed(&r.upload.join("sub/deep/x"), &d));
+        assert!(!path_allowed(&r.upload.join("sub/y"), &d));
+        // A link to a file in the same directory passes this check (the daemon refuses
+        // links itself); the real path is what comes back.
+        symlink(r.upload.join("a.txt"), r.upload.join("alias")).unwrap();
+        assert!(path_allowed(&r.upload.join("alias"), &d));
+        assert_eq!(
+            allowed_real_path(&r.upload.join("alias"), &d),
+            Some(r.upload.join("a.txt"))
+        );
+        assert_eq!(
+            allowed_real_path(&r.upload.join("../upload/a.txt"), &d),
+            Some(r.upload.join("a.txt"))
+        );
         assert!(!path_allowed(&r.upload.join("../outside/o.txt"), &d));
         assert!(!path_allowed(Path::new("a.txt"), &d), "relative");
         assert!(!path_allowed(Path::new("/etc/passwd"), &d));

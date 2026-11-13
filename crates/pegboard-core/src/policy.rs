@@ -115,6 +115,24 @@ pub fn validate(policy: &SessionPolicy) -> Result<(), RpcError> {
     Ok(())
 }
 
+/// Refuses an upload directory that is pegboard's home (where the sessions' files, the
+/// recordings and the browser profile live), inside it, or contains it. Compared by real
+/// path. It needs the home, so `SessionManager::create` (the server) does it, right after
+/// `validate`.
+pub fn check_upload_dir_outside_home(policy: &SessionPolicy, home: &Path) -> Result<(), RpcError> {
+    let Some(dir) = policy.upload_dir.as_deref() else {
+        return Ok(());
+    };
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let (dir, home) = (real(Path::new(dir)), real(home));
+    if dir.starts_with(&home) || home.starts_with(&dir) {
+        return Err(invalid(
+            "--upload-dir must not be pegboard's own data directory or contain it",
+        ));
+    }
+    Ok(())
+}
+
 /// The policy as it is kept: domains lower-cased (IP literals in `IpAddr` form), sorted and
 /// without duplicates; `allow` and `deny` without duplicates, in the order given.
 pub fn normalized(policy: &SessionPolicy) -> SessionPolicy {
@@ -377,6 +395,40 @@ mod tests {
             ..SessionPolicy::default()
         };
         assert!(validate(&upload).is_ok());
+    }
+
+    #[test]
+    fn the_upload_dir_stays_out_of_the_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let home = root.join("home");
+        let other = root.join("other");
+        let inside = home.join("sessions");
+        for d in [&home, &other, &inside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let link = root.join("link-to-home");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let with = |d: &Path| SessionPolicy {
+            allow: vec![ActionClass::Upload],
+            upload_dir: Some(d.display().to_string()),
+            ..SessionPolicy::default()
+        };
+        assert!(check_upload_dir_outside_home(&with(&other), &home).is_ok());
+        assert!(check_upload_dir_outside_home(&SessionPolicy::default(), &home).is_ok());
+        // The home itself, inside it, containing it, and a link to it.
+        for bad in [&home, &inside, root, &link] {
+            let e = check_upload_dir_outside_home(&with(bad), &home).unwrap_err();
+            assert_eq!(e.code, codes::INVALID_PARAMS, "{bad:?}");
+            assert_eq!(
+                e.message,
+                "--upload-dir must not be pegboard's own data directory or contain it"
+            );
+        }
+        // A sibling whose name starts like the home's is outside it.
+        let sibling = root.join("home2");
+        std::fs::create_dir(&sibling).unwrap();
+        assert!(check_upload_dir_outside_home(&with(&sibling), &home).is_ok());
     }
 
     #[test]

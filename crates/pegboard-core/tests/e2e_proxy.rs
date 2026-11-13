@@ -1114,3 +1114,122 @@ fn client_never_hears_about_targets_it_did_not_know() {
         h.finish().await;
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// DOM.setFileInputFiles through a session endpoint (made by the session manager, so the
+// session's policy decides which directories its endpoint takes files from).
+// ---------------------------------------------------------------------------------------------
+
+/// The files the page's `#f` holds, as names.
+async fn chosen_names(c: &CdpConn, sid: &str) -> Value {
+    c.evaluate(
+        sid,
+        "Array.from(document.getElementById('f').files).map(f => f.name)",
+    )
+    .await
+    .unwrap()
+}
+
+/// Tries to put `path` into the page's `#f` through the endpoint.
+async fn set_file(c: &CdpConn, sid: &str, path: &std::path::Path) -> anyhow::Result<Value> {
+    let doc = c
+        .send("DOM.getDocument", json!({}), Some(sid))
+        .await
+        .unwrap();
+    let node = c
+        .send(
+            "DOM.querySelector",
+            json!({ "nodeId": doc["root"]["nodeId"], "selector": "#f" }),
+            Some(sid),
+        )
+        .await
+        .unwrap();
+    c.send(
+        "DOM.setFileInputFiles",
+        json!({ "nodeId": node["nodeId"], "files": [path.display().to_string()] }),
+        Some(sid),
+    )
+    .await
+}
+
+#[test]
+#[ignore]
+fn set_file_input_files_only_takes_files_from_the_sessions_directories() {
+    use pegboard_protocol::{ActionClass, SessionPolicy};
+    common::run(async {
+        let h = common::Harness::start();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (up, outside) = (root.join("up"), root.join("outside"));
+        std::fs::create_dir_all(up.join("sub")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(up.join("a.txt"), "hello").unwrap();
+        std::fs::write(up.join("sub/deep.txt"), "deep").unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let allowing = SessionPolicy {
+            allow: vec![ActionClass::Upload],
+            upload_dir: Some(up.display().to_string()),
+            ..SessionPolicy::default()
+        };
+        let (a, a_ep) = h.session_with_policy("/form", allowing.clone()).await;
+        let (b, _) = h.session_with_policy("/form", allowing).await;
+        let (plain, plain_ep) = h
+            .session_with_policy("/form", SessionPolicy::default())
+            .await;
+        // The sessions' files directories hold a file each.
+        let files = |id| pegboard_core::paths::ensure_session_files(&h.env.paths, id).unwrap();
+        let (a_files, b_files, plain_files) = (files(&a.id), files(&b.id), files(&plain.id));
+        for d in [&a_files, &b_files, &plain_files] {
+            std::fs::write(d.join("got.txt"), "got").unwrap();
+        }
+
+        let mut ready = Vec::new();
+        for (info, ep) in [(&a, &a_ep), (&plain, &plain_ep)] {
+            let target = h.manager.info(&info.id).unwrap().targets[0].clone();
+            let c = common::client(ep).await;
+            let sid = c.attach(&target).await.unwrap();
+            c.evaluate(
+                &sid,
+                "document.body.innerHTML = '<input id=f type=file multiple>'",
+            )
+            .await
+            .unwrap();
+            ready.push((c, sid));
+        }
+        let ((ca, sa), (cp, sp)) = (&ready[0], &ready[1]);
+
+        // A session without --allow upload takes no file at all, not even its own.
+        for path in [plain_files.join("got.txt"), up.join("a.txt")] {
+            let e = set_file(cp, sp, &path).await.unwrap_err();
+            assert!(format!("{e:#}").contains("upload directories"), "{e:#}");
+        }
+        assert_eq!(chosen_names(cp, sp).await, json!([]));
+
+        // A session with it still refuses everything outside its two directories.
+        for path in [
+            outside.join("secret.txt"),
+            b_files.join("got.txt"),
+            up.join("sub/deep.txt"),
+            plain_files.join("got.txt"),
+            std::path::PathBuf::from("/etc/hosts"),
+            up.join("../outside/secret.txt"),
+        ] {
+            let e = set_file(ca, sa, &path).await.unwrap_err();
+            assert!(
+                format!("{e:#}").contains("upload directories"),
+                "{path:?}: {e:#}"
+            );
+            assert_eq!(chosen_names(ca, sa).await, json!([]), "{path:?}");
+        }
+
+        // A file directly inside the upload directory, or the session's own files, goes in.
+        set_file(ca, sa, &up.join("a.txt")).await.unwrap();
+        assert_eq!(chosen_names(ca, sa).await, json!(["a.txt"]));
+        set_file(ca, sa, &a_files.join("got.txt")).await.unwrap();
+        assert_eq!(chosen_names(ca, sa).await, json!(["got.txt"]));
+
+        for id in [&a.id, &b.id, &plain.id] {
+            h.close_session(id).await;
+        }
+    });
+}
