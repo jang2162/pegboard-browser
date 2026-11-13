@@ -440,3 +440,616 @@ fn bad_policy_options_exit_2() {
     let (code, _, err) = home.run(&["session", "create", "--allow", "state", "--deny", "eval"]);
     assert_eq!(code, 3, "{err}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Address rules (task 4). The shared browser resolves `PRIVATE_NAME` and `PUBLIC_LOOKING_NAME`
+// to this machine's private LAN address and `LISTED_NAME`/`UNLISTED_NAME` to 127.0.0.1
+// (`host_rules`). `AddressServer` listens on two loopback ports and on the LAN address and
+// records every request it gets, so "blocked" is told from "reached" by the server, not only by
+// what the page saw. Every request a test sends carries a marker of its own (`m=`).
+// ---------------------------------------------------------------------------------------------
+
+use std::io::{Read as _, Write as _};
+use std::sync::{Arc, Mutex};
+
+/// A tiny HTTP and WebSocket server that records the path and query of every request.
+struct AddressServer {
+    a: u16,
+    b: u16,
+    lan: Option<u16>,
+    hits: Arc<Mutex<Vec<String>>>,
+}
+
+/// Percent-encodes everything but ASCII letters and digits.
+fn enc(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+fn dec(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(&format!("{name}=")).map(dec))
+}
+
+const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+
+impl AddressServer {
+    fn start() -> AddressServer {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let listen = |ip: &str| {
+            let l = std::net::TcpListener::bind((ip, 0)).unwrap();
+            let port = l.local_addr().unwrap().port();
+            let hits = hits.clone();
+            std::thread::spawn(move || {
+                for stream in l.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    let hits = hits.clone();
+                    std::thread::spawn(move || serve_one(stream, hits));
+                }
+            });
+            port
+        };
+        let a = listen("127.0.0.1");
+        let b = listen("127.0.0.1");
+        let lan = lan_ip().map(|ip| listen(&ip.to_string()));
+        AddressServer { a, b, lan, hits }
+    }
+
+    /// The LAN port; the test cannot run without a private address on this machine.
+    fn lan(&self) -> u16 {
+        self.lan.expect(
+            "this test needs a private (RFC 1918) IPv4 address on the default route's interface",
+        )
+    }
+
+    fn reached(&self, marker: &str) -> bool {
+        self.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.contains(&format!("m={marker}")))
+    }
+}
+
+fn serve_one(mut stream: std::net::TcpStream, hits: Arc<Mutex<Vec<String>>>) {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+        if head.len() > 65536 {
+            return;
+        }
+    }
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let target = text
+        .lines()
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .unwrap_or("/")
+        .to_string();
+    hits.lock().unwrap().push(target.clone());
+    let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+    let header = |name: &str| {
+        text.lines().find_map(|l| {
+            let (n, v) = l.split_once(':')?;
+            n.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_string())
+        })
+    };
+    let to = query_param(query, "to").unwrap_or_default();
+    let to2 = query_param(query, "to2").unwrap_or_default();
+    if path == "/ws" {
+        let key = header("sec-websocket-key").unwrap_or_default();
+        let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+        let _ = write!(
+            stream,
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+        );
+        // Hold the socket until the page closes it.
+        while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+        return;
+    }
+    let (status, ctype, body): (&str, &str, Vec<u8>) = match path {
+        "/page" => (
+            "200 OK",
+            "text/html",
+            format!(
+                "<!doctype html><title>policy</title><a id=pop target=_blank href=\"{to}\">pop</a>\
+                 <button id=wopen onclick=\"window.open('{to2}')\">open</button>"
+            )
+            .into_bytes(),
+        ),
+        "/secret" => ("200 OK", "text/plain", b"SECRET-BODY".to_vec()),
+        "/img" => ("200 OK", "image/gif", GIF.to_vec()),
+        "/sw.js" => (
+            "200 OK",
+            "text/javascript",
+            format!(
+                "self.addEventListener('install', e => e.waitUntil(fetch('{to}', {{mode: 'no-cors'}}).catch(() => {{}})));"
+            )
+            .into_bytes(),
+        ),
+        "/redirect" => {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nlocation: {to}\r\naccess-control-allow-origin: *\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            return;
+        }
+        _ => ("404 Not Found", "text/plain", b"not found".to_vec()),
+    };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\naccess-control-allow-origin: *\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(&body);
+}
+
+fn marker(name: &str) -> String {
+    format!(
+        "{name}{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+/// Creates the profile unless it exists.
+fn profile(name: &str) -> &str {
+    let _ = shared_home().run(&["profile", "create", name]);
+    name
+}
+
+/// Runs `promise` (a JavaScript expression that gives a promise) in the session's page and
+/// returns what it settled to, as a string. The page keeps the outcome and it is polled, so
+/// this does not depend on how `eval` treats promises.
+fn settle(handle: &str, promise: &str) -> String {
+    let start = format!(
+        "(() => {{ window.__peg = window.__peg || {{}}; const k = 'k' + Math.random().toString(36).slice(2); \
+         Promise.resolve().then(() => ({promise})).then(v => {{ window.__peg[k] = String(v); }}, e => {{ window.__peg[k] = 'THROW:' + e; }}); return k; }})()"
+    );
+    let (code, out, err) = shared_home().run(&["--session", handle, "eval", &start]);
+    assert_eq!(code, 0, "{err}");
+    let key = json(&out)["result"].as_str().unwrap().to_string();
+    let read = format!("(window.__peg && window.__peg['{key}']) || null");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let (code, out, err) = shared_home().run(&["--session", handle, "eval", &read]);
+        assert_eq!(code, 0, "{err}");
+        if let Some(v) = json(&out)["result"].as_str() {
+            return v.to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{promise} did not settle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+const TIMEOUT_JS: &str = "new Promise(r => setTimeout(() => r('TIMEOUT'), 5000))";
+
+/// `REACHED` when the request got an answer (opaque or not), `FAIL:...` when it failed.
+fn fetch_js(url: &str) -> String {
+    format!(
+        "Promise.race([fetch('{url}', {{mode: 'no-cors'}}).then(() => 'REACHED', e => 'FAIL:' + e.message), {TIMEOUT_JS}])"
+    )
+}
+
+/// The body when the request got one.
+fn read_js(url: &str) -> String {
+    format!(
+        "Promise.race([fetch('{url}').then(r => r.text()).then(t => 'BODY:' + t, e => 'FAIL:' + e.message), {TIMEOUT_JS}])"
+    )
+}
+
+fn img_js(url: &str) -> String {
+    format!(
+        "Promise.race([new Promise(r => {{ const i = new Image(); i.onload = () => r('LOADED'); i.onerror = () => r('ERROR'); i.src = '{url}'; }}), {TIMEOUT_JS}])"
+    )
+}
+
+fn ws_js(url: &str) -> String {
+    format!(
+        "Promise.race([new Promise(r => {{ let w; try {{ w = new WebSocket('{url}'); }} catch (e) {{ return r('THROW:' + e.name); }} \
+         w.onopen = () => {{ r('OPEN'); w.close(); }}; w.onerror = () => r('ERROR'); }}), {TIMEOUT_JS}])"
+    )
+}
+
+/// A dedicated (`shared: false`) or shared worker made from a blob fetches `url`.
+fn worker_js(url: &str, shared: bool) -> String {
+    let body = if shared {
+        format!("onconnect = e => {{ const p = e.ports[0]; fetch('{url}', {{mode: 'no-cors'}}).then(() => p.postMessage('REACHED'), x => p.postMessage('FAIL:' + x.message)); }};")
+    } else {
+        format!("fetch('{url}', {{mode: 'no-cors'}}).then(() => postMessage('REACHED'), x => postMessage('FAIL:' + x.message));")
+    };
+    let make = if shared {
+        "const w = new SharedWorker(src); w.port.onmessage = m => r(m.data); w.port.start();"
+    } else {
+        "const w = new Worker(src); w.onmessage = m => r(m.data);"
+    };
+    format!(
+        "Promise.race([new Promise(r => {{ const src = URL.createObjectURL(new Blob([{body:?}], {{type: 'text/javascript'}})); {make} }}), {TIMEOUT_JS}])"
+    )
+}
+
+fn open(handle: &str, url: &str) -> (i32, String, String) {
+    shared_home().run(&["--session", handle, "open", url])
+}
+
+fn assert_denied(result: (i32, String, String), reason: &str) {
+    let (code, out, err) = result;
+    assert_ne!(code, 0, "{out}");
+    assert!(err.contains("policy_denied"), "{err}");
+    assert!(err.contains(reason), "{err}");
+}
+
+/// The browser's debugging port and the daemon's TCP listening ports (the session proxy).
+fn own_ports() -> Vec<u16> {
+    let home = shared_home();
+    let active = std::fs::read_to_string(home.path().join("chrome").join("DevToolsActivePort"))
+        .expect("DevToolsActivePort");
+    let mut ports = vec![active.lines().next().unwrap().trim().parse().unwrap()];
+    let pid = home.daemon_pid().expect("daemon pid");
+    let out = std::process::Command::new("lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"])
+        .output()
+        .unwrap();
+    for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
+        if let Some(port) = line
+            .split_whitespace()
+            .find_map(|w| w.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()))
+        {
+            ports.push(port);
+        }
+    }
+    assert!(ports.len() >= 2, "no proxy port found: {out:?}");
+    ports
+}
+
+#[test]
+#[ignore]
+fn own_ports_are_never_reachable() {
+    let srv = AddressServer::start();
+    let page = format!("http://127.0.0.1:{}/page", srv.a);
+    let ports = own_ports();
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("pol-own-default", vec![]),
+        ("pol-own-private", vec!["--allow-private-network"]),
+        ("pol-own-listed", vec!["--allow-domain", "127.0.0.1"]),
+    ];
+    for (prof, extra) in cases {
+        let mut args = vec!["--profile", profile(prof), "--url", &page];
+        args.extend(&extra);
+        let h = create(&args);
+        for port in &ports {
+            for host in ["127.0.0.1", "localhost", "[::1]"] {
+                let url = format!("http://{host}:{port}/json/version");
+                assert!(
+                    settle(&h, &fetch_js(&url)).starts_with("FAIL:"),
+                    "{extra:?}: {url} was reached"
+                );
+                assert_ne!(settle(&h, &img_js(&url)), "LOADED", "{extra:?}: {url}");
+                // WebSocket handshakes never reach the guard: Chrome refuses page origins on
+                // its debugging port and the proxy wants a token. Neither may open.
+                let ws = format!("ws://{host}:{port}/devtools/browser");
+                assert_ne!(settle(&h, &ws_js(&ws)), "OPEN", "{extra:?}: {ws}");
+            }
+            assert_denied(
+                open(&h, &format!("http://127.0.0.1:{port}/json")),
+                "pegboard's own port",
+            );
+        }
+        // Positive control: the page's own server is reachable from the same page.
+        let ok = format!("http://127.0.0.1:{}/secret?m={}", srv.b, marker("own"));
+        assert_eq!(settle(&h, &read_js(&ok)), "BODY:SECRET-BODY", "{extra:?}");
+        close(&h);
+    }
+}
+
+#[test]
+#[ignore]
+fn private_network_is_closed_unless_allowed() {
+    let srv = AddressServer::start();
+    let lan = srv.lan();
+    let page = format!("http://localhost:{}/page", srv.a);
+    let private = |path: &str, m: &str| format!("http://{PRIVATE_NAME}:{lan}{path}?m={m}");
+
+    let h = create(&["--profile", profile("pol-priv-closed"), "--url", &page]);
+    let m = marker("open");
+    assert_denied(open(&h, &private("/page", &m)), "private network address");
+    let (fm, im, wm) = (marker("f"), marker("i"), marker("w"));
+    assert!(settle(&h, &fetch_js(&private("/secret", &fm))).starts_with("FAIL:"));
+    assert_ne!(settle(&h, &img_js(&private("/img", &im))), "LOADED");
+    let ws = format!("ws://{PRIVATE_NAME}:{lan}/ws?m={wm}");
+    assert_ne!(settle(&h, &ws_js(&ws)), "OPEN");
+    // The literal address is refused the same way.
+    let ip = lan_ip().unwrap();
+    let lm = marker("lit");
+    assert!(
+        settle(&h, &fetch_js(&format!("http://{ip}:{lan}/secret?m={lm}"))).starts_with("FAIL:")
+    );
+    for m in [&m, &fm, &im, &wm, &lm] {
+        assert!(!srv.reached(m), "{m} reached the private server");
+    }
+    close(&h);
+
+    let h = create(&[
+        "--profile",
+        profile("pol-priv-open"),
+        "--url",
+        &page,
+        "--allow-private-network",
+    ]);
+    let (fm, im, wm) = (marker("f"), marker("i"), marker("w"));
+    assert_eq!(
+        settle(&h, &read_js(&private("/secret", &fm))),
+        "BODY:SECRET-BODY"
+    );
+    assert_eq!(settle(&h, &img_js(&private("/img", &im))), "LOADED");
+    let ws = format!("ws://{PRIVATE_NAME}:{lan}/ws?m={wm}");
+    assert_eq!(settle(&h, &ws_js(&ws)), "OPEN");
+    for m in [&fm, &im, &wm] {
+        assert!(srv.reached(m), "{m} did not reach the private server");
+    }
+    let (code, _, err) = open(&h, &private("/page", &marker("open")));
+    assert_eq!(code, 0, "{err}");
+    close(&h);
+}
+
+#[test]
+#[ignore]
+fn public_name_resolving_to_a_private_address_is_blocked() {
+    let srv = AddressServer::start();
+    let lan = srv.lan();
+    let page = format!("http://localhost:{}/page", srv.a);
+    let h = create(&["--profile", profile("pol-priv-closed"), "--url", &page]);
+    let (om, fm) = (marker("open"), marker("f"));
+    assert_denied(
+        open(
+            &h,
+            &format!("http://{PUBLIC_LOOKING_NAME}:{lan}/page?m={om}"),
+        ),
+        "private network address",
+    );
+    let url = format!("http://{PUBLIC_LOOKING_NAME}:{lan}/secret?m={fm}");
+    assert!(settle(&h, &fetch_js(&url)).starts_with("FAIL:"));
+    assert!(!srv.reached(&om) && !srv.reached(&fm));
+    close(&h);
+}
+
+#[test]
+#[ignore]
+fn redirect_to_private_address_is_blocked() {
+    let srv = AddressServer::start();
+    let lan = srv.lan();
+    let page = format!("http://localhost:{}/page", srv.a);
+    let h = create(&["--profile", profile("pol-priv-closed"), "--url", &page]);
+    let (fm, nm) = (marker("f"), marker("n"));
+    let redirect = |m: &str| {
+        let to = format!("http://{PRIVATE_NAME}:{lan}/secret?m={m}");
+        format!("http://localhost:{}/redirect?to={}", srv.a, enc(&to))
+    };
+    // A subrequest that is redirected.
+    let got = settle(&h, &read_js(&redirect(&fm)));
+    assert!(!got.contains("SECRET-BODY"), "{got}");
+    // A navigation that is redirected: the page never shows the body.
+    let _ = open(&h, &redirect(&nm));
+    // (The tab may show Chrome's error page; whatever it shows is not the body.)
+    let (_, out, _) = shared_home().run(&[
+        "--session",
+        &h,
+        "eval",
+        "document.body ? document.body.innerText : ''",
+    ]);
+    assert!(!out.contains("SECRET-BODY"), "{out}");
+    assert!(!srv.reached(&fm) && !srv.reached(&nm));
+    // Positive control: the redirect itself works to an allowed address.
+    let to = format!("http://127.0.0.1:{}/secret?m={}", srv.b, marker("ok"));
+    let ok = format!("http://localhost:{}/redirect?to={}", srv.a, enc(&to));
+    assert_eq!(settle(&h, &read_js(&ok)), "BODY:SECRET-BODY");
+    close(&h);
+}
+
+#[test]
+#[ignore]
+fn allow_domain_closes_everything_else_including_localhost() {
+    let srv = AddressServer::start();
+    let listed_page = format!("http://{LISTED_NAME}:{}/page", srv.a);
+    let h = create(&[
+        "--profile",
+        profile("pol-listed"),
+        "--allow-domain",
+        LISTED_NAME,
+        "--url",
+        &listed_page,
+    ]);
+    assert_denied(
+        open(&h, &format!("http://localhost:{}/page", srv.a)),
+        "not in the session's allowed domains",
+    );
+    assert_denied(
+        open(&h, &format!("http://127.0.0.1:{}/page", srv.a)),
+        "not in the session's allowed domains",
+    );
+    let (fm, wm, im) = (marker("f"), marker("w"), marker("i"));
+    let unlisted = |path: &str, m: &str| format!("http://{UNLISTED_NAME}:{}{path}?m={m}", srv.b);
+    assert!(settle(&h, &fetch_js(&unlisted("/secret", &fm))).starts_with("FAIL:"));
+    assert_ne!(settle(&h, &img_js(&unlisted("/img", &im))), "LOADED");
+    let ws = format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b);
+    assert_ne!(settle(&h, &ws_js(&ws)), "OPEN");
+    let lws = format!("ws://localhost:{}/ws?m={}", srv.b, marker("lw"));
+    assert_ne!(settle(&h, &ws_js(&lws)), "OPEN");
+    for m in [&fm, &wm, &im] {
+        assert!(!srv.reached(m), "{m} reached an unlisted host");
+    }
+    // What is listed works, WebSocket included, on another port of the listed host.
+    let (fm, wm) = (marker("f"), marker("w"));
+    let listed = format!("http://{LISTED_NAME}:{}/secret?m={fm}", srv.b);
+    assert_eq!(settle(&h, &read_js(&listed)), "BODY:SECRET-BODY");
+    let ws = format!("ws://{LISTED_NAME}:{}/ws?m={wm}", srv.b);
+    assert_eq!(settle(&h, &ws_js(&ws)), "OPEN");
+    assert!(srv.reached(&fm) && srv.reached(&wm));
+    close(&h);
+
+    // Listing localhost opens it.
+    let h = create(&[
+        "--profile",
+        profile("pol-listed-local"),
+        "--allow-domain",
+        &format!("{LISTED_NAME},localhost"),
+        "--url",
+        &listed_page,
+    ]);
+    let (code, _, err) = open(&h, &format!("http://localhost:{}/page", srv.a));
+    assert_eq!(code, 0, "{err}");
+    let ws = format!("ws://localhost:{}/ws?m={}", srv.b, marker("w"));
+    assert_eq!(settle(&h, &ws_js(&ws)), "OPEN");
+    close(&h);
+}
+
+#[test]
+#[ignore]
+fn new_tabs_and_popups_are_guarded_before_their_first_request() {
+    let srv = AddressServer::start();
+    let lan = srv.lan();
+    let private = |m: &str| format!("http://{PRIVATE_NAME}:{lan}/secret?m={m}");
+    // A page whose `#pop` link (target=_blank) and `#wopen` button (window.open) open a new
+    // window whose first request is `link` and `button`.
+    let page_to = |link: &str, button: &str| {
+        format!(
+            "http://localhost:{}/page?to={}&to2={}",
+            srv.a,
+            enc(link),
+            enc(button)
+        )
+    };
+    let wait_reached = |markers: &[&str]| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !markers.iter().all(|m| srv.reached(m)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    };
+    let click = |h: &str, selector: &str| {
+        let (code, _, err) = shared_home().run(&["--session", h, "click", selector]);
+        assert_eq!(code, 0, "{selector}: {err}");
+    };
+
+    let (tm, pm, wm) = (marker("tab"), marker("pop"), marker("wopen"));
+    let h = create(&[
+        "--profile",
+        profile("pol-priv-closed"),
+        "--url",
+        &page_to(&private(&pm), &private(&wm)),
+    ]);
+    assert_denied(
+        shared_home().run(&["--session", &h, "tab", "new", &private(&tm)]),
+        "private network address",
+    );
+    click(&h, "#pop");
+    click(&h, "#wopen");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    for m in [&tm, &pm, &wm] {
+        assert!(!srv.reached(m), "{m} reached the private server");
+    }
+    close(&h);
+
+    // Positive control: with the private network allowed the same popups load.
+    let (pm, wm) = (marker("pop"), marker("wopen"));
+    let h = create(&[
+        "--profile",
+        profile("pol-priv-open"),
+        "--allow-private-network",
+        "--url",
+        &page_to(&private(&pm), &private(&wm)),
+    ]);
+    click(&h, "#pop");
+    click(&h, "#wopen");
+    wait_reached(&[&pm, &wm]);
+    assert!(srv.reached(&pm), "the link popup did not load (control)");
+    assert!(
+        srv.reached(&wm),
+        "the window.open popup did not load (control)"
+    );
+    close(&h);
+}
+
+#[test]
+#[ignore]
+fn workers_follow_the_rules_task_2_established() {
+    let srv = AddressServer::start();
+    let lan = srv.lan();
+    let private = |m: &str| format!("http://{PRIVATE_NAME}:{lan}/secret?m={m}");
+    // Service workers need a secure context: localhost is one.
+    let page = format!("http://localhost:{}/page", srv.a);
+    let sw = |m: &str| {
+        format!(
+            "navigator.serviceWorker.register('/sw.js?to={}&n={m}').then(r => new Promise(res => {{ \
+             const w = r.installing || r.waiting || r.active; if (!w || w.state !== 'installing') return res('STATE:' + (w && w.state)); \
+             w.onstatechange = () => {{ if (w.state !== 'installing') res('STATE:' + w.state); }}; setTimeout(() => res('TIMEOUT'), 5000); }}))",
+            enc(&private(m))
+        )
+    };
+    let unregister = "navigator.serviceWorker.getRegistrations().then(rs => Promise.all(rs.map(r => r.unregister()))).then(() => 'done')";
+
+    let h = create(&["--profile", profile("pol-priv-closed"), "--url", &page]);
+    let (dm, sm, vm) = (marker("dw"), marker("sw"), marker("svc"));
+    assert!(settle(&h, &worker_js(&private(&dm), false)).starts_with("FAIL:"));
+    assert!(settle(&h, &worker_js(&private(&sm), true)).starts_with("FAIL:"));
+    let state = settle(&h, &sw(&vm));
+    eprintln!("service worker (closed): {state}");
+    assert_eq!(settle(&h, unregister), "done");
+    for m in [&dm, &sm, &vm] {
+        assert!(!srv.reached(m), "{m} reached the private server");
+    }
+    close(&h);
+
+    // Positive control.
+    let h = create(&[
+        "--profile",
+        profile("pol-priv-open"),
+        "--allow-private-network",
+        "--url",
+        &page,
+    ]);
+    let (dm, sm, vm) = (marker("dw"), marker("sw"), marker("svc"));
+    assert_eq!(settle(&h, &worker_js(&private(&dm), false)), "REACHED");
+    assert_eq!(settle(&h, &worker_js(&private(&sm), true)), "REACHED");
+    let state = settle(&h, &sw(&vm));
+    eprintln!("service worker (open): {state}");
+    assert_eq!(settle(&h, unregister), "done");
+    assert!(srv.reached(&dm) && srv.reached(&sm) && srv.reached(&vm));
+    close(&h);
+}

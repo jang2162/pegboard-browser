@@ -330,7 +330,11 @@ static SHARED_HOME: std::sync::OnceLock<Home> = std::sync::OnceLock::new();
 pub fn shared_home() -> &'static Home {
     SHARED_HOME.get_or_init(|| {
         let home = Home::new();
-        let (code, _, err) = home.run(&["browser", "start"]);
+        let rules = host_rules();
+        let (code, _, err) = home.run_env(
+            &[("PEGBOARD_TEST_HOST_RULES", rules.as_str())],
+            &["browser", "start"],
+        );
         assert_eq!(code, 0, "{err}");
         guard_shared_home(home.path());
         // SAFETY: registers a plain `extern "C"` function without arguments.
@@ -339,6 +343,41 @@ pub fn shared_home() -> &'static Home {
         }
         home
     })
+}
+
+/// A name the shared browser (and its daemon) resolve to this machine's private LAN address
+/// (`lan_ip`), or to an unroutable private address when the machine has none.
+pub const PRIVATE_NAME: &str = "private.test";
+/// A name that looks public but resolves like `PRIVATE_NAME`.
+pub const PUBLIC_LOOKING_NAME: &str = "looks-public.example";
+/// Names that resolve to 127.0.0.1, for allow-list tests.
+pub const LISTED_NAME: &str = "listed.test";
+pub const UNLISTED_NAME: &str = "unlisted.test";
+
+/// This machine's private IPv4 address (RFC 1918) on the interface of its default route,
+/// if it has one. A UDP `connect` only picks the route; nothing is sent.
+pub fn lan_ip() -> Option<std::net::Ipv4Addr> {
+    static LAN: std::sync::OnceLock<Option<std::net::Ipv4Addr>> = std::sync::OnceLock::new();
+    *LAN.get_or_init(|| {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.connect("192.0.2.1:9").ok()?;
+        match sock.local_addr().ok()?.ip() {
+            std::net::IpAddr::V4(v4) if v4.is_private() => Some(v4),
+            _ => None,
+        }
+    })
+}
+
+/// The `--host-resolver-rules` the shared browser starts with (`PEGBOARD_TEST_HOST_RULES`,
+/// which the daemon's guard reads too).
+pub fn host_rules() -> String {
+    let private = lan_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "10.255.255.1".to_string());
+    format!(
+        "MAP {PRIVATE_NAME} {private}, MAP {PUBLIC_LOOKING_NAME} {private}, \
+         MAP {LISTED_NAME} 127.0.0.1, MAP {UNLISTED_NAME} 127.0.0.1"
+    )
 }
 
 extern "C" fn stop_shared_home() {
