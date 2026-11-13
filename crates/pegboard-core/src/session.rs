@@ -7,12 +7,13 @@
 //! client.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use pegboard_protocol::{
-    codes, ProfileInfo, ProfileKind, RpcError, SessionCloseParams, SessionCreateParams, SessionId,
-    SessionInfo, SessionPolicy, SessionState,
+    codes, ActionClass, ProfileInfo, ProfileKind, RpcError, SessionCloseParams,
+    SessionCreateParams, SessionId, SessionInfo, SessionPolicy, SessionState,
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, OnceCell};
@@ -245,6 +246,17 @@ impl SessionManager {
             vec![first.clone()],
         );
         inner.proxy.set_group_style(&id, &title, color);
+        // Files for an upload may come from the person's directory and from the session's
+        // own files; without `--allow upload` the proxy takes none.
+        if session_policy.allow.contains(&ActionClass::Upload) {
+            let dirs = [
+                session_policy.upload_dir.as_deref().map(PathBuf::from),
+                Some(inner.paths.session_files(&id)),
+            ];
+            inner
+                .proxy
+                .set_upload_dirs(&id, dirs.into_iter().flatten().collect());
+        }
         let created_at = now();
         let info = SessionInfo {
             id: id.clone(),

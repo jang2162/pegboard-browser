@@ -50,6 +50,10 @@ enum Kind {
     TabRef,
     /// A bare file name with one of these extensions, placed in the session's files dir.
     File(&'static [&'static str]),
+    /// A bare file name (any extension) kept as a name: the daemon looks it up in the
+    /// session's upload directory and files directory (`upload::resolve`) once the policy
+    /// has allowed the command.
+    UploadFile,
     Choice(&'static [&'static str]),
 }
 
@@ -219,7 +223,7 @@ const WAIT_FLAGS: &[Flag] = &[
 /// The phase 1 command set. Left out on purpose, besides everything pegboard owns:
 /// `cookies clear` (`Network.clearBrowserCookies`) and `set media|geo|offline` (Emulation
 /// and network-condition methods) need CDP methods the proxy does not allow; `read`,
-/// `flow`, `diff`, `upload`, `download`, `network route|har`, `trace`, `profiler`, `inspect`,
+/// `flow`, `diff`, `download`, `network route|har`, `trace`, `profiler`, `inspect`,
 /// `webmcp`, `clipboard`, `react`, `pushstate` reach outside the session (local files, the
 /// CLI's own network access, an unauthenticated DevTools proxy).
 const GRAMMAR: &[Form] = &[
@@ -368,6 +372,12 @@ const GRAMMAR: &[Form] = &[
         )
     },
     form(&["pdf"], ActionClass::Snapshot, &[req(File(&["pdf"]))]),
+    // The files are looked up by name in the person's upload directory (see `UploadFile`).
+    with_rest(
+        form(&["upload"], ActionClass::Upload, SEL),
+        UploadFile,
+        true,
+    ),
     form(&["tab"], ActionClass::Navigate, &[opt(TabRef)]),
     form(&["tab", "list"], ActionClass::Read, &[]),
     form(&["tab", "new"], ActionClass::Navigate, &[opt(Url)]),
@@ -457,7 +467,7 @@ const fn find(words: &'static [&'static str], args: &'static [Arg]) -> Form {
     }
 }
 
-fn rejected(message: impl Into<String>) -> RpcError {
+pub(crate) fn rejected(message: impl Into<String>) -> RpcError {
     RpcError {
         code: codes::ARGV_REJECTED.to_string(),
         message: message.into(),
@@ -846,7 +856,7 @@ fn kind_name(kind: Kind) -> &'static str {
         Key => "key",
         Number => "number",
         TabRef => "tab",
-        File(_) => "file name",
+        File(_) | UploadFile => "file name",
         Choice(_) => "choice",
     }
 }
@@ -908,6 +918,10 @@ fn accept(kind: Kind, w: &str, files_dir: &Path) -> Result<String, String> {
             }
             Ok(files_dir.join(w).display().to_string())
         }
+        UploadFile => ok(
+            is_file_name(w),
+            "a bare file name (letters, digits, '.', '_', '-'; no path)",
+        ),
         Choice(options) => ok(
             options.contains(&w),
             &format!("one of {}", options.join(", ")),
@@ -951,6 +965,49 @@ mod tests {
         let e = check(&s(v), Path::new(FILES)).expect_err(&format!("{v:?} was accepted"));
         assert_eq!(e.code, "argv_rejected", "{v:?}");
         e
+    }
+
+    #[test]
+    fn upload_takes_bare_file_names_only() {
+        // The names stay names: the daemon looks them up in the session's directories.
+        assert_eq!(
+            run(&["upload", "#f", "a.txt"]).unwrap(),
+            s(&["upload", "#f", "a.txt"])
+        );
+        assert_eq!(
+            run(&["upload", "#f", "a.txt", "b.tar.gz", "c"]).unwrap(),
+            s(&["upload", "#f", "a.txt", "b.tar.gz", "c"])
+        );
+        for bad in [
+            "../a.txt",
+            "/etc/passwd",
+            "sub/a.txt",
+            "a\\b",
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "-a.txt",
+            "a b.txt",
+            "~/a.txt",
+        ] {
+            refused(&["upload", "#f", bad]);
+        }
+        // One bad name among good ones refuses the line.
+        refused(&["upload", "#f", "a.txt", "../b.txt"]);
+        // A selector and at least one file are needed; no flags.
+        refused(&["upload"]);
+        refused(&["upload", "#f"]);
+        refused(&["upload", "#f", "a.txt", "--multiple"]);
+    }
+
+    #[test]
+    fn upload_is_class_upload() {
+        assert_eq!(
+            class_of(&s(&["upload", "#f", "a.txt"])),
+            Some(ActionClass::Upload)
+        );
+        assert_eq!(class_of(&s(&["upload", "#f", "../a.txt"])), None);
     }
 
     #[test]
@@ -1041,7 +1098,8 @@ mod tests {
             &["--session", "x"][..],
             &["click"],
             &["eval"],
-            &["upload", "#f", "a.txt"],
+            &["upload"],
+            &["upload", "#f"],
             &["cookies", "clear"],
             &["wait", "--fn"],
         ] {
@@ -1172,7 +1230,6 @@ mod tests {
             "profiler",
             "webmcp",
             "diff",
-            "upload",
             "download",
             "batch",
             "session",
@@ -1364,6 +1421,7 @@ mod tests {
             Number => "1".into(),
             TabRef => "t1".into(),
             File(exts) => format!("a.{}", exts[0]),
+            UploadFile => "a.txt".into(),
             Choice(options) => options[0].into(),
         }
     }

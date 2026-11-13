@@ -7,6 +7,7 @@
 //! The scope (targets and CDP sessions) is maintained here from what passes the filter.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -151,6 +152,7 @@ impl SessionEntry {
                 context: context.to_string(),
                 targets: targets.into_iter().collect(),
                 cdp_sessions: HashSet::new(),
+                upload_dirs: Vec::new(),
             }),
             closed: watch::channel(false).0,
         }
@@ -257,6 +259,14 @@ impl ProxyServer {
         Endpoint {
             url: format!("ws://127.0.0.1:{}/s/{}", self.port, id.0),
             token,
+        }
+    }
+
+    /// Sets the directories the session's `DOM.setFileInputFiles` may take files from
+    /// (none until this is called).
+    pub fn set_upload_dirs(&self, id: &SessionId, dirs: Vec<PathBuf>) {
+        if let Some(entry) = self.shared.entry(id) {
+            entry.scope.lock().unwrap().upload_dirs = dirs;
         }
     }
 

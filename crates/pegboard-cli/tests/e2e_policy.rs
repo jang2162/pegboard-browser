@@ -226,6 +226,185 @@ fn session_info_shows_the_policy_and_no_token() {
     close(&handle);
 }
 
+/// A page with one file input (`#f`).
+const UPLOAD_PAGE: &str = "data:text/html,<input%20id=f%20type=file%20multiple>";
+
+/// What the page's `#f` holds: `name:size` of each chosen file, comma separated.
+fn chosen(handle: &str) -> String {
+    let (code, out, err) = shared_home().run(&[
+        "--session",
+        handle,
+        "eval",
+        "Array.from(document.getElementById('f').files).map(f => f.name + ':' + f.size).join(',')",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    json(&out)["result"].as_str().unwrap().to_string()
+}
+
+/// A session with an upload directory of its own, opened on the upload page.
+fn upload_session(dir: &std::path::Path) -> String {
+    let handle = create(&[
+        "--url",
+        UPLOAD_PAGE,
+        "--allow",
+        "upload",
+        "--upload-dir",
+        dir.to_str().unwrap(),
+    ]);
+    // The first command makes the session's files directory.
+    let (code, _, err) = shared_home().run(&["--session", &handle, "get", "url"]);
+    assert_eq!(code, 0, "{err}");
+    handle
+}
+
+fn files_dir_of(handle: &str) -> std::path::PathBuf {
+    shared_home()
+        .path()
+        .join("sessions")
+        .join(id_of(handle))
+        .join("files")
+}
+
+#[test]
+#[ignore]
+fn upload_needs_allow_and_a_directory() {
+    let home = shared_home();
+    let plain = create(&["--url", UPLOAD_PAGE]);
+    let (code, _, err) = home.run(&["--session", &plain, "upload", "#f", "a.txt"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("policy_denied"), "{err}");
+    assert!(err.contains("--allow upload"), "{err}");
+    assert!(err.contains("--upload-dir"), "{err}");
+    assert_eq!(chosen(&plain), "");
+    close(&plain);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello upload").unwrap();
+    let handle = upload_session(dir.path());
+    let (code, out, err) = home.run(&["--session", &handle, "upload", "#f", "a.txt"]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert_eq!(chosen(&handle), "a.txt:12");
+    close(&handle);
+}
+
+#[test]
+#[ignore]
+fn upload_cannot_reach_outside_the_directory() {
+    let home = shared_home();
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+    std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.txt"),
+        dir.path().join("link.txt"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("linkdir")).unwrap();
+    let handle = upload_session(dir.path());
+    let absolute = outside.path().join("secret.txt").display().to_string();
+    for name in [
+        "link.txt",
+        "linkdir",
+        "../secret.txt",
+        "linkdir/secret.txt",
+        "/etc/passwd",
+        absolute.as_str(),
+        "missing.txt",
+        ".",
+        "",
+    ] {
+        let (code, out, err) = home.run(&["--session", &handle, "upload", "#f", name]);
+        assert_eq!(code, 2, "{name:?}: {out} {err}");
+        assert!(err.contains("argv_rejected"), "{name:?}: {err}");
+        assert_eq!(chosen(&handle), "", "{name:?}");
+    }
+    // Neither refusal names a directory.
+    let (_, _, err) = home.run(&["--session", &handle, "upload", "#f", "missing.txt"]);
+    let dir_s = dir.path().to_str().unwrap();
+    assert!(!err.contains(dir_s), "{err}");
+    // One bad name among good ones uploads nothing.
+    let (code, _, _) = home.run(&["--session", &handle, "upload", "#f", "ok.txt", "link.txt"]);
+    assert_eq!(code, 2);
+    assert_eq!(chosen(&handle), "");
+    // The good name still works.
+    let (code, _, err) = home.run(&["--session", &handle, "upload", "#f", "ok.txt"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(chosen(&handle), "ok.txt:2");
+    close(&handle);
+}
+
+#[test]
+#[ignore]
+fn a_downloaded_file_can_be_uploaded() {
+    // Downloads land in the session's files directory (a later task); a file put there
+    // stands in for one. The upload directory has no file of that name.
+    let home = shared_home();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mine.txt"), "mine").unwrap();
+    let handle = upload_session(dir.path());
+    std::fs::write(files_dir_of(&handle).join("got.txt"), "downloaded").unwrap();
+    let (code, out, err) = home.run(&["--session", &handle, "upload", "#f", "got.txt"]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert_eq!(chosen(&handle), "got.txt:10");
+    // Both places in one call; the upload directory comes first for a name in both.
+    std::fs::write(files_dir_of(&handle).join("mine.txt"), "from files").unwrap();
+    let (code, out, err) = home.run(&["--session", &handle, "upload", "#f", "mine.txt", "got.txt"]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert_eq!(chosen(&handle), "mine.txt:4,got.txt:10");
+    close(&handle);
+
+    // Without --allow upload the same file cannot be uploaded.
+    let plain = create(&["--url", UPLOAD_PAGE]);
+    let (code, _, err) = home.run(&["--session", &plain, "upload", "#f", "got.txt"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("policy_denied"), "{err}");
+    close(&plain);
+}
+
+#[test]
+#[ignore]
+fn upload_is_logged_by_file_name_only() {
+    let home = shared_home();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("report.txt"), "r").unwrap();
+    let handle = upload_session(dir.path());
+    let (code, out, err) = home.run(&["--session", &handle, "upload", "#f", "report.txt"]);
+    assert_eq!(code, 0, "{out} {err}");
+    // What the agent is told never has the person's directory in it.
+    let dir_s = dir.path().to_str().unwrap();
+    let real = dir.path().canonicalize().unwrap();
+    for text in [&out, &err] {
+        assert!(!text.contains(dir_s), "{text}");
+        assert!(!text.contains(real.to_str().unwrap()), "{text}");
+    }
+    let rid = format!("r_{}", &id_of(&handle)[2..]);
+    let (code, shown, _) = home.run(&["recording", "show", &rid, "--json"]);
+    assert_eq!(code, 0);
+    let entry = json(&shown)["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["command"] == "upload")
+        .unwrap_or_else(|| panic!("no upload entry: {shown}"))
+        .clone();
+    assert_eq!(
+        entry["args"],
+        json!(["upload", "#f", "report.txt"]),
+        "{entry}"
+    );
+    assert_eq!(entry["ok"], true, "{entry}");
+    assert!(
+        !shown.contains(dir_s) && !shown.contains(real.to_str().unwrap()),
+        "{shown}"
+    );
+    // A refused name is logged without its arguments.
+    let _ = home.run(&["--session", &handle, "upload", "#f", "../report.txt"]);
+    let (_, shown, _) = home.run(&["recording", "show", &rid, "--json"]);
+    assert!(!shown.contains("../report.txt"), "{shown}");
+    close(&handle);
+}
+
 #[test]
 fn bad_policy_options_exit_2() {
     // No daemon: the options are checked before one is asked.

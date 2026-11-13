@@ -380,7 +380,6 @@ fn escape_flags_and_commands_are_refused() {
         vec!["open", "chrome://settings"],
         vec!["tab", "new", "file:///etc/hosts"],
         // Commands outside the phase 1 allow-list.
-        vec!["upload", "#f", "x.txt"],
         vec!["inspect"],
         vec!["read"],
         vec!["set", "credentials", "a", "b"],

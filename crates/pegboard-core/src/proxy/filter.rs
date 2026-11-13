@@ -6,6 +6,7 @@
 //! matching row wins.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -14,6 +15,9 @@ pub struct Scope {
     pub context: String,
     pub targets: HashSet<String>,
     pub cdp_sessions: HashSet<String>,
+    /// The directories `DOM.setFileInputFiles` may take files from: the session's upload
+    /// directory and files directory when its policy allows upload, else none.
+    pub upload_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -102,6 +106,9 @@ pub const ALLOWED_METHODS: &[&str] = &[
     // isolated JS world of its frame; a script for its next documents).
     "Page.createIsolatedWorld",
     "Page.addScriptToEvaluateOnNewDocument",
+    // Task 6: `upload`. Only forwarded after `client_message` has checked every path against
+    // the session's upload directories (rule 7b); it reads local files into the page.
+    "DOM.setFileInputFiles",
 ];
 
 const NOT_ALLOWED: &str = "not allowed in a pegboard session";
@@ -268,6 +275,32 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
         let mut rewritten = msg.clone();
         rewritten["params"]["url"] = Value::String(url);
         return ClientDecision::ForwardRewritten(rewritten);
+    }
+
+    // 7b. Files for a file input: only regular files inside the session's upload
+    // directories, which are empty unless the session's policy allows upload. Checked on the
+    // real paths, so a link inside a directory that points out of it does not pass.
+    if method == "DOM.setFileInputFiles" {
+        if session_id.is_none() {
+            return error(
+                -32000,
+                "browser-level call is not allowed; use a page session",
+            );
+        }
+        let Some(files) = params
+            .and_then(|p| p.get("files"))
+            .and_then(Value::as_array)
+            .and_then(|a| a.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+        else {
+            return error(-32602, "Invalid params: files must be an array of strings");
+        };
+        if !files
+            .iter()
+            .all(|f| crate::upload::path_allowed(Path::new(f), &scope.upload_dirs))
+        {
+            return error(-32000, "a file outside the session's upload directories");
+        }
+        return ClientDecision::Forward;
     }
 
     // 8. Allowlist.
@@ -487,6 +520,7 @@ mod tests {
             context: "AGENT".into(),
             targets: ["T1".to_string()].into(),
             cdp_sessions: ["S1".to_string()].into(),
+            upload_dirs: Vec::new(),
         }
     }
 
@@ -495,6 +529,70 @@ mod tests {
             ClientDecision::Error { code, .. } => *code,
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    fn set_files(files: Value) -> Value {
+        json!({"id":1,"sessionId":"S1","method":"DOM.setFileInputFiles",
+               "params":{"files":files,"backendNodeId":7}})
+    }
+
+    #[test]
+    fn set_file_input_files_only_takes_files_inside_the_upload_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (up, files, out) = (root.join("up"), root.join("files"), root.join("out"));
+        for d in [&up, &files, &out] {
+            std::fs::create_dir(d).unwrap();
+            std::fs::write(d.join("a.txt"), "a").unwrap();
+        }
+        std::os::unix::fs::symlink(out.join("a.txt"), up.join("link")).unwrap();
+        let mut sc = scope();
+        let path = |p: PathBuf| json!([p.display().to_string()]);
+
+        // No directory (a session that may not upload): refused, whatever the path.
+        let m = set_files(path(up.join("a.txt")));
+        assert_eq!(err_code(&client_message(&m, &sc)), -32000);
+
+        sc.upload_dirs = vec![up.clone(), files.clone()];
+        for ok in [up.join("a.txt"), files.join("a.txt")] {
+            assert_eq!(
+                client_message(&set_files(path(ok.clone())), &sc),
+                ClientDecision::Forward,
+                "{ok:?}"
+            );
+        }
+        for bad in [
+            out.join("a.txt"),
+            up.join("link"),
+            up.join("../out/a.txt"),
+            up.join("missing"),
+            PathBuf::from("a.txt"),
+            PathBuf::from("/etc/passwd"),
+        ] {
+            let m = set_files(path(bad.clone()));
+            assert_eq!(err_code(&client_message(&m, &sc)), -32000, "{bad:?}");
+        }
+        // One path outside refuses the whole call.
+        let m = set_files(json!([
+            up.join("a.txt").display().to_string(),
+            out.join("a.txt").display().to_string()
+        ]));
+        assert_eq!(err_code(&client_message(&m, &sc)), -32000);
+        // Clearing the input needs no file.
+        assert_eq!(
+            client_message(&set_files(json!([])), &sc),
+            ClientDecision::Forward
+        );
+        // Malformed: files missing, not an array, not strings; no CDP session.
+        for files in [json!(null), json!("x"), json!([1]), json!({"a":1})] {
+            let mut m = set_files(files);
+            assert_eq!(err_code(&client_message(&m, &sc)), -32602);
+            m["params"].as_object_mut().unwrap().remove("files");
+            assert_eq!(err_code(&client_message(&m, &sc)), -32602);
+        }
+        let mut m = set_files(path(up.join("a.txt")));
+        m.as_object_mut().unwrap().remove("sessionId");
+        assert_eq!(err_code(&client_message(&m, &sc)), -32000);
     }
 
     #[test]

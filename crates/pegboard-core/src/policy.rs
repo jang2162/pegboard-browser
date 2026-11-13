@@ -41,11 +41,17 @@ pub fn judge_action(policy: &SessionPolicy, class: ActionClass) -> Result<(), Rp
             ));
         }
     } else if !policy.allow.contains(&class) {
+        // Uploading also needs the folder the files come from.
+        let with = if class == ActionClass::Upload {
+            " and --upload-dir <directory>"
+        } else {
+            ""
+        };
         return Err(error(
             codes::POLICY_DENIED,
             format!(
                 "the session's policy does not allow {name} commands; a person can allow it \
-                 when creating the session with --allow {name}"
+                 when creating the session with --allow {name}{with}"
             ),
         ));
     }
@@ -341,6 +347,14 @@ mod tests {
             e.message,
             "the session's policy does not allow state commands; a person can allow it when \
              creating the session with --allow state"
+        );
+        let e = judge_action(&SessionPolicy::default(), ActionClass::Upload).unwrap_err();
+        assert_eq!(e.code, codes::POLICY_DENIED);
+        assert!(
+            e.message
+                .contains("--allow upload and --upload-dir <directory>"),
+            "{}",
+            e.message
         );
         let e = judge_action(&policy(&[], &[ActionClass::Eval]), ActionClass::Eval).unwrap_err();
         assert_eq!(e.code, codes::POLICY_DENIED);

@@ -1,6 +1,7 @@
 //! The path every agent command takes: check, execute, decide what to hide, log.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use pegboard_protocol::{codes, CommandExecResult, RpcError, SessionId};
@@ -10,12 +11,13 @@ use crate::actionlog::{
     attrs_are_sensitive, logged_args, rejected_args, rejected_command, truncate_chars, url_for_log,
     ActionEntry, ActionLog, MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
 };
-use crate::argv::{self, Checked, TextDestination};
+use crate::argv::{self, rejected, Checked, TextDestination};
 use crate::paths::Paths;
 use crate::policy;
 use crate::proxy::server::Endpoint;
 use crate::runner::{succeeded, Runner, DEFAULT_TIMEOUT_MS};
 use crate::session::SessionManager;
+use crate::upload;
 
 pub use crate::service::Daemon;
 
@@ -172,10 +174,18 @@ pub async fn run_command_with_hook(
         return refuse(log, entry, argv, e, started);
     }
     let is_tab_new = matches!(checked, Checked::TabNew { .. });
-    let run_argv = match checked {
+    let mut run_argv = match checked {
         Checked::Run(words) => words,
         Checked::TabNew { url } => vec!["tab".to_string(), "new".to_string(), url],
     };
+    // An upload names its files; they become paths only now that the policy allows it.
+    let mut path_names = Vec::new();
+    if run_argv.first().map(String::as_str) == Some("upload") {
+        match resolve_upload(sessions, paths, id, &run_argv) {
+            Ok((words, names)) => (run_argv, path_names) = (words, names),
+            Err(e) => return refuse(log, entry, argv, e, started),
+        }
+    }
 
     runner.set_session_targets_provider(sessions.targets_fn());
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
@@ -200,10 +210,11 @@ pub async fn run_command_with_hook(
     };
 
     let had_no_tab = sessions.info(id).is_ok_and(|i| i.targets.is_empty());
-    let outcome = match &endpoint {
+    let mut outcome = match &endpoint {
         Ok(ep) => runner.exec(id, ep, &run_argv, timeout_ms).await,
         Err(e) => Err(e.clone()),
     };
+    hide_paths(&mut outcome, &path_names);
     // A session without a tab: agent-browser opens a blank tab of its own, then `tab new`
     // opens the requested one. Only the tab it ends up bound to stays.
     if is_tab_new && had_no_tab && matches!(&outcome, Ok(r) if succeeded(r)) {
@@ -241,6 +252,91 @@ pub async fn run_command_with_hook(
     append(log, entry)?;
     sessions.touch(id);
     outcome
+}
+
+/// The words of a resolved upload and, per file, its path and its name.
+type Resolved = (Vec<String>, Vec<(String, String)>);
+
+/// Turns the file names of an `upload` command line (`upload <selector> <name>...`) into
+/// paths: each name is looked up in the session's upload directory, then its files
+/// directory. Returns the words to run and, per file, its path and its name (so that the
+/// path can be kept from the agent). A name found in neither is refused without naming a
+/// directory.
+fn resolve_upload(
+    sessions: &SessionManager,
+    paths: &Paths,
+    id: &SessionId,
+    words: &[String],
+) -> Result<Resolved, RpcError> {
+    let policy = sessions.policy(id)?;
+    resolve_names(policy.upload_dir.as_deref(), paths.session_files(id), words)
+}
+
+fn resolve_names(
+    upload_dir: Option<&str>,
+    files_dir: PathBuf,
+    words: &[String],
+) -> Result<Resolved, RpcError> {
+    // `validate` ties the two together; a policy without the directory cannot upload.
+    let Some(upload_dir) = upload_dir else {
+        return Err(RpcError {
+            code: codes::INTERNAL.to_string(),
+            message: "the session has no upload directory".into(),
+            data: None,
+        });
+    };
+    let dirs = [PathBuf::from(upload_dir), files_dir];
+    let mut out = words[..2].to_vec();
+    let mut names = Vec::new();
+    for name in &words[2..] {
+        let path = upload::resolve(name, &dirs).ok_or_else(|| {
+            rejected(format!(
+                "{name:?} was not found in the upload directory or the session's files"
+            ))
+        })?;
+        let path = path.display().to_string();
+        out.push(path.clone());
+        names.push((path, name.clone()));
+    }
+    Ok((out, names))
+}
+
+/// Replaces the paths of uploaded files in what the command answered with their names:
+/// agent-browser may echo them, and the agent never learns where the person's folder is.
+fn hide_paths(outcome: &mut Result<CommandExecResult, RpcError>, names: &[(String, String)]) {
+    if names.is_empty() {
+        return;
+    }
+    let mut pairs = Vec::new();
+    for (path, name) in names {
+        // The CLI may print the real path (a link in the folder's path resolved).
+        if let Ok(real) = std::fs::canonicalize(path) {
+            pairs.push((real.display().to_string(), name.clone()));
+        }
+        pairs.push((path.clone(), name.clone()));
+    }
+    let scrub = |s: &mut String| {
+        for (path, name) in &pairs {
+            if s.contains(path.as_str()) {
+                *s = s.replace(path.as_str(), name);
+            }
+        }
+    };
+    fn walk(v: &mut Value, scrub: &dyn Fn(&mut String)) {
+        match v {
+            Value::String(s) => scrub(s),
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, scrub)),
+            Value::Object(o) => o.values_mut().for_each(|x| walk(x, scrub)),
+            _ => {}
+        }
+    }
+    match outcome {
+        Ok(r) => {
+            walk(&mut r.output, &scrub);
+            scrub(&mut r.stderr);
+        }
+        Err(e) => scrub(&mut e.message),
+    }
 }
 
 /// Logs a command refused before it ran (its line, or the policy) and returns the error.
@@ -500,6 +596,84 @@ mod tests {
             !text.contains("hunter2-secret") && !text.contains("sid"),
             "{text}"
         );
+    }
+
+    fn words(v: &[&str]) -> Vec<String> {
+        v.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn upload_names_become_paths_and_a_missing_one_names_no_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (up, files) = (root.join("person-folder"), root.join("session-files"));
+        std::fs::create_dir(&up).unwrap();
+        std::fs::create_dir(&files).unwrap();
+        std::fs::write(up.join("a.txt"), "a").unwrap();
+        std::fs::write(files.join("b.txt"), "b").unwrap();
+        let up_s = up.to_str().unwrap();
+        let (run, names) = resolve_names(
+            Some(up_s),
+            files.clone(),
+            &words(&["upload", "#f", "a.txt", "b.txt"]),
+        )
+        .unwrap();
+        assert_eq!(
+            run,
+            [
+                "upload".to_string(),
+                "#f".into(),
+                up.join("a.txt").display().to_string(),
+                files.join("b.txt").display().to_string()
+            ]
+        );
+        assert_eq!(names[0].1, "a.txt");
+        let e = resolve_names(
+            Some(up_s),
+            files.clone(),
+            &words(&["upload", "#f", "a.txt", "nope.txt"]),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, codes::ARGV_REJECTED);
+        assert!(e.message.contains("nope.txt"), "{}", e.message);
+        assert!(
+            !e.message.contains("person-folder") && !e.message.contains("session-files"),
+            "{}",
+            e.message
+        );
+        // No upload directory in the policy: nothing is looked up.
+        let e = resolve_names(None, files, &words(&["upload", "#f", "b.txt"])).unwrap_err();
+        assert_eq!(e.code, codes::INTERNAL);
+    }
+
+    #[test]
+    fn an_upload_is_logged_by_file_name_and_is_denied_by_default() {
+        let argv = words(&["upload", "#f", "a.txt"]);
+        assert_eq!(logged_args(&argv, false), argv);
+        let class = argv::class_of(&argv).unwrap();
+        let e = policy::judge_action(&Default::default(), class).unwrap_err();
+        assert_eq!(e.code, codes::POLICY_DENIED);
+    }
+
+    #[test]
+    fn the_agent_never_gets_an_uploaded_files_path_back() {
+        let names = vec![("/p/dir/a.txt".to_string(), "a.txt".to_string())];
+        let mut out = Ok(CommandExecResult {
+            exit_code: 0,
+            output: json!({"success": true, "data": {"uploaded": ["/p/dir/a.txt"]}, "n": 1}),
+            stderr: "read /p/dir/a.txt".into(),
+        });
+        hide_paths(&mut out, &names);
+        let r = out.unwrap();
+        assert_eq!(r.output["data"]["uploaded"][0], "a.txt");
+        assert_eq!(r.stderr, "read a.txt");
+        let mut err: Result<CommandExecResult, RpcError> = Err(RpcError {
+            code: "x".into(),
+            message: "no /p/dir/a.txt".into(),
+            data: None,
+        });
+        hide_paths(&mut err, &names);
+        assert_eq!(err.unwrap_err().message, "no a.txt");
     }
 
     #[test]

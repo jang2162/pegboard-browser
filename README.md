@@ -70,7 +70,8 @@ pegboard profile delete work                            # 열린 세션이 있�
 - MCP 서버, 화면 녹화(지금 기록은 동작 목록뿐이다), 동작 정책과 확인 요청, 원격 제어, 프로필 복사.
 - 1단계 허용목록에서 뺀 명령. 허용목록(`crates/pegboard-core/src/argv.rs`)에 없는 것은 모두 거부되며, 아래는 그중 알려 둘 만한 것이다.
   - `cookies clear`, `set media`, `set geo`, `set offline`: 필요한 CDP 메서드(`Network.clearBrowserCookies`, 에뮬레이션·네트워크 조건 계열)를 프록시가 허용하지 않는다.
-  - `read`, `flow`, `diff`, `upload`, `download`, `network route`, `network har`, `trace`, `profiler`, `inspect`, `webmcp`, `clipboard`, `react`, `pushstate`, `wait --download`: 세션 밖(로컬 파일, CLI 자체의 네트워크 접근, 인증 없는 DevTools 프록시)에 닿는다.
+  - `read`, `flow`, `diff`, `download`, `network route`, `network har`, `trace`, `profiler`, `inspect`, `webmcp`, `clipboard`, `react`, `pushstate`, `wait --download`: 세션 밖(로컬 파일, CLI 자체의 네트워크 접근, 인증 없는 DevTools 프록시)에 닿는다.
+  - `upload <선택자> <파일이름>...`: 사람이 `--allow upload --upload-dir <폴더>`로 만든 세션에서만 된다. 파일은 그 폴더(또는 세션 파일 디렉터리)의 맨 파일 이름으로만 고르며, 심볼릭 링크와 폴더 밖의 이름은 거부한다. 프록시도 `DOM.setFileInputFiles`의 경로가 그 두 폴더 안인지 다시 검사한다.
   - `batch`: 명령 여러 개를 묶어 한 번에 보내므로 명령별 필터를 지나치게 된다.
   - `set credentials`, `set headers`: 인자에 비밀이 들어가거나 요청 전체에 영향을 준다. 허용목록에 없다.
 
