@@ -331,8 +331,12 @@ pub fn shared_home() -> &'static Home {
     SHARED_HOME.get_or_init(|| {
         let home = Home::new();
         let rules = host_rules();
+        let browser_rules = browser_only_host_rules();
         let (code, _, err) = home.run_env(
-            &[("PEGBOARD_TEST_HOST_RULES", rules.as_str())],
+            &[
+                ("PEGBOARD_TEST_HOST_RULES", rules.as_str()),
+                ("PEGBOARD_TEST_BROWSER_HOST_RULES", browser_rules.as_str()),
+            ],
             &["browser", "start"],
         );
         assert_eq!(code, 0, "{err}");
@@ -378,6 +382,17 @@ pub fn host_rules() -> String {
         "MAP {PRIVATE_NAME} {private}, MAP {PUBLIC_LOOKING_NAME} {private}, \
          MAP {LISTED_NAME} 127.0.0.1, MAP {UNLISTED_NAME} 127.0.0.1"
     )
+}
+
+/// A real public name (IANA's reserved example domain). The daemon resolves it through DNS to
+/// its public address, while the shared browser connects to 127.0.0.1 under it
+/// (`browser_only_host_rules`): pages "from a public address" served by a local test server.
+/// Tests that use it need working DNS.
+pub const PUBLIC_NAME: &str = "example.net";
+
+/// Host resolver rules given to the browser only (`PEGBOARD_TEST_BROWSER_HOST_RULES`).
+pub fn browser_only_host_rules() -> String {
+    format!("MAP {PUBLIC_NAME} 127.0.0.1")
 }
 
 extern "C" fn stop_shared_home() {

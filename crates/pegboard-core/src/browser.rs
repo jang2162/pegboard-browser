@@ -407,10 +407,22 @@ async fn wait_for_first_context(conn: &CdpConn) -> Result<String> {
 
 /// Test-only: `PEGBOARD_TEST_HOST_RULES` is passed to the browser as `--host-resolver-rules`
 /// (and read by the guard's resolver), so tests can give names private addresses.
+/// `PEGBOARD_TEST_BROWSER_HOST_RULES` is passed to the browser only, so a test can make the
+/// browser and the daemon disagree (the daemon resolving a name to a public address while the
+/// browser reaches a local test server under it).
 fn test_host_rules() -> Vec<String> {
-    match std::env::var("PEGBOARD_TEST_HOST_RULES") {
-        Ok(rules) if !rules.is_empty() => vec![format!("--host-resolver-rules={rules}")],
-        _ => Vec::new(),
+    let rules: Vec<String> = [
+        "PEGBOARD_TEST_HOST_RULES",
+        "PEGBOARD_TEST_BROWSER_HOST_RULES",
+    ]
+    .iter()
+    .filter_map(|name| std::env::var(name).ok())
+    .filter(|r| !r.is_empty())
+    .collect();
+    if rules.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("--host-resolver-rules={}", rules.join(", "))]
     }
 }
 

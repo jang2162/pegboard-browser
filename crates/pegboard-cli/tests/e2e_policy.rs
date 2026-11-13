@@ -966,13 +966,12 @@ fn allow_domain_closes_everything_else_including_localhost() {
     close(&h);
 }
 
-/// What Chrome does to a document pegboard serves again (with its CSP) on an insecure
-/// origin: such a document has no address space of its own, and these requests are allowed
-/// by the session's policy. Expected to pass; a failure means serving documents again breaks
-/// pages on `http:` origins other than `localhost` (the D4 stop condition).
+/// Pages on an insecure (`http:`, not `localhost`) origin whose host is an allowed loopback or
+/// private address are not served again, so they keep their address space and reach the local
+/// hosts the policy allows (a served-again one could not: second-machine round 2).
 #[test]
 #[ignore]
-fn served_again_page_on_an_insecure_origin_reaches_allowed_local_hosts() {
+fn pages_on_allowed_local_origins_are_not_served_again() {
     let srv = AddressServer::start();
     // An allow-list (served again): an `http:` name that resolves to loopback.
     let h = create(&[
@@ -999,8 +998,7 @@ fn served_again_page_on_an_insecure_origin_reaches_allowed_local_hosts() {
     let other_default = format!("http://{UNLISTED_NAME}:{}/secret?m={}", srv.b, marker("d"));
     let got_default = settle(&h, &read_js(&other_default));
     close(&h);
-    // Control without serving again (`--allow-private-network`, no allow-list): an `http:`
-    // page on the private name.
+    // `--allow-private-network`, no allow-list: an `http:` page on the private name.
     let lan = srv.lan();
     let h = create(&[
         "--profile",
@@ -1014,9 +1012,9 @@ fn served_again_page_on_an_insecure_origin_reaches_allowed_local_hosts() {
     close(&h);
     eprintln!(
         "listed same-origin: {got_same}; listed other port: {got_other}; \
-         default other port: {got_default}; not served again: {got_control}"
+         default other port: {got_default}; private page: {got_control}"
     );
-    assert_eq!(got_control, "BODY:SECRET-BODY", "control");
+    assert_eq!(got_control, "BODY:SECRET-BODY", "private page");
     assert_eq!(got_same, "BODY:SECRET-BODY", "listed, same origin");
     assert_eq!(got_other, "BODY:SECRET-BODY", "listed, other port");
     assert_eq!(
@@ -1137,5 +1135,69 @@ fn workers_follow_the_rules_task_2_established() {
     eprintln!("service worker (open): {state}");
     assert_eq!(settle(&h, unregister), "done");
     assert!(srv.reached(&dm) && srv.reached(&sm) && srv.reached(&vm));
+    close(&h);
+}
+
+/// Records the outcome of `new WebSocket(url)` and the CSP violations the page reported, as
+/// `<outcome>|<violated directives>`.
+fn ws_csp_js(url: &str) -> String {
+    format!(
+        "new Promise(r => {{ const v = []; document.addEventListener('securitypolicyviolation', e => v.push(e.violatedDirective)); \
+         let out = ''; try {{ const w = new WebSocket('{url}'); w.onopen = () => {{ out = 'OPEN'; w.close(); }}; w.onerror = () => {{ out = out || 'ERROR'; }}; }} \
+         catch (e) {{ out = 'THROW:' + e.name; }} setTimeout(() => r((out || 'PENDING') + '|' + v.join(',')), 2000); }})"
+    )
+}
+
+/// A page from a public address (the daemon resolves `PUBLIC_NAME` through DNS; the browser
+/// reaches the local test server under it) is served again with the CSP: a plain WebSocket to
+/// a host the default policy does not open is refused by `connect-src`, while one to loopback
+/// raises no violation. A page on a local origin is not served again, and the same WebSocket
+/// opens there (not covered, by the owner's ruling). Needs DNS for `example.net`.
+#[test]
+#[ignore]
+fn pages_from_a_public_address_get_the_csp() {
+    let srv = AddressServer::start();
+    let h = create(&[
+        "--profile",
+        profile("pol-csp-default"),
+        "--url",
+        &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
+    ]);
+    let wm = marker("w");
+    let refused = settle(
+        &h,
+        &ws_csp_js(&format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b)),
+    );
+    let local = settle(
+        &h,
+        &ws_csp_js(&format!("ws://localhost:{}/ws?m={}", srv.b, marker("l"))),
+    );
+    eprintln!("public page: ws to unlisted: {refused}; ws to localhost: {local}");
+    assert!(!refused.starts_with("OPEN"), "{refused}");
+    assert!(
+        refused.contains("connect-src"),
+        "no CSP violation: {refused}"
+    );
+    assert!(!srv.reached(&wm));
+    assert!(
+        !local.contains("connect-src"),
+        "loopback is open in the CSP: {local}"
+    );
+    close(&h);
+
+    let h = create(&[
+        "--profile",
+        profile("pol-csp-default"),
+        "--url",
+        &format!("http://localhost:{}/page", srv.a),
+    ]);
+    let wm = marker("w");
+    let open_ws = settle(
+        &h,
+        &ws_csp_js(&format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b)),
+    );
+    eprintln!("local page: ws to unlisted: {open_ws}");
+    assert!(open_ws.starts_with("OPEN|"), "{open_ws}");
+    assert!(srv.reached(&wm));
     close(&h);
 }
