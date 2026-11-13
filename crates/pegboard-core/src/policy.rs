@@ -202,6 +202,18 @@ pub struct AddressPins {
     pub no_localhost: bool,
 }
 
+impl AddressPins {
+    /// A policy that carries these address settings and nothing else.
+    pub fn as_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            allow_domains: self.allow_domains.clone(),
+            allow_private_network: self.allow_private_network,
+            no_localhost: self.no_localhost,
+            ..SessionPolicy::default()
+        }
+    }
+}
+
 impl std::fmt::Display for AddressPins {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.allow_domains.is_empty() {
@@ -265,6 +277,16 @@ impl PinTable {
             pinned: self.pinned.clone(),
             profile: profile.to_string(),
         })
+    }
+
+    /// The address policy the profile's sessions hold, or the default one when no session
+    /// holds a pin (a tab left in the profile by a closed session).
+    pub fn address_policy(&self, profile: &str) -> SessionPolicy {
+        let table = self.pinned.lock().unwrap();
+        match table.get(profile) {
+            Some((pins, _)) => pins.address.as_policy(),
+            None => SessionPolicy::default(),
+        }
     }
 }
 
@@ -591,6 +613,23 @@ mod tests {
         let g3 = table.acquire("p", b.clone()).unwrap();
         drop((other, g3));
         assert!(table.acquire("p", a).is_ok());
+    }
+
+    #[test]
+    fn the_guard_reads_the_address_policy_a_profile_is_pinned_to() {
+        let table = PinTable::default();
+        assert_eq!(table.address_policy("p"), SessionPolicy::default());
+        let g = table
+            .acquire("p", pins(true, &["a.test"], true, true))
+            .unwrap();
+        let p = table.address_policy("p");
+        assert_eq!(p.allow_domains, ["a.test"]);
+        assert!(p.allow_private_network && p.no_localhost);
+        // Only the address settings: nothing else is carried.
+        assert!(p.allow.is_empty() && p.deny.is_empty() && p.upload_dir.is_none());
+        assert_eq!(table.address_policy("q"), SessionPolicy::default());
+        drop(g);
+        assert_eq!(table.address_policy("p"), SessionPolicy::default());
     }
 
     #[test]

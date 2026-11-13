@@ -168,11 +168,17 @@ pub type TargetAdded = Arc<dyn Fn(&SessionId, &str) + Send + Sync>;
 /// for a tab a client created.
 pub type GroupChanged = Arc<dyn Fn(&SessionId, &GroupId) + Send + Sync>;
 
+/// Called with a tab the bridge made for a client's `Target.createTarget`, before the tab
+/// joins the scope; an error keeps it out (the tab is closed and the client gets the error).
+pub type TabGate =
+    Arc<dyn Fn(String) -> futures_util::future::BoxFuture<'static, Result<()>> + Send + Sync>;
+
 struct Shared {
     upstream: Arc<dyn Upstream>,
     sessions: Sessions,
     on_target_added: Mutex<Option<TargetAdded>>,
     on_group_changed: Mutex<Option<GroupChanged>>,
+    tab_gate: Mutex<Option<TabGate>>,
     /// Client connections whose upstream is open.
     connections: Arc<AtomicUsize>,
     /// Test hook: delay before each bridge tab creation.
@@ -200,6 +206,7 @@ impl ProxyServer {
             sessions: Mutex::new(HashMap::new()),
             on_target_added: Mutex::new(None),
             on_group_changed: Mutex::new(None),
+            tab_gate: Mutex::new(None),
             connections: Arc::new(AtomicUsize::new(0)),
             tab_delay_ms: AtomicU64::new(0),
             refused: Mutex::new(BTreeMap::new()),
@@ -340,6 +347,11 @@ impl ProxyServer {
     /// connection's task, so it must not block.
     pub fn on_target_added(&self, f: impl Fn(&SessionId, &str) + Send + Sync + 'static) {
         *self.shared.on_target_added.lock().unwrap() = Some(Arc::new(f));
+    }
+
+    /// Sets the check every tab a client creates must pass before it joins the scope.
+    pub fn set_tab_gate(&self, gate: TabGate) {
+        *self.shared.tab_gate.lock().unwrap() = Some(gate);
     }
 
     pub fn port(&self) -> u16 {
@@ -953,9 +965,16 @@ impl ClientConn {
                 let (title, color) = self.entry.style.lock().unwrap().clone();
                 let tx = self.tab_tx.clone();
                 let delay = self.tab_delay;
+                let gate = self.shared.tab_gate.lock().unwrap().clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let result = bridge.create_tab(&group, &url, &title, &color).await;
+                    let mut result = bridge.create_tab(&group, &url, &title, &color).await;
+                    if let (Ok((target_id, _)), Some(gate)) = (&result, gate) {
+                        if let Err(e) = gate(target_id.clone()).await {
+                            let _ = bridge.close_targets(std::slice::from_ref(target_id)).await;
+                            result = Err(e);
+                        }
+                    }
                     let _ = tx.send(TabCreated { client, result });
                 });
                 return Ok(());

@@ -19,9 +19,11 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, OnceCell};
 use tokio::task::JoinHandle;
 
+use crate::address::Verdict;
 use crate::bridge::{Bridge, GroupId};
 use crate::browser::{Browser, BrowserConfig};
 use crate::cdp::{page_targets, CdpConn, CdpEvent};
+use crate::guard::{judge_request, Guard, Resolver};
 use crate::paths::Paths;
 use crate::policy::{self, PinGuard, PinTable};
 use crate::profiles::{profile_dir, rpc_error, valid_profile_name, Profiles, DEFAULT_PROFILE};
@@ -33,6 +35,8 @@ const GROUP_COLORS: &[&str] = &[
 ];
 const MAX_TITLE_CHARS: usize = 60;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a new tab may wait for the request guard before it is closed.
+const GUARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tab group title: the name, or the session id when the name is missing or blank; at most
 /// 60 characters (not bytes), cut with '…'. Names are not unique and never identify a session.
@@ -150,6 +154,11 @@ struct Inner {
     focus: Mutex<HashMap<String, Option<String>>>,
     /// Target discovery on the daemon's browser connection, turned on once.
     discovery: OnceCell<()>,
+    /// Judges every request of the agent profiles (`guard`).
+    guard: Guard,
+    resolver: Resolver,
+    /// Browser context -> the profile it belongs to, for the guard's policy lookup.
+    contexts: Arc<Mutex<HashMap<String, String>>>,
 }
 
 pub struct SessionManager {
@@ -173,6 +182,27 @@ impl SessionManager {
         cfg: BrowserConfig,
     ) -> Self {
         let events = browser.conn.events();
+        let pins = PinTable::default();
+        let contexts: Arc<Mutex<HashMap<String, String>>> = Arc::default();
+        let resolver = Resolver::from_env();
+        let guard = {
+            let (pins, contexts) = (pins.clone(), contexts.clone());
+            let policy_of = Arc::new(move |context: &str| {
+                let profile = contexts.lock().unwrap().get(context).cloned();
+                match profile {
+                    Some(profile) => pins.address_policy(&profile),
+                    // A context no session was opened in: the default rules.
+                    None => SessionPolicy::default(),
+                }
+            });
+            Guard::start(
+                &browser.ws_url,
+                &browser.human_context,
+                policy_of,
+                own_ports_fn(&browser, &proxy),
+                resolver.clone(),
+            )
+        };
         let inner = Arc::new(Inner {
             browser,
             proxy,
@@ -181,9 +211,12 @@ impl SessionManager {
             cfg,
             runtimes: tokio::sync::Mutex::new(HashMap::new()),
             table: Mutex::new(Table::default()),
-            pins: PinTable::default(),
+            pins,
             focus: Mutex::new(HashMap::new()),
             discovery: OnceCell::new(),
+            guard,
+            resolver,
+            contexts,
         });
         let weak = Arc::downgrade(&inner);
         inner.proxy.on_target_added(move |_, target_id| {
@@ -200,6 +233,16 @@ impl SessionManager {
                 inner.record_group(id, group);
             }
         });
+        let weak = Arc::downgrade(&inner);
+        inner.proxy.set_tab_gate(Arc::new(move |target: String| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let inner = weak
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("the daemon is stopping"))?;
+                inner.guard.wait_guarded(&target, GUARD_TIMEOUT).await
+            })
+        }));
         let watcher = tokio::spawn(watch(Arc::downgrade(&inner), events));
         SessionManager { inner, watcher }
     }
@@ -218,6 +261,10 @@ impl SessionManager {
         let (id, seq) = (reservation.id.clone(), reservation.seq);
         let url = p.url.as_deref().map(checked_url).transpose()?;
         inner.ensure_discovery().await?;
+        inner.require_guard().await?;
+        if let Some(url) = &url {
+            inner.judge_navigation(&session_policy, url).await?;
+        }
         let runtime = inner.runtime(&profile).await?;
 
         let title = group_title(p.name.as_deref(), &id);
@@ -231,7 +278,15 @@ impl SessionManager {
         // once the browser confirms it is in the profile. If not, it is not touched; only
         // the group's members are closed (through the bridge, which refuses foreign tabs).
         let conn = &inner.browser.conn;
-        if let Err(e) = require_context(conn, &first, &runtime.context).await {
+        let checked = async {
+            require_context(conn, &first, &runtime.context).await?;
+            inner
+                .guard
+                .wait_guarded(&first, GUARD_TIMEOUT)
+                .await
+                .map_err(browser_failed)
+        };
+        if let Err(e) = checked.await {
             if let Ok(members) = runtime.bridge.members(&group).await {
                 let _ = close_tabs(conn, &runtime.bridge, &members.into_iter().collect()).await;
             }
@@ -423,6 +478,9 @@ impl SessionManager {
             )
         };
         let url = checked_url(url)?;
+        inner.require_guard().await?;
+        let policy = self.policy(id)?;
+        inner.judge_navigation(&policy, &url).await?;
         let (target, moved) = bridge
             .create_tab(&group, &url, &title, color)
             .await
@@ -433,6 +491,11 @@ impl SessionManager {
         }
         let added = async {
             require_context(&inner.browser.conn, &target, &context).await?;
+            inner
+                .guard
+                .wait_guarded(&target, GUARD_TIMEOUT)
+                .await
+                .map_err(browser_failed)?;
             inner.ensure_focus(&target).await.map_err(browser_failed)?;
             if !inner.proxy.add_target(id, &target) {
                 return Err(not_found(id));
@@ -447,6 +510,30 @@ impl SessionManager {
             return Err(e);
         }
         Ok(target)
+    }
+
+    /// Refuses (`browser_failed`) while pegboard's request guard is not running: Chrome
+    /// lifts its interception when the guard's connection ends, so commands wait until it is
+    /// back.
+    pub fn require_guard(&self) -> Result<(), RpcError> {
+        if self.inner.guard.is_ready() {
+            Ok(())
+        } else {
+            Err(guard_down())
+        }
+    }
+
+    /// Judges a URL the session wants to open by its address policy, before anything runs
+    /// (`policy_denied` with the reason). The guard judges the request again in the browser.
+    pub async fn judge_navigation(&self, id: &SessionId, url: &str) -> Result<(), RpcError> {
+        let policy = self.policy(id)?;
+        self.inner.judge_navigation(&policy, url).await
+    }
+
+    /// Requests the guard refused, per reason (diagnostics).
+    #[doc(hidden)]
+    pub fn guard_denied(&self) -> std::collections::BTreeMap<&'static str, u64> {
+        self.inner.guard.denied()
     }
 
     /// Opens a window of the profile (and its bridge) if it has none.
@@ -636,11 +723,54 @@ fn ready<'a>(table: &'a Table, id: &SessionId) -> Result<&'a SessionRecord, RpcE
         .ok_or_else(|| not_found(id))
 }
 
+fn guard_down() -> RpcError {
+    rpc_error(
+        codes::BROWSER_FAILED,
+        "pegboard's request guard is not running; commands are refused until it is back",
+    )
+}
+
+/// pegboard's own ports, read when a request is judged: the browser's debugging port and the
+/// session proxy's port.
+fn own_ports_fn(browser: &Arc<Browser>, proxy: &Arc<ProxyServer>) -> crate::guard::OwnPorts {
+    let (browser, proxy) = (Arc::downgrade(browser), Arc::downgrade(proxy));
+    Arc::new(move || {
+        let mut ports = Vec::new();
+        if let Some(p) = browser.upgrade().and_then(|b| b.debugging_port()) {
+            ports.push(p);
+        }
+        if let Some(p) = proxy.upgrade() {
+            ports.push(p.port());
+        }
+        ports
+    })
+}
+
 impl Inner {
     fn info_of(&self, record: &SessionRecord) -> SessionInfo {
         let mut info = record.info.clone();
         info.targets = self.proxy.targets(&info.id);
         info
+    }
+
+    async fn require_guard(&self) -> Result<(), RpcError> {
+        self.guard
+            .wait_ready(GUARD_TIMEOUT)
+            .await
+            .map_err(|_| guard_down())
+    }
+
+    async fn judge_navigation(&self, policy: &SessionPolicy, url: &str) -> Result<(), RpcError> {
+        let own_ports = own_ports_fn(&self.browser, &self.proxy)();
+        match judge_request(url, policy, &own_ports, &self.resolver).await {
+            Verdict::Allow => Ok(()),
+            Verdict::Deny(reason) => Err(rpc_error(
+                codes::POLICY_DENIED,
+                format!(
+                    "the session's address policy does not allow opening this address: {reason}"
+                ),
+            )),
+        }
     }
 
     async fn ensure_discovery(&self) -> Result<(), RpcError> {
@@ -671,6 +801,10 @@ impl Inner {
             .open_profile_window(&self.paths, &self.cfg, &profile_dir(name))
             .await
             .map_err(browser_failed)?;
+        self.contexts
+            .lock()
+            .unwrap()
+            .insert(context.clone(), name.to_string());
         if let Some(rt) = runtimes.get(name) {
             if rt.context == context {
                 return Ok(rt.clone());

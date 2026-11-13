@@ -37,6 +37,9 @@ struct Inner {
     pending: Pending,
     next_id: AtomicU64,
     events: broadcast::Sender<CdpEvent>,
+    /// Every event, unbounded and in order, for a reader that must not miss one (see
+    /// `connect_queued`). Dropped when the connection ends, which ends the queue.
+    queue: Mutex<Option<mpsc::UnboundedSender<CdpEvent>>>,
 }
 
 /// Cheap to clone; all clones share one websocket.
@@ -52,6 +55,24 @@ impl CdpConn {
 
     /// Connects sending extra HTTP headers with the upgrade request (e.g. `Authorization`).
     pub async fn connect_with_headers(ws_url: &str, headers: &[(&str, &str)]) -> Result<CdpConn> {
+        Self::open(ws_url, headers, None).await
+    }
+
+    /// Connects and also hands every event to the returned queue, none dropped (the
+    /// broadcast of `events` drops events for a reader that lags). The queue ends when the
+    /// connection does.
+    pub async fn connect_queued(
+        ws_url: &str,
+    ) -> Result<(CdpConn, mpsc::UnboundedReceiver<CdpEvent>)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Ok((Self::open(ws_url, &[], Some(tx)).await?, rx))
+    }
+
+    async fn open(
+        ws_url: &str,
+        headers: &[(&str, &str)],
+        queue: Option<mpsc::UnboundedSender<CdpEvent>>,
+    ) -> Result<CdpConn> {
         let mut request = ws_url
             .into_client_request()
             .with_context(|| format!("invalid websocket url {ws_url}"))?;
@@ -72,6 +93,7 @@ impl CdpConn {
             pending: Mutex::new(PendingState::default()),
             next_id: AtomicU64::new(1),
             events,
+            queue: Mutex::new(queue),
         });
 
         tokio::spawn(async move {
@@ -99,13 +121,18 @@ impl CdpConn {
                         let _ = tx.send(result);
                     }
                 } else if let Some(method) = v.get("method").and_then(Value::as_str) {
-                    let _ = reader.events.send(CdpEvent {
+                    let event = CdpEvent {
                         method: method.to_string(),
                         params: v.get("params").cloned().unwrap_or(Value::Null),
                         session_id: v.get("sessionId").and_then(Value::as_str).map(String::from),
-                    });
+                    };
+                    if let Some(queue) = reader.queue.lock().unwrap().as_ref() {
+                        let _ = queue.send(event.clone());
+                    }
+                    let _ = reader.events.send(event);
                 }
             }
+            reader.queue.lock().unwrap().take();
             // Connection closed: fail every outstanding request, and every later one.
             let waiters: Vec<_> = {
                 let mut pending = reader.pending.lock().unwrap();
@@ -151,6 +178,12 @@ impl CdpConn {
                 bail!("{method} timed out after {}s", REQUEST_TIMEOUT.as_secs())
             }
         }
+    }
+
+    /// Closes the websocket; outstanding and later requests fail. Chrome drops what the
+    /// connection had set (permissions, download behavior, interception).
+    pub fn close(&self) {
+        let _ = self.inner.out.send(Message::Close(None));
     }
 
     pub fn events(&self) -> broadcast::Receiver<CdpEvent> {

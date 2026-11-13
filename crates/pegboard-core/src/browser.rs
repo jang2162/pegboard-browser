@@ -75,6 +75,9 @@ pub struct Browser {
     /// One long-lived connection per agent context that holds its deny policy (see
     /// `deny_downloads`). Kept for the life of the browser.
     deny_conns: Mutex<HashMap<String, CdpConn>>,
+    /// Agent contexts granted local-network access, each with the connection that holds the
+    /// grant (see `grant_local_network`).
+    lna_conns: Mutex<HashMap<String, CdpConn>>,
 }
 
 impl Browser {
@@ -91,6 +94,7 @@ impl Browser {
             .arg("--no-default-browser-check")
             .arg(format!("--load-extension={}", cfg.extension_dir.display()))
             .arg("--disable-features=DisableLoadExtensionCommandLineSwitch")
+            .args(test_host_rules())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -132,6 +136,7 @@ impl Browser {
             )])),
             denied: Mutex::new(HashSet::new()),
             deny_conns: Mutex::new(HashMap::new()),
+            lna_conns: Mutex::new(HashMap::new()),
         })
     }
 
@@ -154,10 +159,14 @@ impl Browser {
             {
                 // Normally applied already; retried when an earlier attempt failed.
                 self.deny_downloads(&ctx).await?;
+                self.grant_local_network(&ctx).await?;
                 return Ok(ctx);
             }
             // The context is gone (Chrome unloaded the profile): its policy went with it.
             self.denied.lock().unwrap().remove(&ctx);
+            if let Some(conn) = self.lna_conns.lock().unwrap().remove(&ctx) {
+                conn.close();
+            }
         }
         let before: Vec<String> = page_targets(&self.conn)
             .await?
@@ -209,6 +218,7 @@ impl Browser {
                     .insert(profile_dir.to_string(), ctx.clone());
                 self.denied.lock().unwrap().remove(&ctx);
                 self.deny_downloads(&ctx).await?;
+                self.grant_local_network(&ctx).await?;
                 return Ok(ctx);
             }
         }
@@ -274,6 +284,66 @@ impl Browser {
             .context("could not block downloads in the agent profile"))
     }
 
+    /// Grants Chrome's local-network-access permission in the agent profile `context`, for
+    /// the life of the browser. pegboard's guard judges loopback and private addresses
+    /// itself and serves agent documents again with its CSP; such a document has no address
+    /// space of its own, and without the grant Chrome holds its loopback and private requests
+    /// for a permission prompt nobody answers (spike round 3, `31-csp-reserve.mjs`).
+    ///
+    /// Like the download policy, the grant lives as long as the connection that set it
+    /// (spike C2) and Chrome takes it only while the profile is the browser's default
+    /// context (spike E): it is set on a connection of its own right after the profile's
+    /// window opened, retried briefly, and an error leaves the profile unusable for
+    /// sessions. Never for the human context.
+    async fn grant_local_network(&self, context: &str) -> Result<()> {
+        if context.is_empty() || context == self.human_context {
+            bail!("refusing to grant local network access to the human or an unknown context");
+        }
+        if self.lna_conns.lock().unwrap().contains_key(context) {
+            return Ok(());
+        }
+        let conn = CdpConn::connect(&self.ws_url).await?;
+        let mut last = None;
+        for _ in 0..20 {
+            let mut any = false;
+            // Chrome 157 accepts all three names; which one has the effect was not measured.
+            for name in ["local-network-access", "local-network", "loopback-network"] {
+                let sent = conn
+                    .send(
+                        "Browser.setPermission",
+                        json!({
+                            "permission": { "name": name },
+                            "setting": "granted",
+                            "browserContextId": context,
+                        }),
+                        None,
+                    )
+                    .await;
+                match sent {
+                    Ok(_) => any = true,
+                    Err(e) => last = Some(e),
+                }
+            }
+            if any {
+                self.lna_conns
+                    .lock()
+                    .unwrap()
+                    .insert(context.to_string(), conn);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        conn.close();
+        Err(last
+            .unwrap()
+            .context("could not grant local network access in the agent profile"))
+    }
+
+    /// The browser's remote debugging port.
+    pub fn debugging_port(&self) -> Option<u16> {
+        url::Url::parse(&self.ws_url).ok()?.port()
+    }
+
     /// Whether the browser process has ended.
     pub fn has_exited(&self) -> bool {
         matches!(self.child.lock().unwrap().try_wait(), Ok(Some(_)) | Err(_))
@@ -333,6 +403,15 @@ async fn wait_for_first_context(conn: &CdpConn) -> Result<String> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     bail!("no page target appeared after launch")
+}
+
+/// Test-only: `PEGBOARD_TEST_HOST_RULES` is passed to the browser as `--host-resolver-rules`
+/// (and read by the guard's resolver), so tests can give names private addresses.
+fn test_host_rules() -> Vec<String> {
+    match std::env::var("PEGBOARD_TEST_HOST_RULES") {
+        Ok(rules) if !rules.is_empty() => vec![format!("--host-resolver-rules={rules}")],
+        _ => Vec::new(),
+    }
 }
 
 /// Test-only counter: when `PEGBOARD_TEST_LAUNCH_LOG` names a file, every launch appends one line to it.

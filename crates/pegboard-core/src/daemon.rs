@@ -4,7 +4,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use pegboard_protocol::{codes, CommandExecResult, RpcError, SessionId};
+use pegboard_protocol::{codes, ActionClass, CommandExecResult, RpcError, SessionId};
 use serde_json::Value;
 
 use crate::actionlog::{
@@ -173,6 +173,15 @@ pub async fn run_command_with_hook(
     if let Err(e) = judged {
         return refuse(log, entry, argv, e, started);
     }
+    // Without the request guard the browser checks no request of the session: nothing runs.
+    if let Err(e) = sessions.require_guard() {
+        return refuse(log, entry, argv, e, started);
+    }
+    // An address the session may not open is refused here with the reason, before the
+    // guard would only make the page fail to load.
+    if let Err(e) = judge_navigation_urls(sessions, id, argv).await {
+        return refuse(log, entry, argv, e, started);
+    }
     let is_tab_new = matches!(checked, Checked::TabNew { .. });
     let mut run_argv = match checked {
         Checked::Run(words) => words,
@@ -252,6 +261,22 @@ pub async fn run_command_with_hook(
     append(log, entry)?;
     sessions.touch(id);
     outcome
+}
+
+/// The URLs a navigating command line opens (`open`, `tab new`, `a11y <url>`, `vitals <url>`),
+/// each judged by the session's address policy.
+async fn judge_navigation_urls(
+    sessions: &SessionManager,
+    id: &SessionId,
+    argv: &[String],
+) -> Result<(), RpcError> {
+    if argv::class_of(argv) != Some(ActionClass::Navigate) {
+        return Ok(());
+    }
+    for url in argv::text_at(argv).urls.iter().filter_map(|&i| argv.get(i)) {
+        sessions.judge_navigation(id, url).await?;
+    }
+    Ok(())
 }
 
 /// The words of a resolved upload and, per file, its path and its name.
