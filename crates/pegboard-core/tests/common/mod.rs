@@ -451,19 +451,41 @@ fn rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PENDING_CLEANUP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Runs a test body on the shared runtime, starting the shared browser first if needed.
 /// Panics of the body surface in the calling test thread.
+/// Shared tests never overlap (also without `--test-threads=1`), and a test starts only after
+/// the cleanup that a failed test spawned (`spawn_shared`) has finished, so a count taken at
+/// the start of a test is not changed by the previous test's cleanup.
 pub fn run<F: std::future::Future>(f: F) -> F::Output {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     shared();
-    rt().block_on(f)
+    rt().block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while PENDING_CLEANUP.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cleanup of a previous test did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        f.await
+    })
 }
 
-/// Spawns a task on the shared runtime (for cleanup that must outlive a failing test).
+/// Spawns cleanup on the shared runtime that must outlive a failing test; the next `run`
+/// waits for it.
 pub fn spawn_shared<F>(f: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    rt().spawn(f);
+    PENDING_CLEANUP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    rt().spawn(async move {
+        f.await;
+        PENDING_CLEANUP.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 pub struct Shared {
@@ -586,12 +608,34 @@ extern "C" fn shutdown_at_exit() {
     }
 }
 
-fn remove_leftovers(env: &Env) {
-    let udd = env.paths.chrome_udd.display().to_string();
-    let _ = std::fs::remove_dir_all(&env.paths.home);
+/// Ends the browser of `udd` (SIGTERM, a short wait, then SIGKILL) by its user data
+/// directory, never by anything broader.
+fn kill_browser_of(udd: &std::path::Path) {
+    let pattern = format!("--user-data-dir={}", udd.display());
+    let running = || {
+        std::process::Command::new("pgrep")
+            .args(["-f", "--", &pattern])
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false)
+    };
     let _ = std::process::Command::new("pkill")
-        .args(["-f", "--", &udd])
+        .args(["-f", "--", &pattern])
         .status();
+    for _ in 0..30 {
+        if !running() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = std::process::Command::new("pkill")
+        .args(["-KILL", "-f", "--", &pattern])
+        .status();
+}
+
+fn remove_leftovers(env: &Env) {
+    kill_browser_of(&env.paths.chrome_udd);
+    let _ = std::fs::remove_dir_all(&env.paths.home);
 }
 
 /// A detached process that, once this test binary is gone (even killed), kills the browser by
@@ -600,7 +644,12 @@ fn guard_leftovers(env: &Env) {
     let _ = std::process::Command::new("sh")
         .arg("-c")
         .arg(
-            r#"while kill -0 "$1" 2>/dev/null; do sleep 1; done; rm -rf -- "$2"; pkill -f -- "$3""#,
+            r#"while kill -0 "$1" 2>/dev/null; do sleep 1; done
+pat="--user-data-dir=$3"
+pkill -f -- "$pat"
+i=0; while pgrep -f -- "$pat" >/dev/null && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i+1)); done
+pkill -KILL -f -- "$pat"
+rm -rf -- "$2""#,
         )
         .arg("pegboard-test-guard")
         .arg(std::process::id().to_string())

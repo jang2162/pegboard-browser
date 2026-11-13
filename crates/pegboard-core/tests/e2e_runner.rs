@@ -114,7 +114,14 @@ fn stream_exposure_window_has_no_browser() {
         // connection to the session endpoint meanwhile.
         let proxy = &h.proxy;
         // Connections other than the daemon's (none expected) are not counted against it.
+        // Connections of earlier tests' daemons have closed by now; start from none.
+        assert!(
+            eventually(5, || async { proxy.open_connections() == 0 }).await,
+            "{} connections are open before this test attached anything",
+            proxy.open_connections()
+        );
         let baseline = proxy.open_connections();
+        assert_eq!(baseline, 0);
         let watch = async {
             let t0 = Instant::now();
             let mut first_seen = None;
@@ -533,7 +540,7 @@ fn cookies_set_stays_in_the_agent_profile() {
         let h = Harness::start();
         let (info, ep) = h.session("/counter").await;
         let set = h
-            .exec(&info, &ep, &["cookies", "set", "pegtest", "1"])
+            .exec(&info, &ep, &["cookies", "set", "pegcookieset", "1"])
             .await;
         assert!(ok(&set), "{set:?}");
         // The agent profile is shared with other tests: look for this test's own cookie among
@@ -544,7 +551,7 @@ fn cookies_set_stays_in_the_agent_profile() {
                 .as_str()
                 .unwrap()
                 .split("; ")
-                .any(|c| c == "pegtest=1"),
+                .any(|c| c == "pegcookieset=1"),
             "{agent_cookies}"
         );
         let conn = &h.browser.conn;
@@ -558,14 +565,13 @@ fn cookies_set_stays_in_the_agent_profile() {
         let s = conn.attach(&human).await.unwrap();
         conn.navigate(&s, &h.url("/counter")).await.unwrap();
         let human_cookies = conn.evaluate(&s, "document.cookie").await.unwrap();
-        assert!(
-            !human_cookies.as_str().unwrap().contains("pegtest"),
-            "{human_cookies}"
-        );
+        // No test of this binary plants a cookie in the human profile (the only fixture page
+        // that sets one, `/cookie/set`, is never opened there), so it has none at all.
+        assert_eq!(human_cookies, json!(""));
         // Leave nothing behind for other tests.
         h.eval(
             &info.targets[0],
-            "document.cookie = 'pegtest=; Max-Age=0; Path=/'",
+            "document.cookie = 'pegcookieset=; Max-Age=0; Path=/'",
         )
         .await;
         h.finish().await;
@@ -740,7 +746,7 @@ fn compatibility_matrix() {
             s(&["tab", "t1"]),
             s(&["tab", "1"]),
             s(&["cookies"]),
-            s(&["cookies", "set", "pegtest", "1"]),
+            s(&["cookies", "set", "pegmatrix", "1"]),
             s(&["cookies", "get"]),
             s(&["cookies", "clear"]),
             s(&["storage", "local"]),

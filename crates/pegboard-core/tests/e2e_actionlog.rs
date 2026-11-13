@@ -475,6 +475,11 @@ fn cookie_value_never_reaches_the_log() {
             h.entries(&info)[0].args,
             s(&["cookies", "set", "sid", REDACTED])
         );
+        // The agent profile is shared with the other tests: take back what this one planted.
+        let _ = h.run(&mut log, &info, &["cookies", "clear"]).await;
+        let _ = h
+            .run(&mut log, &info, &["eval", "localStorage.removeItem('k')"])
+            .await;
         h.finish().await;
     });
 }

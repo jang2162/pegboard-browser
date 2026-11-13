@@ -286,6 +286,12 @@ fn named_profile_is_isolated_from_default() {
                 Some(work.as_str()),
             ))
             .await;
+        // Positive control: the cookie is there in the default profile that `a` uses.
+        let planted = eval(&h.browser, &a.targets[0], "document.cookie").await;
+        assert!(
+            planted.as_str().unwrap().contains("spike=1"),
+            "the default profile has no cookie to hide: {planted}"
+        );
         assert_eq!(b.profile, work);
         let text = eval(
             &h.browser,
@@ -371,6 +377,11 @@ fn close_removes_tabs_and_keep_tabs_leaves_them() {
         assert!(live_targets(&h.browser).await.contains(&b.targets[0]));
         let members = bridge.members(&GroupId(b.tab_group_id)).await.unwrap();
         assert!(members.is_empty(), "{members:?}");
+        assert!(h
+            .manager
+            .list()
+            .iter()
+            .all(|i| i.id != a.id && i.id != b.id));
         assert_eq!(h.manager.list().len(), before);
         let again = h
             .manager

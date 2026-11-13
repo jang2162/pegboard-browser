@@ -953,9 +953,46 @@ fn agent_cannot_reenable_downloads() {
             tokio::time::sleep(Duration::from_secs(4)).await;
             // The tab and its session survived the blocked download.
             assert_eq!(c.evaluate(&session, "1 + 1").await.unwrap(), 2, "{path}");
+            eprintln!(
+                "after {path}: real ~/Downloads entries with the token: {:?}",
+                probe.in_real_downloads()
+            );
         }
+        // A new blank tab whose first navigation is a download, as an agent's `tab new <url>`
+        // makes one. Chrome may close such a tab and end its CDP session: that is allowed here
+        // (errors below are ignored on purpose); what must hold is that no file is written.
+        let blank_probe = common::DownloadProbe::new();
+        let blank = create_tab(&c, json!({})).await;
+        let blank_url = format!("{}/dl/{}", s.fixture.origin, blank_probe.token);
+        match c.attach(&blank).await {
+            Ok(blank_session) => {
+                let r = c
+                    .send(
+                        "Page.navigate",
+                        json!({ "url": blank_url }),
+                        Some(&blank_session),
+                    )
+                    .await;
+                eprintln!("blank tab: navigating straight to a download: {r:?}");
+            }
+            Err(e) => eprintln!("blank tab: attach failed: {e:#}"),
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        eprintln!(
+            "blank tab still listed: {}",
+            listed(&c).await.contains(&blank)
+        );
+        eprintln!(
+            "after the blank tab's download: real ~/Downloads entries with the token: {:?}",
+            blank_probe.in_real_downloads()
+        );
         let leaked = probe.in_real_downloads();
         assert!(leaked.is_empty(), "a download was saved: {leaked:?}");
+        let leaked = blank_probe.in_real_downloads();
+        assert!(
+            leaked.is_empty(),
+            "a download of the blank tab was saved: {leaked:?}"
+        );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         s.shutdown().await;
     });
