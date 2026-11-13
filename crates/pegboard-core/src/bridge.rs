@@ -10,6 +10,8 @@ use crate::cdp::CdpConn;
 
 const WORKER_WAIT: Duration = Duration::from_secs(10);
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest wait for the load of a data: URL the bridge opens through CDP.
+const DATA_LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupId(pub i64);
@@ -121,14 +123,73 @@ impl Bridge {
         title: &str,
         color: &str,
     ) -> Result<(String, Option<GroupId>)> {
+        // `chrome.tabs.update` navigates as if the extension's page asked for it, and Chrome
+        // does not let that kind of navigation take a tab to a data: URL: the call succeeds
+        // and the tab stays at about:blank. A data: URL is opened through CDP instead, the
+        // way `open` does it.
+        let via_cdp = url.starts_with("data:");
+        let for_worker = if via_cdp { "about:blank" } else { url };
         let r = self
             .call(
                 "createTab",
-                &[json!(group.0), json!(url), json!(title), json!(color)],
+                &[
+                    json!(group.0),
+                    json!(for_worker),
+                    json!(title),
+                    json!(color),
+                ],
             )
             .await?;
         let moved = r["newGroupId"].as_i64().map(GroupId);
-        Ok((target_id(&r)?, moved))
+        let target = target_id(&r)?;
+        if via_cdp {
+            if let Err(e) = self.open_in_tab(&target, url).await {
+                // The tab was made for this URL: it does not stay behind without it.
+                let _ = self.close_targets(std::slice::from_ref(&target)).await;
+                return Err(e);
+            }
+        }
+        Ok((target, moved))
+    }
+
+    /// Navigates the tab on a CDP session of its own and waits for the load (a page that
+    /// loads slowly is not an error; a navigation that fails is).
+    async fn open_in_tab(&self, target: &str, url: &str) -> Result<()> {
+        let session = self.conn.attach(target).await?;
+        let navigate = async {
+            let mut events = self.conn.events();
+            self.conn
+                .send("Page.enable", json!({}), Some(&session))
+                .await?;
+            let r = self
+                .conn
+                .send("Page.navigate", json!({ "url": url }), Some(&session))
+                .await?;
+            if let Some(err) = r.get("errorText").and_then(Value::as_str) {
+                bail!("opening the URL failed: {err}");
+            }
+            let loaded = async {
+                while let Ok(e) = events.recv().await {
+                    if e.method == "Page.loadEventFired"
+                        && e.session_id.as_deref() == Some(session.as_str())
+                    {
+                        return;
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(DATA_LOAD_TIMEOUT, loaded).await;
+            Ok(())
+        };
+        let result = navigate.await;
+        let _ = self
+            .conn
+            .send(
+                "Target.detachFromTarget",
+                json!({ "sessionId": session }),
+                None,
+            )
+            .await;
+        result
     }
 
     pub async fn add_to_group(&self, group: &GroupId, target_id: &str) -> Result<()> {

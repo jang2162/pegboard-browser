@@ -665,3 +665,44 @@ fn handle_in_command_position_never_reaches_the_log() {
     }
     assert_eq!(home.run(&["session", "close", &handle]).0, 0);
 }
+
+#[test]
+#[ignore]
+fn tab_new_opens_a_data_url() {
+    let home = shared_home();
+    let (code, out, err) = home.run(&["session", "create"]);
+    assert_eq!(code, 0, "{err}");
+    let sid = session_handle(&out);
+    let (code, _, err) = home.run(&[
+        "--session",
+        &sid,
+        "tab",
+        "new",
+        "data:text/html,<title>d</title>",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let (code, out, err) = home.run(&["--session", &sid, "get", "title"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains('d') && !out.contains("about:blank"), "{out}");
+    let (code, out, err) = home.run(&["--session", &sid, "get", "url"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("data:text/html"), "{out}");
+    assert_eq!(home.run(&["session", "close", &sid]).0, 0);
+}
+
+#[test]
+#[ignore]
+fn oversized_command_line_exits_2_with_limit_exceeded() {
+    let home = shared_home();
+    let (code, out, err) = home.run(&["session", "create"]);
+    assert_eq!(code, 0, "{err}");
+    let sid = session_handle(&out);
+    let word = "x".repeat(64 * 1024 + 1);
+    let (code, _, err) = home.run(&["--session", &sid, "eval", &word]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("limit_exceeded"), "{err}");
+    assert!(!err.contains("xxxx"), "the error quotes the word");
+    // The session still works.
+    assert_eq!(home.run(&["--session", &sid, "get", "url"]).0, 0);
+    assert_eq!(home.run(&["session", "close", &sid]).0, 0);
+}
