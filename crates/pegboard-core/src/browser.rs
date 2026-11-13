@@ -80,6 +80,7 @@ pub struct Browser {
 impl Browser {
     pub async fn launch(paths: &Paths, cfg: &BrowserConfig) -> Result<Browser> {
         ensure(paths)?;
+        record_launch();
         let port_file = paths.chrome_udd.join("DevToolsActivePort");
         let _ = std::fs::remove_file(&port_file);
         let mut child = Command::new(&cfg.chrome)
@@ -332,4 +333,38 @@ async fn wait_for_first_context(conn: &CdpConn) -> Result<String> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     bail!("no page target appeared after launch")
+}
+
+/// Test-only counter: when `PEGBOARD_TEST_LAUNCH_LOG` names a file, every launch appends one line to it.
+fn record_launch() {
+    if let Some(path) = std::env::var_os("PEGBOARD_TEST_LAUNCH_LOG") {
+        append_launch_line(std::path::Path::new(&path));
+    }
+}
+
+fn append_launch_line(path: &std::path::Path) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "launch pid={}", std::process::id());
+    }
+}
+
+#[cfg(test)]
+mod launch_log_tests {
+    use super::append_launch_line;
+
+    #[test]
+    fn each_launch_appends_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.log");
+        append_launch_line(&log);
+        append_launch_line(&log);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.lines().all(|l| l.starts_with("launch pid=")));
+    }
 }
