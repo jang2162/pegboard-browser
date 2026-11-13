@@ -495,6 +495,33 @@ impl SessionManager {
         Ok(futures_util::future::join_all(targets.into_iter().map(one)).await)
     }
 
+    /// Closes the session's tabs that sit at about:blank, except `keep`. agent-browser opens
+    /// a blank tab of its own when it learns that the session's last tab is gone, and
+    /// `tab new <url>` then adds the requested one; this removes the leftover.
+    pub async fn close_blank_tabs_except(&self, id: &SessionId, keep: &str) {
+        let inner = &self.inner;
+        let bridge = {
+            let table = inner.table.lock().unwrap();
+            match ready(&table, id) {
+                Ok(r) => r.bridge.clone(),
+                Err(_) => return,
+            }
+        };
+        let own: HashSet<String> = inner.proxy.targets(id).into_iter().collect();
+        let Ok(pages) = page_targets(&inner.browser.conn).await else {
+            return;
+        };
+        let blank: BTreeSet<String> = pages
+            .into_iter()
+            .filter(|t| own.contains(&t.target_id) && t.target_id != keep)
+            .filter(|t| t.url == "about:blank")
+            .map(|t| t.target_id)
+            .collect();
+        if !blank.is_empty() {
+            let _ = close_tabs(&inner.browser.conn, &bridge, &blank).await;
+        }
+    }
+
     pub fn touch(&self, id: &SessionId) {
         let mut table = self.inner.table.lock().unwrap();
         if let Some(r) = table.records.get_mut(id).filter(|r| r.ready) {

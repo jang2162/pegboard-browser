@@ -385,15 +385,17 @@ impl Daemon {
             if matches!(self.sessions.policy(&id), Ok(p) if p.no_expire) {
                 continue;
             }
-            // Same path as `session close`. `closing` is set before `busy` is looked at
-            // again: a command that got in first is seen, one that comes later is refused.
-            if slot.closing.swap(true, Ordering::SeqCst) {
+            // Same path as `session close`. The log is what a command holds while it runs
+            // and takes before it starts: with it in hand nothing is running, and `busy`
+            // shows whether one is on its way to it. Only then is the session marked
+            // closing, so a command is either seen here or refused as coming too late.
+            let Ok(guard) = slot.log.try_lock() else {
+                continue;
+            };
+            if !slot.idle_for(self.idle) || slot.closing.swap(true, Ordering::SeqCst) {
                 continue;
             }
-            if slot.busy.load(Ordering::SeqCst) > 0 {
-                slot.closing.store(false, Ordering::SeqCst);
-                continue;
-            }
+            drop(guard);
             if let Err(e) = self.close_slot(id.clone(), slot, false).await {
                 eprintln!(
                     "pegboard: expiring session {}: {}: {}",

@@ -723,12 +723,6 @@ fn idle_session_is_closed_after_the_expiry() {
     };
     let idle = create(&[]);
     let kept = create(&["--no-expire"]);
-    let busy = create(&[]);
-    // A command that runs for longer than the expiry is not cut, and the session is not
-    // closed under it; the idle time counts from its end.
-    let (code, _, err) = home.run(&["--session", &busy, "wait", "5000"]);
-    assert_eq!(code, 0, "{err}");
-    assert_eq!(home.run(&["--session", &busy, "get", "url"]).0, 0);
     let listed = |id: &str| {
         let (_, out, _) = home.run(&["session", "list", "--json"]);
         json(&out).as_array().unwrap().iter().any(|s| s["id"] == id)
@@ -739,6 +733,35 @@ fn idle_session_is_closed_after_the_expiry() {
         std::thread::sleep(Duration::from_millis(500));
     }
     assert!(listed(id_of(&kept)), "a no-expire session was closed");
+    // A command that runs for much longer than the period (and the check interval) is
+    // neither cut nor is the session closed under it; the idle time counts from its END.
+    // The session sat idle for a moment first.
+    let busy = create(&[]);
+    std::thread::sleep(Duration::from_secs(1));
+    let started = Instant::now();
+    let (code, _, err) = home.run(&["--session", &busy, "wait", "8000"]);
+    assert_eq!(code, 0, "the long command was cut or refused: {err}");
+    assert!(started.elapsed() >= Duration::from_secs(7));
+    // It started more than 8 s ago but ended just now: not expired at the next checks.
+    assert!(listed(id_of(&busy)), "closed right after its long command");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        listed(id_of(&busy)),
+        "closed 1 s after its last command ended"
+    );
+    assert_eq!(home.run(&["--session", &busy, "get", "url"]).0, 0);
+    let ended = Instant::now();
+    // It expires after a further idle period, not before.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while listed(id_of(&busy)) {
+        assert!(Instant::now() < deadline, "the session never expired");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        ended.elapsed() >= Duration::from_millis(2500),
+        "expired {:?} after its last command",
+        ended.elapsed()
+    );
     assert_eq!(home.run(&["--session", &kept, "get", "url"]).0, 0);
     // Its recording is finalized.
     let rid = format!("r_{}", &id_of(&idle)[2..]);

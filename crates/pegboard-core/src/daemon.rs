@@ -171,6 +171,7 @@ pub async fn run_command_with_hook(
     if let Err(e) = judged {
         return refuse(log, entry, argv, e, started);
     }
+    let is_tab_new = matches!(checked, Checked::TabNew { .. });
     let run_argv = match checked {
         Checked::Run(words) => words,
         Checked::TabNew { url } => vec!["tab".to_string(), "new".to_string(), url],
@@ -198,10 +199,18 @@ pub async fn run_command_with_hook(
         }
     };
 
+    let had_no_tab = sessions.info(id).is_ok_and(|i| i.targets.is_empty());
     let outcome = match &endpoint {
         Ok(ep) => runner.exec(id, ep, &run_argv, timeout_ms).await,
         Err(e) => Err(e.clone()),
     };
+    // A session without a tab: agent-browser opens a blank tab of its own, then `tab new`
+    // opens the requested one. Only the tab it ends up bound to stays.
+    if is_tab_new && had_no_tab && matches!(&outcome, Ok(r) if succeeded(r)) {
+        if let Some(bound) = runner.bound_target(id) {
+            sessions.close_blank_tabs_except(id, &bound).await;
+        }
+    }
     after_exec.await;
 
     // After: the focus may have moved (a submit, a script that blurs); anything unclear
