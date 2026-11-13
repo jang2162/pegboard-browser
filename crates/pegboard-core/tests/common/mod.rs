@@ -414,3 +414,175 @@ pub async fn client(endpoint: &pegboard_core::proxy::server::Endpoint) -> CdpCon
         .await
         .unwrap()
 }
+
+// ---------------------------------------------------------------------------------------------
+// One browser per test binary.
+//
+// The browser, the fixture server, the proxy, the session manager and the runner live on a
+// multi-thread runtime that is a static and so outlives every test. `#[tokio::test]` gives each
+// test its own runtime, which would take the tasks these types spawn (proxy connections, focus
+// emulation, the event watcher) down with the first test that ends; so shared-browser tests are
+// plain `#[test]` functions whose whole body runs through `run` on that runtime.
+// Statics are never dropped: an `atexit` hook closes the browser and removes the temp home when
+// the test binary ends (also after a failing test), and a detached watcher process does the
+// same if the binary is killed before the hook can run.
+// ---------------------------------------------------------------------------------------------
+
+use pegboard_core::profiles::Profiles;
+use pegboard_core::proxy::server::{Endpoint, ProxyServer, WsUpstream};
+use pegboard_core::runner::Runner;
+use pegboard_core::session::SessionManager;
+use pegboard_protocol::{SessionCreateParams, SessionInfo};
+use std::sync::{Arc, OnceLock};
+
+static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static SHARED: OnceLock<Shared> = OnceLock::new();
+
+fn rt() -> &'static tokio::runtime::Runtime {
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    })
+}
+
+/// Runs a test body on the shared runtime, starting the shared browser first if needed.
+/// Panics of the body surface in the calling test thread.
+pub fn run<F: std::future::Future>(f: F) -> F::Output {
+    shared();
+    rt().block_on(f)
+}
+
+/// Spawns a task on the shared runtime (for cleanup that must outlive a failing test).
+pub fn spawn_shared<F>(f: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    rt().spawn(f);
+}
+
+pub struct Shared {
+    pub env: Env,
+    pub fixture: Fixture,
+    pub browser: Arc<Browser>,
+    pub proxy: Arc<ProxyServer>,
+    pub manager: SessionManager,
+    pub runner: Arc<Runner>,
+}
+
+/// The binary's browser, started on first use. Call it from inside `run` or a plain test.
+pub fn shared() -> &'static Shared {
+    SHARED.get_or_init(|| {
+        let s = rt().block_on(Shared::start());
+        guard_leftovers(&s.env);
+        // SAFETY: registers a plain `extern "C"` function without arguments.
+        unsafe {
+            libc::atexit(shutdown_at_exit);
+        }
+        s
+    })
+}
+
+impl Shared {
+    async fn start() -> Shared {
+        let env = env();
+        let fixture = fixture().await;
+        let browser = Arc::new(Browser::launch(&env.paths, &env.cfg).await.unwrap());
+        let upstream = Arc::new(WsUpstream {
+            browser_ws_url: browser.ws_url.clone(),
+        });
+        let proxy = Arc::new(ProxyServer::start(upstream).await.unwrap());
+        let profiles = Profiles::load(&env.paths).unwrap();
+        let manager = SessionManager::new(
+            browser.clone(),
+            proxy.clone(),
+            profiles,
+            env.paths.clone(),
+            env.cfg.clone(),
+        );
+        let runner = Arc::new(Runner::new(env.paths.clone()).unwrap());
+        let scope = proxy.clone();
+        runner.set_session_targets(move |id| scope.targets(id));
+        Shared {
+            env,
+            fixture,
+            browser,
+            proxy,
+            manager,
+            runner,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.fixture.origin)
+    }
+
+    /// A new session of the test's own (own tab group, own tabs) on `path`, in the default
+    /// agent profile. The test closes it with `close_session`.
+    pub async fn session(&self, path: &str) -> (SessionInfo, Endpoint) {
+        let info = self
+            .manager
+            .create(SessionCreateParams {
+                name: None,
+                url: Some(self.url(path)),
+                profile: None,
+            })
+            .await
+            .unwrap();
+        let ep = self.manager.endpoint(&info.id).unwrap();
+        (info, ep)
+    }
+
+    /// Closes a session and its tabs; returns the ids of the targets that belonged to it.
+    pub async fn close_session(&self, id: &pegboard_protocol::SessionId) -> Vec<String> {
+        let mut targets = self.manager.info(id).map(|i| i.targets).unwrap_or_default();
+        if let Ok(info) = self
+            .manager
+            .close(pegboard_protocol::SessionCloseParams {
+                session_id: id.clone(),
+                keep_tabs: false,
+            })
+            .await
+        {
+            targets.extend(info.targets);
+        }
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+}
+
+extern "C" fn shutdown_at_exit() {
+    if let Some(s) = SHARED.get() {
+        rt().block_on(s.browser.close());
+        remove_leftovers(&s.env);
+    }
+}
+
+fn remove_leftovers(env: &Env) {
+    let udd = env.paths.chrome_udd.display().to_string();
+    let _ = std::fs::remove_dir_all(&env.paths.home);
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "--", &udd])
+        .status();
+}
+
+/// A detached process that, once this test binary is gone (even killed), kills the browser by
+/// its user data directory and removes the temp home, as the exit hook would have.
+fn guard_leftovers(env: &Env) {
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(
+            r#"while kill -0 "$1" 2>/dev/null; do sleep 1; done; rm -rf -- "$2"; pkill -f -- "$3""#,
+        )
+        .arg("pegboard-test-guard")
+        .arg(std::process::id().to_string())
+        .arg(&env.paths.home)
+        .arg(&env.paths.chrome_udd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
