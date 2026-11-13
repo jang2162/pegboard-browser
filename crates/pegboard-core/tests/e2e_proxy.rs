@@ -933,6 +933,12 @@ fn agent_cannot_reenable_downloads() {
             assert!(r.is_err(), "{method} (session {sid:?}) was accepted: {r:?}");
         }
 
+        // The tab has a page of its own first, as an agent's tab has: Chrome closes a tab that
+        // has never shown anything when it turns out to be only a download, which would end the
+        // session id this test navigates with before it has tried both kinds of download.
+        c.navigate(&session, &format!("{}/counter", s.fixture.origin))
+            .await
+            .unwrap();
         for path in [
             format!("/dl/{}", probe.token),
             format!("/zip/{}.zip", probe.token),
@@ -945,6 +951,8 @@ fn agent_cannot_reenable_downloads() {
             .await
             .unwrap();
             tokio::time::sleep(Duration::from_secs(4)).await;
+            // The tab and its session survived the blocked download.
+            assert_eq!(c.evaluate(&session, "1 + 1").await.unwrap(), 2, "{path}");
         }
         let leaked = probe.in_real_downloads();
         assert!(leaked.is_empty(), "a download was saved: {leaked:?}");

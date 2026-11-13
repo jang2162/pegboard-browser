@@ -402,6 +402,21 @@ fn session_handle_is_required() {
 #[test]
 #[ignore]
 fn concurrent_browser_start_yields_one_daemon() {
+    // Daemons of other homes may be running (the shared home's): only the ones this test
+    // starts count, found as the pids that were not there before.
+    let daemon_pids = || -> Vec<i32> {
+        processes(&format!("{} daemon", bin()))
+            .iter()
+            .filter_map(|l| l.split_whitespace().next()?.parse().ok())
+            .collect()
+    };
+    let others = daemon_pids();
+    let ours = || -> Vec<i32> {
+        daemon_pids()
+            .into_iter()
+            .filter(|p| !others.contains(p))
+            .collect()
+    };
     let home = Home::new();
     let children: Vec<_> = (0..2)
         .map(|_| {
@@ -422,12 +437,17 @@ fn concurrent_browser_start_yields_one_daemon() {
     }
     // The daemon that lost the lock retries it for about a second before it gives up.
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut daemons = processes(&format!("{} daemon", bin()));
+    let mut daemons = ours();
     while daemons.len() > 1 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
-        daemons = processes(&format!("{} daemon", bin()));
+        daemons = ours();
     }
     assert_eq!(daemons.len(), 1, "{daemons:?}");
+    assert_eq!(
+        Some(daemons[0]),
+        home.daemon_pid(),
+        "the survivor serves the home"
+    );
     let udd = format!("--user-data-dir={}", home.path().join("chrome").display());
     let chromes: Vec<String> = processes(&udd)
         .into_iter()
