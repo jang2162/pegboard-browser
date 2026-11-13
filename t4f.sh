@@ -9,7 +9,7 @@ old='''    let resumed = conn
         .send("Runtime.runIfWaitingForDebugger", json!({}), Some(session))
         .await;'''
 assert old in s, "MUT NOT FOUND"
-s=s.replace(old,'''    let resumed: Result<serde_json::Value, crate::cdp::CdpError> = Err(crate::cdp::CdpError::Closed);''',1); open(p,'w').write(s)
+s=s.replace(old,'''    let resumed: Result<Value> = Err(anyhow::anyhow!("skipped"));''',1); open(p,'w').write(s)
 PY
 echo "== MUTATION (no resume)"; h; git checkout -q -- .
 echo "LEFT :: $(pgrep -f -- '--user-data-dir=/(private/)?var/folders' | wc -l | tr -d ' ')"
