@@ -578,6 +578,7 @@ async fn handle_socket(shared: Arc<Shared>, mut sock: TcpStream) -> Result<()> {
         stash: VecDeque::new(),
         auto_sessions: HashMap::new(),
         recovered: HashSet::new(),
+        told: Mutex::new(filter::Told::default()),
         tab_tx,
         tab_rx,
         stray_tx,
@@ -767,6 +768,9 @@ struct ClientConn {
     /// Targets already re-attached once to resume them; never retried, so a target whose
     /// resume keeps failing cannot loop.
     recovered: HashSet<String>,
+    /// What this connection was told about, so the end of those targets and sessions still
+    /// reaches it after the target left the session scope.
+    told: Mutex<filter::Told>,
     tab_tx: mpsc::UnboundedSender<TabCreated>,
     tab_rx: mpsc::UnboundedReceiver<TabCreated>,
     stray_tx: mpsc::UnboundedSender<StrayClosed>,
@@ -871,6 +875,7 @@ impl ClientConn {
     }
 
     fn send_client(&self, v: &Value) -> Result<()> {
+        self.told.lock().unwrap().on_sent(v);
         self.client_tx.send(v)
     }
 
@@ -1032,7 +1037,8 @@ impl ClientConn {
         let (decision, own_context, adopted) = {
             let mut scope = self.entry.scope.lock().unwrap();
             let own_context = event_context.as_deref() == Some(scope.context.as_str());
-            let decision = filter::browser_message(msg, None, &scope);
+            let decision =
+                filter::browser_message_told(msg, None, &scope, &self.told.lock().unwrap());
             let mut adopted = None;
             match &decision {
                 BrowserDecision::Forward(v) => track_event(v, &mut scope),

@@ -383,6 +383,96 @@ pub fn browser_message(
     BrowserDecision::Forward(msg)
 }
 
+/// The targets and CDP sessions one client connection was told about (what was sent to it:
+/// listings, events, attach and create replies). A target that left the session scope
+/// because the human closed it is still reported as gone to the connections that knew it,
+/// and to no other.
+#[derive(Debug, Default)]
+pub struct Told {
+    targets: HashSet<String>,
+    sessions: HashSet<String>,
+}
+
+impl Told {
+    /// Notes what a message that is about to be sent to the client reveals.
+    pub fn on_sent(&mut self, msg: &Value) {
+        let params = msg.get("params").unwrap_or(&Value::Null);
+        let string = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_owned);
+        match msg.get("method").and_then(Value::as_str) {
+            Some("Target.targetDestroyed") => {
+                if let Some(t) = string(params.get("targetId")) {
+                    self.targets.remove(&t);
+                }
+            }
+            Some("Target.detachedFromTarget") => {
+                if let Some(s) = string(params.get("sessionId")) {
+                    self.sessions.remove(&s);
+                }
+            }
+            Some("Target.attachedToTarget") => {
+                self.sessions.extend(string(params.get("sessionId")));
+                self.targets
+                    .extend(string(params.pointer("/targetInfo/targetId")));
+            }
+            Some("Target.targetCreated" | "Target.targetInfoChanged") => {
+                self.targets
+                    .extend(string(params.pointer("/targetInfo/targetId")));
+            }
+            Some(_) => {}
+            None => {
+                let result = msg.get("result").unwrap_or(&Value::Null);
+                self.targets.extend(string(result.get("targetId")));
+                self.sessions.extend(string(result.get("sessionId")));
+                for info in result
+                    .get("targetInfos")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    self.targets.extend(string(info.get("targetId")));
+                }
+            }
+        }
+    }
+
+    /// A top-level `Target.targetDestroyed` or `Target.detachedFromTarget` about something
+    /// this connection was told about.
+    fn knows_ending(&self, msg: &Value) -> bool {
+        if msg.get("sessionId").is_some() {
+            return false;
+        }
+        let params = msg.get("params").unwrap_or(&Value::Null);
+        let has = |set: &HashSet<String>, key: &str| {
+            params
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|v| set.contains(v))
+        };
+        match msg.get("method").and_then(Value::as_str) {
+            Some("Target.targetDestroyed") => has(&self.targets, "targetId"),
+            Some("Target.detachedFromTarget") => {
+                has(&self.sessions, "sessionId") || has(&self.targets, "targetId")
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `browser_message`, except that the end of a target or CDP session this connection was
+/// told about is passed on even when the target already left the session scope.
+pub fn browser_message_told(
+    msg: Value,
+    request_method: Option<&str>,
+    scope: &Scope,
+    told: &Told,
+) -> BrowserDecision {
+    let ending = told.knows_ending(&msg);
+    match browser_message(msg.clone(), request_method, scope) {
+        BrowserDecision::Drop if ending => BrowserDecision::Forward(msg),
+        decision => decision,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,5 +941,71 @@ mod tests {
     fn storage_get_cookies_on_own_session_is_not_allowed() {
         let m = json!({"method":"Storage.getCookies","sessionId":"S1"});
         assert_eq!(err_code(&client_message(&m, &scope())), -32601);
+    }
+
+    #[test]
+    fn end_of_a_target_the_connection_was_told_about_is_forwarded_once_it_left_the_scope() {
+        let mut told = Told::default();
+        told.on_sent(
+            &json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"GONE"}}}),
+        );
+        told.on_sent(&json!({"method":"Target.attachedToTarget","params":{"sessionId":"SG","targetInfo":{"targetId":"GONE"}}}));
+        let destroyed = json!({"method":"Target.targetDestroyed","params":{"targetId":"GONE"}});
+        // GONE is not in scope() any more.
+        assert_eq!(
+            browser_message_told(destroyed.clone(), None, &scope(), &told),
+            BrowserDecision::Forward(destroyed.clone())
+        );
+        let detached = json!({"method":"Target.detachedFromTarget","params":{"sessionId":"SG"}});
+        assert_eq!(
+            browser_message_told(detached.clone(), None, &scope(), &told),
+            BrowserDecision::Forward(detached)
+        );
+        // Once told, it is forgotten: a repeat is dropped again.
+        told.on_sent(&destroyed);
+        told.on_sent(&json!({"method":"Target.detachedFromTarget","params":{"sessionId":"SG"}}));
+        assert_eq!(
+            browser_message_told(destroyed, None, &scope(), &told),
+            BrowserDecision::Drop
+        );
+    }
+
+    #[test]
+    fn end_of_a_target_the_connection_never_heard_of_is_dropped() {
+        let mut told = Told::default();
+        told.on_sent(
+            &json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"T1"}}}),
+        );
+        for m in [
+            json!({"method":"Target.targetDestroyed","params":{"targetId":"H1"}}),
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":"S9"}}),
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":"S9","targetId":"H1"}}),
+            json!({"method":"Target.targetDestroyed","params":{}}),
+        ] {
+            assert_eq!(
+                browser_message_told(m, None, &scope(), &told),
+                BrowserDecision::Drop
+            );
+        }
+    }
+
+    #[test]
+    fn listings_and_replies_make_a_target_known() {
+        let mut told = Told::default();
+        told.on_sent(&json!({"id":1,"result":{"targetInfos":[{"targetId":"A"},{"targetId":"B"}]}}));
+        told.on_sent(&json!({"id":2,"result":{"targetId":"C"}}));
+        told.on_sent(&json!({"id":3,"result":{"sessionId":"SX"}}));
+        for t in ["A", "B", "C"] {
+            let m = json!({"method":"Target.targetDestroyed","params":{"targetId":t}});
+            assert!(matches!(
+                browser_message_told(m, None, &scope(), &told),
+                BrowserDecision::Forward(_)
+            ));
+        }
+        let m = json!({"method":"Target.detachedFromTarget","params":{"sessionId":"SX"}});
+        assert!(matches!(
+            browser_message_told(m, None, &scope(), &told),
+            BrowserDecision::Forward(_)
+        ));
     }
 }
