@@ -1345,3 +1345,207 @@ saved <repo>/spikes/out/31-csp-reserve.json
 Items: (1) A7 contamination fixed (A3 onAttach listener removed with a new `off` in lib/cdp.mjs); A7 re-run twice with `--only=a7` (a first attempt with `--only a7` ran everything because the argument needs `=`): A7a/A7b identical across runs, all execCommand results `true` (O_hard absent). A7c: sandboxed srcdoc iframe without runImmediately → clipboard CHANGED; with runImmediately (fresh document) → unchanged; cross-site sandboxed iframe → unchanged with O_hard absent. (2) spikes/32-policy-round4.mjs, 2 runs × 3 cycles: no-policy writeText ok/CHANGED under both agent-default and human-default (focus true); dedicated deny connection: no file anywhere for existing tab, new tab, two kinds of new window; after closing the connection the file lands in ~/Downloads (6/6). Creating a tab/window flips the default context to Agent. (3) sentence fixes in docs/spike-findings.md. (3b) F1b: script 30 now compares parentFrameId to the tab targetId: equal, 3/3 in each of 2 runs. (4) The clipboard held text/empty at the start of every clipboard run.
 
 Outputs: spikes/out/r4-a7-1.txt, r4-a7-2.txt, r4-32-1.txt, r4-32-2.txt, r4-30-1.txt, r4-30-2.txt (local, not committed).
+
+### Round 4 follow-up (review fixes)
+
+- 32 rerun twice (3 cycles each): `probeTab` now records the click's return value (`a.click()` returns `undefined`, no exception) and `location.href` (`/blank` on the probe origin) for every step; results read 'not in ~/Downloads (no policy folder is checked in this script)' instead of 'nowhere'. Positive controls with the deny connection CLOSED: a new `window.open` tab and a re-invoked Agent window both dropped a file in ~/Downloads (3/3 cycles, both runs; removed afterwards). Deny steps 1-5 as before: no file in ~/Downloads, 3/3 cycles, both runs.
+- 23: the A3 `onAttach` scripts are recorded in `installed` and uninstalled; `--only=a3,a7` run once: A7 lines identical to the A7-alone run (timestamps and run ids aside); no `page false`.
+- Clipboard on new tabs is left to the product's Task 7 tests.
+
+### Raw A7 output (A7-alone run 1, A7a/A7b/A7c lines)
+
+`r4-a7-1.txt`:
+
+```
+A7a.L_hard: agent session OLDER than pegboard injecting session | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7b.a_click_execCopy: unchanged (true)
+A7b.b_click_execCut: unchanged (true)
+A7b.c_evalGesture_execCopy: unchanged (true)
+A7b.d_evalGesture_execCut: unchanged (true)
+A7b.e_key_Meta+C_commands: unchanged
+A7b.f_key_Meta+X_commands: unchanged
+A7b.g_key_paste_commands: unchanged (textarea="" pasteEvent="null")
+A7b.h_pageCopyHandler_click: unchanged
+A7b.i_pageCopyHandler_keyCommands: unchanged
+A7b.j_click_writeText_API: unchanged (ERR NotAllowedError)
+A7b.Control+Insert (no commands): unchanged
+A7b.Shift+Delete (no commands): unchanged
+A7b.Shift+Insert (no commands): no read
+A7b.Control+C commands:[copy]: unchanged
+A7b.Control+X commands:[cut]: unchanged
+A7b.Control+V commands:[paste]: no read
+A7c.targetsAttachedWhileCreatingSandboxedSrcdocIframe: ["iframe:about:srcdoc","iframe:about:srcdoc"]
+A7c.control_targetsAttachedForPlainSrcdocIframe: []
+A7c.control_targetsAttachedByLoadingThePageAlone: []
+A7c.srcdocSandboxOpaque_gestureCopy_withoutRunImmediately: {"messages":"[{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794608899832}},{\"sbx\":\"true\",\"defL\":false}]","system":"CHANGED(expected text)","topDocumentO_hard":false}
+A7c.srcdocSandboxOpaque_gestureCopy_withRunImmediately: {"messages":"[{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794608900958}},{\"sbx\":\"true\",\"defL\":true}]","system":"unchanged"}
+A7c.targetsAttachedWhileCreatingSandboxedCrossSiteIframe: ["iframe:(paused)","iframe:(paused)"]
+A7c.crossSiteSandboxed_gestureCopy: {"topDocumentO_hard":false,"messages":"[{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794608902086}},{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794608902110}},{\"ce\":\"true\"}]","system":"unchanged"}
+Clipboard: restored (0 bytes text); equals the saved one: true; contains this run's marker: false
+```
+
+
+### Raw A7 output (A7-alone run 2)
+
+`r4-a7-2.txt`:
+
+```
+A7a.L_hard: agent session OLDER than pegboard injecting session | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7b.a_click_execCopy: unchanged (true)
+A7b.b_click_execCut: unchanged (true)
+A7b.c_evalGesture_execCopy: unchanged (true)
+A7b.d_evalGesture_execCut: unchanged (true)
+A7b.e_key_Meta+C_commands: unchanged
+A7b.f_key_Meta+X_commands: unchanged
+A7b.g_key_paste_commands: unchanged (textarea="" pasteEvent="null")
+A7b.h_pageCopyHandler_click: unchanged
+A7b.i_pageCopyHandler_keyCommands: unchanged
+A7b.j_click_writeText_API: unchanged (ERR NotAllowedError)
+A7b.Control+Insert (no commands): unchanged
+A7b.Shift+Delete (no commands): unchanged
+A7b.Shift+Insert (no commands): no read
+A7b.Control+C commands:[copy]: unchanged
+A7b.Control+X commands:[cut]: unchanged
+A7b.Control+V commands:[paste]: no read
+A7c.targetsAttachedWhileCreatingSandboxedSrcdocIframe: ["iframe:about:srcdoc","iframe:about:srcdoc"]
+A7c.control_targetsAttachedForPlainSrcdocIframe: []
+A7c.control_targetsAttachedByLoadingThePageAlone: []
+A7c.srcdocSandboxOpaque_gestureCopy_withoutRunImmediately: {"messages":"[{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794608940577}},{\"sbx\":\"true\",\"defL\":false}]","system":"CHANGED(expected text)","topDocumentO_hard":false}
+A7c.srcdocSandboxOpaque_gestureCopy_withRunImmediately: {"messages":"[{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794608941703}},{\"sbx\":\"true\",\"defL\":true}]","system":"unchanged"}
+A7c.targetsAttachedWhileCreatingSandboxedCrossSiteIframe: ["iframe:(paused)","iframe:(paused)"]
+A7c.crossSiteSandboxed_gestureCopy: {"topDocumentO_hard":false,"messages":"[{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794608942829}},{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794608942853}},{\"ce\":\"true\"}]","system":"unchanged"}
+Clipboard: restored (0 bytes text); equals the saved one: true; contains this run's marker: false
+```
+
+
+### Raw A3+A7 output (after the cleanup fix; A7 lines)
+
+`r4-a3a7.txt`:
+
+```
+A7a.L_hard: agent session OLDER than pegboard injecting session | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: agent session OLDER than pegboard injecting session | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard: pegboard injecting session OLDER than agent session (control) | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"CHANGED(expected text) (page true)","keyCommandsCopy":"CHANGED(expected text)","evalGestureExecCommandCopy":"CHANGED(expected text) (page true)"}
+A7a.L_hard2: agent session OLDER than pegboard injecting session | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i3 Function.prototype.call replaced (L_hard calls the saved originals through it): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation: {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7a.L_hard2: pegboard injecting session OLDER than agent session (control) | i4 agent saves pristine references on window, no tampering (control: capture only): {"clickExecCommandCopy":"unchanged (page true)","keyCommandsCopy":"unchanged","evalGestureExecCommandCopy":"unchanged (page true)"}
+A7b.a_click_execCopy: unchanged (true)
+A7b.b_click_execCut: unchanged (true)
+A7b.c_evalGesture_execCopy: unchanged (true)
+A7b.d_evalGesture_execCut: unchanged (true)
+A7b.e_key_Meta+C_commands: unchanged
+A7b.f_key_Meta+X_commands: unchanged
+A7b.g_key_paste_commands: unchanged (textarea="" pasteEvent="null")
+A7b.h_pageCopyHandler_click: unchanged
+A7b.i_pageCopyHandler_keyCommands: unchanged
+A7b.j_click_writeText_API: unchanged (ERR NotAllowedError)
+A7b.Control+Insert (no commands): unchanged
+A7b.Shift+Delete (no commands): unchanged
+A7b.Shift+Insert (no commands): no read
+A7b.Control+C commands:[copy]: unchanged
+A7b.Control+X commands:[cut]: unchanged
+A7b.Control+V commands:[paste]: no read
+A7c.targetsAttachedWhileCreatingSandboxedSrcdocIframe: ["iframe:about:srcdoc","iframe:about:srcdoc"]
+A7c.control_targetsAttachedForPlainSrcdocIframe: []
+A7c.control_targetsAttachedByLoadingThePageAlone: []
+A7c.srcdocSandboxOpaque_gestureCopy_withoutRunImmediately: {"messages":"[{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794612673772}},{\"sbx\":\"true\",\"defL\":false}]","system":"CHANGED(expected text)","topDocumentO_hard":false}
+A7c.srcdocSandboxOpaque_gestureCopy_withRunImmediately: {"messages":"[{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794612674903}},{\"sbx\":\"true\",\"defL\":true}]","system":"unchanged"}
+A7c.targetsAttachedWhileCreatingSandboxedCrossSiteIframe: ["iframe:(paused)","iframe:(paused)"]
+A7c.crossSiteSandboxed_gestureCopy: {"topDocumentO_hard":false,"messages":"[{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794612676032}},{\"first\":{\"defL\":true,\"defO\":false,\"t\":1794612676056}},{\"ce\":\"true\"}]","system":"unchanged"}
+Clipboard: restored (14 bytes text); equals the saved one: true; contains this run's marker: false
+```
+
+
+### Raw script 32 output, run 1
+
+`r4-32-1.txt`:
+
+```
+BROWSER: Chrome/157.0.8103.78
+DEFAULT_CONTEXT: Agent; contexts listed by Target.getBrowserContexts: 0
+RUN: {"id":"run-b4273be6","version":"Chrome/157.0.8103.78"}
+CLIPBOARD_CONTROL_no_policy.rep1: {"agentDefault":{"default":"Agent","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"},"humanDefault":{"default":"Human","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"}}
+CLIPBOARD_CONTROL_no_policy.rep2: {"agentDefault":{"default":"Agent","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"},"humanDefault":{"default":"Human","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"}}
+CLIPBOARD_CONTROL_no_policy.rep3: {"agentDefault":{"default":"Agent","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"},"humanDefault":{"default":"Human","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"}}
+DOWNLOAD_CONTROL_no_policy: {"default":"Agent","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}
+DENY_DEDICATED.cycle1: {"cycle":1,"steps":{"1 agent default, deny just set":{"default":"Agent","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"2 human default, existing agent tab":{"default":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"3 NEW agent tab (window.open) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"4 NEW agent window (window.open popup) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"5 NEW agent window (re-invoke) created, human made default again":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}},"defaultWhenSet":"Agent","setDownloadBehavior":"ok","newTabCreatedByWindowOpen":{"created":true,"defaultAfterCreate":"Agent"},"newWindowCreatedByWindowOpenPopup":{"created":true,"defaultAfterCreate":"Agent"},"newWindowByReinvoke":{"created":true,"defaultAfterCreate":"Agent"},"deniedConnectionAliveAtEnd":true,"afterDedicatedConnectionClosed":{"default":"Agent","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_newTab_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_reinvokedAgentWindow_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}}
+DENY_DEDICATED.cycle2: {"cycle":2,"steps":{"1 agent default, deny just set":{"default":"Agent","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"2 human default, existing agent tab":{"default":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"3 NEW agent tab (window.open) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"4 NEW agent window (window.open popup) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"5 NEW agent window (re-invoke) created, human made default again":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}},"defaultWhenSet":"Agent","setDownloadBehavior":"ok","newTabCreatedByWindowOpen":{"created":true,"defaultAfterCreate":"Agent"},"newWindowCreatedByWindowOpenPopup":{"created":true,"defaultAfterCreate":"Agent"},"newWindowByReinvoke":{"created":true,"defaultAfterCreate":"Agent"},"deniedConnectionAliveAtEnd":true,"afterDedicatedConnectionClosed":{"default":"Agent","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_newTab_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_reinvokedAgentWindow_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}}
+DENY_DEDICATED.cycle3: {"cycle":3,"steps":{"1 agent default, deny just set":{"default":"Agent","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"2 human default, existing agent tab":{"default":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"3 NEW agent tab (window.open) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"4 NEW agent window (window.open popup) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"5 NEW agent window (re-invoke) created, human made default again":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}},"defaultWhenSet":"Agent","setDownloadBehavior":"ok","newTabCreatedByWindowOpen":{"created":true,"defaultAfterCreate":"Agent"},"newWindowCreatedByWindowOpenPopup":{"created":true,"defaultAfterCreate":"Agent"},"newWindowByReinvoke":{"created":true,"defaultAfterCreate":"Agent"},"deniedConnectionAliveAtEnd":true,"afterDedicatedConnectionClosed":{"default":"Agent","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_newTab_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_reinvokedAgentWindow_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}}
+Cleanup: clipboard restored: true; files with this run's id left in ~/Downloads: 0
+saved spikes/out/32-policy-round4.json
+
+```
+
+
+### Raw script 32 output, run 2
+
+`r4-32-2.txt`:
+
+```
+BROWSER: Chrome/157.0.8103.78
+DEFAULT_CONTEXT: Agent; contexts listed by Target.getBrowserContexts: 0
+RUN: {"id":"run-62300fda","version":"Chrome/157.0.8103.78"}
+CLIPBOARD_CONTROL_no_policy.rep1: {"agentDefault":{"default":"Agent","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"},"humanDefault":{"default":"Human","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"}}
+CLIPBOARD_CONTROL_no_policy.rep2: {"agentDefault":{"default":"Agent","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"},"humanDefault":{"default":"Human","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"}}
+CLIPBOARD_CONTROL_no_policy.rep3: {"agentDefault":{"default":"Agent","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"},"humanDefault":{"default":"Human","writeText":"ok","hasFocus":true,"visibility":"visible","systemClipboard":"CHANGED (page wrote it)"}}
+DOWNLOAD_CONTROL_no_policy: {"default":"Agent","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}
+DENY_DEDICATED.cycle1: {"cycle":1,"steps":{"1 agent default, deny just set":{"default":"Agent","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"2 human default, existing agent tab":{"default":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"3 NEW agent tab (window.open) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"4 NEW agent window (window.open popup) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"5 NEW agent window (re-invoke) created, human made default again":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}},"defaultWhenSet":"Agent","setDownloadBehavior":"ok","newTabCreatedByWindowOpen":{"created":true,"defaultAfterCreate":"Agent"},"newWindowCreatedByWindowOpenPopup":{"created":true,"defaultAfterCreate":"Agent"},"newWindowByReinvoke":{"created":true,"defaultAfterCreate":"Agent"},"deniedConnectionAliveAtEnd":true,"afterDedicatedConnectionClosed":{"default":"Agent","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_newTab_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_reinvokedAgentWindow_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}}
+DENY_DEDICATED.cycle2: {"cycle":2,"steps":{"1 agent default, deny just set":{"default":"Agent","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"2 human default, existing agent tab":{"default":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"3 NEW agent tab (window.open) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"4 NEW agent window (window.open popup) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"5 NEW agent window (re-invoke) created, human made default again":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}},"defaultWhenSet":"Agent","setDownloadBehavior":"ok","newTabCreatedByWindowOpen":{"created":true,"defaultAfterCreate":"Agent"},"newWindowCreatedByWindowOpenPopup":{"created":true,"defaultAfterCreate":"Agent"},"newWindowByReinvoke":{"created":true,"defaultAfterCreate":"Agent"},"deniedConnectionAliveAtEnd":true,"afterDedicatedConnectionClosed":{"default":"Agent","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_newTab_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_reinvokedAgentWindow_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}}
+DENY_DEDICATED.cycle3: {"cycle":3,"steps":{"1 agent default, deny just set":{"default":"Agent","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"2 human default, existing agent tab":{"default":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"3 NEW agent tab (window.open) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"4 NEW agent window (window.open popup) created while human default":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"5 NEW agent window (re-invoke) created, human made default again":{"defaultAtTest":"Human","download":"not in ~/Downloads (no policy folder is checked in this script)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}},"defaultWhenSet":"Agent","setDownloadBehavior":"ok","newTabCreatedByWindowOpen":{"created":true,"defaultAfterCreate":"Agent"},"newWindowCreatedByWindowOpenPopup":{"created":true,"defaultAfterCreate":"Agent"},"newWindowByReinvoke":{"created":true,"defaultAfterCreate":"Agent"},"deniedConnectionAliveAtEnd":true,"afterDedicatedConnectionClosed":{"default":"Agent","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_newTab_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"},"positiveControl_reinvokedAgentWindow_denyConnectionClosed":{"defaultAtTest":"Human","download":"~/Downloads (removed at the end)","clickReturn":"undefined","href":"http://127.0.0.1:PORT/blank"}}
+Cleanup: clipboard restored: true; files with this run's id left in ~/Downloads: 0
+saved spikes/out/32-policy-round4.json
+
+```
+

@@ -216,7 +216,8 @@ try {
       injected.push({ type: p.targetInfo.type, url: p.targetInfo.url.replace(/:\d+/, ':PORT'), waiting: p.waitingForDebugger });
       try {
         await b.send('Page.enable', {}, sid).catch(() => {});
-        await b.send('Page.addScriptToEvaluateOnNewDocument', { source: defSrc }, sid).catch(() => {});
+        const added = await b.send('Page.addScriptToEvaluateOnNewDocument', { source: defSrc }, sid).catch(() => null);
+        if (added) installed.push({ conn: b, sid, id: added.identifier }); // round 4: recorded so uninstall() removes it
         if (p.targetInfo.type === 'page' || p.targetInfo.type === 'iframe') await b.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sid).catch(() => {});
         await b.send('Runtime.runIfWaitingForDebugger', {}, sid).catch(() => {});
       } catch {}
