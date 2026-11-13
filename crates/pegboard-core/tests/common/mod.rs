@@ -630,13 +630,13 @@ pub struct Daemons {
 }
 
 impl Daemons {
-    fn add(&self, id: &SessionId) {
+    pub fn add(&self, id: &SessionId) {
         if let Some(pid) = self.runner.daemon_pid(id) {
             self.list.lock().unwrap().push((id.clone(), pid));
         }
     }
 
-    fn get(&self) -> Vec<(SessionId, i32)> {
+    pub fn get(&self) -> Vec<(SessionId, i32)> {
         self.list.lock().unwrap().clone()
     }
 }
