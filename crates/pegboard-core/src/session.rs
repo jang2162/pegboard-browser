@@ -536,6 +536,12 @@ impl SessionManager {
         self.inner.guard.denied()
     }
 
+    /// What the guard did with its last attachments (diagnostics).
+    #[doc(hidden)]
+    pub fn guard_attach_log(&self) -> Vec<String> {
+        self.inner.guard.attach_log()
+    }
+
     /// Connections the guard has made (diagnostics: a reconnect shows as a jump).
     #[doc(hidden)]
     pub fn guard_connections(&self) -> u64 {

@@ -50,6 +50,8 @@ const BODY_PIECE: usize = 1 << 20;
 /// Request-stage resolutions of documents kept for their response stage; past this many
 /// the table is emptied (those documents are then served again: fail closed).
 const MAX_PENDING_DOCUMENTS: usize = 4096;
+/// Attachments kept in the diagnostics log.
+const ATTACH_LOG: usize = 256;
 /// How long a failed tab's status is kept for a waiter.
 const FAILED_KEPT: Duration = Duration::from_secs(60);
 
@@ -344,6 +346,8 @@ struct State {
     documents: HashMap<String, Resolved>,
     /// Connections made so far (diagnostics: a reconnect shows as a jump).
     connections: u64,
+    /// The last `ATTACH_LOG` attachments and what the guard did with them (diagnostics).
+    attach_log: std::collections::VecDeque<String>,
     /// Refused requests per reason, since the daemon started (diagnostics, no URLs).
     denied: BTreeMap<&'static str, u64>,
 }
@@ -454,6 +458,20 @@ impl Guard {
     #[doc(hidden)]
     pub fn denied(&self) -> BTreeMap<&'static str, u64> {
         self.inner.state.lock().unwrap().denied.clone()
+    }
+
+    /// What the guard did with its last attachments, oldest first (diagnostics): target id,
+    /// kind, whose profile, whether it was waiting for the debugger, and the outcome.
+    #[doc(hidden)]
+    pub fn attach_log(&self) -> Vec<String> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .attach_log
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Connections the guard has made since it started (diagnostics).
@@ -578,18 +596,45 @@ impl Inner {
         }
         let me = self.clone();
         let conn = conn.clone();
+        let whose = if context == me.human_context {
+            "human"
+        } else if context.is_empty() {
+            "no-context"
+        } else {
+            "agent"
+        };
         tokio::spawn(async move {
-            if foreign {
-                release(&conn, &session, parent.as_deref()).await;
+            let outcome = if foreign {
+                release(&conn, &session, parent.as_deref()).await
             } else {
-                me.set_up(&conn, &session, &target, &kind, waiting).await;
-            }
+                me.set_up(&conn, &session, &target, &kind, waiting).await
+            };
+            me.log_attach(format!(
+                "{target} {kind} {whose} waiting={waiting} parent={} -> {outcome}",
+                parent.is_some()
+            ));
         });
     }
 
+    fn log_attach(&self, line: String) {
+        let mut state = self.state.lock().unwrap();
+        if state.attach_log.len() == ATTACH_LOG {
+            state.attach_log.pop_front();
+        }
+        state.attach_log.push_back(line);
+    }
+
     /// Turns interception on for an agent target and resumes it. A tab that cannot be
-    /// guarded is closed; a frame or worker is left waiting.
-    async fn set_up(&self, conn: &CdpConn, session: &str, target: &str, kind: &str, waiting: bool) {
+    /// guarded is closed; a frame or worker is left waiting. Returns what happened (for the
+    /// diagnostics log).
+    async fn set_up(
+        &self,
+        conn: &CdpConn,
+        session: &str,
+        target: &str,
+        kind: &str,
+        waiting: bool,
+    ) -> String {
         let s = Some(session);
         let result = async {
             if matches!(kind, "page" | "iframe") {
@@ -622,20 +667,25 @@ impl Inner {
         .await;
         match result {
             Ok(()) => {
-                if waiting {
-                    let _ = conn
-                        .send("Runtime.runIfWaitingForDebugger", json!({}), s)
-                        .await;
-                }
+                let resumed = if waiting {
+                    outcome(
+                        conn.send("Runtime.runIfWaitingForDebugger", json!({}), s)
+                            .await,
+                    )
+                } else {
+                    "not-waiting".to_string()
+                };
                 self.set_page(kind, target, Status::Guarded { paused: waiting });
+                format!("guarded resume={resumed}")
             }
-            Err(_) => {
+            Err(e) => {
                 self.set_page(kind, target, Status::Failed(std::time::Instant::now()));
                 if kind == "page" {
                     let _ = conn
                         .send("Target.closeTarget", json!({ "targetId": target }), None)
                         .await;
                 }
+                format!("failed ({e:#})")
             }
         }
     }
@@ -919,17 +969,29 @@ async fn read_body_capped(
 
 /// Lets go of a target the guard does not judge: resumes it (Chrome holds a target an
 /// auto-attached session never resumed) and detaches.
-async fn release(conn: &CdpConn, session: &str, parent: Option<&str>) {
-    let _ = conn
+async fn release(conn: &CdpConn, session: &str, parent: Option<&str>) -> String {
+    let resumed = conn
         .send("Runtime.runIfWaitingForDebugger", json!({}), Some(session))
         .await;
-    let _ = conn
+    let detached = conn
         .send(
             "Target.detachFromTarget",
             json!({ "sessionId": session }),
             parent,
         )
         .await;
+    format!(
+        "released resume={} detach={}",
+        outcome(resumed),
+        outcome(detached)
+    )
+}
+
+fn outcome(r: Result<Value>) -> String {
+    match r {
+        Ok(_) => "ok".into(),
+        Err(e) => format!("err({e:#})"),
+    }
 }
 
 #[cfg(test)]
