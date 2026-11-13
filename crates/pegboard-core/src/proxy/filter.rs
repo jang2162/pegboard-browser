@@ -125,6 +125,39 @@ const TARGET_ID_METHODS: &[&str] = &[
 ];
 const URL_REFUSED: &str = "url scheme is not allowed in a pegboard session";
 
+/// Methods that could turn off, take over or hide pegboard's request checks (`guard`):
+/// request interception of the client's own (a later client session that intercepts can win
+/// over pegboard's, spike G4/D5), request blocking and throttling, the service-worker bypass,
+/// CSP bypass (the WebSocket defence is a CSP pegboard adds to documents), permissions (the
+/// guard grants local-network access to agent profiles), and handing the protocol to a page.
+/// Refused on every level, whatever the allow-list says (`ALLOWED_METHODS` must not name
+/// them; a test pins it).
+pub const GUARD_METHODS: &[&str] = &[
+    "Network.setBlockedURLs",
+    "Network.setBypassServiceWorker",
+    "Network.setRequestInterception",
+    "Network.continueInterceptedRequest",
+    "Network.getResponseBodyForInterception",
+    "Network.takeResponseBodyForInterceptionAsStream",
+    "Network.emulateNetworkConditions",
+    "Network.emulateNetworkConditionsByRule",
+    "Network.overrideNetworkState",
+    "Network.setCacheDisabled",
+    "Network.disable",
+    "Page.setBypassCSP",
+    "Browser.setPermission",
+    "Browser.grantPermissions",
+    "Browser.resetPermissions",
+    "Target.exposeDevToolsProtocol",
+];
+/// Every method of these domains is refused like `GUARD_METHODS`.
+pub const GUARD_PREFIXES: &[&str] = &["Fetch."];
+const GUARD_REFUSED: &str = "not allowed in a pegboard session: it would change pegboard's checks of the session's requests";
+
+pub fn is_guard_method(method: &str) -> bool {
+    GUARD_METHODS.contains(&method) || GUARD_PREFIXES.iter().any(|p| method.starts_with(p))
+}
+
 /// Judge and normalize a URL an agent wants to open or navigate to. Returns the
 /// string the browser must receive, or `None` when it is refused.
 ///
@@ -206,6 +239,11 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
     // 2. Calls that could take down the browser or create contexts.
     if REFUSED_METHODS.contains(&method) {
         return error(-32000, NOT_ALLOWED);
+    }
+
+    // 2b. Calls that could switch off or hide the daemon's request checks.
+    if is_guard_method(method) {
+        return error(-32000, GUARD_REFUSED);
     }
 
     // 3. Target-addressed calls must name one of the session's targets.
@@ -1148,5 +1186,41 @@ mod tests {
             browser_message_told(m, None, &scope(), &told),
             BrowserDecision::Forward(_)
         ));
+    }
+
+    #[test]
+    fn methods_that_could_switch_off_the_request_guard_are_refused_on_every_level() {
+        let fetch = [
+            "Fetch.enable",
+            "Fetch.disable",
+            "Fetch.continueRequest",
+            "Fetch.failRequest",
+            "Fetch.fulfillRequest",
+            "Fetch.continueResponse",
+            "Fetch.continueWithAuth",
+            "Fetch.getResponseBody",
+            "Fetch.takeResponseBodyAsStream",
+        ];
+        for method in GUARD_METHODS.iter().copied().chain(fetch) {
+            assert!(
+                !ALLOWED_METHODS.contains(&method),
+                "{method} is allow-listed"
+            );
+            for msg in [
+                json!({"id": 1, "method": method, "params": {}}),
+                json!({"id": 1, "sessionId": "S1", "method": method, "params": {}}),
+                json!({"id": 1, "sessionId": "S1", "method": method}),
+            ] {
+                match client_message(&msg, &scope()) {
+                    ClientDecision::Error { code, message } => {
+                        assert_eq!(code, -32000, "{msg}");
+                        assert_eq!(message, GUARD_REFUSED, "{msg}");
+                    }
+                    other => panic!("{msg} was not refused: {other:?}"),
+                }
+            }
+        }
+        // Allow-listed methods are not caught by the guard rule.
+        assert!(ALLOWED_METHODS.iter().all(|m| !is_guard_method(m)));
     }
 }
