@@ -348,3 +348,157 @@ Extended Stable 태그 `156.0.8078.96`을 받아 한 번 빌드했다. 스크립
 7. **1단계 브리지는 서비스 워커 수명을 다룬다 (A5).** 확장이 `pegboardd`에 연결을 유지하는 방식을 1단계 첫 작업에서 검증한다. → 결정 3, 로드맵 1단계
 8. **프로필 복사 전 쿠키 반영을 기다린다 (A13).** 복사 직전 30초 안에 바뀐 쿠키는 CDP로 읽어 복사본에 넣는 보완을 검토한다. → 6절 복사 방식
 9. **에이전트 프로필 창은 실행 파일을 다시 불러 연다 (A11).** `--profile-directory=<이름>`. 3단계에서는 `Pegboard` 도메인으로 바꾼다. → 6절 에이전트 프로필
+
+## 2a단계 측정
+
+2a단계 작업 4(주소 규칙), 5(다운로드), 7(클립보드)이 고를 방법을 정하려고 Chrome for Testing 157.0.8103.78에서 쟀다(2026-11-13). 스크립트는 `spikes/20-request-guard.mjs`, `21-downloads.mjs`, `22-clipboard.mjs`이고 각각 두 번 이상 돌렸다. 아래 줄은 마지막 실행의 출력이다. 두 번 사이에 달라진 것은 밀리초 수치와, 같은 밀리초에 찍힌 사건의 선후 판정 한 건(G4 조합 11)뿐이다. 전체 출력은 `docs/plans/phase2a-notes/task-2-report.md`에 있다. 표기는 위와 같다: [확인]은 직접 관찰한 것.
+
+공통 설정: 임시 user-data-dir에 프로필 둘(`Human`, `Agent`)을 1단계 `04-profiles.mjs`와 같은 방식으로 연다. **21과 22의 모든 실행에서 기본 브라우저 컨텍스트는 `Agent`였다**(20은 확인하지 않았다) [확인]. 그리고 `Browser.setDownloadBehavior`와 `Browser.setPermission`에 `Human`의 컨텍스트 ID를 주면 `Failed to find browser context for id ...`로 거절됐고 `Agent`의 ID는 받아들여졌다(5절의 "남는 질문" 참고). 용어: P는 `pegboardd` 역을 하는 브라우저 연결, A는 에이전트 역을 하는 연결이다. 프록시를 거치지 않은 Chrome의 동작이다. 프록시 필터에 관한 말은 `filter.rs`를 읽은 것이지 실행한 것이 아니다.
+
+### G. 요청 가로채기 (`20-request-guard.mjs`)
+
+**G1. 어떤 요청이 `Fetch.requestPaused`로 잡히는가** [확인]. 세 가지 걸기 방식으로 같은 페이지(`/g1`)를 열었다. A: P가 에이전트 탭의 페이지 세션에만 `Fetch.enable`. B: 거기에 페이지 수준 `Target.setAutoAttach`(`waitForDebuggerOnStart`)를 더하고 새로 붙은 타깃마다 `Fetch.enable`. C: 브라우저 수준 `Target.setAutoAttach`.
+
+| 요청 | A 페이지 세션만 | B +페이지 자동 연결 | C +브라우저 자동 연결 |
+|---|---|---|---|
+| 주 프레임 탐색 (`Page.navigate`) | 잡힘 | 잡힘 | 잡힘 |
+| iframe, 이미지 | 잡힘 | 잡힘 | 잡힘 |
+| 페이지 스크립트의 `fetch`, `XMLHttpRequest`, `sendBeacon` | 잡힘 | 잡힘 | 잡힘 |
+| `Runtime.evaluate`로 낸 `fetch` | **잡힘** | 잡힘 | 잡힘 |
+| 전용 워커의 스크립트와 그 워커의 `fetch` | 잡힘(페이지 세션이 본다. 워커 타깃에는 `Fetch.enable`이 없다: `'Fetch.enable' wasn't found`) | 잡힘 | 잡힘 |
+| 공유 워커의 스크립트 | 잡힘 | 잡힘 | 잡힘 |
+| 공유 워커가 낸 `fetch` | **못 잡음** | **못 잡음** | 잡힘(`shared_worker` 세션) |
+| 서비스 워커의 스크립트 등록 요청 | 못 잡음 | 잡힘(`service_worker` 세션) | 못 잡음 |
+| 서비스 워커가 낸 `fetch` | **못 잡음** | 잡힘(`service_worker` 세션) | 잡힘 |
+| 웹소켓 핸드셰이크 | **못 잡음** | **못 잡음** | **못 잡음** |
+
+- `G1: evalFetch and pageFetch caught with page-session Fetch: PASS; not caught in phase A (page session only): websocket,sharedWorkerFetch,serviceWorkerScript,serviceWorkerFetch`
+- `G1.websocket: handshake never reaches Fetch.requestPaused (phases A, B, C); Network.webSocketCreated at P with Network.enable: ["ws://127.0.0.1:PORT/t/ws?p=A"] (observation only; blocking it was not measured)` 웹소켓은 서버에 도달했고(핸드셰이크 도착), 가로채기는 URL을 알려 주는 `Network.webSocketCreated` 이벤트를 받았을 뿐이다. 막을 수 있는지는 재지 않았다.
+- 서비스 워커가 `respondWith`로 처리하는 요청은 **페이지 세션에서 안 보인다** (G4.serviceWorker 참고).
+
+**G2. 요청 단계와 응답 단계에서 보이는 것** [확인].
+- `G2.request`: 요청 단계 이벤트의 필드는 `requestId, request{url, method, headers, initialPriority, referrerPolicy}, frameId, resourceType, networkId`. **원격 주소 필드는 없다.** 이름(URL)만 보인다.
+- `G2.response`: 응답 단계(`requestStage: Response`) 이벤트는 거기에 `responseStatusCode, responseStatusText, responseHeaders`가 붙는다. `{"remoteIpAtPause":null,"remoteIpAfter500ms":null,"responseReceivedBeforePauseEvent":false}`: 붙들고 있는 동안 `Network.responseReceived`(원격 IP가 들어 있는 이벤트)는 **오지 않았다**(500ms 기다림).
+- 풀어 주면 `Network.responseReceived`가 1~2ms 뒤에 오고, 페이지가 응답 헤더를 받는 것과 같은 때다(`ripAfterContinue.receivedByP_msAfterContinue` 1~2, `pageGotHeadersAt_msAfterContinue` 1~2). 즉 IP를 알았을 때는 이미 페이지가 응답을 받은 뒤다.
+- `Fetch.getResponseBody`는 붙들고 있는 동안 된다(`ok:16chars`). 본문은 읽히지만 원격 IP는 알 수 없다.
+- `G2.redirect: {"requestStageOnly":["/t/redirect","/t/body<-redirect"],"bothStages":["Request::/t/redirect","Response:302:/t/redirect","Request::/t/body:redirected","Response:200:/t/body:redirected"]}`: 리다이렉트의 각 단계가 새 `requestPaused`로 온다. 이동한 곳의 요청에는 `redirectedRequestId`가 붙는다.
+- `G2.cut: PASS body not delivered (ERR:Failed to fetch); server was contacted: true`: 응답 단계에서 `Fetch.failRequest`(`BlockedByClient`)를 하면 페이지는 본문을 받지 못하고 `Failed to fetch`가 된다. 그러나 서버는 요청을 받았다(부작용은 일어난다).
+
+**G3. 공개 이름이 사설 주소로 풀릴 때** [확인]. `--host-resolver-rules`로 한 번의 실행에 세 이름을 매핑했다(계획은 따로 실행하라고 했으나 같은 결과를 한 번에 얻었다): `loop.test`→`127.0.0.1`, `lan.test`→이 기기의 사설 LAN 주소(서버가 거기서도 듣게 했다), `ten.test`→`10.255.255.1`(라우팅 안 됨).
+- 요청 단계: 세 이름 모두 호스트 이름만 보인다. 요청 단계에서 400ms 붙들어 두는 동안 서버는 연락받지 않았다(`serverContactedBeforeRequestStageContinue:false`).
+- 응답 단계: `loop`, `lan` 모두 붙들고 있는 동안 원격 IP를 알 수 없었다(`ripAtResponsePause:null`, `ripWithin600ms:null`). 풀어 준 뒤에야 `127.0.0.1`과 사설 LAN 주소가 `Network.responseReceived`로 왔고, 그때 본문은 이미 페이지에 갔다(`bodyReachedPage:true`).
+- `ten.test`: 요청 단계는 보이나 응답이 오지 않았다. `Network.loadingFailed`도 9초 동안 없었고 페이지의 `fetch`는 9005ms에 시간 초과(`ERR:timeout`), 서버 접촉 0.
+- 결론: **응답 도착 때의 실제 원격 주소로 본문 전에 끊는다는 설계 5.3의 방법은 쓸 수 없다.** 요청 단계의 이름 판정만 가능하다. 이름을 `pegboardd`가 따로 풀어 보는 방법 등은 재지 않았다.
+
+**G4. 에이전트 쪽 연결이 가로채기를 끄거나 가릴 수 있는가** [확인].
+- `G4.switchOff: A's Fetch.disable=ok; P still caught after: Fetch.disable=true, Network.setBypassServiceWorker=true, Network.disable=true, Target.setAutoAttach(off)=true => PASS`: A의 `Fetch.disable`, `Network.setBypassServiceWorker`, `Network.disable`, `Target.setAutoAttach(끄기)`는 P의 가로채기를 끄지 못한다(Fetch 상태는 세션마다 따로다).
+- `G4.steal`: A가 P가 붙든 요청의 `requestId`로 `Fetch.continueRequest`/`failRequest`/`fulfillRequest`를 보내면 `Invalid InterceptionId.`로 거절된다. 자기가 `Fetch.enable`을 했을 때도 같다(앞서 안 했을 때는 `Fetch domain is not enabled`).
+- **두 세션 모두 `Fetch.enable`을 했을 때는 "가장 새로 만든 세션"이 먼저 판정한다**(`Fetch.enable`을 먼저 했는지가 아니라 세션을 만든 순서). 조합 3(P는 실패, A는 응답 만들기)에서 A의 세션이 P보다 먼저 만들어졌으면 P가 먼저 보고 막는다. 조합 9: P보다 **나중에 만든 A의 새 세션**이 `fulfillRequest`하면 P는 그 요청을 보지도 못하고 페이지는 `OK:FROM-A2`를 받는다(`P saw=false A saw=true`). 즉 새 세션에서 `Fetch.enable`을 할 수 있는 클라이언트는 P의 차단을 우회한다. 한쪽이 응답을 만들거나 실패시키면 뒤의 세션은 그 요청을 보지 못한다.
+- 프록시 필터(`crates/pegboard-core/src/proxy/filter.rs`, 읽었을 뿐 실행하지 않음)는 허용 목록 방식이고 `Fetch.*`와 `Network.setBypassServiceWorker`는 목록에 없다. 브라우저 수준 `Fetch.`/`Network.`/`Storage.`는 따로 거절한다. 그래서 위 우회는 필터가 막는다. `Target.setAutoAttach`(페이지 수준)와 `Target.attachToTarget`은 허용 목록에 있다.
+- `G4.serviceWorker: {"pageControlledBySW":true,"pageFetch_caughtByP_pageSessionOnly":[],"pageFetch_caughtByP_whenAbypassesSW":["page:XHR"],"caughtByP_whenPAlsoAttachedToSwTarget":["service_worker:XHR:sw=1"],"serverHitsInOrder_plain_bypass_withSw":["SW","page","SW"]}`: 서비스 워커가 `respondWith(fetch(...))`로 처리하는 페이지의 요청은 P의 페이지 세션에서 **보이지 않고**, 서비스 워커가 낸 요청은 P가 그 타깃에도 붙어 `Fetch.enable`을 해야 보인다. `Network.setBypassServiceWorker`는 A가 켜도 P가 덜 보게 만들지는 않는다(켜면 페이지 요청이 P에게 보인다). 서비스 워커는 에이전트 프로필에 속한다(`browserContextId`가 `Agent`).
+- `G4.workerRace`: 전용 워커의 요청은 페이지 세션을 거쳐 P에게 보이므로(G1), A가 워커를 먼저 재개해도 숨기지 못한다. 서비스 워커와 공유 워커에 대한 같은 경주는 재지 않았다.
+
+**G5. 가로채기의 수명과 범위** [확인].
+- `G5.closeReleases`: P의 연결을 닫으면 붙들려 있던 요청은 **서버로 나가 정상 응답을 받았고**(`OK:not found`는 서버의 404 본문), 그 뒤 요청도 가로채기 없이 나간다. 연결이 끊기면 열려 버린다(fail-open).
+- 탭마다 걸어야 한다. 에이전트 탭에서 `window.open`으로 연 탭의 첫 요청은 가로채지 못했다(자동 연결을 안 건 경우, 페이지 수준 자동 연결을 건 경우 모두. 페이지 수준 자동 연결은 팝업을 붙여 주지 않는다: 붙은 것은 워커와 서비스 워커뿐).
+- **브라우저 수준 `Target.setAutoAttach`(`waitForDebuggerOnStart: true`)를 걸면** 팝업이 `page/Agent/wait`로 붙고, `Fetch.enable` 뒤 `Runtime.runIfWaitingForDebugger`로 재개하면 팝업의 첫 요청과 하위 요청이 모두 잡혔다(`G5.popupBrowserAutoAttach: {"firstRequestCaught":true,"subresourceCaught":true,...}`). 같은 방식으로 **사람 프로필의 새 탭도** `page/Human/wait`로 붙어 재개될 때까지 멈춘다.
+- 브라우저가 URL을 줘서 새 창을 여는 경우(`--profile-directory=Agent --new-window <URL>`)는 브라우저 수준 자동 연결로 붙어도 첫 요청을 못 잡았다. `Target.setDiscoverTargets`로 알아채고 뒤늦게 붙는 방법도 못 잡았다(`G5.newWindow: discoverThenAttach firstRequestCaught:false, browserAutoAttachWait firstRequestCaught:false`). 이미 붙은 탭에서 `Page.navigate`하는 요청은 잡힌다(G1 `nav`).
+
+**G6. 지연** [확인]. 같은 탭에서 `fetch` 100번(순차, 로컬 서버): `G6: mean per request (100 sequential fetches): baseline 0.39ms (runs 0.49/0.29); request-stage 0.54ms (+0.15); request+response stage 0.56ms (+0.17)`. 요청 하나에 더하는 지연은 0.2ms 안팎이다(처리기가 즉시 풀어 줄 때).
+
+**작업 4가 쓸 방법.** P가 에이전트 컨텍스트의 모든 페이지 타깃에 요청 단계 `Fetch.enable`을 건다. 새 탭, 팝업, 서비스 워커, 공유 워커를 놓치지 않도록 브라우저 수준 `Target.setAutoAttach`(`waitForDebuggerOnStart`)로 붙고, 에이전트 컨텍스트가 아닌 타깃(사람 프로필)은 바로 재개한다. 새 탭은 `about:blank`로 만들어 가로채기를 건 뒤 `pegboardd`가 이동시킨다(URL을 주고 여는 경로는 첫 요청이 안 잡힌다). 판정은 URL의 이름과 리터럴 IP로만 하고, 이름이 사설 주소로 풀리는 경우는 응답 단계로는 막을 수 없으므로 "남는 위험"에 적거나 `pegboardd`가 이름을 따로 풀어 보는 방법을 따로 실험한다(재지 않았다). 웹소켓은 `Fetch`로 막을 수 없다. P의 연결이 끊기면 가로채기가 풀리므로 그동안 세션 명령을 받지 않는다(fail-closed). 프록시 허용 목록에 `Fetch.*`가 없는 것을 시험으로 고정한다.
+
+### L. 다운로드 (`21-downloads.mjs`)
+
+모든 파일은 임시 폴더로만 받았다. 정책이 없는 사람 프로필의 다운로드와 정책 연결이 사라진 뒤의 다운로드는 사용자의 `~/Downloads`에 떨어진다(L1b, L5가 재는 것이다). 그 파일은 실행마다 새로 만든 무작위 ID가 이름에 들어 있었고 스크립트가 끝에 그 ID가 든 파일만 지웠다.
+
+**L1. 프로필마다 다른 폴더를 가질 수 있는가** [확인].
+- `L1.perProfile: PASS: ... D1 set Agent dir by browserContextId (ok) ...; agent download landed: {"agentDir":true,...}; human download landed: {"userDownloadsByName":true}`: 에이전트 컨텍스트 ID로 건 정책(`allowAndName`, `eventsEnabled:true`)은 에이전트 프로필의 다운로드를 그 폴더로 보냈고 사람 프로필에는 번지지 않았다(사람 쪽 다운로드는 정책이 없어 `~/Downloads`로 갔다).
+- **사람 프로필의 컨텍스트 ID는 거절된다**: `Browser.setDownloadBehavior: Failed to find browser context for id <ID>`. 컨텍스트 ID 없이 걸면 기본 컨텍스트에 걸리는데 이 측정에서는 기본이 `Agent`였으므로 사람 프로필에는 정책을 걸 수 없었다(걸지 않는 것이 2a의 요구이므로 문제는 아니다).
+- 이벤트(`Browser.downloadWillBegin`, `downloadProgress`)는 `eventsEnabled`로 건 연결에 오고, **컨텍스트와 상관없이 브라우저 전체의 다운로드가 온다**: 에이전트 컨텍스트에 정책을 건 연결이 사람 프로필의 다운로드 시작도 받았다. 걸러내는 일은 `pegboardd`가 해야 한다.
+- `L1b` (같은 컨텍스트에 연결 둘): 나중에 건 연결의 폴더가 이긴다. **나중 연결을 닫으면 먼저 건 연결의 정책이 되살아나지 않는다**: 이후 에이전트 다운로드는 `~/Downloads`로 갔다. 연결 하나가 두 컨텍스트를 쥐는 것은 사람 쪽이 거절되어 재지 못했다.
+
+**L2. 다운로드를 탭으로 찾을 수 있는가** [확인]. `Browser.downloadWillBegin`의 `frameId`로 찾는다. 주 프레임의 `frameId`는 그 탭의 `targetId`와 같다. 아래는 모든 시나리오가 에이전트 탭으로 풀렸다는 뜻이다.
+
+| 시나리오 | 찾은 방법 |
+|---|---|
+| 링크 클릭 (`a.click()`) | `frameId == targetId`(page, Agent). 프레임 트리로도 같은 탭 |
+| 주소로 직접 이동(`Page.navigate`), `blob:` 다운로드 | 같다 |
+| `window.open`으로 연 탭(바로 닫힘) | `frameId == targetId`인 타깃이 이미 사라졌어도 `targetCreated`로 만들어 둔 표에서 찾는다. `openerId`가 에이전트 탭을 가리킨다. 사라진 뒤에는 프레임 트리로는 못 찾는다 |
+| 같은 사이트 iframe의 링크(실제 마우스 클릭) | `targetId`로는 못 찾고 **그 탭의 `Page.getFrameTree`에서** 자식 프레임으로 찾는다 |
+| 다른 사이트 iframe(OOPIF) | `frameId == targetId`인 `iframe` 타깃(Agent). 부모 탭은 `frameId`만으로는 알 수 없다(그 탭의 프레임 트리에서도 안 나왔다) |
+| 서비스 워커가 `client.navigate`로 시킨 다운로드, 서비스 워커가 만든 `Content-Disposition` 응답 | 해당 클라이언트 탭의 `frameId` |
+| 사람 프로필 탭의 다운로드(`JS click`) | `frameId == targetId`(page, **Human**) |
+
+- `L2: link click resolves to an Agent tab: PASS; all agent scenarios resolved: ...=true ...; human tab, synthetic mouse click (hidden window): NO downloadWillBegin; human tab, JS click: resolves to Human: true (a real person's click: not measured)`
+- 사람이 그 창에서 직접 누른 다운로드는 재지 못했다. 가려진 사람 창에 `Input.dispatchMouseEvent`로 낸 클릭은 12초를 기다려도 다운로드를 시작하지 못했다. 실제 사람의 클릭은 사람이 해야 한다.
+- 다른 사이트 iframe(OOPIF)의 부모 탭을 `frameId`만으로 찾지 못한다는 점은 작업 5가 "어느 세션 것인지 알 수 없으면 지운다"로 처리해야 한다. 이 경우를 "탭을 못 찾음"으로 막을지 `iframe` 타깃의 `Target.getTargetInfo`나 연결 정보를 더 볼지는 재지 않았다.
+
+**L3. 취소와 한도** [확인].
+- `Browser.cancelDownload {guid, browserContextId}`가 된다(41~51ms에 응답, 서버는 연결이 끊긴 것을 봄, 상태 `canceled`). 취소 뒤 정책 폴더에 부분 파일은 남지 않았다(`leftover files []`). 진행 중에는 정책 폴더에 `guid` 이름의 부분 파일이 있고 커진다(L5).
+- `L3.withContentLength: ... totalBytes first reported 30000000 ...`: `Content-Length`가 있으면 첫 `downloadProgress`부터 `totalBytes`를 알려 준다(0바이트 시점에 선언된 크기가 한도를 넘는 것을 알 수 있다). 없으면(`nolen`) `totalBytes`는 0이다.
+- **진행 이벤트는 약 500ms에 한 번 온다**(`ms between events [2,514,4]`, `received series [0,0,6553600,0]`). 한도(예: 2 MiB)를 넘은 것을 본 첫 이벤트의 `receivedBytes`는 약 6.3~6.5 MiB였고(서버가 초당 약 13MB를 보냄), 서버는 취소가 걸리기까지 6.5 MiB를 보냈다. 한도를 넘는 양은 전송 속도에 500ms를 곱한 만큼이다. `canceled` 이벤트의 `receivedBytes`는 0이다.
+
+**L4. 저장 파일 이름** [확인]. `allowAndName`이면 정책 폴더에 `guid`(대문자 UUID 모양) 이름으로 저장된다(`file on disk is named by the download guid: true`). 원래 이름은 `Browser.downloadWillBegin.suggestedFilename`에서 얻는다: `filename="..."`은 그대로, `filename*=UTF-8''...`은 디코드된 `한글-....txt`, `filename="../../x.txt"`는 `_.._x.txt`로 정리되고, 헤더가 없으면 URL의 마지막 조각(`plain.bin`).
+
+**L5. 정책 연결이 닫혔을 때** [확인].
+- `L5: policy connection closed after {"state":"inProgress","received":851968}; the download FINISHED (server sent all); ... the finished file landed: {"agentDir":true,"userDownloads":false} ... events after close seen on: []`: 진행 중이던 다운로드는 **정해 둔 폴더로 끝까지 받아졌다**(4,000,000바이트). 그러나 **이벤트는 더 오지 않는다**(완료 이벤트도). `pegboardd`가 완료를 알 수 없다.
+- 연결이 닫힌 뒤에 시작한 다운로드는 `~/Downloads`로 간다(이름으로 찾았다). 그 다운로드의 시작 이벤트도 아무에게도 가지 않는다(`L5.afterLoss`: `landed: null`, 이벤트를 본 연결 없음).
+
+**작업 5가 쓸 방법.** 프로필마다 정책 연결 하나를 두고(`Agent` 프로필에는 컨텍스트 ID로) `allowAndName` + `eventsEnabled`로 `pegboardd` 전용 폴더에 받게 한다. `downloadWillBegin.frameId`를 `targetCreated`로 쌓은 표(주 프레임은 `frameId == targetId`, 팝업은 `openerId`)와 탭의 `Page.getFrameTree`로 세션을 찾고, 사람 프로필의 이벤트(같은 연결에 온다)는 무시한다. 진행 이벤트로 한도를 검사하고(500ms 간격이라 한도를 넘는 양이 생기므로 한도에 여유를 두거나 `totalBytes`가 한도를 넘으면 시작 즉시 취소) `cancelDownload`로 끊는다. `Content-Length` 없는 다운로드는 `totalBytes`가 0이라 진행 이벤트의 `receivedBytes`로만 안다. 세션 폴더로의 이동은 `completed` 이벤트의 `guid` 파일을 옮기는 것이다. 정책 연결이 끊기면 그 프로필의 세션은 명령을 받지 않아야 한다(끊긴 뒤 시작한 다운로드는 `~/Downloads`로 간다). 새 연결을 걸어도 이전 연결의 정책은 되살아나지 않으므로 다시 걸어야 하고, 같은 컨텍스트에 연결 둘이 걸리지 않게 한다.
+
+### C. 클립보드 (`22-clipboard.mjs`)
+
+시작할 때 `pbpaste`로 저장하고 끝에서 `pbcopy`로 되돌렸다(종료 신호와 예외에서도). 측정 때 클립보드는 비어 있었고 끝난 뒤에도 비어 있다.
+
+**C1. 권한을 주지 않은 에이전트 프로필 탭** [확인]. 기본 권한 상태는 `clipboard-read: prompt`, `clipboard-write: granted`.
+- 쓰기: 사용자 제스처가 있는 `Runtime.evaluate`의 `writeText`가 **시스템 클립보드를 바꾼다**(포커스 에뮬레이션을 켰을 때). 제스처가 없으면 쓰이지 않는다(`PENDING`, 시스템 클립보드 그대로). 포커스 에뮬레이션이 없고 창이 앞에 없으면 `NotAllowedError: ... Document is not focused`. 페이지의 클릭 처리기에서 낸 `writeText`와 `clipboard.write`는 실제 마우스 클릭(`Input.dispatchMouseEvent`)이면 포커스 에뮬레이션 없이도 쓰인다.
+- 읽기: `readText`는 기본이 `prompt`라서 **사람이 눌러 줄 권한 창을 기다리며 대답이 오지 않는다**(`PENDING: no answer in 5s`). 거부가 아니라 대기다.
+- `C1.withFocusEmulation: ... W1_writeText_evaluate_gesture=CHANGED to expected marker (page: ok); W1b_writeText_evaluate_noGesture=unchanged (page: PENDING: no answer in 5s); W2_writeText_realClickHandler=CHANGED ...; R1_readText_evaluate_gesture=saw "PENDING: no answer in 5s"; R2_readText_realClickHandler=saw "ERR NotAllowedError ..."`
+
+**C2. `Browser.setPermission` / `grantPermissions` / `resetPermissions`** [확인].
+- `Browser.setPermission {permission:{name:"clipboard-read"|"clipboard-write"}, setting:"denied", origin, browserContextId}`가 된다. `clipboard-sanitized-write`는 `Invalid PermissionDescriptor name: clipboard-sanitized-write`. `grantPermissions`의 `clipboardReadWrite`, `clipboardSanitizedWrite`는 허용만 하고 거부는 없다. `Human`의 컨텍스트 ID는 `Failed to find browser context for id ...`로 거절된다.
+- 거부 뒤: `writeText`(제스처, 클릭 처리기)와 `clipboard.write`는 `NotAllowedError ... Write permission denied`, `readText`는 `NotAllowedError`.
+- 범위(`C2.scope`, 한 번도 권한 창이 뜬 적 없는 출처 `c.test`로 잼): **프로필(컨텍스트) × 출처 단위**다. 같은 프로필 같은 출처의 다른 탭에도 걸려 있고(`sameOriginNewTabSameProfile: read denied, write denied`), 다른 출처(`localhost`)에는 안 걸리고, 사람 프로필 탭에도 안 걸린다. **탭 단위는 없다.** `origin`을 안 주면 그 컨텍스트의 모든 출처에 걸린다(`noOriginGiven_otherOrigin: denied/denied`).
+- **설정한 연결을 닫으면 설정이 사라진다**(`agentTabAfterSetterConnectionClosed: read prompt, write granted`). `resetPermissions`도 같은 효과다. 다운로드 정책과 같은 수명이다.
+- 주의: 같은 출처에서 `readText`를 기다리게 두면 권한 창이 뜨고 반복되면 Chrome이 그 출처의 읽기를 `denied`로 막아 둔다(우리가 걸지 않았는데도 `denied`가 남았다). 범위 측정은 그래서 따로 새 출처로 했다.
+
+**C3. `document.execCommand('copy')`와 `'paste'`** [확인].
+- `copy`는 **제스처가 있으면(평가에 `userGesture:true`, 또는 페이지 클릭 처리기) 시스템 클립보드를 바꾸고, 클립보드 권한을 전부 거부해도 똑같이 바꾼다**(`C3: ... with all clipboard permissions denied [W3_... =CHANGED to expected marker, W4_execCommandCopy_realClickHandler=CHANGED ...]`). 제스처가 없으면 `false`이고 바뀌지 않는다. `execCommand('paste')`는 아무것도 읽어 오지 못했다.
+- 포커스: 포커스 에뮬레이션이 없을 때 평가로 낸 `copy`는 `false`지만 실제 마우스 클릭으로 낸 것은 쓰인다(클릭이 문서에 포커스를 준다). 즉 포커스 에뮬레이션을 끄는 것은 방어가 아니다.
+- 막는 방법: 다른 `pegboardd` 연결이 `Page.addScriptToEvaluateOnNewDocument`로 `Document.prototype.execCommand = ()=>false`를 넣으면 클릭 처리기의 `copy`도 막혔다(`C3.override: overrideActiveInPage:true, realClickWithOverride: pageSaw "false", system "unchanged"`). 같은 페이지의 iframe에서도 `false`였다. 그러나 (1) 키 입력의 `commands:["copy"]` 경로는 이것으로 안 막힌다(`keyCommandsWithOverride: CHANGED`), (2) **주입한 연결을 닫으면 주입이 사라져 다시 쓰인다**(`overrideActiveAfterInjectingConnectionClosed:false`), (3) 새 탭과 팝업에는 따로 주입해야 한다. 이 주입이 우회되는지는 더 시험하지 않았다.
+
+**C4. CDP 키 입력** [확인].
+- `Input.dispatchKeyEvent`로 Meta+C, Meta+X를 `commands` 없이 보내면 **시스템 클립보드가 바뀌지 않는다**. Meta+V도 아무것도 붙지 않는다(`W7, W9, R5: unchanged/empty`).
+- `commands:["copy"]`, `["cut"]`을 붙이면 선택한 글자가 **시스템 클립보드에 쓰인다**. `commands:["paste"]`는 **시스템 클립보드의 내용이 페이지에 붙는다**(`R4: PAGE SAW THE SYSTEM CLIPBOARD`). 이 셋은 클립보드 권한을 전부 거부해도 똑같다(`C4: denied [W6=CHANGED, W8=CHANGED, R4=PAGE SAW THE SYSTEM CLIPBOARD]`).
+
+**C5. 페이지의 `copy` 이벤트 처리기** [확인]. 페이지가 `copy` 처리기에서 `clipboardData.setData`와 `preventDefault`를 하면 `execCommand('copy')`와 키 `commands:["copy"]` 모두 **페이지가 정한 내용이 시스템 클립보드에 쓰인다**(`C5: default [... CHANGED to expected marker] ; denied [... CHANGED to expected marker]`). 권한 거부로 막히지 않는다.
+
+**작업 7이 쓸 방법.** 에이전트 컨텍스트 × 출처에 `Browser.setPermission`으로 `clipboard-read`, `clipboard-write`를 `denied`로 건다(출처를 생략하면 그 컨텍스트 전체. 설정한 연결이 살아 있는 동안만 유지되므로 연결이 끊기면 다시 걸고, 그동안 세션 명령을 받지 않는다). 이것으로 `navigator.clipboard`의 읽기와 쓰기는 막힌다. 나머지 경로는 권한이 아니라 프록시와 문법이 막아야 한다: `Input.dispatchKeyEvent`의 `commands` 매개변수를 거부하고(`Meta`/`Ctrl` + `c`/`x`/`v` 조합은 `commands` 없이는 아무 일도 안 하지만 안전하게 같이 거부), `Runtime.evaluate`와 `callFunctionOn`의 `userGesture`를 `false`로 고쳐 쓰게 한다(제스처 없는 `execCommand('copy')`는 안 된다). 페이지 클릭 처리기의 `execCommand('copy')`는 권한으로도 막히지 않는다(아래 정지 조건 4). 완화로 `Page.addScriptToEvaluateOnNewDocument` 주입을 쓸 수 있으나 연결 수명과 새 탭 적용 문제가 G5와 같다.
+
+### 프로필(브라우저 컨텍스트) 단위로만 강제되는 항목
+
+| 항목 | 단위 | 수명 | 근거 |
+|---|---|---|---|
+| 다운로드 폴더/동작 (`Browser.setDownloadBehavior`) | 컨텍스트 | 건 연결이 살아 있는 동안. 같은 컨텍스트에 연결 둘이면 나중 것이 이기고, 나중 것을 닫으면 정책이 없어진다. 연결이 끊겨도 진행 중인 다운로드는 끝까지 받는다 | L1, L1b, L5 |
+| 다운로드 이벤트 | 연결(컨텍스트와 무관, 모든 컨텍스트의 이벤트) | 이벤트를 켠 연결 | L1 |
+| 클립보드 권한 (`Browser.setPermission`) | 컨텍스트 × 출처(출처 생략 시 컨텍스트 전체). 탭 단위 없음 | 건 연결이 살아 있는 동안 | C2 |
+| 서비스 워커, 공유 워커가 내는 요청의 판정 | 탭이 아니라 별도 타깃(에이전트 컨텍스트에 속함). 붙어서 `Fetch.enable`을 해야 보인다 | 그 타깃 세션이 살아 있는 동안 | G1, G4 |
+| 요청 가로채기 (`Fetch.enable`) | **탭(세션)마다**. 컨텍스트 전체에 한 번에 거는 방법은 없다. 브라우저 수준 자동 연결로 새 타깃에 건다 | 건 연결이 살아 있는 동안. 닫히면 열린다 | G5 |
+| 스크립트 주입 (`Page.addScriptToEvaluateOnNewDocument`) | 탭(세션)마다 | 주입한 연결이 살아 있는 동안 | C3 |
+| 포커스 에뮬레이션 | 탭마다 | 건 세션 | C1(방어가 아님) |
+
+공통점: 건 연결이 사라지면 모두 풀리거나(권한, 가로채기, 주입) 정책 없이 기본값으로 돌아간다(다운로드). 그 프로필의 세션이 하나라도 있는 동안 이 연결들을 `pegboardd`가 유지하고, 하나라도 끊기면 그 프로필의 명령을 거절해야 한다.
+
+### 정지 조건 판정 (계획 작업 2 5단계)
+
+1. **G1에서 `Runtime.evaluate`로 낸 요청이나 페이지 스크립트의 `fetch`가 잡히지 않는다: 해당 없음(not met).** 둘 다 세 방식 모두에서 잡혔다(`G1: evalFetch and pageFetch caught with page-session Fetch: PASS`). 다만 알려야 할 구멍이 있다: 웹소켓 핸드셰이크는 어떤 방식으로도 안 잡히고, 서비스 워커가 `respondWith`로 처리한 페이지 요청은 페이지 세션에서 안 보이며 서비스 워커/공유 워커가 낸 요청은 그 타깃에 붙어야 보인다(브라우저 수준 자동 연결로 보였다).
+2. **G4에서 에이전트 쪽이 가로채기를 끄거나 가릴 수 있고 프록시 필터로 그 메서드를 막아도 막히지 않는다: 해당 없음(not met).** A는 P의 가로채기를 끄지 못하고(`G4.switchOff: PASS`), P가 붙든 요청을 가로채지도 못한다(`Invalid InterceptionId.`). 다만 P보다 나중에 만든 세션이 `Fetch.enable`을 하면 먼저 판정해 P의 차단을 우회할 수 있다(조합 9, 10). 이 `Fetch.enable`은 프록시 허용 목록에 없어 막힌다(`filter.rs`를 읽은 것이며 프록시로 시험한 것은 아니다). 필터의 허용 목록에서 `Fetch.*`가 빠지지 않게 시험으로 고정해야 한다. 서비스 워커 경로(`G4.serviceWorker`)는 CDP 메서드가 아니라 필터로 막을 수 없고, P가 서비스 워커 타깃에도 붙는 것으로 막아야 한다.
+3. **L2에서 링크 클릭 다운로드의 탭을 찾을 수 없다: 해당 없음(not met).** 링크 클릭, 직접 이동, `blob:`, `window.open` 탭, 같은 사이트 iframe, 서비스 워커 경로 모두 에이전트 탭으로 풀렸다(`L2: link click resolves to an Agent tab: PASS`). 예외: 다른 사이트 iframe(OOPIF)은 `iframe` 타깃까지만 알 수 있고 부모 탭은 이 측정으로 풀지 못했다.
+4. **C1~C4에서 막을 방법이 없는 쓰기 경로가 있다: 해당함(met).** 제스처가 있는 `document.execCommand('copy')`(페이지 클릭 처리기, 또는 `userGesture:true`)는 클립보드 권한을 전부 거부해도 시스템 클립보드를 바꾼다(C3). 에이전트가 `eval`로 단추를 만들어 마우스 클릭으로 누르면 제스처를 얻을 수 있다. `commands:["copy"]` 키 경로도 권한으로는 못 막고 프록시가 `commands`를 거부해야 한다. 막는 방법으로 측정한 것은 스크립트 주입 하나뿐이고 연결 수명과 키 경로 때문에 불완전하다. 읽기는 권한 거부(`readText`)와 프록시의 `commands` 거부(붙여넣기 경로)로 막을 수 있다. 사용자에게 알리고 작업 7을 시작하기 전에 정할 것: 쓰기 경로를 "남는 위험"으로 받아들일지, 주입을 쓸지, `--allow clipboard`가 없는 세션에서 `eval`과 클릭을 어떻게 다룰지.
+
+### 남는 질문과 재지 않은 것
+
+- 사람 프로필의 컨텍스트 ID가 `setDownloadBehavior`와 `setPermission`에서 거절되고 에이전트 쪽이 받아들여지는 것이 이 측정의 모든 실행에서 그랬다. 제품의 시작 순서(사람 프로필이 먼저)에서도 같은지, 1단계 `04`의 "기본 컨텍스트가 실행마다 달랐다"와 어떻게 맞는지는 조사하지 않았다. 작업 5와 7은 시작할 때 에이전트 컨텍스트 ID로 정책이 걸리는지 확인하는 검사를 넣어야 한다.
+- 웹소켓을 막을 수 있는지, 이름 해석을 `pegboardd`가 따로 하는 방법, HTTPS 요청의 가로채기, IPv6 주소, 서비스 워커와 공유 워커의 "재개 경주"는 재지 않았다.
+- 사람이 직접 한 다운로드 클릭과 사람이 누른 Cmd+C/V는 재지 않았다. 클립보드는 텍스트만 다뤘다.
