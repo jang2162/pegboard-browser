@@ -161,9 +161,16 @@ fn main() {
 /// Prints the error and returns the exit code it stands for.
 fn report(e: &RpcError) -> i32 {
     eprintln!("pegboard: {}: {}", e.code, e.message);
-    match e.code.as_str() {
+    exit_code(&e.code)
+}
+
+fn exit_code(code: &str) -> i32 {
+    match code {
         codes::NOT_RUNNING => EXIT_NO_DAEMON,
-        codes::ARGV_REJECTED | codes::INVALID_PARAMS | codes::PROFILE_POLICY_CONFLICT => EXIT_USAGE,
+        codes::ARGV_REJECTED
+        | codes::INVALID_PARAMS
+        | codes::LIMIT_EXCEEDED
+        | codes::PROFILE_POLICY_CONFLICT => EXIT_USAGE,
         _ => EXIT_FAILURE,
     }
 }
@@ -744,6 +751,13 @@ fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn limit_exceeded_is_a_usage_exit() {
+        assert_eq!(super::exit_code("limit_exceeded"), 2);
+        assert_eq!(super::exit_code("argv_rejected"), 2);
+        assert_eq!(super::exit_code("timeout"), super::EXIT_FAILURE);
+    }
+
     use super::*;
 
     fn policy(domains: &[&str], private: bool, no_localhost: bool) -> SessionPolicy {

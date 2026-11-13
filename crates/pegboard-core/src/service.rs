@@ -82,6 +82,35 @@ fn checked_timeout(timeout_ms: Option<u64>) -> Result<(), RpcError> {
     }
 }
 
+/// Longest argv word, whole argv and word count `command.exec` accepts.
+pub const MAX_ARGV_WORD_BYTES: usize = 64 * 1024;
+pub const MAX_ARGV_TOTAL_BYTES: usize = 256 * 1024;
+pub const MAX_ARGV_WORDS: usize = 256;
+
+fn limit_exceeded(message: impl Into<String>) -> RpcError {
+    rpc_error(codes::LIMIT_EXCEEDED, message)
+}
+
+/// The size of the command line of `command.exec`. The message never quotes a word.
+fn checked_argv_size(argv: &[String]) -> Result<(), RpcError> {
+    if argv.len() > MAX_ARGV_WORDS {
+        return Err(limit_exceeded(format!(
+            "a command line has at most {MAX_ARGV_WORDS} words"
+        )));
+    }
+    if argv.iter().any(|w| w.len() > MAX_ARGV_WORD_BYTES) {
+        return Err(limit_exceeded(format!(
+            "a word of a command line has at most {MAX_ARGV_WORD_BYTES} bytes"
+        )));
+    }
+    if argv.iter().map(String::len).sum::<usize>() > MAX_ARGV_TOTAL_BYTES {
+        return Err(limit_exceeded(format!(
+            "a command line has at most {MAX_ARGV_TOTAL_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// The session's log, locked for one command. Once the session's close has begun nothing
 /// is logged any more, so nothing runs either.
 async fn begin_command<'a>(
@@ -545,6 +574,7 @@ impl Daemon {
         let id = checked_session(&p.session_id)?;
         let slot = self.authorize(&id, p.token.as_deref())?;
         checked_timeout(p.timeout_ms)?;
+        checked_argv_size(&p.argv)?;
         // One command at a time per session; other sessions are not held up.
         let mut log = begin_command(&slot, &id).await?;
         let result = run_command(
@@ -646,6 +676,28 @@ mod tests {
         assert!(
             params::<CloseParams>(&json!({"sessionId": "s_abcdefgh", "keepTabs": true})).is_ok()
         );
+    }
+
+    #[test]
+    fn oversized_argv_is_refused() {
+        let words = |n: usize, len: usize| vec!["a".repeat(len); n];
+        assert!(checked_argv_size(&words(1, MAX_ARGV_WORD_BYTES)).is_ok());
+        assert!(checked_argv_size(&words(MAX_ARGV_WORDS, 1)).is_ok());
+        assert!(checked_argv_size(&words(4, MAX_ARGV_TOTAL_BYTES / 4)).is_ok());
+        for bad in [
+            words(1, MAX_ARGV_WORD_BYTES + 1),
+            words(MAX_ARGV_WORDS + 1, 1),
+            // Each word fits, the whole does not.
+            words(5, MAX_ARGV_TOTAL_BYTES / 4),
+            words(4, MAX_ARGV_TOTAL_BYTES / 4 + 1),
+        ] {
+            let e = checked_argv_size(&bad).unwrap_err();
+            assert_eq!(e.code, codes::LIMIT_EXCEEDED);
+            assert!(
+                e.message.len() < 200,
+                "the message does not quote the words"
+            );
+        }
     }
 
     #[test]
