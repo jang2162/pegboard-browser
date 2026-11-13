@@ -276,6 +276,16 @@ impl Runner {
         if *closed.borrow() {
             return Err(session_closed(id));
         }
+        // A session with no tab left: agent-browser would quietly open a blank tab and run
+        // the command there (the proxy lets a session create tabs again after its last one
+        // closed), so a `snapshot` would succeed on `about:blank` and hide that the page is
+        // gone. Only the commands that open or pick a tab may run; the rest say so.
+        if self.session_has_no_tab(id) && !opens_or_picks_a_tab(argv) {
+            return Err(rpc_error(
+                codes::TAB_GONE,
+                "this session has no open tab (its last tab was closed); open one with `tab new <url>` or `open <url>`",
+            ));
+        }
         let _running = Running::new(&slot.running);
         *slot.token.lock().unwrap() = Some(endpoint.token.clone());
         // One time limit for the whole call, including a daemon start.
@@ -311,6 +321,12 @@ impl Runner {
         let live = targets(id);
         let bound = self.bound_target(id);
         live.is_empty() || bound.is_some_and(|b| !live.contains(&b))
+    }
+
+    /// True when the session's targets are known and there are none.
+    fn session_has_no_tab(&self, id: &SessionId) -> bool {
+        let targets = self.targets.lock().unwrap().clone();
+        targets.is_some_and(|live| live(id).is_empty())
     }
 
     /// The tab agent-browser's daemon is bound to (from its `.target` file), if it has one.
@@ -585,6 +601,11 @@ fn scrub(text: &str, token: Option<&str>) -> String {
     }
 }
 
+/// The commands a session with no tab may still run: they open a tab or list and pick one.
+fn opens_or_picks_a_tab(argv: &[String]) -> bool {
+    matches!(argv.first().map(String::as_str), Some("open" | "tab"))
+}
+
 fn session_closed(id: &SessionId) -> RpcError {
     rpc_error(
         codes::SESSION_NOT_FOUND,
@@ -850,6 +871,39 @@ mod tests {
         live.lock().unwrap().clear();
         assert!(runner.tab_gone(&id, &failed));
         let _ = std::fs::remove_file(target_file);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_tab_refuses_everything_but_opening_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = fake_runner(tmp.path(), "exit 0");
+        let id = SessionId(format!("s_{}", "notabtst"));
+        let ep = Endpoint {
+            url: "ws://127.0.0.1:1/x".to_string(),
+            token: "t".to_string(),
+        };
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Targets unknown: nothing is refused up front.
+        assert!(!runner.session_has_no_tab(&id));
+        let live = Arc::new(Mutex::new(vec!["T1".to_string()]));
+        let seen = live.clone();
+        runner.set_session_targets(move |_| seen.lock().unwrap().clone());
+        assert!(!runner.session_has_no_tab(&id));
+        live.lock().unwrap().clear();
+        assert!(runner.session_has_no_tab(&id));
+        for argv in [
+            words(&["snapshot", "-i"]),
+            words(&["click", "#a"]),
+            words(&["get", "url"]),
+        ] {
+            let e = runner.exec(&id, &ep, &argv, 5_000).await.unwrap_err();
+            assert_eq!(e.code, codes::TAB_GONE, "{argv:?}");
+        }
+        assert!(opens_or_picks_a_tab(&words(&["tab", "new", "about:blank"])));
+        assert!(opens_or_picks_a_tab(&words(&["tab", "list"])));
+        assert!(opens_or_picks_a_tab(&words(&["open", "https://a.test"])));
+        assert!(!opens_or_picks_a_tab(&words(&["eval", "1"])));
+        assert!(!opens_or_picks_a_tab(&[]));
     }
 
     #[test]
