@@ -793,13 +793,23 @@ fn private_network_is_closed_unless_allowed() {
     let (fm, im, wm) = (marker("f"), marker("i"), marker("w"));
     assert!(settle(&h, &fetch_js(&private("/secret", &fm))).starts_with("FAIL:"));
     assert_ne!(settle(&h, &img_js(&private("/img", &im))), "LOADED");
-    let ws = format!("ws://{PRIVATE_NAME}:{lan}/ws?m={wm}");
-    assert_ne!(settle(&h, &ws_js(&ws)), "OPEN");
     // The literal address is refused the same way.
     let ip = lan_ip().unwrap();
     let lm = marker("lit");
     assert!(
         settle(&h, &fetch_js(&format!("http://{ip}:{lan}/secret?m={lm}"))).starts_with("FAIL:")
+    );
+    // WebSockets are covered on pages from public addresses only (the CSP): a page on a local
+    // origin is passed unchanged (owner's ruling).
+    let (code, _, err) = open(&h, &format!("http://{PUBLIC_NAME}:{}/page", srv.a));
+    assert_eq!(code, 0, "{err}");
+    let ws = settle(
+        &h,
+        &ws_csp_js(&format!("ws://{PRIVATE_NAME}:{lan}/ws?m={wm}")),
+    );
+    assert!(
+        !ws.starts_with("OPEN") && ws.contains("connect-src"),
+        "{ws}"
     );
     for m in [&m, &fm, &im, &wm, &lm] {
         assert!(!srv.reached(m), "{m} reached the private server");
@@ -918,7 +928,7 @@ fn allow_domain_closes_everything_else_including_localhost() {
         "--profile",
         profile("pol-listed"),
         "--allow-domain",
-        &format!("{LISTED_NAME},{local_name}"),
+        &format!("{LISTED_NAME},{local_name},{PUBLIC_NAME}"),
         "--url",
         &format!("http://{local_name}:{}/page", srv.a),
     ]);
@@ -935,15 +945,40 @@ fn allow_domain_closes_everything_else_including_localhost() {
     let unlisted = |path: &str, m: &str| format!("http://{UNLISTED_NAME}:{}{path}?m={m}", srv.b);
     assert!(settle(&h, &fetch_js(&unlisted("/secret", &fm))).starts_with("FAIL:"));
     assert_ne!(settle(&h, &img_js(&unlisted("/img", &im))), "LOADED");
-    let ws = format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b);
-    assert_ne!(settle(&h, &ws_js(&ws)), "OPEN");
+    // WebSockets, from a page of the listed public name (served again with the CSP; a page
+    // on a local origin is passed unchanged by the owner's ruling).
+    let page = |host: &str| format!("http://{host}:{}/page", srv.a);
+    let (code, _, err) = open(&h, &page(PUBLIC_NAME));
+    assert_eq!(code, 0, "{err}");
     let lm = marker("lw");
-    let lws = format!("ws://localhost:{}/ws?m={lm}", srv.b);
-    assert_ne!(settle(&h, &ws_js(&lws)), "OPEN");
+    for url in [
+        format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b),
+        format!("ws://localhost:{}/ws?m={lm}", srv.b),
+    ] {
+        let got = settle(&h, &ws_csp_js(&url));
+        assert!(
+            !got.starts_with("OPEN") && got.contains("connect-src"),
+            "{url}: {got}"
+        );
+    }
+    let got = settle(
+        &h,
+        &ws_csp_js(&format!(
+            "ws://{LISTED_NAME}:{}/ws?m={}",
+            srv.b,
+            marker("x")
+        )),
+    );
+    assert!(
+        !got.contains("connect-src"),
+        "a listed host is refused by the CSP: {got}"
+    );
     for m in [&fm, &wm, &im, &lm] {
         assert!(!srv.reached(m), "{m} reached an unlisted host");
     }
     // What is listed works, WebSocket included, on another port of the listed hosts.
+    let (code, _, err) = open(&h, &page(local_name));
+    assert_eq!(code, 0, "{err}");
     let (fm, wm) = (marker("f"), marker("w"));
     let listed = format!("http://{LISTED_NAME}:{}/secret?m={fm}", srv.b);
     assert_eq!(settle(&h, &read_js(&listed)), "BODY:SECRET-BODY");
