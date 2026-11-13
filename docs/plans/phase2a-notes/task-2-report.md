@@ -1339,3 +1339,9 @@ saved <repo>/spikes/out/31-csp-reserve.json
  "Cleanup": "clipboard restored: true; files with this run's id left in ~/Downloads: 0"
 }
 ```
+
+## Round 4
+
+Items: (1) A7 contamination fixed (A3 onAttach listener removed with a new `off` in lib/cdp.mjs); A7 re-run twice with `--only=a7` (a first attempt with `--only a7` ran everything because the argument needs `=`): A7a/A7b identical across runs, all execCommand results `true` (O_hard absent). A7c: sandboxed srcdoc iframe without runImmediately → clipboard CHANGED; with runImmediately (fresh document) → unchanged; cross-site sandboxed iframe → unchanged with O_hard absent. (2) spikes/32-policy-round4.mjs, 2 runs × 3 cycles: no-policy writeText ok/CHANGED under both agent-default and human-default (focus true); dedicated deny connection: no file anywhere for existing tab, new tab, two kinds of new window; after closing the connection the file lands in ~/Downloads (6/6). Creating a tab/window flips the default context to Agent. (3) sentence fixes in docs/spike-findings.md. (3b) F1b: script 30 now compares parentFrameId to the tab targetId: equal, 3/3 in each of 2 runs. (4) The clipboard held text/empty at the start of every clipboard run.
+
+Outputs: spikes/out/r4-a7-1.txt, r4-a7-2.txt, r4-32-1.txt, r4-32-2.txt, r4-30-1.txt, r4-30-2.txt (local, not committed).

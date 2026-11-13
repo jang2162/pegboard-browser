@@ -221,7 +221,8 @@ try {
         await b.send('Runtime.runIfWaitingForDebugger', {}, sid).catch(() => {});
       } catch {}
     };
-    b.on('Target.attachedToTarget', (p, from) => { if (!from) onAttach(p, p.sessionId); else onAttach(p, p.sessionId); });
+    const a3Listener = (p) => onAttach(p, p.sessionId);
+    b.on('Target.attachedToTarget', a3Listener);
     await b.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
     await b.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, ps); // the existing agent tab: OOPIFs attach below its page session
     installed.push({ conn: b, sid: ps, id: (await b.send('Page.addScriptToEvaluateOnNewDocument', { source: defSrc }, ps)).identifier });
@@ -270,6 +271,7 @@ try {
     a3.attached = injected;
     await b.send('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
     await b.send('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }, ps).catch(() => {});
+    b.off('Target.attachedToTarget', a3Listener); // round 4: this listener used to stay active and kept injecting O_hard into later runs (A7)
     await uninstall();
     (out.A3 = out.A3 || {})[a3Name] = a3;
   }
@@ -319,10 +321,11 @@ try {
       await uninstall();
       const S = await env.connection();
       for (const n of ['clipboard-read', 'clipboard-write']) await S.send('Browser.setPermission', { permission: { name: n }, setting: 'denied', browserContextId: agentCtx }).catch((e) => console.log('setPermission', e.message));
+      let useRI = true; // round 4: (c) is measured once with and once without runImmediately
       const handler = async (p) => {
         await P.send('Page.enable', {}, p.sessionId).catch(() => {});
         // an attach that is NOT paused (observed for sandboxed srcdoc iframes) is also injected into the running document
-        await P.send('Page.addScriptToEvaluateOnNewDocument', { source: DEF.L_hard2[0], ...(p.waitingForDebugger ? {} : { runImmediately: true }) }, p.sessionId).catch(() => {});
+        await P.send('Page.addScriptToEvaluateOnNewDocument', { source: DEF.L_hard2[0], ...(p.waitingForDebugger || !useRI ? {} : { runImmediately: true }) }, p.sessionId).catch(() => {});
         if (p.targetInfo.type === 'page' || p.targetInfo.type === 'iframe') await P.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, p.sessionId).catch(() => {});
         await P.send('Runtime.runIfWaitingForDebugger', {}, p.sessionId).catch(() => {});
       };
@@ -364,17 +367,24 @@ try {
       await load(); seen.length = 0; await sleep(700);
       c.control_targetsAttachedByLoadingThePageAlone = seen.slice();
       await load(); seen.length = 0;
+      // round 4: the same sandboxed srcdoc iframe WITHOUT runImmediately for an unpaused attach (injection only through addScriptToEvaluateOnNewDocument)
+      useRI = false; await load(); seen.length = 0; sys.set(SYSVAL);
       await ev(ags, `(()=>{const f=document.createElement('iframe');f.id='sbx';f.setAttribute('sandbox','allow-scripts');f.style.cssText='position:absolute;left:300px;top:320px;width:300px;height:100px;border:0';f.srcdoc='<body style="margin:0"><textarea id=q style="width:100px;height:30px">${SEL}</textarea><button id=b style="position:absolute;left:0;top:50px;width:100px;height:40px" onclick="const q=document.getElementById(\\'q\\');q.focus();q.select();parent.postMessage({sbx:String(document.execCommand(\\'copy\\')),defL:!!window.__defL},\\'*\\')">c</button>';document.body.appendChild(f);return 1})()`);
       await sleep(700);
       await clickAt(ags, 350, 320 + 70); await settle();
-      c.srcdocSandboxOpaque_gestureCopy = { messages: await ev(ags, 'JSON.stringify(window.__msgs)'), system: classify(SYSVAL, sys.get(), SEL) };
+      c.srcdocSandboxOpaque_gestureCopy_withoutRunImmediately = { messages: await ev(ags, 'JSON.stringify(window.__msgs)'), system: classify(SYSVAL, sys.get(), SEL), topDocumentO_hard: await ev(ags, `String(Document.prototype.execCommand).includes('return false')`) };
+      useRI = true; await load(); seen.length = 0; sys.set(SYSVAL); // fresh document for the with-runImmediately trial
+      await ev(ags, `(()=>{const f=document.createElement('iframe');f.id='sbx';f.setAttribute('sandbox','allow-scripts');f.style.cssText='position:absolute;left:300px;top:320px;width:300px;height:100px;border:0';f.srcdoc='<body style="margin:0"><textarea id=q style="width:100px;height:30px">${SEL}</textarea><button id=b style="position:absolute;left:0;top:50px;width:100px;height:40px" onclick="const q=document.getElementById(\\'q\\');q.focus();q.select();parent.postMessage({sbx:String(document.execCommand(\\'copy\\')),defL:!!window.__defL},\\'*\\')">c</button>';document.body.appendChild(f);return 1})()`);
+      await sleep(700);
+      await clickAt(ags, 350, 320 + 70); await settle();
+      c.srcdocSandboxOpaque_gestureCopy_withRunImmediately = { messages: await ev(ags, 'JSON.stringify(window.__msgs)'), system: classify(SYSVAL, sys.get(), SEL) };
       // the same sandbox on a cross-site src (its own process)
       await load(`${O}/clip`); seen.length = 0; sys.set(SYSVAL);
       await ev(ags, `(()=>{const f=document.createElement('iframe');f.setAttribute('sandbox','allow-scripts');f.style.cssText='position:absolute;left:300px;top:0;width:400px;height:300px;border:0';f.src='http://c.test:${probe.port}/clip';document.body.appendChild(f);return 1})()`);
       await sleep(1500);
       c.targetsAttachedWhileCreatingSandboxedCrossSiteIframe = seen.slice();
       await clickAt(ags, 300 + 60, 60 + 20); await settle();
-      c.crossSiteSandboxed_gestureCopy = { messages: await ev(ags, 'JSON.stringify(window.__msgs)'), system: classify(SYSVAL, sys.get(), SEL) };
+      c.crossSiteSandboxed_gestureCopy = { topDocumentO_hard: await ev(ags, `String(Document.prototype.execCommand).includes('return false')`), messages: await ev(ags, 'JSON.stringify(window.__msgs)'), system: classify(SYSVAL, sys.get(), SEL) };
       for (const [k, v] of Object.entries(c)) rec(`A7c.${k}`, JSON.stringify(v));
       a7.configuration_c = c;
       on = false; await unsetAuto(); await uninstall(); await S.close?.();

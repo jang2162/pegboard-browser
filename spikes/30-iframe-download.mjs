@@ -73,7 +73,9 @@ try {
       r.topTabFoundBy = [];
       if (Object.values(tree).some((v) => v.containsDownloadFrameId)) r.topTabFoundBy.push('Page.getFrameTree on each page (containsDownloadFrameId)');
       if (r.getFrameTreeFromIframeSession?.parentIdIsTopFrame) r.topTabFoundBy.push('frame.parentId from the iframe session equals the tab targetId');
-      if (r.iframeTargetInfo?.parentFrameId) r.topTabFoundBy.push('TargetInfo.parentFrameId');
+      r.parentFrameIdEqualsTabTargetId = r.iframeTargetInfo?.parentFrameId === env.agent.targetId; // round 4: compared, not just present
+      r.parentFrameIdIsPresent = !!r.iframeTargetInfo?.parentFrameId;
+      if (r.parentFrameIdEqualsTabTargetId) r.topTabFoundBy.push('TargetInfo.parentFrameId equals the tab targetId');
       if (r.iframeTargetInfo?.openerId) r.topTabFoundBy.push('TargetInfo.openerId');
       await sleep(600);
       r.fileInPolicyDir = readdirSync(dir).length;
