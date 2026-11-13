@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { networkInterfaces } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { WebSocketServer } from 'ws';
-import { launchChrome, sleep, CHROME } from './launch.mjs';
+import { launchChrome, sleep, CHROME, onCleanup } from './launch.mjs';
 import { connect } from './cdp.mjs';
 
 // First RFC 1918 address of this machine, or null. Only used to listen on it for the private-address probe.
@@ -74,6 +74,8 @@ export async function openTwoProfiles({ name, args = [], seedPath = '/blank', pr
   const chrome = await launchChrome({ name, profileDirectory: 'Human', args });
   const udd = chrome.userDataDir;
   const cdp = await connect(chrome.browserWsUrl);
+  const version = (await cdp.send('Browser.getVersion')).product;
+  console.log(`BROWSER: ${version}`);
   const extraConns = [];
   const pages = async () => (await cdp.send('Target.getTargets')).targetInfos.filter((t) => t.type === 'page');
   const human1 = await cdp.firstPage();
@@ -88,6 +90,9 @@ export async function openTwoProfiles({ name, args = [], seedPath = '/blank', pr
   }
   if (!agentTarget) throw new Error('Agent profile window did not open');
   const agentCtx = agentTarget.browserContextId;
+  const ctxs = await cdp.send('Target.getBrowserContexts');
+  const defaultCtxIs = ctxs.defaultBrowserContextId === agentCtx ? 'Agent' : ctxs.defaultBrowserContextId === humanCtx ? 'Human' : 'other';
+  console.log(`DEFAULT_CONTEXT: ${defaultCtxIs}; contexts listed by Target.getBrowserContexts: ${ctxs.browserContextIds.length}`);
   const agentSession = await cdp.attach(agentTarget.targetId);
   await cdp.navigate(agentSession, `${probe.origin}${seedPath}`);
   const api = {
@@ -96,6 +101,8 @@ export async function openTwoProfiles({ name, args = [], seedPath = '/blank', pr
     udd,
     humanCtx,
     agentCtx,
+    version,
+    defaultCtxIs,
     human: { targetId: human1.targetId, sessionId: human1.sessionId },
     agent: { targetId: agentTarget.targetId, sessionId: agentSession },
     pages,

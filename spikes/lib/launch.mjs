@@ -1,8 +1,7 @@
 // Throwaway spike helper: launch headed Chrome for Testing on a scratch user data dir.
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -11,11 +10,35 @@ export const OUT = join(SPIKES, 'out');
 // CHROME wins; otherwise the newest chrome-* under ~/.agent-browser/browsers (as the README says).
 function newestChrome() {
   const base = join(homedir(), '.agent-browser/browsers');
-  const dirs = existsSync(base) ? readdirSync(base).filter((d) => d.startsWith('chrome-')).sort() : [];
+  // Only folders named chrome-<digits.digits...>, compared numerically (157.0.8103.78 > 157.0.8103.9).
+  const dirs = existsSync(base) ? readdirSync(base).filter((d) => /^chrome-\d+(\.\d+)*$/.test(d)) : [];
+  const ver = (d) => d.slice(7).split('.').map(Number);
+  dirs.sort((a, b) => {
+    const x = ver(a), y = ver(b);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+    return 0;
+  });
   const dir = dirs.length ? dirs[dirs.length - 1] : 'chrome-157.0.8103.50';
   return join(base, dir, 'Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 }
 export const CHROME = process.env.CHROME || newestChrome();
+
+// Cleanup registry: every launched Chrome is killed, and registered callbacks run, on exit, SIGINT/SIGTERM/SIGHUP,
+// uncaught errors and failed setup (a rejected top-level await ends in 'exit' as well).
+const cleanups = [];
+const procs = new Set();
+let cleaned = false;
+export function onCleanup(fn) { cleanups.push(fn); }
+function runCleanups() {
+  if (cleaned) return;
+  cleaned = true;
+  for (const fn of cleanups.reverse()) try { fn(); } catch {}
+  for (const p of procs) try { p.kill('SIGKILL'); } catch {}
+}
+process.on('exit', runCleanups);
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { runCleanups(); process.exit(130); });
+process.on('uncaughtException', (e) => { console.error(e); runCleanups(); process.exit(1); });
+process.on('unhandledRejection', (e) => { console.error(e); runCleanups(); process.exit(1); });
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -47,6 +70,7 @@ export async function launchChrome({ name, args = [], profileDirectory, fresh = 
   const proc = viaOpen
     ? spawn('open', ['-n', '-a', CHROME.replace(/\/Contents\/MacOS\/.*$/, ''), '--args', ...argv], { stdio: 'ignore' })
     : spawn(CHROME, argv, { stdio: 'ignore' });
+  procs.add(proc);
   for (let i = 0; i < 150 && !existsSync(portFile); i++) await sleep(100);
   if (!existsSync(portFile)) throw new Error('DevToolsActivePort not written; Chrome did not start');
   await sleep(200);

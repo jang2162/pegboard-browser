@@ -19,10 +19,13 @@ const dirExtra = join(DL, 'extra');
 rmSync(DL, { recursive: true, force: true });
 for (const d of [dirAgent, dirHuman, dirExtra]) mkdirSync(d, { recursive: true });
 const userDownloads = join(homedir(), 'Downloads');
+import { onCleanup } from './lib/launch.mjs';
 const landedInUserDownloads = () => (existsSync(userDownloads) ? readdirSync(userDownloads).filter((f) => f.includes(runId)) : []);
 const ls = (d) => readdirSync(d).map((f) => `${f.length > 24 ? f.slice(0, 8) + '…' : f}:${statSync(join(d, f)).size}`);
 
 // ---------- probe server ----------
+// also on SIGINT/SIGTERM/early failure: remove only files carrying this run's random id
+onCleanup(() => { for (const f of landedInUserDownloads()) rmSync(join(userDownloads, f), { force: true }); });
 const probe = await startProbe();
 const R = probe.routes;
 const slow = {};
