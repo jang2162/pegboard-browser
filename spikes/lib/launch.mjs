@@ -2,14 +2,20 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const SPIKES = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const OUT = join(SPIKES, 'out');
-export const CHROME =
-  process.env.CHROME ||
-  join(homedir(), '.agent-browser/browsers/chrome-157.0.8103.50/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+// CHROME wins; otherwise the newest chrome-* under ~/.agent-browser/browsers (as the README says).
+function newestChrome() {
+  const base = join(homedir(), '.agent-browser/browsers');
+  const dirs = existsSync(base) ? readdirSync(base).filter((d) => d.startsWith('chrome-')).sort() : [];
+  const dir = dirs.length ? dirs[dirs.length - 1] : 'chrome-157.0.8103.50';
+  return join(base, dir, 'Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
+}
+export const CHROME = process.env.CHROME || newestChrome();
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
