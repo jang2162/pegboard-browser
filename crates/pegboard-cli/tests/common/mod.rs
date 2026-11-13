@@ -284,8 +284,10 @@ impl Home {
     }
 }
 
-impl Drop for Home {
-    fn drop(&mut self) {
+impl Home {
+    /// Stops the daemon and its browser: `browser stop`, then SIGKILL of a daemon that is
+    /// still there, then every browser that uses this home's profile directory.
+    fn stop_everything(&self) {
         let _ = self.command(&["browser", "stop"]).output();
         if let Some(pid) = self.daemon_pid() {
             // A stale pid file could name an unrelated process: only a `pegboard daemon`
@@ -309,6 +311,59 @@ impl Drop for Home {
             ))
             .output();
     }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        self.stop_everything();
+    }
+}
+
+static SHARED_HOME: std::sync::OnceLock<Home> = std::sync::OnceLock::new();
+
+/// One pegboard home with a running daemon and browser for the whole test binary, started on
+/// first use. Statics are never dropped, so an `atexit` hook stops the daemon and browser and
+/// removes the home when the binary ends (also after a failing test), and a detached watcher
+/// does the same if the binary is killed before the hook can run.
+/// Tests that use it open their own sessions and close them; tests of start, stop, locks,
+/// signals or stale files make their own `Home`.
+pub fn shared_home() -> &'static Home {
+    SHARED_HOME.get_or_init(|| {
+        let home = Home::new();
+        let (code, _, err) = home.run(&["browser", "start"]);
+        assert_eq!(code, 0, "{err}");
+        guard_shared_home(home.path());
+        // SAFETY: registers a plain `extern "C"` function without arguments.
+        unsafe {
+            libc::atexit(stop_shared_home);
+        }
+        home
+    })
+}
+
+extern "C" fn stop_shared_home() {
+    if let Some(home) = SHARED_HOME.get() {
+        home.stop_everything();
+        let _ = std::fs::remove_dir_all(home.path());
+    }
+}
+
+/// A detached process that, once this test binary is gone (even killed), stops the daemon,
+/// removes the home and kills the browser of that home, as the exit hook would have.
+fn guard_shared_home(home: &Path) {
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(
+            r#"while kill -0 "$1" 2>/dev/null; do sleep 1; done; PEGBOARD_HOME="$3" "$2" browser stop >/dev/null 2>&1; rm -rf -- "$3"; pkill -f -- "--user-data-dir=$3/chrome""#,
+        )
+        .arg("pegboard-test-guard")
+        .arg(std::process::id().to_string())
+        .arg(bin())
+        .arg(home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 pub fn alive(pid: i32) -> bool {

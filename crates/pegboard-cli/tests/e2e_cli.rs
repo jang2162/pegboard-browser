@@ -1,5 +1,12 @@
 //! End-to-end tests of the `pegboard` binary. Tests that start a browser are `#[ignore]`d:
 //! run them with `cargo test -p pegboard-cli -- --ignored --test-threads=1`.
+//!
+//! Browser tests use the binary's one daemon and browser (`shared_home()`, own sessions closed
+//! at the end), except those that make their own `Home` because they test starting, stopping,
+//! locking, signals or leftovers: `full_flow`, `daemon_exits_when_browser_is_closed`,
+//! `leftovers_of_a_dead_pegboard_are_cleaned_on_start`, `concurrent_browser_start_yields_one_daemon`,
+//! `sigterm_closes_sessions_then_removes_socket`, `waiting_start_spawns_when_lock_is_released`,
+//! `browser_start_waits_out_a_stopping_daemon`.
 
 mod common;
 
@@ -83,8 +90,7 @@ fn full_flow() {
 #[ignore]
 fn rejected_flags_exit_2_and_are_logged() {
     let origin = fixture();
-    let home = Home::new();
-    assert_eq!(home.run(&["browser", "start"]).0, 0);
+    let home = shared_home();
     let (code, out, err) = home.run(&["session", "create", "--url", &format!("{origin}/counter")]);
     assert_eq!(code, 0, "{err}");
     let sid = session_handle(&out);
@@ -97,19 +103,18 @@ fn rejected_flags_exit_2_and_are_logged() {
     assert_eq!(code, 2);
     assert!(err.contains("not a session id"), "{err}");
 
-    let (_, out, _) = home.run(&["recording", "list", "--json"]);
-    let rid = json(&out)[0]["recordingId"].as_str().unwrap().to_string();
+    let rid = format!("r_{}", &id_of(&sid)[2..]);
     let (code, out, _) = home.run(&["recording", "show", &rid, "--json"]);
     assert_eq!(code, 0);
     let actions = json(&out)["actions"].as_array().unwrap().clone();
     assert!(actions.iter().any(|a| a["ok"] == false), "{actions:?}");
+    assert_eq!(home.run(&["session", "close", &sid]).0, 0);
 }
 
 #[test]
 #[ignore]
 fn missing_session_is_a_usage_error() {
-    let home = Home::new();
-    assert_eq!(home.run(&["browser", "start"]).0, 0);
+    let home = shared_home();
     let (code, _, err) = home.run(&["snapshot"]);
     assert_eq!(code, 2);
     assert!(err.contains("no session"), "{err}");
@@ -171,8 +176,7 @@ fn daemon_exits_when_browser_is_closed() {
 #[test]
 #[ignore]
 fn socket_is_owner_only() {
-    let home = Home::new();
-    assert_eq!(home.run(&["browser", "start"]).0, 0);
+    let home = shared_home();
     let mode = std::fs::metadata(home.path().join("pegboardd.sock"))
         .unwrap()
         .permissions()
@@ -322,8 +326,7 @@ fn second_daemon_refuses_when_lock_is_held() {
 #[ignore]
 fn session_handle_is_required() {
     let origin = fixture();
-    let home = Home::new();
-    assert_eq!(home.run(&["browser", "start"]).0, 0);
+    let home = shared_home();
     let url = format!("{origin}/counter");
     let (code, out, err) = home.run(&["session", "create", "--url", &url]);
     assert_eq!(code, 0, "{err}");
@@ -549,8 +552,9 @@ fn browser_start_waits_out_a_stopping_daemon() {
 #[ignore]
 fn undelivered_session_create_is_cleaned_up() {
     let origin = fixture();
-    let home = Home::new();
-    assert_eq!(home.run(&["browser", "start"]).0, 0);
+    let home = shared_home();
+    let (_, out, _) = home.run(&["session", "list", "--json"]);
+    let before = json(&out).as_array().unwrap().len();
     assert_eq!(home.run(&["profile", "create", "solo"]).0, 0);
     // Creation takes a page load: the CLI is killed while the daemon is still working.
     let mut child = home
@@ -572,7 +576,10 @@ fn undelivered_session_create_is_cleaned_up() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (_, out, _) = home.run(&["session", "list", "--json"]);
-        let empty = json(&out).as_array().map(|a| a.is_empty()).unwrap_or(false);
+        let empty = json(&out)
+            .as_array()
+            .map(|a| a.len() == before)
+            .unwrap_or(false);
         let (code, _, _) = home.run(&["profile", "delete", "solo"]);
         if empty && code == 0 {
             break;
@@ -589,8 +596,7 @@ fn undelivered_session_create_is_cleaned_up() {
 #[ignore]
 fn handle_in_command_position_never_reaches_the_log() {
     let origin = fixture();
-    let home = Home::new();
-    assert_eq!(home.run(&["browser", "start"]).0, 0);
+    let home = shared_home();
     let (code, out, err) = home.run(&["session", "create", "--url", &format!("{origin}/counter")]);
     assert_eq!(code, 0, "{err}");
     let handle = session_handle(&out);
@@ -607,8 +613,7 @@ fn handle_in_command_position_never_reaches_the_log() {
         0
     );
 
-    let (_, out, _) = home.run(&["recording", "list", "--json"]);
-    let rid = json(&out)[0]["recordingId"].as_str().unwrap().to_string();
+    let rid = format!("r_{}", &id_of(&handle)[2..]);
     let (code, shown, _) = home.run(&["recording", "show", &rid]);
     assert_eq!(code, 0);
     let (_, shown_json, _) = home.run(&["recording", "show", &rid, "--json"]);
@@ -638,4 +643,5 @@ fn handle_in_command_position_never_reaches_the_log() {
             }
         }
     }
+    assert_eq!(home.run(&["session", "close", &handle]).0, 0);
 }
