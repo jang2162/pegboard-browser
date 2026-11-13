@@ -18,7 +18,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pegboard_protocol::{codes, RpcError};
+use pegboard_protocol::{codes, ActionClass, RpcError};
 
 use crate::proxy::filter::normalize_url;
 
@@ -93,6 +93,9 @@ enum TextUse {
 struct Form {
     /// Command and subcommand words, matched literally.
     words: &'static [&'static str],
+    /// What kind of action the form is, for the session policy. `class_of` refines it for
+    /// the two forms whose class depends on a flag or an argument (`wait --fn`, `find`).
+    class: ActionClass,
     args: &'static [Arg],
     /// Further words of this kind after `args` (joined into text, or a list of values).
     rest: Option<Kind>,
@@ -143,9 +146,10 @@ const fn value(names: &'static [&'static str], kind: Kind) -> Flag {
     }
 }
 
-const fn form(words: &'static [&'static str], args: &'static [Arg]) -> Form {
+const fn form(words: &'static [&'static str], class: ActionClass, args: &'static [Arg]) -> Form {
     Form {
         words,
+        class,
         args,
         rest: None,
         rest_required: false,
@@ -219,69 +223,102 @@ const WAIT_FLAGS: &[Flag] = &[
 /// `webmcp`, `clipboard`, `react`, `pushstate` reach outside the session (local files, the
 /// CLI's own network access, an unauthenticated DevTools proxy).
 const GRAMMAR: &[Form] = &[
-    form(&["open"], &[req(Url)]),
-    form(&["back"], &[]),
-    form(&["forward"], &[]),
-    form(&["reload"], &[]),
-    with_flags(form(&["snapshot"], &[]), SNAPSHOT_FLAGS),
-    form(&["get", "url"], &[]),
-    form(&["get", "title"], &[]),
-    form(&["get", "text"], SEL),
-    form(&["get", "html"], SEL),
-    form(&["get", "value"], SEL),
-    form(&["get", "attr"], &[req(Selector), req(Text)]),
-    form(&["get", "count"], SEL),
-    form(&["get", "box"], SEL),
-    form(&["get", "styles"], SEL),
-    form(&["is", "visible"], SEL),
-    form(&["is", "enabled"], SEL),
-    form(&["is", "checked"], SEL),
+    form(&["open"], ActionClass::Navigate, &[req(Url)]),
+    form(&["back"], ActionClass::Navigate, &[]),
+    form(&["forward"], ActionClass::Navigate, &[]),
+    form(&["reload"], ActionClass::Navigate, &[]),
     with_flags(
-        form(&["click"], SEL),
+        form(&["snapshot"], ActionClass::Snapshot, &[]),
+        SNAPSHOT_FLAGS,
+    ),
+    form(&["get", "url"], ActionClass::Get, &[]),
+    form(&["get", "title"], ActionClass::Get, &[]),
+    form(&["get", "text"], ActionClass::Get, SEL),
+    form(&["get", "html"], ActionClass::Get, SEL),
+    form(&["get", "value"], ActionClass::Get, SEL),
+    form(
+        &["get", "attr"],
+        ActionClass::Get,
+        &[req(Selector), req(Text)],
+    ),
+    form(&["get", "count"], ActionClass::Get, SEL),
+    form(&["get", "box"], ActionClass::Get, SEL),
+    form(&["get", "styles"], ActionClass::Get, SEL),
+    form(&["is", "visible"], ActionClass::Get, SEL),
+    form(&["is", "enabled"], ActionClass::Get, SEL),
+    form(&["is", "checked"], ActionClass::Get, SEL),
+    with_flags(
+        form(&["click"], ActionClass::Click, SEL),
         &[switch(&["--new-tab"]), switch(&["--human"])],
     ),
-    form(&["dblclick"], SEL),
-    form(&["hover"], SEL),
-    form(&["focus"], SEL),
-    form(&["check"], SEL),
-    form(&["uncheck"], SEL),
-    form(&["scrollintoview"], SEL),
-    form(&["highlight"], SEL),
+    form(&["dblclick"], ActionClass::Click, SEL),
+    form(&["hover"], ActionClass::Interact, SEL),
+    form(&["focus"], ActionClass::Interact, SEL),
+    form(&["check"], ActionClass::Click, SEL),
+    form(&["uncheck"], ActionClass::Click, SEL),
+    form(&["scrollintoview"], ActionClass::Scroll, SEL),
+    form(&["highlight"], ActionClass::Snapshot, SEL),
     Form {
         literal_rest: true,
-        ..with_text(with_rest(form(&["fill"], SEL), Text, true), TextUse::Typed)
+        ..with_text(
+            with_rest(form(&["fill"], ActionClass::Fill, SEL), Text, true),
+            TextUse::Typed,
+        )
     },
     Form {
         literal_rest: true,
         flags: &[switch(&["--clear"]), value(&["--delay"], Number)],
-        ..with_text(with_rest(form(&["type"], SEL), Text, true), TextUse::Typed)
+        ..with_text(
+            with_rest(form(&["type"], ActionClass::Fill, SEL), Text, true),
+            TextUse::Typed,
+        )
     },
-    with_text(form(&["press"], &[req(Key)]), TextUse::Key),
     with_text(
-        with_rest(form(&["keyboard", "type"], &[]), Text, true),
+        form(&["press"], ActionClass::Fill, &[req(Key)]),
+        TextUse::Key,
+    ),
+    with_text(
+        with_rest(
+            form(&["keyboard", "type"], ActionClass::Fill, &[]),
+            Text,
+            true,
+        ),
         TextUse::Typed,
     ),
     with_text(
-        with_rest(form(&["keyboard", "inserttext"], &[]), Text, true),
+        with_rest(
+            form(&["keyboard", "inserttext"], ActionClass::Fill, &[]),
+            Text,
+            true,
+        ),
         TextUse::Typed,
     ),
     with_text(
-        with_rest(form(&["select"], SEL), Text, true),
+        with_rest(form(&["select"], ActionClass::Click, SEL), Text, true),
         TextUse::Typed,
     ),
     with_flags(
         form(
             &["scroll"],
+            ActionClass::Scroll,
             &[opt(Choice(&["up", "down", "left", "right"])), opt(Number)],
         ),
         &[value(&["-s", "--selector"], Selector)],
     ),
     with_flags(
-        form(&["drag"], &[req(Selector), req(Selector)]),
+        form(
+            &["drag"],
+            ActionClass::Click,
+            &[req(Selector), req(Selector)],
+        ),
         &[switch(&["--human"])],
     ),
     with_flags(
-        form(&["mouse", "move"], &[req(Number), req(Number)]),
+        form(
+            &["mouse", "move"],
+            ActionClass::Click,
+            &[req(Number), req(Number)],
+        ),
         &[
             value(&["--duration"], Number),
             value(&["--steps"], Number),
@@ -289,9 +326,13 @@ const GRAMMAR: &[Form] = &[
             value(&["--seed"], Number),
         ],
     ),
-    form(&["mouse", "down"], &[opt(MOUSE_BUTTON)]),
-    form(&["mouse", "up"], &[opt(MOUSE_BUTTON)]),
-    form(&["mouse", "wheel"], &[req(Number), opt(Number)]),
+    form(&["mouse", "down"], ActionClass::Click, &[opt(MOUSE_BUTTON)]),
+    form(&["mouse", "up"], ActionClass::Click, &[opt(MOUSE_BUTTON)]),
+    form(
+        &["mouse", "wheel"],
+        ActionClass::Scroll,
+        &[req(Number), opt(Number)],
+    ),
     find(&["find", "role"], &[req(Text), opt(FIND_ACTIONS)]),
     find(&["find", "text"], &[req(Text), opt(FIND_ACTIONS)]),
     find(&["find", "label"], &[req(Text), opt(FIND_ACTIONS)]),
@@ -306,8 +347,11 @@ const GRAMMAR: &[Form] = &[
         &[req(Number), req(Selector), opt(FIND_ACTIONS)],
     ),
     // A number waits that long; anything else is a selector.
-    with_flags(form(&["wait"], &[opt(Selector)]), WAIT_FLAGS),
-    with_rest(form(&["eval"], &[]), Text, true),
+    with_flags(
+        form(&["wait"], ActionClass::Wait, &[opt(Selector)]),
+        WAIT_FLAGS,
+    ),
+    with_rest(form(&["eval"], ActionClass::Eval, &[]), Text, true),
     Form {
         flags: &[
             switch(&["--full", "-f"]),
@@ -317,41 +361,69 @@ const GRAMMAR: &[Form] = &[
             },
         ],
         default_file: Some("png"),
-        ..form(&["screenshot"], &[opt(ShotSelector), opt(File(IMAGE))])
+        ..form(
+            &["screenshot"],
+            ActionClass::Snapshot,
+            &[opt(ShotSelector), opt(File(IMAGE))],
+        )
     },
-    form(&["pdf"], &[req(File(&["pdf"]))]),
-    form(&["tab"], &[opt(TabRef)]),
-    form(&["tab", "list"], &[]),
-    form(&["tab", "new"], &[opt(Url)]),
-    form(&["tab", "close"], &[opt(TabRef)]),
-    form(&["frame"], SEL),
-    form(&["dialog", "accept"], &[secret(opt(Text))]),
-    form(&["dialog", "dismiss"], &[]),
-    form(&["dialog", "status"], &[]),
-    form(&["cookies"], &[]),
-    form(&["cookies", "get"], &[]),
+    form(&["pdf"], ActionClass::Snapshot, &[req(File(&["pdf"]))]),
+    form(&["tab"], ActionClass::Navigate, &[opt(TabRef)]),
+    form(&["tab", "list"], ActionClass::Read, &[]),
+    form(&["tab", "new"], ActionClass::Navigate, &[opt(Url)]),
+    form(&["tab", "close"], ActionClass::Navigate, &[opt(TabRef)]),
+    form(&["frame"], ActionClass::Navigate, SEL),
+    form(
+        &["dialog", "accept"],
+        ActionClass::Interact,
+        &[secret(opt(Text))],
+    ),
+    form(&["dialog", "dismiss"], ActionClass::Interact, &[]),
+    form(&["dialog", "status"], ActionClass::Read, &[]),
+    form(&["cookies"], ActionClass::Read, &[]),
+    form(&["cookies", "get"], ActionClass::Read, &[]),
     with_flags(
-        form(&["cookies", "set"], &[req(Text), secret(req(Text))]),
+        form(
+            &["cookies", "set"],
+            ActionClass::State,
+            &[req(Text), secret(req(Text))],
+        ),
         COOKIE_FLAGS,
     ),
-    form(&["storage", "local"], &[opt(Text)]),
-    form(&["storage", "local", "get"], &[opt(Text)]),
+    form(&["storage", "local"], ActionClass::Read, &[opt(Text)]),
+    form(
+        &["storage", "local", "get"],
+        ActionClass::Read,
+        &[opt(Text)],
+    ),
     form(
         &["storage", "local", "set"],
+        ActionClass::State,
         &[req(Text), secret(req(Text))],
     ),
-    form(&["storage", "local", "clear"], &[]),
-    form(&["storage", "session"], &[opt(Text)]),
-    form(&["storage", "session", "get"], &[opt(Text)]),
+    form(&["storage", "local", "clear"], ActionClass::State, &[]),
+    form(&["storage", "session"], ActionClass::Read, &[opt(Text)]),
+    form(
+        &["storage", "session", "get"],
+        ActionClass::Read,
+        &[opt(Text)],
+    ),
     form(
         &["storage", "session", "set"],
+        ActionClass::State,
         &[req(Text), secret(req(Text))],
     ),
-    form(&["storage", "session", "clear"], &[]),
-    with_flags(form(&["console"], &[]), &[switch(&["--clear"])]),
-    with_flags(form(&["errors"], &[]), &[switch(&["--clear"])]),
+    form(&["storage", "session", "clear"], ActionClass::State, &[]),
     with_flags(
-        form(&["network", "requests"], &[]),
+        form(&["console"], ActionClass::Read, &[]),
+        &[switch(&["--clear"])],
+    ),
+    with_flags(
+        form(&["errors"], ActionClass::Read, &[]),
+        &[switch(&["--clear"])],
+    ),
+    with_flags(
+        form(&["network", "requests"], ActionClass::Read, &[]),
         &[
             switch(&["--clear"]),
             value(&["--filter"], Text),
@@ -361,15 +433,16 @@ const GRAMMAR: &[Form] = &[
         ],
     ),
     with_flags(
-        form(&["a11y"], &[opt(Url)]),
+        form(&["a11y"], ActionClass::Snapshot, &[opt(Url)]),
         &[
             value(&["--tags"], Text),
             value(&["-s", "--selector"], Selector),
         ],
     ),
-    form(&["vitals"], &[opt(Url)]),
+    form(&["vitals"], ActionClass::Read, &[opt(Url)]),
     form(
         &["set", "viewport"],
+        ActionClass::Interact,
         &[req(Number), req(Number), opt(Number)],
     ),
 ];
@@ -377,7 +450,10 @@ const GRAMMAR: &[Form] = &[
 const fn find(words: &'static [&'static str], args: &'static [Arg]) -> Form {
     Form {
         flags: FIND_FLAGS,
-        ..with_text(with_rest(form(words, args), Text, false), TextUse::Typed)
+        ..with_text(
+            with_rest(form(words, ActionClass::Click, args), Text, false),
+            TextUse::Typed,
+        )
     }
 }
 
@@ -424,6 +500,52 @@ pub fn check(argv: &[String], files_dir: &Path) -> Result<Checked, RpcError> {
         return Ok(Checked::TabNew { url });
     }
     Ok(Checked::Run(words))
+}
+
+/// The action class of a command line the grammar accepts, `None` for one it does not.
+///
+/// Every form carries a class (`form` takes it). Two are decided by the words as well:
+/// `wait --fn <expr>` evaluates script (`eval`), and `find <locator> <value> <action>` is
+/// what its action is (`fill` is `fill`, `hover` is `interact`, `text` is `get`; `click`,
+/// `check` and no action at all are `click`).
+pub fn class_of(argv: &[String]) -> Option<ActionClass> {
+    let form = form_of(argv)?;
+    let words = &argv[form.words.len()..];
+    // Only the shape matters here, so any absolute directory will do.
+    parse(form, words, Path::new("/")).ok()?;
+    Some(match form.words {
+        ["wait"] if words.iter().any(|w| w == "--fn") => ActionClass::Eval,
+        ["find", ..] => match find_action(form, words) {
+            Some("fill") => ActionClass::Fill,
+            Some("hover") => ActionClass::Interact,
+            Some("text") => ActionClass::Get,
+            _ => ActionClass::Click,
+        },
+        _ => form.class,
+    })
+}
+
+/// The action word of a `find` command line (words after `find <locator>`), if given: the
+/// last positional argument of the form, when it is one of the actions.
+fn find_action<'a>(form: &Form, words: &'a [String]) -> Option<&'a str> {
+    let mut positional = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = &words[i];
+        i += 1;
+        if w.starts_with('-') && !is_number(w) {
+            // Parsing accepted the line, so the flag is declared; skip its value.
+            if let Some(flag) = form.flags.iter().find(|f| f.names.contains(&w.as_str())) {
+                if matches!(flag.arity, Arity::Value(_)) {
+                    i += 1;
+                }
+            }
+        } else {
+            positional.push(w.as_str());
+        }
+    }
+    let action = *positional.get(form.args.len() - 1)?;
+    matches!(FIND_ACTIONS, Choice(options) if options.contains(&action)).then_some(action)
 }
 
 /// Where the secret words of a command line are, by the grammar.
@@ -821,6 +943,127 @@ mod tests {
         let e = check(&s(v), Path::new(FILES)).expect_err(&format!("{v:?} was accepted"));
         assert_eq!(e.code, "argv_rejected", "{v:?}");
         e
+    }
+
+    #[test]
+    fn every_form_has_a_class_and_the_table_matches() {
+        use ActionClass::*;
+        let table: &[(&[&str], ActionClass)] = &[
+            (&["open", "https://a.test"], Navigate),
+            (&["back"], Navigate),
+            (&["forward"], Navigate),
+            (&["reload"], Navigate),
+            (&["tab"], Navigate),
+            (&["tab", "t1"], Navigate),
+            (&["tab", "new"], Navigate),
+            (&["tab", "close"], Navigate),
+            (&["frame", "#f"], Navigate),
+            (&["click", "#a"], Click),
+            (&["dblclick", "#a"], Click),
+            (&["check", "#a"], Click),
+            (&["uncheck", "#a"], Click),
+            (&["select", "#a", "x"], Click),
+            (&["drag", "#a", "#b"], Click),
+            (&["mouse", "move", "1", "2"], Click),
+            (&["mouse", "down"], Click),
+            (&["mouse", "up"], Click),
+            (&["fill", "#a", "x"], Fill),
+            (&["type", "#a", "x"], Fill),
+            (&["press", "Enter"], Fill),
+            (&["keyboard", "type", "x"], Fill),
+            (&["keyboard", "inserttext", "x"], Fill),
+            (&["snapshot"], Snapshot),
+            (&["screenshot"], Snapshot),
+            (&["pdf", "a.pdf"], Snapshot),
+            (&["a11y"], Snapshot),
+            (&["highlight", "#a"], Snapshot),
+            (&["scrollintoview", "#a"], Scroll),
+            (&["scroll", "down"], Scroll),
+            (&["mouse", "wheel", "10"], Scroll),
+            (&["wait", "100"], Wait),
+            (&["wait", "#a", "--state", "hidden"], Wait),
+            (&["wait", "--text", "x"], Wait),
+            (&["console"], Read),
+            (&["errors"], Read),
+            (&["network", "requests"], Read),
+            (&["vitals"], Read),
+            (&["tab", "list"], Read),
+            (&["dialog", "status"], Read),
+            (&["cookies"], Read),
+            (&["cookies", "get"], Read),
+            (&["storage", "local"], Read),
+            (&["storage", "local", "get", "k"], Read),
+            (&["storage", "session"], Read),
+            (&["storage", "session", "get", "k"], Read),
+            (&["get", "url"], Get),
+            (&["get", "attr", "#a", "id"], Get),
+            (&["is", "visible", "#a"], Get),
+            (&["hover", "#a"], Interact),
+            (&["focus", "#a"], Interact),
+            (&["dialog", "accept"], Interact),
+            (&["dialog", "dismiss"], Interact),
+            (&["set", "viewport", "800", "600"], Interact),
+            (&["eval", "1"], Eval),
+            (&["wait", "--fn", "x"], Eval),
+            (&["wait", "#a", "--fn", "x"], Eval),
+            (&["cookies", "set", "a", "b"], State),
+            (&["storage", "local", "set", "k", "v"], State),
+            (&["storage", "local", "clear"], State),
+            (&["storage", "session", "set", "k", "v"], State),
+            (&["storage", "session", "clear"], State),
+            // find is what its action is; no action is a click
+            (&["find", "role", "button"], Click),
+            (&["find", "role", "button", "click"], Click),
+            (&["find", "role", "button", "check", "--name", "Add"], Click),
+            (&["find", "text", "Hi", "fill", "x"], Fill),
+            (&["find", "label", "Name", "--exact", "fill", "x"], Fill),
+            (&["find", "nth", "0", "button", "hover"], Interact),
+            (&["find", "first", "#a", "text"], Get),
+            // "fill" as the value being looked for is not an action
+            (&["find", "text", "fill"], Click),
+        ];
+        for (argv, class) in table {
+            assert_eq!(class_of(&s(argv)), Some(*class), "{argv:?}");
+        }
+        for bad in [
+            &["--session", "x"][..],
+            &["click"],
+            &["eval"],
+            &["upload", "#f", "a.txt"],
+            &["cookies", "clear"],
+            &["wait", "--fn"],
+        ] {
+            assert_eq!(class_of(&s(bad)), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn no_grammar_form_is_left_without_a_class_at_its_own_words() {
+        // Each form reached by its own words gets the class its form carries, except the
+        // two that `class_of` refines.
+        for f in GRAMMAR {
+            let class = {
+                let mut argv: Vec<String> = f.words.iter().map(|w| w.to_string()).collect();
+                for a in f.args.iter().filter(|a| a.required) {
+                    argv.push(match a.kind {
+                        Kind::Number => "1".into(),
+                        Kind::Url => "https://a.test".into(),
+                        Kind::File(exts) => format!("f.{}", exts[0]),
+                        Kind::Choice(o) => o[0].into(),
+                        Kind::Key => "Enter".into(),
+                        _ => "x".into(),
+                    });
+                }
+                if f.rest_required {
+                    argv.push("x".into());
+                }
+                class_of(&argv)
+            };
+            let c = class.unwrap_or_else(|| panic!("{:?} has no class", f.words));
+            if f.words[0] != "find" {
+                assert_eq!(c, f.class, "{:?}", f.words);
+            }
+        }
     }
 
     #[test]

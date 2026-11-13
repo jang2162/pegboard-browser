@@ -141,6 +141,7 @@ fn params(name: Option<&str>, url: Option<String>, profile: Option<&str>) -> Ses
         name: name.map(String::from),
         url,
         profile: profile.map(String::from),
+        policy: Default::default(),
     }
 }
 

@@ -12,6 +12,7 @@ use crate::actionlog::{
 };
 use crate::argv::{self, Checked, TextDestination};
 use crate::paths::Paths;
+use crate::policy;
 use crate::proxy::server::Endpoint;
 use crate::runner::{succeeded, Runner, DEFAULT_TIMEOUT_MS};
 use crate::session::SessionManager;
@@ -155,17 +156,21 @@ pub async fn run_command_with_hook(
 
     let checked = match argv::check(argv, &paths.session_files(id)) {
         Ok(checked) => checked,
-        Err(e) => {
-            // The message names the offending word, which may be typed text.
-            entry.command = rejected_command(argv);
-            entry.args = rejected_args(argv);
-            entry.redacted = true;
-            entry.error = Some(withheld(&e.code));
-            entry.duration_ms = elapsed_ms(started);
-            append(log, entry)?;
-            return Err(e);
-        }
+        Err(e) => return refuse(log, entry, argv, e, started),
     };
+    // The policy judges every command before anything runs for it. (The selector checks
+    // below are pegboard's own and are not judged.) A session that cannot be found has no
+    // policy to read: refused too.
+    let judged = argv::class_of(argv)
+        .ok_or_else(|| RpcError {
+            code: codes::INTERNAL.to_string(),
+            message: "a checked command line has no action class".into(),
+            data: None,
+        })
+        .and_then(|class| policy::judge_action(&sessions.policy(id)?, class));
+    if let Err(e) = judged {
+        return refuse(log, entry, argv, e, started);
+    }
     let run_argv = match checked {
         Checked::Run(words) => words,
         Checked::TabNew { url } => vec!["tab".to_string(), "new".to_string(), url],
@@ -227,6 +232,25 @@ pub async fn run_command_with_hook(
     append(log, entry)?;
     sessions.touch(id);
     outcome
+}
+
+/// Logs a command refused before it ran (its line, or the policy) and returns the error.
+/// The command word is shown when the grammar knows it; every later word is hidden, since
+/// the error message may name one and they may be typed text.
+fn refuse(
+    log: &mut ActionLog,
+    mut entry: ActionEntry,
+    argv: &[String],
+    e: RpcError,
+    started: Instant,
+) -> Result<CommandExecResult, RpcError> {
+    entry.command = rejected_command(argv);
+    entry.args = rejected_args(argv);
+    entry.redacted = true;
+    entry.error = Some(withheld(&e.code));
+    entry.duration_ms = elapsed_ms(started);
+    append(log, entry)?;
+    Err(e)
 }
 
 /// An `eval` whose logged expression is not the one given (strings masked, or cut).
@@ -412,6 +436,60 @@ mod tests {
         });
         assert!(
             error_text(false, false, &fine).is_none() && error_text(true, false, &fine).is_none()
+        );
+    }
+
+    #[test]
+    fn a_denied_command_is_logged_like_a_rejected_one() {
+        use crate::actionlog::{read, Manifest, REDACTED};
+        use pegboard_protocol::{ActionClass, SessionPolicy};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        let manifest = Manifest::new("r_abcdefgh", "s_abcdefgh", "n", "default", "t", "c", "a");
+        let mut log = ActionLog::open(&paths, manifest).unwrap();
+        let argv: Vec<String> = ["cookies", "set", "sid", "hunter2-secret"]
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
+        let class = argv::class_of(&argv).unwrap();
+        assert_eq!(class, ActionClass::State);
+        let denied = policy::judge_action(&SessionPolicy::default(), class).unwrap_err();
+        let entry = ActionEntry {
+            seq: 0,
+            ts: now(),
+            session_id: "s_abcdefgh".into(),
+            target_id: None,
+            url: None,
+            command: argv[0].clone(),
+            args: Vec::new(),
+            ok: false,
+            error: None,
+            duration_ms: 0,
+            redacted: false,
+        };
+        let e = refuse(&mut log, entry, &argv, denied, Instant::now()).unwrap_err();
+        assert_eq!(e.code, codes::POLICY_DENIED);
+        let (_, entries) = read(&paths, "r_abcdefgh").unwrap();
+        assert_eq!(entries.len(), 1);
+        let logged = &entries[0];
+        assert_eq!(logged.command, "cookies");
+        assert_eq!(logged.args, ["cookies", REDACTED, REDACTED, REDACTED]);
+        assert!(logged.redacted && !logged.ok);
+        assert_eq!(
+            logged.error.as_deref(),
+            Some("policy_denied: details withheld (entry redacted)")
+        );
+        let text = std::fs::read_to_string(
+            tmp.path()
+                .join("recordings")
+                .join("r_abcdefgh")
+                .join("actions.jsonl"),
+        )
+        .unwrap();
+        assert!(
+            !text.contains("hunter2-secret") && !text.contains("sid"),
+            "{text}"
         );
     }
 

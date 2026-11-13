@@ -432,7 +432,9 @@ use pegboard_core::profiles::Profiles;
 use pegboard_core::proxy::server::{Endpoint, ProxyServer, WsUpstream};
 use pegboard_core::runner::Runner;
 use pegboard_core::session::SessionManager;
-use pegboard_protocol::{CommandExecResult, SessionCreateParams, SessionId, SessionInfo};
+use pegboard_protocol::{
+    CommandExecResult, SessionCreateParams, SessionId, SessionInfo, SessionPolicy,
+};
 use serde_json::{json, Value};
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
@@ -569,12 +571,23 @@ impl Shared {
     /// A new session of the test's own (own tab group, own tabs) on `path`, in the default
     /// agent profile. The test closes it with `close_session`.
     pub async fn session(&self, path: &str) -> (SessionInfo, Endpoint) {
+        self.session_with_policy(path, SessionPolicy::default())
+            .await
+    }
+
+    /// `session`, created with `policy`.
+    pub async fn session_with_policy(
+        &self,
+        path: &str,
+        policy: SessionPolicy,
+    ) -> (SessionInfo, Endpoint) {
         let info = self
             .manager
             .create(SessionCreateParams {
                 name: None,
                 url: Some(self.url(path)),
                 profile: None,
+                policy,
             })
             .await
             .unwrap();

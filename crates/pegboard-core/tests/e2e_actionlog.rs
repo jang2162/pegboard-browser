@@ -8,14 +8,25 @@ use std::time::Duration;
 use pegboard_core::actionlog::{self, ActionEntry, ActionLog, Manifest, REDACTED};
 use pegboard_core::daemon::{run_command, run_command_with_hook};
 use pegboard_core::proxy::server::Endpoint;
-use pegboard_protocol::{codes, CommandExecResult, RpcError, SessionInfo};
+use pegboard_protocol::{
+    codes, ActionClass, CommandExecResult, RpcError, SessionInfo, SessionPolicy,
+};
 use serde_json::json;
 
 const BIN: &str = "vendor/agent-browser/agent-browser";
 
 /// A session on `path` with agent-browser attached and its action log open.
 async fn logged(h: &Harness, path: &str) -> (SessionInfo, Endpoint, ActionLog) {
-    let (info, ep) = h.session(path).await;
+    logged_with(h, path, SessionPolicy::default()).await
+}
+
+/// `logged`, in a session created with `policy`.
+async fn logged_with(
+    h: &Harness,
+    path: &str,
+    policy: SessionPolicy,
+) -> (SessionInfo, Endpoint, ActionLog) {
+    let (info, ep) = h.session_with_policy(path, policy).await;
     let manifest = Manifest::new(
         &info.recording_id,
         &info.id.0,
@@ -449,7 +460,12 @@ fn non_sensitive_text_is_still_logged() {
 fn cookie_value_never_reaches_the_log() {
     common::run(async {
         let h = Harness::start();
-        let (info, _ep, mut log) = logged(&h, "/form").await;
+        // Writing cookies and storage is a `state` command: the session is allowed it.
+        let allow_state = SessionPolicy {
+            allow: vec![ActionClass::State],
+            ..SessionPolicy::default()
+        };
+        let (info, _ep, mut log) = logged_with(&h, "/form", allow_state).await;
         let r = h
             .run(
                 &mut log,

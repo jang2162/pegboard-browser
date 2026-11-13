@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use pegboard_protocol::{
     codes, ProfileInfo, ProfileKind, RpcError, SessionCloseParams, SessionCreateParams, SessionId,
-    SessionInfo, SessionState,
+    SessionInfo, SessionPolicy, SessionState,
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, OnceCell};
@@ -22,6 +22,7 @@ use crate::bridge::{Bridge, GroupId};
 use crate::browser::{Browser, BrowserConfig};
 use crate::cdp::{page_targets, CdpConn, CdpEvent};
 use crate::paths::Paths;
+use crate::policy::{self, PinGuard, PinTable};
 use crate::profiles::{profile_dir, rpc_error, valid_profile_name, Profiles, DEFAULT_PROFILE};
 use crate::proxy::filter::normalize_url;
 use crate::proxy::server::{Endpoint, ProxyServer};
@@ -92,6 +93,9 @@ struct SessionRecord {
     group: GroupId,
     bridge: Arc<Bridge>,
     endpoint: Endpoint,
+    /// The session's hold on its profile's pinned settings: dropping the record (however
+    /// the session ends) releases it.
+    _pin: PinGuard,
 }
 
 #[derive(Default)]
@@ -138,6 +142,8 @@ struct Inner {
     /// the same profile's window twice.
     runtimes: tokio::sync::Mutex<HashMap<String, Arc<ProfileRuntime>>>,
     table: Mutex<Table>,
+    /// What each profile is pinned to by its open sessions' policies.
+    pins: PinTable,
     /// Target -> the daemon's own CDP session holding focus emulation on it (`None` while
     /// it is being attached).
     focus: Mutex<HashMap<String, Option<String>>>,
@@ -174,6 +180,7 @@ impl SessionManager {
             cfg,
             runtimes: tokio::sync::Mutex::new(HashMap::new()),
             table: Mutex::new(Table::default()),
+            pins: PinTable::default(),
             focus: Mutex::new(HashMap::new()),
             discovery: OnceCell::new(),
         });
@@ -198,8 +205,14 @@ impl SessionManager {
 
     pub async fn create(&self, p: SessionCreateParams) -> Result<SessionInfo, RpcError> {
         let inner = &self.inner;
+        policy::validate(&p.policy)?;
+        let session_policy = policy::normalized(&p.policy);
         let profile = p.profile.as_deref().unwrap_or(DEFAULT_PROFILE).to_string();
         let reservation = self.reserve(&profile).await?;
+        // Held by the record from here on; until then (an early return) it just drops.
+        let pin = inner
+            .pins
+            .acquire(&profile, policy::pins_of(&session_policy))?;
         let (id, seq) = (reservation.id.clone(), reservation.seq);
         let url = p.url.as_deref().map(checked_url).transpose()?;
         inner.ensure_discovery().await?;
@@ -244,6 +257,7 @@ impl SessionManager {
             created_at: created_at.clone(),
             last_activity_at: created_at,
             token: None,
+            policy: session_policy,
         };
         inner.table.lock().unwrap().records.insert(
             id.clone(),
@@ -255,6 +269,7 @@ impl SessionManager {
                 group: group.clone(),
                 bridge: runtime.bridge.clone(),
                 endpoint,
+                _pin: pin,
             },
         );
         let setup = async {
@@ -347,6 +362,12 @@ impl SessionManager {
         info.targets = targets.into_iter().collect();
         info.state = SessionState::Closed;
         Ok(info)
+    }
+
+    /// The policy the session was created with.
+    pub fn policy(&self, id: &SessionId) -> Result<SessionPolicy, RpcError> {
+        let table = self.inner.table.lock().unwrap();
+        Ok(ready(&table, id)?.info.policy.clone())
     }
 
     pub fn endpoint(&self, id: &SessionId) -> Result<Endpoint, RpcError> {

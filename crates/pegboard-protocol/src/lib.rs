@@ -21,6 +21,11 @@ pub mod codes {
     pub const BROWSER_FAILED: &str = "browser_failed";
     /// A command did not finish within its time limit (it was stopped).
     pub const TIMEOUT: &str = "timeout";
+    /// The session's policy does not allow the command's action class.
+    pub const POLICY_DENIED: &str = "policy_denied";
+    /// A session asks for a profile-wide setting the profile is pinned to differently.
+    pub const PROFILE_POLICY_CONFLICT: &str = "profile_policy_conflict";
+    pub const LIMIT_EXCEEDED: &str = "limit_exceeded";
     pub const INTERNAL: &str = "internal";
 }
 
@@ -71,6 +76,96 @@ impl SessionId {
     }
 }
 
+/// The kind of action a command is, which a session policy allows or denies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionClass {
+    Navigate,
+    Click,
+    Fill,
+    Snapshot,
+    Scroll,
+    Wait,
+    Read,
+    Get,
+    Interact,
+    Eval,
+    Download,
+    Upload,
+    State,
+    Clipboard,
+}
+
+impl ActionClass {
+    pub const ALL: [ActionClass; 14] = [
+        ActionClass::Navigate,
+        ActionClass::Click,
+        ActionClass::Fill,
+        ActionClass::Snapshot,
+        ActionClass::Scroll,
+        ActionClass::Wait,
+        ActionClass::Read,
+        ActionClass::Get,
+        ActionClass::Interact,
+        ActionClass::Eval,
+        ActionClass::Download,
+        ActionClass::Upload,
+        ActionClass::State,
+        ActionClass::Clipboard,
+    ];
+
+    /// The lower-case name used on the wire and in options.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionClass::Navigate => "navigate",
+            ActionClass::Click => "click",
+            ActionClass::Fill => "fill",
+            ActionClass::Snapshot => "snapshot",
+            ActionClass::Scroll => "scroll",
+            ActionClass::Wait => "wait",
+            ActionClass::Read => "read",
+            ActionClass::Get => "get",
+            ActionClass::Interact => "interact",
+            ActionClass::Eval => "eval",
+            ActionClass::Download => "download",
+            ActionClass::Upload => "upload",
+            ActionClass::State => "state",
+            ActionClass::Clipboard => "clipboard",
+        }
+    }
+}
+
+impl std::str::FromStr for ActionClass {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        ActionClass::ALL
+            .into_iter()
+            .find(|c| c.as_str() == s)
+            .ok_or_else(|| {
+                let all: Vec<&str> = ActionClass::ALL.iter().map(|c| c.as_str()).collect();
+                format!("{s:?} is not an action class (one of {})", all.join(", "))
+            })
+    }
+}
+
+/// What a session may do. Fixed when the session is created.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SessionPolicy {
+    /// Opens a class that is denied by default.
+    pub allow: Vec<ActionClass>,
+    /// Closes a class that is allowed by default.
+    pub deny: Vec<ActionClass>,
+    /// Empty means no allow-list.
+    pub allow_domains: Vec<String>,
+    pub allow_private_network: bool,
+    pub no_localhost: bool,
+    /// Absolute path, checked at `session.create`.
+    pub upload_dir: Option<String>,
+    pub no_expire: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
@@ -89,6 +184,8 @@ pub struct SessionInfo {
     /// carries it, once; it is never in `session.list` or `session.info`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    #[serde(default)]
+    pub policy: SessionPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +200,8 @@ pub struct SessionCreateParams {
     pub name: Option<String>,
     pub url: Option<String>,
     pub profile: Option<String>,
+    #[serde(default)]
+    pub policy: SessionPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +272,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             last_activity_at: "2026-01-01T00:00:00Z".into(),
             token: None,
+            policy: SessionPolicy::default(),
         }
     }
 
@@ -199,6 +299,20 @@ mod tests {
         let json = serde_json::to_value(sample_session_info()).unwrap();
         assert!(json.get("tabGroupId").is_some());
         assert_eq!(json["state"], "active");
+    }
+
+    #[test]
+    fn policy_defaults_and_names() {
+        let p: SessionPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(p, SessionPolicy::default());
+        let p: SessionPolicy =
+            serde_json::from_str(r#"{"allow":["state"],"allowDomains":["a.test"]}"#).unwrap();
+        assert_eq!(p.allow, vec![ActionClass::State]);
+        for c in ActionClass::ALL {
+            assert_eq!(c.as_str().parse::<ActionClass>(), Ok(c));
+            assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
+        }
+        assert!("Eval".parse::<ActionClass>().is_err());
     }
 
     #[test]

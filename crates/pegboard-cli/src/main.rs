@@ -14,10 +14,11 @@ use pegboard_core::api::{serve, Client};
 use pegboard_core::daemon::Daemon;
 use pegboard_core::lock::DaemonLock;
 use pegboard_core::paths::{ensure_home, paths, socket_path_fits, Paths};
+use pegboard_core::policy;
 use pegboard_core::runner::succeeded;
 use pegboard_protocol::{
-    codes, BrowserStatus, CommandExecParams, CommandExecResult, ProfileInfo, RpcError,
-    SessionCreateParams, SessionId, SessionInfo,
+    codes, ActionClass, BrowserStatus, CommandExecParams, CommandExecResult, ProfileInfo, RpcError,
+    SessionCreateParams, SessionId, SessionInfo, SessionPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -104,6 +105,27 @@ enum SessionCmd {
         url: Option<String>,
         #[arg(long)]
         profile: Option<String>,
+        /// Open command classes that are denied by default (upload, state, clipboard).
+        #[arg(long, value_delimiter = ',', value_name = "CLASS,...")]
+        allow: Vec<ActionClass>,
+        /// Close command classes that are allowed by default (e.g. eval, download).
+        #[arg(long, value_delimiter = ',', value_name = "CLASS,...")]
+        deny: Vec<ActionClass>,
+        /// Only these hosts (and their subdomains) can be reached.
+        #[arg(long, value_delimiter = ',', value_name = "DOMAIN,...")]
+        allow_domain: Vec<String>,
+        /// Allow addresses on private networks.
+        #[arg(long)]
+        allow_private_network: bool,
+        /// Do not allow localhost.
+        #[arg(long)]
+        no_localhost: bool,
+        /// Directory the session may upload files from (needs --allow upload).
+        #[arg(long, value_name = "DIR")]
+        upload_dir: Option<String>,
+        /// Do not expire the session after it has been idle.
+        #[arg(long)]
+        no_expire: bool,
     },
     List,
     Info {
@@ -141,7 +163,7 @@ fn report(e: &RpcError) -> i32 {
     eprintln!("pegboard: {}: {}", e.code, e.message);
     match e.code.as_str() {
         codes::NOT_RUNNING => EXIT_NO_DAEMON,
-        codes::ARGV_REJECTED | codes::INVALID_PARAMS => EXIT_USAGE,
+        codes::ARGV_REJECTED | codes::INVALID_PARAMS | codes::PROFILE_POLICY_CONFLICT => EXIT_USAGE,
         _ => EXIT_FAILURE,
     }
 }
@@ -263,6 +285,38 @@ fn profile(paths: &Paths, command: ProfileCmd, json: bool) -> Result<(), RpcErro
     Ok(())
 }
 
+fn describe_policy(p: &SessionPolicy) -> String {
+    let names = |list: &[ActionClass]| {
+        if list.is_empty() {
+            "-".to_string()
+        } else {
+            list.iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    };
+    format!(
+        "policy: allow {}; deny {}; allow-domain {}; private network {}; localhost {}; \
+         upload-dir {}; expires {}",
+        names(&p.allow),
+        names(&p.deny),
+        if p.allow_domains.is_empty() {
+            "-".to_string()
+        } else {
+            p.allow_domains.join(",")
+        },
+        if p.allow_private_network {
+            "allowed"
+        } else {
+            "blocked"
+        },
+        if p.no_localhost { "blocked" } else { "allowed" },
+        p.upload_dir.as_deref().unwrap_or("-"),
+        if p.no_expire { "never" } else { "when idle" },
+    )
+}
+
 fn describe(s: &SessionInfo) -> String {
     format!(
         "{}  {}  {}  {:?}  {} tabs",
@@ -276,11 +330,40 @@ fn describe(s: &SessionInfo) -> String {
 
 fn session(paths: &Paths, command: SessionCmd, json: bool) -> Result<(), RpcError> {
     match command {
-        SessionCmd::Create { name, url, profile } => {
+        SessionCmd::Create {
+            name,
+            url,
+            profile,
+            allow,
+            deny,
+            allow_domain,
+            allow_private_network,
+            no_localhost,
+            upload_dir,
+            no_expire,
+        } => {
+            let policy = SessionPolicy {
+                allow,
+                deny,
+                allow_domains: allow_domain,
+                allow_private_network,
+                no_localhost,
+                upload_dir,
+                no_expire,
+            };
+            // The daemon judges it again; this saves a round trip and works without one.
+            if let Err(e) = policy::validate(&policy) {
+                usage(&e.message);
+            }
             let s: SessionInfo = call(
                 paths,
                 "session.create",
-                SessionCreateParams { name, url, profile },
+                SessionCreateParams {
+                    name,
+                    url,
+                    profile,
+                    policy,
+                },
             )?;
             // The handle is `<id>.<token>`; this is the only place a token is printed.
             let handle = format!("{}.{}", s.id.0, s.token.clone().unwrap_or_default());
@@ -316,6 +399,7 @@ fn session(paths: &Paths, command: SessionCmd, json: bool) -> Result<(), RpcErro
                 print_json(&s);
             } else {
                 println!("{}", describe(&s));
+                println!("{}", describe_policy(&s.policy));
             }
         }
         SessionCmd::Close { id, keep_tabs } => {

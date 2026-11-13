@@ -7,6 +7,7 @@ pub mod cdp;
 pub mod daemon;
 pub mod lock;
 pub mod paths;
+pub mod policy;
 pub mod profiles;
 pub mod proxy;
 pub mod runner;
