@@ -179,6 +179,56 @@ pub fn connect_src(policy: &SessionPolicy) -> Option<String> {
     Some(format!("connect-src {}", sources.join(" ")))
 }
 
+/// Whether a document from `url` is served again with the CSP. Not when its host is on an
+/// allowed loopback or private address (owner's ruling): served again, such a document would
+/// lose its address space, and Chrome refuses the local requests of an insecure document
+/// without one (second-machine round 2), which breaks `http:` intranet and dev sites. Those
+/// documents pass unchanged; their requests are still judged, their WebSockets are not
+/// covered. Anything else is served again: a public address, a name that does not resolve,
+/// a URL without a host.
+pub async fn serves_again(
+    url: &str,
+    policy: &SessionPolicy,
+    own_ports: &[u16],
+    resolver: &Resolver,
+) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return true;
+    };
+    let (Some(target), Some(port)) = (address::target_of(&parsed), parsed.port_or_known_default())
+    else {
+        return true;
+    };
+    let (host, addresses) = match target {
+        Target::Ip(ip) => (ip.to_string(), Some(vec![ip])),
+        Target::Name(name) if address::is_loopback_name(&name) => {
+            (name, Some(vec![IpAddr::from([127, 0, 0, 1])]))
+        }
+        Target::Name(name) => {
+            let found = resolver.resolve(&name, port).await.ok();
+            (name, found)
+        }
+    };
+    !local_and_allowed(addresses.as_deref(), &host, port, policy, own_ports)
+}
+
+/// True when the host's addresses are known, all loopback or private, and all allowed.
+fn local_and_allowed(
+    addresses: Option<&[IpAddr]>,
+    host: &str,
+    port: u16,
+    policy: &SessionPolicy,
+    own_ports: &[u16],
+) -> bool {
+    let Some(addresses) = addresses.filter(|a| !a.is_empty()) else {
+        return false;
+    };
+    addresses.iter().all(|&ip| {
+        let local = address::is_loopback(ip) || address::is_private(ip);
+        local && judge_resolved(ip, port, host, policy, own_ports) == Verdict::Allow
+    })
+}
+
 /// Whether a document response can run script that opens connections (it gets the CSP).
 fn runs_script(headers: &[(String, String)]) -> bool {
     let Some((_, value)) = headers
@@ -625,6 +675,14 @@ impl Inner {
         if no_document {
             return pass().await;
         }
+        let url = params
+            .pointer("/request/url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let own_ports = (self.own_ports)();
+        if !serves_again(url, policy, &own_ports, &self.resolver).await {
+            return pass().await;
+        }
         let served = async {
             let body = conn
                 .send(
@@ -757,6 +815,70 @@ mod tests {
             ..listed(&["a.test"])
         };
         assert!(connect_src(&listed_open).is_some());
+    }
+
+    #[tokio::test]
+    async fn documents_on_allowed_local_addresses_are_not_served_again() {
+        let r = Resolver::from_rules(
+            "MAP pub.test 93.184.216.34, MAP loop.test 127.0.0.1, MAP lan.test 192.168.1.20, MAP mixed.test 10.0.0.1",
+        );
+        let ports = [9222];
+        let default = SessionPolicy::default();
+        let private = SessionPolicy {
+            allow_private_network: true,
+            ..SessionPolicy::default()
+        };
+        let again = |url: &'static str, p: SessionPolicy| {
+            let r = r.clone();
+            async move { serves_again(url, &p, &ports, &r).await }
+        };
+        // Public: served again.
+        assert!(again("http://pub.test/", default.clone()).await);
+        assert!(again("http://93.184.216.34/", default.clone()).await);
+        // Loopback, allowed: passed unchanged (name, literal, localhost names).
+        assert!(!again("http://loop.test:3000/", default.clone()).await);
+        assert!(!again("http://127.0.0.1:3000/", default.clone()).await);
+        assert!(!again("http://[::1]:3000/", default.clone()).await);
+        assert!(!again("http://a.localhost/", default.clone()).await);
+        // Loopback, not allowed by the policy: served again.
+        let closed = SessionPolicy {
+            no_localhost: true,
+            ..SessionPolicy::default()
+        };
+        assert!(again("http://loop.test/", closed).await);
+        // Private: passed when allowed, served again when not.
+        assert!(!again("http://lan.test/", private.clone()).await);
+        assert!(!again("http://10.0.0.1/", private.clone()).await);
+        assert!(again("http://lan.test/", default.clone()).await);
+        assert!(again("http://10.0.0.1/", default.clone()).await);
+        // A name that does not resolve, or no host: served again (fail closed).
+        assert!(again("http://nothing.invalid/", private.clone()).await);
+        assert!(again("not a url", private.clone()).await);
+        // Every address must be local and allowed; one public address serves again.
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(local_and_allowed(
+            Some(&[ip("10.0.0.1"), ip("127.0.0.1")]),
+            "m",
+            80,
+            &private,
+            &ports
+        ));
+        assert!(!local_and_allowed(
+            Some(&[ip("10.0.0.1"), ip("8.8.8.8")]),
+            "m",
+            80,
+            &private,
+            &ports
+        ));
+        assert!(!local_and_allowed(
+            Some(&[ip("127.0.0.1")]),
+            "m",
+            9222,
+            &default,
+            &ports
+        ));
+        assert!(!local_and_allowed(None, "m", 80, &default, &ports));
+        assert!(!local_and_allowed(Some(&[]), "m", 80, &default, &ports));
     }
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
