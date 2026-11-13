@@ -283,50 +283,53 @@ fn the_human_profile_is_untouched() {
             denied_before
         );
 
-        // A popup of the human page: there and loaded within 3 s.
-        let before: Vec<String> = page_targets(conn)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|t| t.target_id)
-            .collect();
-        let started = std::time::Instant::now();
-        let r = conn
-            .send(
-                "Runtime.evaluate",
-                json!({ "expression": format!("String(!!window.open('{}/marker'))", h.fixture.origin), "userGesture": true, "returnByValue": true }),
-                Some(&s),
-            )
+        // A popup of the human page loads within 3 s, under the guard and, as a control, in
+        // a second browser launched the same way that has no guard.
+        let (_env2, fixture2, plain) = common::launched().await;
+        let plain_human = human_page(&plain).await;
+        let ps = plain.conn.attach(&plain_human).await.unwrap();
+        plain
+            .conn
+            .navigate(&ps, &format!("{}/counter", fixture2.origin))
             .await
             .unwrap();
-        assert_eq!(r["result"]["value"], "true", "{r}");
-        let popup = loop {
-            let found = page_targets(conn)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|t| !before.contains(&t.target_id) && t.url.ends_with("/marker"));
-            if let Some(t) = found {
-                break t.target_id;
+        let control = human_popup_loads(&plain.conn, &ps, &fixture2.origin).await;
+        plain.close().await;
+        eprintln!("control (no guard): {control:?}");
+        let control_popup =
+            control.expect("the popup step fails without a guard: the test is wrong");
+        let guarded = human_popup_loads(conn, &s, &h.fixture.origin).await;
+        let popup = match guarded {
+            Ok((popup, took)) => {
+                eprintln!(
+                    "under the guard: loaded in {took:?} (control: {:?})",
+                    control_popup.1
+                );
+                popup
             }
-            assert!(started.elapsed() < Duration::from_secs(3), "no human popup");
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            Err((popup, state)) => {
+                let log: Vec<String> = h
+                    .manager
+                    .guard_attach_log()
+                    .into_iter()
+                    .filter(|l| popup.as_deref().is_some_and(|p| l.starts_with(p)))
+                    .collect();
+                panic!("the human popup did not load in 3 s under the guard: {state}; guard log: {log:?}");
+            }
         };
-        let ps = conn.attach(&popup).await.unwrap();
-        loop {
-            let marker = conn
-                .evaluate(&ps, "window.pageMarker || null")
-                .await
-                .unwrap();
-            if marker == "main" {
-                break;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(3),
-                "the human popup did not load in 3 s"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let log: Vec<String> = h
+            .manager
+            .guard_attach_log()
+            .into_iter()
+            .filter(|l| l.starts_with(&popup))
+            .collect();
+        eprintln!("guard log for the popup: {log:?}");
+        // The guard saw the popup as the human's and let it go at once.
+        assert!(
+            log.iter()
+                .any(|l| l.contains(" human ") && l.contains("released resume=ok")),
+            "{log:?}"
+        );
         let _ = conn
             .send("Target.closeTarget", json!({ "targetId": popup }), None)
             .await;
@@ -335,6 +338,87 @@ fn the_human_profile_is_untouched() {
             .send("Target.detachFromTarget", json!({ "sessionId": s }), None)
             .await;
     });
+}
+
+/// The first page of the browser's human profile.
+async fn human_page(b: &pegboard_core::browser::Browser) -> String {
+    page_targets(&b.conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.browser_context_id.as_deref() == Some(b.human_context.as_str()))
+        .expect("a human page")
+        .target_id
+}
+
+/// Makes the human page (CDP session `human`) open `<origin>/counter` with a user gesture and
+/// waits up to 3 s for the popup's title. `Ok((popup, time to load))`, or `Err((popup if one
+/// appeared, where it stood))`.
+async fn human_popup_loads(
+    conn: &CdpConn,
+    human: &str,
+    origin: &str,
+) -> Result<(String, Duration), (Option<String>, String)> {
+    let limit = Duration::from_secs(3);
+    let before: Vec<String> = page_targets(conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.target_id)
+        .collect();
+    let started = std::time::Instant::now();
+    // Deferred, so that a held popup cannot hold this evaluate too.
+    let open = format!("setTimeout(() => window.open('{origin}/counter'), 0); 'scheduled'");
+    conn.send(
+        "Runtime.evaluate",
+        json!({ "expression": open, "userGesture": true }),
+        Some(human),
+    )
+    .await
+    .unwrap();
+    let popup = loop {
+        let found = page_targets(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| !before.contains(&t.target_id));
+        if let Some(t) = found {
+            break t.target_id;
+        }
+        if started.elapsed() > limit {
+            return Err((None, "no popup target appeared".into()));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let ps = conn.attach(&popup).await.unwrap();
+    let mut last = String::new();
+    while started.elapsed() < limit {
+        let state = tokio::time::timeout(
+            Duration::from_millis(500),
+            conn.evaluate(
+                &ps,
+                "JSON.stringify([location.href, document.readyState, document.title])",
+            ),
+        )
+        .await;
+        match state {
+            Ok(Ok(v)) => {
+                last = v.as_str().unwrap_or_default().to_string();
+                if last.contains("\"counter\"]") {
+                    return Ok((popup, started.elapsed()));
+                }
+            }
+            Ok(Err(e)) => last = format!("evaluate failed: {e:#}"),
+            Err(_) => last = "evaluate did not answer in 500 ms".into(),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let info = conn
+        .send("Target.getTargetInfo", json!({ "targetId": popup }), None)
+        .await
+        .map(|v| v["targetInfo"].to_string())
+        .unwrap_or_else(|e| format!("{e:#}"));
+    Err((Some(popup), format!("last state {last}; target {info}")))
 }
 
 /// Waits up to 15 s for the guard to be back.
