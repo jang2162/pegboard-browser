@@ -966,7 +966,7 @@ mod tests {
             .unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].len() + 1 <= MAX_LINE_BYTES, "{}", lines[0].len());
+        assert!(lines[0].len() < MAX_LINE_BYTES, "{}", lines[0].len());
         let got: ActionEntry = serde_json::from_str(lines[0]).unwrap();
         // The words that had to go are named by their size; a redaction marker and short
         // words stay as they are, and nothing of an over-long word is kept.
