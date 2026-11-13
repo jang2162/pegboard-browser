@@ -142,13 +142,19 @@ pub async fn judge_request(
 ///   `allow_private_network`.
 ///
 /// `data:` and `blob:` stay open in every case (nothing leaves the browser).
-pub fn connect_src(policy: &SessionPolicy) -> String {
+///
+/// `None` when the CSP would restrict nothing (no allow-list and `allow_private_network`):
+/// such documents are not served again. A served-again document loses its address space,
+/// and Chrome then refuses its loopback and private requests outright when it is not a
+/// secure context (an `http:` page on a name other than `localhost`).
+pub fn connect_src(policy: &SessionPolicy) -> Option<String> {
     let mut sources: Vec<String> = Vec::new();
     if policy.allow_domains.is_empty() {
-        sources.extend(["'self'", "http:", "https:", "wss:"].map(String::from));
         if policy.allow_private_network {
-            sources.push("ws:".into());
-        } else if !policy.no_localhost {
+            return None;
+        }
+        sources.extend(["'self'", "http:", "https:", "wss:"].map(String::from));
+        if !policy.no_localhost {
             for host in ["localhost", "*.localhost", "127.0.0.1", "[::1]"] {
                 sources.push(format!("ws://{host}:*"));
             }
@@ -170,7 +176,7 @@ pub fn connect_src(policy: &SessionPolicy) -> String {
         }
     }
     sources.extend(["data:", "blob:"].map(String::from));
-    format!("connect-src {}", sources.join(" "))
+    Some(format!("connect-src {}", sources.join(" ")))
 }
 
 /// Whether a document response can run script that opens connections (it gets the CSP).
@@ -607,7 +613,9 @@ impl Inner {
                     .collect()
             })
             .unwrap_or_default();
-        let csp = connect_src(policy);
+        let Some(csp) = connect_src(policy) else {
+            return pass().await;
+        };
         // No document is made from a redirect, an empty answer or a download.
         let no_document = params.get("responseErrorReason").is_some()
             || (300..400).contains(&status)
@@ -691,7 +699,7 @@ mod tests {
 
     #[test]
     fn with_an_allow_list_only_the_listed_hosts_can_be_connected_to() {
-        let csp = connect_src(&listed(&["example.com", "10.0.0.1", "::1"]));
+        let csp = connect_src(&listed(&["example.com", "10.0.0.1", "::1"])).unwrap();
         let w = words(&csp);
         for source in [
             "http://example.com:*",
@@ -711,7 +719,7 @@ mod tests {
 
     #[test]
     fn without_an_allow_list_plain_websockets_go_to_loopback_and_the_own_origin_only() {
-        let w_of = |p: SessionPolicy| connect_src(&p);
+        let w_of = |p: SessionPolicy| connect_src(&p).unwrap();
         let default = w_of(SessionPolicy::default());
         let w = words(&default);
         for source in [
@@ -734,11 +742,21 @@ mod tests {
         });
         assert!(!closed.contains("ws://"), "{closed}");
         assert!(!words(&closed).contains(&"ws:"), "{closed}");
-        let open = w_of(SessionPolicy {
+        // Nothing to restrict: the document is passed on as it came.
+        for no_localhost in [false, true] {
+            let open = SessionPolicy {
+                allow_private_network: true,
+                no_localhost,
+                ..SessionPolicy::default()
+            };
+            assert_eq!(connect_src(&open), None);
+        }
+        // With an allow-list there is always a CSP.
+        let listed_open = SessionPolicy {
             allow_private_network: true,
-            ..SessionPolicy::default()
-        });
-        assert!(words(&open).contains(&"ws:"), "{open}");
+            ..listed(&["a.test"])
+        };
+        assert!(connect_src(&listed_open).is_some());
     }
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
