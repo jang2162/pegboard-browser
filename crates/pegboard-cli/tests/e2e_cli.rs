@@ -6,7 +6,8 @@
 //! locking, signals or leftovers: `full_flow`, `daemon_exits_when_browser_is_closed`,
 //! `leftovers_of_a_dead_pegboard_are_cleaned_on_start`, `concurrent_browser_start_yields_one_daemon`,
 //! `sigterm_closes_sessions_then_removes_socket`, `waiting_start_spawns_when_lock_is_released`,
-//! `browser_start_waits_out_a_stopping_daemon`.
+//! `browser_start_waits_out_a_stopping_daemon`, `idle_session_is_closed_after_the_expiry` (the
+//! daemon needs `PEGBOARD_TEST_IDLE_SECS` in its environment, which is read once at its start).
 
 mod common;
 
@@ -705,4 +706,47 @@ fn oversized_command_line_exits_2_with_limit_exceeded() {
     // The session still works.
     assert_eq!(home.run(&["--session", &sid, "get", "url"]).0, 0);
     assert_eq!(home.run(&["session", "close", &sid]).0, 0);
+}
+
+#[test]
+#[ignore]
+fn idle_session_is_closed_after_the_expiry() {
+    let home = Home::new();
+    let (code, _, err) = home.run_env(&[("PEGBOARD_TEST_IDLE_SECS", "3")], &["browser", "start"]);
+    assert_eq!(code, 0, "{err}");
+    let create = |extra: &[&str]| {
+        let mut args = vec!["session", "create"];
+        args.extend_from_slice(extra);
+        let (code, out, err) = home.run(&args);
+        assert_eq!(code, 0, "{err}");
+        session_handle(&out)
+    };
+    let idle = create(&[]);
+    let kept = create(&["--no-expire"]);
+    let busy = create(&[]);
+    // A command that runs for longer than the expiry is not cut, and the session is not
+    // closed under it; the idle time counts from its end.
+    let (code, _, err) = home.run(&["--session", &busy, "wait", "5000"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(home.run(&["--session", &busy, "get", "url"]).0, 0);
+    let listed = |id: &str| {
+        let (_, out, _) = home.run(&["session", "list", "--json"]);
+        json(&out).as_array().unwrap().iter().any(|s| s["id"] == id)
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while listed(id_of(&idle)) {
+        assert!(Instant::now() < deadline, "the idle session was not closed");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(listed(id_of(&kept)), "a no-expire session was closed");
+    assert_eq!(home.run(&["--session", &kept, "get", "url"]).0, 0);
+    // Its recording is finalized.
+    let rid = format!("r_{}", &id_of(&idle)[2..]);
+    let (code, out, _) = home.run(&["recording", "show", &rid, "--json"]);
+    assert_eq!(code, 0);
+    assert!(json(&out)["manifest"]["endedAt"].is_string());
+    // The expired handle no longer works.
+    let (code, _, err) = home.run(&["--session", &idle, "get", "url"]);
+    assert_ne!(code, 0, "{err}");
+    assert_eq!(home.run(&["session", "close", &kept]).0, 0);
 }

@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use pegboard_protocol::{
@@ -41,6 +41,56 @@ struct Slot {
     token: String,
     /// A close is running.
     closing: AtomicBool,
+    /// Commands accepted and not finished yet (running, or waiting for the log).
+    busy: AtomicUsize,
+    /// When the session was created or its last command ended.
+    last_end: Mutex<Instant>,
+}
+
+/// How long a session may sit without a command before it is closed.
+const DEFAULT_IDLE: Duration = Duration::from_secs(3600);
+
+/// The idle period: `PEGBOARD_TEST_IDLE_SECS` (a test hook, read once when the daemon
+/// starts, so only whoever starts the daemon can set it) or an hour.
+fn idle_period(var: Option<&str>) -> Duration {
+    match var.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => DEFAULT_IDLE,
+    }
+}
+
+impl Slot {
+    fn new(log: SessionLog, token: String) -> Slot {
+        Slot {
+            log,
+            token,
+            closing: AtomicBool::new(false),
+            busy: AtomicUsize::new(0),
+            last_end: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// No command is running or waiting, and the last one ended at least `period` ago.
+    fn idle_for(&self, period: Duration) -> bool {
+        self.busy.load(Ordering::SeqCst) == 0 && self.last_end.lock().unwrap().elapsed() >= period
+    }
+}
+
+/// A command in flight; the session's idle time counts from when it is dropped.
+struct Active<'a>(&'a Slot);
+
+impl<'a> Active<'a> {
+    fn begin(slot: &'a Slot) -> Active<'a> {
+        slot.busy.fetch_add(1, Ordering::SeqCst);
+        Active(slot)
+    }
+}
+
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        *self.0.last_end.lock().unwrap() = Instant::now();
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub struct Daemon {
@@ -54,6 +104,9 @@ pub struct Daemon {
     slots: Mutex<HashMap<SessionId, Arc<Slot>>>,
     /// Set once shutdown begins; new sessions and commands are refused from then on.
     stopping: AtomicBool,
+    /// Sessions without a command for this long are closed (unless their policy says
+    /// `no_expire`).
+    idle: Duration,
     shutdown_done: AsyncMutex<bool>,
     stop: watch::Sender<bool>,
     me: Weak<Daemon>,
@@ -274,6 +327,7 @@ impl Daemon {
         // Once, here: it is what lets the runner tell `tab_gone` from other failures.
         runner.set_session_targets_provider(sessions.targets_fn());
         let (stop, _) = watch::channel(false);
+        let idle = idle_period(std::env::var("PEGBOARD_TEST_IDLE_SECS").ok().as_deref());
         let daemon = Arc::new_cyclic(|me| Daemon {
             paths,
             browser,
@@ -283,6 +337,7 @@ impl Daemon {
             chrome_version,
             slots: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
+            idle,
             shutdown_done: AsyncMutex::new(false),
             stop,
             me: me.clone(),
@@ -299,7 +354,53 @@ impl Daemon {
                 }
             }
         });
+        // Sessions nobody has used for the idle period are closed like `session close` does.
+        let weak = Arc::downgrade(&daemon);
+        let every = (idle / 4).clamp(Duration::from_millis(100), Duration::from_secs(30));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(d) = weak.upgrade() else { return };
+                d.expire_idle().await;
+            }
+        });
         Ok(daemon)
+    }
+
+    /// Closes the sessions that have been idle for the idle period. A session with a
+    /// command in flight is never closed (its idle time starts when the command ends).
+    async fn expire_idle(&self) {
+        if self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let due: Vec<(SessionId, Arc<Slot>)> = self
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, slot)| slot.idle_for(self.idle))
+            .map(|(id, slot)| (id.clone(), slot.clone()))
+            .collect();
+        for (id, slot) in due {
+            if matches!(self.sessions.policy(&id), Ok(p) if p.no_expire) {
+                continue;
+            }
+            // Same path as `session close`. `closing` is set before `busy` is looked at
+            // again: a command that got in first is seen, one that comes later is refused.
+            if slot.closing.swap(true, Ordering::SeqCst) {
+                continue;
+            }
+            if slot.busy.load(Ordering::SeqCst) > 0 {
+                slot.closing.store(false, Ordering::SeqCst);
+                continue;
+            }
+            if let Err(e) = self.close_slot(id.clone(), slot, false).await {
+                eprintln!(
+                    "pegboard: expiring session {}: {}: {}",
+                    id.0, e.code, e.message
+                );
+            }
+        }
     }
 
     /// Asks whoever runs the daemon to end it (`wait_stopped` then returns).
@@ -436,11 +537,7 @@ impl Daemon {
             return Err(e);
         }
         let token = new_token();
-        let slot = Arc::new(Slot {
-            log: log.clone(),
-            token: token.clone(),
-            closing: AtomicBool::new(false),
-        });
+        let slot = Arc::new(Slot::new(log.clone(), token.clone()));
         // Checked under the lock `shutdown` drains with: a session is either drained by
         // the shutdown or refused here, never left behind.
         let refused = {
@@ -524,9 +621,19 @@ impl Daemon {
         if slot.closing.swap(true, Ordering::SeqCst) {
             return Err(no_session(&id));
         }
+        self.close_slot(id, slot, p.keep_tabs).await
+    }
+
+    /// Closes a session whose slot has `closing` set by the caller.
+    async fn close_slot(
+        &self,
+        id: SessionId,
+        slot: Arc<Slot>,
+        keep_tabs: bool,
+    ) -> Result<SessionInfo, RpcError> {
         let p = SessionCloseParams {
             session_id: id.clone(),
-            keep_tabs: p.keep_tabs,
+            keep_tabs,
         };
         let me = self.me()?;
         let closed = tokio::spawn(async move {
@@ -575,6 +682,8 @@ impl Daemon {
         let slot = self.authorize(&id, p.token.as_deref())?;
         checked_timeout(p.timeout_ms)?;
         checked_argv_size(&p.argv)?;
+        // Counted from here, so the session is not closed for idleness under the command.
+        let _active = Active::begin(&slot);
         // One command at a time per session; other sessions are not held up.
         let mut log = begin_command(&slot, &id).await?;
         let result = run_command(
@@ -701,6 +810,34 @@ mod tests {
     }
 
     #[test]
+    fn idle_period_comes_from_the_test_variable_or_is_an_hour() {
+        assert_eq!(idle_period(None), Duration::from_secs(3600));
+        assert_eq!(idle_period(Some("2")), Duration::from_secs(2));
+        for bad in ["", "0", "-1", "soon"] {
+            assert_eq!(idle_period(Some(bad)), Duration::from_secs(3600), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_session_with_a_command_in_flight_is_not_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = slot(tmp.path());
+        let period = Duration::from_millis(50);
+        assert!(!slot.idle_for(period), "just created");
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(slot.idle_for(period));
+        {
+            let _active = Active::begin(&slot);
+            std::thread::sleep(Duration::from_millis(80));
+            assert!(!slot.idle_for(period), "a command is running");
+        }
+        // The idle time starts when the command ends.
+        assert!(!slot.idle_for(period));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(slot.idle_for(period));
+    }
+
+    #[test]
     fn command_timeout_is_bounded() {
         assert!(checked_timeout(None).is_ok());
         assert!(checked_timeout(Some(1)).is_ok());
@@ -722,11 +859,10 @@ mod tests {
             "157",
             "0.42.0",
         );
-        Slot {
-            log: Arc::new(AsyncMutex::new(ActionLog::open(&paths, manifest).unwrap())),
-            token: "t".into(),
-            closing: AtomicBool::new(false),
-        }
+        Slot::new(
+            Arc::new(AsyncMutex::new(ActionLog::open(&paths, manifest).unwrap())),
+            "t".into(),
+        )
     }
 
     #[tokio::test]
