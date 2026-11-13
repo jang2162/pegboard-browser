@@ -876,26 +876,53 @@ fn redirect_to_private_address_is_blocked() {
     ]);
     assert!(!out.contains("SECRET-BODY"), "{out}");
     assert!(!srv.reached(&fm) && !srv.reached(&nm));
-    // Positive control: the redirect itself works to an allowed address.
+    // Positive control, from the page again (the tab now shows the failed navigation): the
+    // redirect itself works to an allowed address.
+    let (code, _, err) = open(&h, &page);
+    assert_eq!(code, 0, "{err}");
     let to = format!("http://127.0.0.1:{}/secret?m={}", srv.b, marker("ok"));
     let ok = format!("http://localhost:{}/redirect?to={}", srv.a, enc(&to));
     assert_eq!(settle(&h, &read_js(&ok)), "BODY:SECRET-BODY");
     close(&h);
 }
 
+fn is_secure_context(handle: &str) -> bool {
+    let (code, out, err) =
+        shared_home().run(&["--session", handle, "eval", "window.isSecureContext"]);
+    assert_eq!(code, 0, "{err}");
+    json(&out)["result"] == true
+}
+
 #[test]
 #[ignore]
 fn allow_domain_closes_everything_else_including_localhost() {
     let srv = AddressServer::start();
-    let listed_page = format!("http://{LISTED_NAME}:{}/page", srv.a);
+    // A listed name that resolves to loopback is not open unless the list also opens
+    // loopback (DNS rebinding of a listed name).
+    let (code, out, err) = shared_home().run(&[
+        "session",
+        "create",
+        "--profile",
+        profile("pol-listed-only"),
+        "--allow-domain",
+        LISTED_NAME,
+        "--url",
+        &format!("http://{LISTED_NAME}:{}/page", srv.a),
+    ]);
+    assert_denied((code, out, err), "localhost is closed for this session");
+
+    // `listed.localhost` opens loopback for the listed names, and its page is a secure
+    // context (Chrome refuses local requests from an insecure one, whatever the policy).
+    let local_name = "listed.localhost";
     let h = create(&[
         "--profile",
         profile("pol-listed"),
         "--allow-domain",
-        LISTED_NAME,
+        &format!("{LISTED_NAME},{local_name}"),
         "--url",
-        &listed_page,
+        &format!("http://{local_name}:{}/page", srv.a),
     ]);
+    assert!(is_secure_context(&h));
     assert_denied(
         open(&h, &format!("http://localhost:{}/page", srv.a)),
         "not in the session's allowed domains",
@@ -910,12 +937,13 @@ fn allow_domain_closes_everything_else_including_localhost() {
     assert_ne!(settle(&h, &img_js(&unlisted("/img", &im))), "LOADED");
     let ws = format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b);
     assert_ne!(settle(&h, &ws_js(&ws)), "OPEN");
-    let lws = format!("ws://localhost:{}/ws?m={}", srv.b, marker("lw"));
+    let lm = marker("lw");
+    let lws = format!("ws://localhost:{}/ws?m={lm}", srv.b);
     assert_ne!(settle(&h, &ws_js(&lws)), "OPEN");
-    for m in [&fm, &wm, &im] {
+    for m in [&fm, &wm, &im, &lm] {
         assert!(!srv.reached(m), "{m} reached an unlisted host");
     }
-    // What is listed works, WebSocket included, on another port of the listed host.
+    // What is listed works, WebSocket included, on another port of the listed hosts.
     let (fm, wm) = (marker("f"), marker("w"));
     let listed = format!("http://{LISTED_NAME}:{}/secret?m={fm}", srv.b);
     assert_eq!(settle(&h, &read_js(&listed)), "BODY:SECRET-BODY");
@@ -931,13 +959,70 @@ fn allow_domain_closes_everything_else_including_localhost() {
         "--allow-domain",
         &format!("{LISTED_NAME},localhost"),
         "--url",
-        &listed_page,
+        &format!("http://localhost:{}/page", srv.a),
     ]);
-    let (code, _, err) = open(&h, &format!("http://localhost:{}/page", srv.a));
-    assert_eq!(code, 0, "{err}");
     let ws = format!("ws://localhost:{}/ws?m={}", srv.b, marker("w"));
     assert_eq!(settle(&h, &ws_js(&ws)), "OPEN");
     close(&h);
+}
+
+/// What Chrome does to a document pegboard serves again (with its CSP) on an insecure
+/// origin: such a document has no address space of its own, and these requests are allowed
+/// by the session's policy. Expected to pass; a failure means serving documents again breaks
+/// pages on `http:` origins other than `localhost` (the D4 stop condition).
+#[test]
+#[ignore]
+fn served_again_page_on_an_insecure_origin_reaches_allowed_local_hosts() {
+    let srv = AddressServer::start();
+    // An allow-list (served again): an `http:` name that resolves to loopback.
+    let h = create(&[
+        "--profile",
+        profile("pol-listed-local"),
+        "--allow-domain",
+        &format!("{LISTED_NAME},localhost"),
+        "--url",
+        &format!("http://{LISTED_NAME}:{}/page", srv.a),
+    ]);
+    eprintln!("listed page secure context: {}", is_secure_context(&h));
+    let same = format!("http://{LISTED_NAME}:{}/secret?m={}", srv.a, marker("s"));
+    let other = format!("http://{LISTED_NAME}:{}/secret?m={}", srv.b, marker("o"));
+    let got_same = settle(&h, &read_js(&same));
+    let got_other = settle(&h, &read_js(&other));
+    close(&h);
+    // The default policy (served again): the same name, no allow-list.
+    let h = create(&[
+        "--profile",
+        profile("pol-insecure-default"),
+        "--url",
+        &format!("http://{UNLISTED_NAME}:{}/page", srv.a),
+    ]);
+    let other_default = format!("http://{UNLISTED_NAME}:{}/secret?m={}", srv.b, marker("d"));
+    let got_default = settle(&h, &read_js(&other_default));
+    close(&h);
+    // Control without serving again (`--allow-private-network`, no allow-list): an `http:`
+    // page on the private name.
+    let lan = srv.lan();
+    let h = create(&[
+        "--profile",
+        profile("pol-priv-open"),
+        "--allow-private-network",
+        "--url",
+        &format!("http://{PRIVATE_NAME}:{lan}/page"),
+    ]);
+    let control = format!("http://{PRIVATE_NAME}:{lan}/secret?m={}", marker("c"));
+    let got_control = settle(&h, &read_js(&control));
+    close(&h);
+    eprintln!(
+        "listed same-origin: {got_same}; listed other port: {got_other}; \
+         default other port: {got_default}; not served again: {got_control}"
+    );
+    assert_eq!(got_control, "BODY:SECRET-BODY", "control");
+    assert_eq!(got_same, "BODY:SECRET-BODY", "listed, same origin");
+    assert_eq!(got_other, "BODY:SECRET-BODY", "listed, other port");
+    assert_eq!(
+        got_default, "BODY:SECRET-BODY",
+        "default policy, other port"
+    );
 }
 
 #[test]
@@ -962,24 +1047,24 @@ fn new_tabs_and_popups_are_guarded_before_their_first_request() {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     };
-    let click = |h: &str, selector: &str| {
+    // A click that opens a window can leave agent-browser on the new tab, so the page is
+    // opened again in the current tab before each click.
+    let click = |h: &str, page: &str, selector: &str| {
+        let (code, _, err) = open(h, page);
+        assert_eq!(code, 0, "{page}: {err}");
         let (code, _, err) = shared_home().run(&["--session", h, "click", selector]);
         assert_eq!(code, 0, "{selector}: {err}");
     };
 
     let (tm, pm, wm) = (marker("tab"), marker("pop"), marker("wopen"));
-    let h = create(&[
-        "--profile",
-        profile("pol-priv-closed"),
-        "--url",
-        &page_to(&private(&pm), &private(&wm)),
-    ]);
+    let page = page_to(&private(&pm), &private(&wm));
+    let h = create(&["--profile", profile("pol-priv-closed"), "--url", &page]);
     assert_denied(
         shared_home().run(&["--session", &h, "tab", "new", &private(&tm)]),
         "private network address",
     );
-    click(&h, "#pop");
-    click(&h, "#wopen");
+    click(&h, &page, "#pop");
+    click(&h, &page, "#wopen");
     std::thread::sleep(std::time::Duration::from_secs(3));
     for m in [&tm, &pm, &wm] {
         assert!(!srv.reached(m), "{m} reached the private server");
@@ -988,15 +1073,16 @@ fn new_tabs_and_popups_are_guarded_before_their_first_request() {
 
     // Positive control: with the private network allowed the same popups load.
     let (pm, wm) = (marker("pop"), marker("wopen"));
+    let page = page_to(&private(&pm), &private(&wm));
     let h = create(&[
         "--profile",
         profile("pol-priv-open"),
         "--allow-private-network",
         "--url",
-        &page_to(&private(&pm), &private(&wm)),
+        &page,
     ]);
-    click(&h, "#pop");
-    click(&h, "#wopen");
+    click(&h, &page, "#pop");
+    click(&h, &page, "#wopen");
     wait_reached(&[&pm, &wm]);
     assert!(srv.reached(&pm), "the link popup did not load (control)");
     assert!(
