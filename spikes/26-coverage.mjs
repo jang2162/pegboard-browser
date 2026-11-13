@@ -96,7 +96,7 @@ try {
     // does the browser-level Fetch also see cross-site iframe subrequests, a dedicated worker, a popup's first request?
     paused.length = 0;
     await P.navigate(ps, `${probe.origin}/oop`).catch(() => {});
-    await ev(ps, `new Promise(r=>{const w=new Worker(URL.createObjectURL(new Blob(["fetch('/ok?d3=blw-worker',{mode:'no-cors'}).then(()=>postMessage(1))"])));w.onmessage=()=>r(1);setTimeout(()=>r(0),3000)})`);
+    await ev(ps, `new Promise(r=>{const w=new Worker(URL.createObjectURL(new Blob(["fetch('${probe.origin}/ok?d3=blw-worker',{mode:'no-cors'}).then(()=>postMessage(1))"])));w.onmessage=()=>r(1);setTimeout(()=>r(0),3000)})`);
     await ev(ps, `window.open('/blank?d3=blw-popup')&&1`, true);
     await sleep(1500);
     d3.browserLevel_extra = { crossSiteIframeImg: pausedFor('inner-img').length > 0, crossSiteIframeFetch: pausedFor('inner-fetch').length > 0, dedicatedWorkerFetch: pausedFor('blw-worker').length > 0, popupFirstRequest: pausedFor('blw-popup').length > 0 };
