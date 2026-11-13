@@ -163,3 +163,66 @@ async fn undelivered_session_create_is_discarded() {
     assert_eq!(undelivered.lock().unwrap().len(), 1);
     server.abort();
 }
+
+/// A raw server: answers each request line with `{"n": <method>}` after the delay the
+/// method names (`slow` waits 600 ms), and with the id `id_of(request id)`.
+fn raw_server(
+    paths: &pegboard_core::paths::Paths,
+    id_of: fn(u64) -> u64,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{BufRead, BufReader};
+    let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            std::thread::spawn(move || {
+                let mut write = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { return };
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    let method = req["method"].as_str().unwrap().to_string();
+                    if method == "slow" {
+                        std::thread::sleep(Duration::from_millis(600));
+                    }
+                    let id = id_of(req["id"].as_u64().unwrap());
+                    let answer = json!({"jsonrpc": JSONRPC, "id": id, "result": {"n": method}});
+                    if writeln!(write, "{answer}").is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    })
+}
+
+#[test]
+fn a_late_response_is_not_taken_for_the_next_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
+    let _server = raw_server(&paths, |id| id);
+    let mut client = Client::connect(&paths).unwrap();
+    client.set_call_limit(Duration::from_millis(200));
+    let e = client.call::<_, Value>("slow", json!({})).unwrap_err();
+    assert_eq!(e.code, pegboard_protocol::codes::TIMEOUT);
+    // The late answer to `slow` arrives while the next call waits.
+    std::thread::sleep(Duration::from_millis(500));
+    client.set_call_limit(Duration::from_secs(5));
+    let r: Value = client.call("fast", json!({})).unwrap();
+    assert_eq!(r["n"], "fast", "the next call got its own answer");
+}
+
+#[test]
+fn an_answer_with_another_id_is_an_internal_error_and_drops_the_connection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    std::fs::create_dir_all(paths.socket.parent().unwrap()).unwrap();
+    // The server answers one id behind.
+    let _server = raw_server(&paths, |id| id + 100);
+    let mut client = Client::connect(&paths).unwrap();
+    let e = client.call::<_, Value>("a", json!({})).unwrap_err();
+    assert_eq!(e.code, pegboard_protocol::codes::INTERNAL);
+    // The next call connects anew (its id starts again) and is judged by the same rule.
+    let e = client.call::<_, Value>("b", json!({})).unwrap_err();
+    assert_eq!(e.code, pegboard_protocol::codes::INTERNAL);
+}

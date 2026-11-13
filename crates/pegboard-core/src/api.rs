@@ -201,8 +201,14 @@ async fn write_line(
 
 /// A blocking client of the core API.
 pub struct Client {
+    paths: Paths,
     reader: BufReader<StdStream>,
     next_id: u64,
+    /// Set when the connection can no longer be trusted to answer the next request (a
+    /// timeout, a wrong answer, a failed write): the next call connects anew.
+    broken: bool,
+    /// Replaces the per-method time limit (tests).
+    limit: Option<Duration>,
 }
 
 fn not_running() -> RpcError {
@@ -228,8 +234,11 @@ impl Client {
     pub fn connect(paths: &Paths) -> Result<Client, RpcError> {
         match StdStream::connect(&paths.socket) {
             Ok(stream) => Ok(Client {
+                paths: paths.clone(),
                 reader: BufReader::new(stream),
                 next_id: 1,
+                broken: false,
+                limit: None,
             }),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                 // Stale only if no daemon holds the lock: a daemon that is starting has
@@ -244,7 +253,33 @@ impl Client {
         }
     }
 
+    /// Replaces the time limit of every call (for tests).
+    #[doc(hidden)]
+    pub fn set_call_limit(&mut self, limit: Duration) {
+        self.limit = Some(limit);
+    }
+
     pub fn call<P: Serialize, R: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: P,
+    ) -> Result<R, RpcError> {
+        if self.broken {
+            // The old connection may still deliver an answer to an earlier request.
+            let stream = StdStream::connect(&self.paths.socket).map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                    not_running()
+                }
+                _ => io_error(e),
+            })?;
+            self.reader = BufReader::new(stream);
+            self.next_id = 1;
+            self.broken = false;
+        }
+        self.exchange(method, params)
+    }
+
+    fn exchange<P: Serialize, R: DeserializeOwned>(
         &mut self,
         method: &str,
         params: P,
@@ -275,6 +310,9 @@ impl Client {
             "browser.stop" => Duration::from_secs(300),
             _ => Duration::from_secs(60),
         };
+        let limit = self.limit.unwrap_or(limit);
+        // Any failure from here on may leave an answer to this request on the way.
+        self.broken = true;
         let stream = self.reader.get_mut();
         stream.set_read_timeout(Some(limit)).map_err(io_error)?;
         stream.write_all(&line).map_err(io_error)?;
@@ -299,6 +337,19 @@ impl Client {
             });
         }
         let response: Response = serde_json::from_str(&answer).map_err(|e| io_error(e.into()))?;
+        // Id 0 is what the server uses for an error about the connection itself (busy,
+        // a line too long, not a request); the server closes after it.
+        if response.id != id && !(response.id == 0 && response.error.is_some()) {
+            return Err(RpcError {
+                code: codes::INTERNAL.to_string(),
+                message: "the daemon answered a different request; the connection was dropped"
+                    .to_string(),
+                data: None,
+            });
+        }
+        // The answer to this very request is read: the connection is clean again (unless
+        // the server speaks for the connection itself).
+        self.broken = response.id != id;
         if let Some(e) = response.error {
             return Err(e);
         }
