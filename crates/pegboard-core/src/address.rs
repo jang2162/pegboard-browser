@@ -135,13 +135,16 @@ pub fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
-/// RFC 1918, link-local, CGNAT, `0.0.0.0/8`, IPv6 ULA, IPv6 link-local and `::`; IPv6 forms
-/// that carry an IPv4 address are judged as that address.
+/// RFC 1918, link-local, CGNAT, `0.0.0.0/8`, benchmarking `198.18.0.0/15`, IETF protocol
+/// assignments `192.0.0.0/24`, IPv6 ULA, IPv6 link-local and `::`; IPv6 forms that carry an
+/// IPv4 address are judged as that address.
 pub fn is_private(ip: IpAddr) -> bool {
     match canonical(ip) {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             a == 10
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 192 && b == 0 && c == 0)
                 || a == 0
                 || (a == 172 && (16..=31).contains(&b))
                 || (a == 192 && b == 168)
@@ -441,6 +444,9 @@ mod tests {
             "fe80::1",
             "febf::1",
             "2002:c0a8:101::",
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.0.0.9",
         ] {
             assert!(is_private(ip(a)), "{a}");
             assert!(!is_loopback(ip(a)), "{a}");
@@ -451,6 +457,10 @@ mod tests {
             "100.63.0.1",
             "2001:db8::1",
             "fec0::1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "192.0.1.1",
+            "192.0.2.1",
         ] {
             assert!(!is_private(ip(a)) && !is_loopback(ip(a)), "{a}");
         }

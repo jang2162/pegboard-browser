@@ -177,16 +177,16 @@ pub async fn run_command_with_hook(
     if let Err(e) = sessions.require_guard() {
         return refuse(log, entry, argv, e, started);
     }
-    // An address the session may not open is refused here with the reason, before the
-    // guard would only make the page fail to load.
-    if let Err(e) = judge_navigation_urls(sessions, id, argv).await {
-        return refuse(log, entry, argv, e, started);
-    }
     let is_tab_new = matches!(checked, Checked::TabNew { .. });
     let mut run_argv = match checked {
         Checked::Run(words) => words,
         Checked::TabNew { url } => vec!["tab".to_string(), "new".to_string(), url],
     };
+    // An address the session may not open is refused here with the reason, before the
+    // guard would only make the page fail to load. Judged on the normalised words that run.
+    if let Err(e) = judge_navigation_urls(sessions, id, argv, &run_argv).await {
+        return refuse(log, entry, argv, e, started);
+    }
     // An upload names its files; they become paths only now that the policy allows it.
     let mut path_names = Vec::new();
     if run_argv.first().map(String::as_str) == Some("upload") {
@@ -264,16 +264,23 @@ pub async fn run_command_with_hook(
 }
 
 /// The URLs a navigating command line opens (`open`, `tab new`, `a11y <url>`, `vitals <url>`),
-/// each judged by the session's address policy.
+/// each judged by the session's address policy. The grammar finds them in `argv`; the words
+/// judged are those of `run` (the normalised line that runs), at the same positions.
 async fn judge_navigation_urls(
     sessions: &SessionManager,
     id: &SessionId,
     argv: &[String],
+    run: &[String],
 ) -> Result<(), RpcError> {
     if argv::class_of(argv) != Some(ActionClass::Navigate) {
         return Ok(());
     }
-    for url in argv::text_at(argv).urls.iter().filter_map(|&i| argv.get(i)) {
+    for &i in &argv::text_at(argv).urls {
+        let url = run.get(i).ok_or_else(|| RpcError {
+            code: codes::INTERNAL.to_string(),
+            message: "a URL of the command line is missing from the line that runs".into(),
+            data: None,
+        })?;
         sessions.judge_navigation(id, url).await?;
     }
     Ok(())

@@ -536,6 +536,23 @@ impl SessionManager {
         self.inner.guard.denied()
     }
 
+    /// Connections the guard has made (diagnostics: a reconnect shows as a jump).
+    #[doc(hidden)]
+    pub fn guard_connections(&self) -> u64 {
+        self.inner.guard.connections()
+    }
+
+    /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: drops the guard's connection as a
+    /// failure would and keeps it down for `hold`. Returns whether it did.
+    #[doc(hidden)]
+    pub fn drop_guard_for_test(&self, hold: Duration) -> bool {
+        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+            return false;
+        }
+        self.inner.guard.drop_connection_for_test(hold);
+        true
+    }
+
     /// Opens a window of the profile (and its bridge) if it has none.
     pub async fn open_profile(&self, name: &str) -> Result<(), RpcError> {
         check_profile(&*self.inner.profiles.lock().await, name)?;

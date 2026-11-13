@@ -11,10 +11,15 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const NAVIGATE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Largest message and frame a queued connection takes (Chrome sends a CDP message as one
+/// frame). The request guard reads response bodies in pieces well below this; the limit is
+/// there so that no other message (a long URL in an event) can end the guard's connection.
+const QUEUED_MAX_MESSAGE: usize = 256 << 20;
 
 #[derive(Debug, Clone)]
 pub struct CdpEvent {
@@ -55,23 +60,28 @@ impl CdpConn {
 
     /// Connects sending extra HTTP headers with the upgrade request (e.g. `Authorization`).
     pub async fn connect_with_headers(ws_url: &str, headers: &[(&str, &str)]) -> Result<CdpConn> {
-        Self::open(ws_url, headers, None).await
+        Self::open(ws_url, headers, None, None).await
     }
 
     /// Connects and also hands every event to the returned queue, none dropped (the
     /// broadcast of `events` drops events for a reader that lags). The queue ends when the
-    /// connection does.
+    /// connection does. Messages up to 256 MiB are accepted (tungstenite's default is 64 MiB
+    /// a message and 16 MiB a frame).
     pub async fn connect_queued(
         ws_url: &str,
     ) -> Result<(CdpConn, mpsc::UnboundedReceiver<CdpEvent>)> {
         let (tx, rx) = mpsc::unbounded_channel();
-        Ok((Self::open(ws_url, &[], Some(tx)).await?, rx))
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(QUEUED_MAX_MESSAGE))
+            .max_frame_size(Some(QUEUED_MAX_MESSAGE));
+        Ok((Self::open(ws_url, &[], Some(tx), Some(config)).await?, rx))
     }
 
     async fn open(
         ws_url: &str,
         headers: &[(&str, &str)],
         queue: Option<mpsc::UnboundedSender<CdpEvent>>,
+        config: Option<WebSocketConfig>,
     ) -> Result<CdpConn> {
         let mut request = ws_url
             .into_client_request()
@@ -82,7 +92,7 @@ impl CdpConn {
                 HeaderValue::from_str(value).context("invalid header value")?,
             );
         }
-        let (ws, _) = tokio_tungstenite::connect_async(request)
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(request, config, false)
             .await
             .with_context(|| format!("connecting to {ws_url}"))?;
         let (mut sink, mut stream) = ws.split();
@@ -133,6 +143,9 @@ impl CdpConn {
                 }
             }
             reader.queue.lock().unwrap().take();
+            // The stream ended or failed (e.g. a message over the limit): close the socket
+            // too, so the other side sees the end and nothing half-open is left.
+            let _ = reader.out.send(Message::Close(None));
             // Connection closed: fail every outstanding request, and every later one.
             let waiters: Vec<_> = {
                 let mut pending = reader.pending.lock().unwrap();

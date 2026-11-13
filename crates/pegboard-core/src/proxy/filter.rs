@@ -128,8 +128,9 @@ const URL_REFUSED: &str = "url scheme is not allowed in a pegboard session";
 /// Methods that could turn off, take over or hide pegboard's request checks (`guard`):
 /// request interception of the client's own (a later client session that intercepts can win
 /// over pegboard's, spike G4/D5), request blocking and throttling, the service-worker bypass,
-/// CSP bypass (the WebSocket defence is a CSP pegboard adds to documents), permissions (the
-/// guard grants local-network access to agent profiles), and handing the protocol to a page.
+/// CSP bypass (the WebSocket defence is a CSP pegboard adds to documents), permissions (a
+/// local-network-access grant would switch off Chrome's own check of local addresses), and
+/// handing the protocol to a page.
 /// Refused on every level, whatever the allow-list says (`ALLOWED_METHODS` must not name
 /// them; a test pins it).
 pub const GUARD_METHODS: &[&str] = &[
@@ -152,7 +153,7 @@ pub const GUARD_METHODS: &[&str] = &[
 ];
 /// Every method of these domains is refused like `GUARD_METHODS`.
 pub const GUARD_PREFIXES: &[&str] = &["Fetch."];
-const GUARD_REFUSED: &str = "not allowed in a pegboard session: it would change pegboard's checks of the session's requests";
+pub const GUARD_REFUSED: &str = "not allowed in a pegboard session: it would change pegboard's checks of the session's requests";
 
 pub fn is_guard_method(method: &str) -> bool {
     GUARD_METHODS.contains(&method) || GUARD_PREFIXES.iter().any(|p| method.starts_with(p))

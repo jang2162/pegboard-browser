@@ -11,11 +11,11 @@
 //!   paused, failed or changed. The extension's own targets are let go the same way.
 //! - Each paused request is judged by `judge_request`: the URL first, then every address the
 //!   daemon resolves its host name to (2 s limit; no answer fails the request).
-//! - WebSocket handshakes never reach `Fetch` (spike B1). Documents that can run script are
-//!   served again with a `Content-Security-Policy: connect-src` header derived from the
-//!   address policy (`connect_src`; spike B2, round 3). The browser grants local-network
-//!   access in agent profiles (`Browser::grant_local_network`), without which Chrome holds the
-//!   local requests of such a document.
+//! - WebSocket handshakes never reach `Fetch` (spike B1). Documents from public addresses
+//!   that may run script are served again with a `Content-Security-Policy: connect-src`
+//!   header derived from the address policy (`connect_src`; spike B2, round 3), their bodies
+//!   read in pieces up to `MAX_BODY`. Documents from allowed loopback and private addresses
+//!   pass unchanged (owner's ruling, `serves_again`).
 //! - A target the guard cannot set up is closed (a tab) or left waiting (a frame or worker):
 //!   it never runs unguarded. If the connection ends, Chrome lifts the interception (G5):
 //!   `ready()` is false until the guard has reconnected and the daemon refuses commands
@@ -43,6 +43,15 @@ pub type OwnPorts = Arc<dyn Fn() -> Vec<u16> + Send + Sync>;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_PAUSE: Duration = Duration::from_millis(500);
+/// Largest document body the guard serves again; a larger one (as sent or once decoded) is
+/// failed. Read in `BODY_PIECE` pieces, so no single CDP message gets big.
+pub const MAX_BODY: usize = 16 << 20;
+const BODY_PIECE: usize = 1 << 20;
+/// Request-stage resolutions of documents kept for their response stage; past this many
+/// the table is emptied (those documents are then served again: fail closed).
+const MAX_PENDING_DOCUMENTS: usize = 4096;
+/// How long a failed tab's status is kept for a waiter.
+const FAILED_KEPT: Duration = Duration::from_secs(60);
 
 /// Kinds of target whose requests the guard intercepts on their own session.
 const INTERCEPTED: &[&str] = &["page", "iframe", "shared_worker", "service_worker"];
@@ -100,35 +109,63 @@ pub async fn judge_request(
     own_ports: &[u16],
     resolver: &Resolver,
 ) -> Verdict {
+    judge_and_resolve(url, policy, own_ports, resolver).await.0
+}
+
+/// Where a request was judged to go: its host and port and the addresses it was judged on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub host: String,
+    pub port: u16,
+    pub addresses: Vec<IpAddr>,
+}
+
+/// `judge_request`, also returning the addresses an allowed http(s)/ws(s) request was judged
+/// on: the resolved ones for a name, the literal for an IP, 127.0.0.1 for `*.localhost`.
+pub async fn judge_and_resolve(
+    url: &str,
+    policy: &SessionPolicy,
+    own_ports: &[u16],
+    resolver: &Resolver,
+) -> (Verdict, Option<Resolved>) {
     let verdict = judge_url(url, policy, own_ports);
     if verdict != Verdict::Allow {
-        return verdict;
+        return (verdict, None);
     }
     let Ok(parsed) = Url::parse(url) else {
-        return Verdict::Deny(address::SCHEME);
+        return (Verdict::Deny(address::SCHEME), None);
     };
     if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") {
-        return verdict;
+        return (verdict, None);
     }
-    let (Some(Target::Name(name)), Some(port)) =
-        (address::target_of(&parsed), parsed.port_or_known_default())
+    let (Some(target), Some(port)) = (address::target_of(&parsed), parsed.port_or_known_default())
     else {
-        return verdict;
+        return (verdict, None);
     };
-    if address::is_loopback_name(&name) {
-        return verdict;
-    }
+    let resolved = |host: String, addresses: Vec<IpAddr>| Resolved {
+        host,
+        port,
+        addresses,
+    };
+    let name = match target {
+        Target::Ip(ip) => return (verdict, Some(resolved(ip.to_string(), vec![ip]))),
+        Target::Name(name) if address::is_loopback_name(&name) => {
+            let loopback = vec![IpAddr::from([127, 0, 0, 1])];
+            return (verdict, Some(resolved(name, loopback)));
+        }
+        Target::Name(name) => name,
+    };
     let addresses = match resolver.resolve(&name, port).await {
         Ok(a) if !a.is_empty() => a,
-        _ => return Verdict::Deny(address::UNRESOLVED),
+        _ => return (Verdict::Deny(address::UNRESOLVED), None),
     };
-    for ip in addresses {
+    for &ip in &addresses {
         let v = judge_resolved(ip, port, &name, policy, own_ports);
         if v != Verdict::Allow {
-            return v;
+            return (v, None);
         }
     }
-    Verdict::Allow
+    (Verdict::Allow, Some(resolved(name, addresses)))
 }
 
 /// The `Content-Security-Policy` an agent document is served with: `connect-src` derived
@@ -179,37 +216,17 @@ pub fn connect_src(policy: &SessionPolicy) -> Option<String> {
     Some(format!("connect-src {}", sources.join(" ")))
 }
 
-/// Whether a document from `url` is served again with the CSP. Not when its host is on an
-/// allowed loopback or private address (owner's ruling): served again, such a document would
-/// lose its address space, and Chrome refuses the local requests of an insecure document
-/// without one (second-machine round 2), which breaks `http:` intranet and dev sites. Those
-/// documents pass unchanged; their requests are still judged, their WebSockets are not
-/// covered. Anything else is served again: a public address, a name that does not resolve,
-/// a URL without a host.
-pub async fn serves_again(
-    url: &str,
-    policy: &SessionPolicy,
-    own_ports: &[u16],
-    resolver: &Resolver,
-) -> bool {
-    let Ok(parsed) = Url::parse(url) else {
-        return true;
-    };
-    let (Some(target), Some(port)) = (address::target_of(&parsed), parsed.port_or_known_default())
-    else {
-        return true;
-    };
-    let (host, addresses) = match target {
-        Target::Ip(ip) => (ip.to_string(), Some(vec![ip])),
-        Target::Name(name) if address::is_loopback_name(&name) => {
-            (name, Some(vec![IpAddr::from([127, 0, 0, 1])]))
-        }
-        Target::Name(name) => {
-            let found = resolver.resolve(&name, port).await.ok();
-            (name, found)
-        }
-    };
-    !local_and_allowed(addresses.as_deref(), &host, port, policy, own_ports)
+/// Whether a document is served again with the CSP, given the addresses its request was
+/// judged on at the request stage (`stored`; never resolved again, so a second DNS answer
+/// cannot pick the outcome). Not when every one of them is a loopback or private address the
+/// policy allows (owner's ruling): served again, such a document would lose its address
+/// space, and Chrome refuses the local requests of an insecure document without one
+/// (second-machine round 2), which breaks `http:` intranet and dev sites. Those documents
+/// pass unchanged; their requests are still judged, their WebSockets are not covered.
+/// Anything else is served again: a public address, a mix, no stored resolution.
+pub fn serves_again(stored: Option<&Resolved>, policy: &SessionPolicy, own_ports: &[u16]) -> bool {
+    !stored
+        .is_some_and(|r| local_and_allowed(Some(&r.addresses), &r.host, r.port, policy, own_ports))
 }
 
 /// True when the host's addresses are known, all loopback or private, and all allowed.
@@ -229,26 +246,50 @@ fn local_and_allowed(
     })
 }
 
-/// Whether a document response can run script that opens connections (it gets the CSP).
-fn runs_script(headers: &[(String, String)]) -> bool {
-    let Some((_, value)) = headers
+/// Types a navigation never turns into a document that runs script: Chrome shows them as
+/// they are (images other than SVG, media, fonts, plain text, CSS, JSON, PDF in its viewer)
+/// or saves them (`application/octet-stream`, archives). Chrome does not sniff `text/plain`
+/// or `application/octet-stream` into HTML for a navigation.
+fn is_inert_type(mime: &str) -> bool {
+    let inert_family = ["image/", "audio/", "video/", "font/"]
         .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-    else {
-        return true;
-    };
-    let mime = value
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    mime.is_empty()
-        || mime.ends_with("+xml")
+        .any(|f| mime.starts_with(f));
+    (inert_family && !mime.contains("svg"))
         || matches!(
-            mime.as_str(),
-            "text/html" | "application/xhtml+xml" | "text/xml" | "application/xml"
+            mime,
+            "text/plain"
+                | "text/css"
+                | "text/csv"
+                | "application/json"
+                | "application/pdf"
+                | "application/octet-stream"
+                | "application/zip"
+                | "application/gzip"
+                | "application/x-gzip"
+                | "application/x-tar"
+                | "application/x-7z-compressed"
+                | "application/wasm"
         )
+}
+
+/// Whether a document response may run script (and so gets the CSP). Fail closed: yes,
+/// unless every `Content-Type` value (all headers, each comma-separated item; Chrome uses
+/// the last valid one) is a known inert type. A missing or unparseable type, and the types
+/// Chrome sniffs (`unknown/unknown`, `application/unknown`, `*/*`), may become HTML.
+fn runs_script(headers: &[(String, String)]) -> bool {
+    let types: Vec<String> = headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+        .flat_map(|(_, v)| v.split(','))
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .collect();
+    types.is_empty() || types.iter().any(|t| !is_inert_type(t))
 }
 
 fn is_attachment(headers: &[(String, String)]) -> bool {
@@ -278,8 +319,12 @@ fn reserved_headers(headers: &[(String, String)], csp: &str) -> Vec<Value> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
-    Guarded,
-    Failed,
+    /// Interception is on; `paused` when the guard held the target from its start (it was
+    /// attached waiting for the debugger), so not one of its requests went unjudged.
+    Guarded {
+        paused: bool,
+    },
+    Failed(std::time::Instant),
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +339,11 @@ struct State {
     sessions: HashMap<String, Attached>,
     /// Agent page targets and whether interception is on for them.
     pages: HashMap<String, Status>,
+    /// Request id of an allowed document request -> where it was judged to go, for its
+    /// response stage (`serves_again`).
+    documents: HashMap<String, Resolved>,
+    /// Connections made so far (diagnostics: a reconnect shows as a jump).
+    connections: u64,
     /// Refused requests per reason, since the daemon started (diagnostics, no URLs).
     denied: BTreeMap<&'static str, u64>,
 }
@@ -312,6 +362,8 @@ struct Inner {
     changed: watch::Sender<u64>,
     /// True while the guard's connection is up and auto-attach is on.
     ready: watch::Sender<bool>,
+    /// Test hook (`drop_connection_for_test`): no reconnect before this instant.
+    hold_until: Mutex<Option<tokio::time::Instant>>,
 }
 
 pub struct Guard {
@@ -348,6 +400,7 @@ impl Guard {
             conn: Mutex::new(None),
             changed: watch::channel(0).0,
             ready: watch::channel(false).0,
+            hold_until: Mutex::new(None),
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner)));
         Guard { inner, supervisor }
@@ -375,11 +428,17 @@ impl Guard {
             loop {
                 let status = self.inner.state.lock().unwrap().pages.get(target).copied();
                 match status {
-                    Some(Status::Guarded) if self.is_ready() => return Ok(()),
-                    Some(Status::Failed) => {
+                    Some(Status::Guarded { paused: true }) if self.is_ready() => return Ok(()),
+                    // Attached only after it had started (the guard was reconnecting): its
+                    // first requests may have gone unjudged.
+                    Some(Status::Guarded { paused: false }) => {
+                        bail!("pegboard could not check the first requests of the new tab")
+                    }
+                    Some(Status::Failed(_)) => {
+                        self.inner.state.lock().unwrap().pages.remove(target);
                         bail!("pegboard could not check the requests of the new tab")
                     }
-                    _ => {}
+                    Some(Status::Guarded { paused: true }) | None => {}
                 }
                 if changed.changed().await.is_err() {
                     bail!("pegboard's request guard stopped");
@@ -396,6 +455,23 @@ impl Guard {
     pub fn denied(&self) -> BTreeMap<&'static str, u64> {
         self.inner.state.lock().unwrap().denied.clone()
     }
+
+    /// Connections the guard has made since it started (diagnostics).
+    #[doc(hidden)]
+    pub fn connections(&self) -> u64 {
+        self.inner.state.lock().unwrap().connections
+    }
+
+    /// Test hook: closes the guard's connection as a failure would, and keeps it from
+    /// reconnecting for `hold`. The caller gates it (`SessionManager`).
+    #[doc(hidden)]
+    pub fn drop_connection_for_test(&self, hold: Duration) {
+        *self.inner.hold_until.lock().unwrap() = Some(tokio::time::Instant::now() + hold);
+        self.inner.ready.send_replace(false);
+        if let Some(conn) = self.inner.conn.lock().unwrap().as_ref() {
+            conn.close();
+        }
+    }
 }
 
 async fn supervise(inner: Weak<Inner>) {
@@ -403,8 +479,14 @@ async fn supervise(inner: Weak<Inner>) {
         let Some(guard) = inner.upgrade() else {
             return;
         };
+        let hold = *guard.hold_until.lock().unwrap();
+        if let Some(until) = hold {
+            tokio::time::sleep_until(until).await;
+            guard.hold_until.lock().unwrap().take();
+        }
         if let Ok((conn, events)) = guard.connect().await {
             *guard.conn.lock().unwrap() = Some(conn.clone());
+            guard.state.lock().unwrap().connections += 1;
             guard.clone().run(conn, events).await;
             guard.conn.lock().unwrap().take();
         }
@@ -413,6 +495,7 @@ async fn supervise(inner: Weak<Inner>) {
             let mut state = guard.state.lock().unwrap();
             state.sessions.clear();
             state.pages.clear();
+            state.documents.clear();
         }
         guard.changed.send_modify(|n| *n += 1);
         drop(guard);
@@ -440,6 +523,9 @@ impl Inner {
 
     /// Handles the connection's events until it ends.
     async fn run(self: Arc<Self>, conn: CdpConn, mut events: mpsc::UnboundedReceiver<CdpEvent>) {
+        if self.hold_until.lock().unwrap().is_some() {
+            return;
+        }
         self.ready.send_replace(true);
         self.changed.send_modify(|n| *n += 1);
         while let Some(event) = events.recv().await {
@@ -476,7 +562,10 @@ impl Inner {
         let waiting = p["waitingForDebugger"].as_bool().unwrap_or(false);
         // The session the event came on owns the new one (`None`: the browser's).
         let parent = event.session_id.clone();
-        let foreign = context == self.human_context || url.starts_with("chrome-extension://");
+        // The bridge extension's service worker runs in every profile; it is let go like the
+        // human's targets. Any other extension target in an agent profile is judged.
+        let bridge_worker = kind == "service_worker" && url.starts_with("chrome-extension://");
+        let foreign = context == self.human_context || bridge_worker;
         if !foreign && !session.is_empty() {
             let mut state = self.state.lock().unwrap();
             state.sessions.insert(
@@ -538,10 +627,10 @@ impl Inner {
                         .send("Runtime.runIfWaitingForDebugger", json!({}), s)
                         .await;
                 }
-                self.set_page(kind, target, Status::Guarded);
+                self.set_page(kind, target, Status::Guarded { paused: waiting });
             }
             Err(_) => {
-                self.set_page(kind, target, Status::Failed);
+                self.set_page(kind, target, Status::Failed(std::time::Instant::now()));
                 if kind == "page" {
                     let _ = conn
                         .send("Target.closeTarget", json!({ "targetId": target }), None)
@@ -555,11 +644,14 @@ impl Inner {
         if kind != "page" {
             return;
         }
-        self.state
-            .lock()
-            .unwrap()
-            .pages
-            .insert(target.to_string(), status);
+        {
+            let mut state = self.state.lock().unwrap();
+            // Failures nobody waited for do not pile up.
+            state
+                .pages
+                .retain(|_, s| !matches!(s, Status::Failed(at) if at.elapsed() > FAILED_KEPT));
+            state.pages.insert(target.to_string(), status);
+        }
         self.changed.send_modify(|n| *n += 1);
     }
 
@@ -569,8 +661,9 @@ impl Inner {
         };
         let mut state = self.state.lock().unwrap();
         if let Some(gone) = state.sessions.remove(session) {
-            // A tab's session ends with the tab; keep a failure visible to a waiter.
-            if state.pages.get(&gone.target) == Some(&Status::Guarded) {
+            // A tab's session ends with the tab; a failure stays visible to a waiter for a
+            // while (`FAILED_KEPT`).
+            if matches!(state.pages.get(&gone.target), Some(Status::Guarded { .. })) {
                 state.pages.remove(&gone.target);
             }
         }
@@ -622,8 +715,29 @@ impl Inner {
             return pass().await;
         }
         let own_ports = (self.own_ports)();
-        match judge_request(url, &policy, &own_ports, &self.resolver).await {
-            Verdict::Allow => pass().await,
+        let (verdict, resolved) = judge_and_resolve(url, &policy, &own_ports, &self.resolver).await;
+        match verdict {
+            Verdict::Allow => {
+                if params["resourceType"] == "Document" {
+                    if let Some(resolved) = resolved {
+                        let mut state = self.state.lock().unwrap();
+                        if state.documents.len() >= MAX_PENDING_DOCUMENTS {
+                            state.documents.clear();
+                        }
+                        // Under the interception id and, in case Chrome gives the response
+                        // stage another one, under the request's network id (a redirect keeps
+                        // that id: each hop's response stage takes it before the next hop
+                        // stores it again).
+                        if let Some(network) = params["networkId"].as_str() {
+                            state
+                                .documents
+                                .insert(format!("net:{network}"), resolved.clone());
+                        }
+                        state.documents.insert(request_id.to_string(), resolved);
+                    }
+                }
+                pass().await
+            }
             Verdict::Deny(reason) => {
                 *self.state.lock().unwrap().denied.entry(reason).or_default() += 1;
                 fail().await
@@ -663,45 +777,55 @@ impl Inner {
                     .collect()
             })
             .unwrap_or_default();
+        let fail = || async {
+            let _ = conn
+                .send(
+                    "Fetch.failRequest",
+                    json!({ "requestId": request_id, "errorReason": "BlockedByClient" }),
+                    s,
+                )
+                .await;
+        };
+        // Where the request stage judged this document to go (taken in any case, so the
+        // table does not keep it).
+        let stored = {
+            let mut state = self.state.lock().unwrap();
+            let by_id = state.documents.remove(request_id);
+            let by_network = params["networkId"]
+                .as_str()
+                .and_then(|n| state.documents.remove(&format!("net:{n}")));
+            by_id.or(by_network)
+        };
         let Some(csp) = connect_src(policy) else {
             return pass().await;
         };
-        // No document is made from a redirect, an empty answer or a download.
+        // No document is made from a redirect, an empty answer, an error or a download.
+        let has_location = headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("location"));
         let no_document = params.get("responseErrorReason").is_some()
-            || (300..400).contains(&status)
+            || (matches!(status, 301 | 302 | 303 | 307 | 308) && has_location)
             || matches!(status, 204 | 205)
             || is_attachment(&headers)
             || !runs_script(&headers);
         if no_document {
             return pass().await;
         }
-        let url = params
-            .pointer("/request/url")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         let own_ports = (self.own_ports)();
-        if !serves_again(url, policy, &own_ports, &self.resolver).await {
+        if !serves_again(stored.as_ref(), policy, &own_ports) {
             return pass().await;
         }
         let served = async {
-            let body = conn
-                .send(
-                    "Fetch.getResponseBody",
-                    json!({ "requestId": request_id }),
-                    s,
-                )
-                .await?;
-            let text = body["body"].as_str().unwrap_or_default();
-            let encoded = if body["base64Encoded"].as_bool().unwrap_or(false) {
-                text.to_string()
-            } else {
-                data_encoding::BASE64.encode(text.as_bytes())
+            let Some(body) =
+                read_body_capped(conn, session, request_id, &headers, MAX_BODY).await?
+            else {
+                bail!("the document is larger than {MAX_BODY} bytes");
             };
             let mut fulfill = json!({
                 "requestId": request_id,
                 "responseCode": status,
                 "responseHeaders": reserved_headers(&headers, &csp),
-                "body": encoded,
+                "body": data_encoding::BASE64.encode(&body),
             });
             if let Some(phrase) = params["responseStatusText"]
                 .as_str()
@@ -712,16 +836,85 @@ impl Inner {
             conn.send("Fetch.fulfillRequest", fulfill, s).await
         };
         if served.await.is_err() {
-            // The document cannot get its CSP: it does not load.
-            let _ = conn
-                .send(
-                    "Fetch.failRequest",
-                    json!({ "requestId": request_id, "errorReason": "BlockedByClient" }),
-                    s,
-                )
-                .await;
+            // The document cannot get its CSP (too large, or the body could not be read): it
+            // does not load.
+            *self
+                .state
+                .lock()
+                .unwrap()
+                .denied
+                .entry(NOT_SERVED)
+                .or_default() += 1;
+            fail().await;
         }
     }
+}
+
+/// Diagnostics key for documents failed because they could not be served again.
+pub const NOT_SERVED: &str = "document could not be served again";
+
+/// The body of a paused response, at most `limit` bytes, or `None` when it is larger.
+/// A declared `Content-Length` over the limit is refused without reading; otherwise the body
+/// is taken as a stream and read in `BODY_PIECE` pieces (as Chrome decodes it, so a small
+/// compressed body that grows past the limit is caught too).
+async fn read_body_capped(
+    conn: &CdpConn,
+    session: &str,
+    request_id: &str,
+    headers: &[(String, String)],
+    limit: usize,
+) -> Result<Option<Vec<u8>>> {
+    let declared = headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+        .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
+        .max();
+    if declared.is_some_and(|n| n > limit as u64) {
+        return Ok(None);
+    }
+    let s = Some(session);
+    let stream = conn
+        .send(
+            "Fetch.takeResponseBodyAsStream",
+            json!({ "requestId": request_id }),
+            s,
+        )
+        .await?;
+    let handle = stream["stream"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no stream handle"))?
+        .to_string();
+    let mut body = Vec::new();
+    let result = loop {
+        let piece = match conn
+            .send(
+                "IO.read",
+                json!({ "handle": handle, "size": BODY_PIECE }),
+                s,
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => break Err(e),
+        };
+        let data = piece["data"].as_str().unwrap_or_default();
+        if piece["base64Encoded"].as_bool().unwrap_or(false) {
+            match data_encoding::BASE64.decode(data.as_bytes()) {
+                Ok(bytes) => body.extend_from_slice(&bytes),
+                Err(e) => break Err(anyhow!("bad base64 from IO.read: {e}")),
+            }
+        } else {
+            body.extend_from_slice(data.as_bytes());
+        }
+        if body.len() > limit {
+            break Ok(None);
+        }
+        if piece["eof"].as_bool().unwrap_or(false) {
+            break Ok(Some(std::mem::take(&mut body)));
+        }
+    };
+    let _ = conn.send("IO.close", json!({ "handle": handle }), s).await;
+    result
 }
 
 /// Lets go of a target the guard does not judge: resumes it (Chrome holds a target an
@@ -820,7 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn documents_on_allowed_local_addresses_are_not_served_again() {
         let r = Resolver::from_rules(
-            "MAP pub.test 93.184.216.34, MAP loop.test 127.0.0.1, MAP lan.test 192.168.1.20, MAP mixed.test 10.0.0.1",
+            "MAP pub.test 93.184.216.34, MAP loop.test 127.0.0.1, MAP lan.test 192.168.1.20",
         );
         let ports = [9222];
         let default = SessionPolicy::default();
@@ -828,9 +1021,14 @@ mod tests {
             allow_private_network: true,
             ..SessionPolicy::default()
         };
+        // As the guard does it: the request stage judges and resolves, the response stage
+        // decides on what the request stage stored.
         let again = |url: &'static str, p: SessionPolicy| {
             let r = r.clone();
-            async move { serves_again(url, &p, &ports, &r).await }
+            async move {
+                let (_, stored) = judge_and_resolve(url, &p, &ports, &r).await;
+                serves_again(stored.as_ref(), &p, &ports)
+            }
         };
         // Public: served again.
         assert!(again("http://pub.test/", default.clone()).await);
@@ -840,7 +1038,8 @@ mod tests {
         assert!(!again("http://127.0.0.1:3000/", default.clone()).await);
         assert!(!again("http://[::1]:3000/", default.clone()).await);
         assert!(!again("http://a.localhost/", default.clone()).await);
-        // Loopback, not allowed by the policy: served again.
+        // Loopback, not allowed by the policy: nothing stored (the request was refused), so
+        // served again.
         let closed = SessionPolicy {
             no_localhost: true,
             ..SessionPolicy::default()
@@ -854,6 +1053,49 @@ mod tests {
         // A name that does not resolve, or no host: served again (fail closed).
         assert!(again("http://nothing.invalid/", private.clone()).await);
         assert!(again("not a url", private.clone()).await);
+    }
+
+    #[test]
+    fn the_response_stage_uses_the_request_stage_resolution_only() {
+        let ports = [9222];
+        let default = SessionPolicy::default();
+        let stored = |addresses: &[&str]| Resolved {
+            host: "rebind.test".into(),
+            port: 80,
+            addresses: addresses.iter().map(|a| a.parse().unwrap()).collect(),
+        };
+        // The request went to a public address: served again, whatever a later lookup of the
+        // name would say (there is no later lookup).
+        assert!(serves_again(
+            Some(&stored(&["93.184.216.34"])),
+            &default,
+            &ports
+        ));
+        // It went to an allowed loopback address: passed unchanged.
+        assert!(!serves_again(
+            Some(&stored(&["127.0.0.1"])),
+            &default,
+            &ports
+        ));
+        // One public address among them: served again.
+        assert!(serves_again(
+            Some(&stored(&["127.0.0.1", "93.184.216.34"])),
+            &default,
+            &ports
+        ));
+        // Nothing stored (the request stage never saw it, or the table was emptied): served
+        // again.
+        assert!(serves_again(None, &default, &ports));
+    }
+
+    #[test]
+    fn local_and_allowed_needs_every_address() {
+        let ports = [9222];
+        let default = SessionPolicy::default();
+        let private = SessionPolicy {
+            allow_private_network: true,
+            ..SessionPolicy::default()
+        };
         // Every address must be local and allowed; one public address serves again.
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         assert!(local_and_allowed(
@@ -881,6 +1123,75 @@ mod tests {
         assert!(!local_and_allowed(Some(&[]), "m", 80, &default, &ports));
     }
 
+    /// A CDP endpoint that answers `Fetch.takeResponseBodyAsStream` and `IO.read` with a body
+    /// of `total` bytes in pieces of `piece`, and counts the reads.
+    async fn body_server(
+        total: usize,
+        piece: usize,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reads.clone();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+            let mut sent = 0usize;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                let result = match v["method"].as_str().unwrap() {
+                    "Fetch.takeResponseBodyAsStream" => json!({ "stream": "s1" }),
+                    "IO.read" => {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let n = piece.min(total - sent);
+                        sent += n;
+                        let data = data_encoding::BASE64.encode(&vec![b'a'; n]);
+                        json!({ "data": data, "base64Encoded": true, "eof": sent == total })
+                    }
+                    _ => json!({}),
+                };
+                let reply = json!({ "id": v["id"], "result": result }).to_string();
+                if ws.send(Message::text(reply)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (url, reads)
+    }
+
+    #[tokio::test]
+    async fn document_bodies_are_read_in_pieces_up_to_the_limit() {
+        let ordinal = std::sync::atomic::Ordering::SeqCst;
+        let (piece, limit) = (1000, 10_000);
+        // Under the limit: the whole body.
+        let (url, _) = body_server(limit - 5, piece).await;
+        let conn = CdpConn::connect(&url).await.unwrap();
+        let body = read_body_capped(&conn, "S", "r1", &[], limit)
+            .await
+            .unwrap();
+        assert_eq!(body.map(|b| b.len()), Some(limit - 5));
+        // Over the limit, with no length declared (a compressed body grows when decoded):
+        // reading stops just past the limit.
+        let (url, reads) = body_server(limit * 100, piece).await;
+        let conn = CdpConn::connect(&url).await.unwrap();
+        let body = read_body_capped(&conn, "S", "r2", &[], limit)
+            .await
+            .unwrap();
+        assert!(body.is_none());
+        assert_eq!(reads.load(ordinal), limit / piece + 1);
+        // A declared length over the limit: refused without reading.
+        let (url, reads) = body_server(10, piece).await;
+        let conn = CdpConn::connect(&url).await.unwrap();
+        let too_long = vec![("Content-Length".to_string(), (limit + 1).to_string())];
+        let body = read_body_capped(&conn, "S", "r3", &too_long, limit)
+            .await
+            .unwrap();
+        assert!(body.is_none());
+        assert_eq!(reads.load(ordinal), 0);
+    }
+
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
             .iter()
@@ -902,6 +1213,41 @@ mod tests {
         assert!(runs_script(&h(&[])));
         assert!(!runs_script(&h(&[("content-type", "application/pdf")])));
         assert!(!runs_script(&h(&[("content-type", "text/plain")])));
+        assert!(!runs_script(&h(&[("content-type", "image/png")])));
+        assert!(!runs_script(&h(&[(
+            "content-type",
+            "application/octet-stream"
+        )])));
+        // Types Chrome sniffs, unknown and unparseable types: may become HTML.
+        for t in [
+            "unknown/unknown",
+            "application/unknown",
+            "*/*",
+            "",
+            "nonsense",
+            "application/x-whatever",
+            "text/xml",
+            "multipart/x-mixed-replace",
+        ] {
+            assert!(runs_script(&h(&[("content-type", t)])), "{t}");
+        }
+        // Every Content-Type value counts, in any header and any comma-separated item.
+        assert!(runs_script(&h(&[
+            ("content-type", "text/plain"),
+            ("Content-Type", "text/html")
+        ])));
+        assert!(runs_script(&h(&[
+            ("content-type", "text/html"),
+            ("Content-Type", "text/plain")
+        ])));
+        assert!(runs_script(&h(&[(
+            "content-type",
+            "text/plain, text/html"
+        )])));
+        assert!(!runs_script(&h(&[
+            ("content-type", "text/plain"),
+            ("content-type", "image/png")
+        ])));
         assert!(is_attachment(&h(&[(
             "Content-Disposition",
             "attachment; filename=a.html"
