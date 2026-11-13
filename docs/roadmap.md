@@ -55,7 +55,7 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 
 ## 1단계. 로컬 MVP (포크 없음)
 
-**자동 시험 완료, 수동 확인 대기 (2026-11-12)**: 구현과 자동 시험은 끝났다. 사람 손이 필요한 확인 M1~M7(화면 잠금, 다른 데스크톱 공간, 디스플레이 절전, 설정 누출, 다운로드 경로, 탭그룹 사이 끌기, 창 닫기)과 M8(사람 창을 클릭해 앞으로 가져온 뒤 `tab new`), M8b(에이전트 동작 중 다른 앱의 입력)는 아직 수행하지 않았다. 절차는 [phase1-manual-checks.md](./phase1-manual-checks.md). 9개가 끝나면 이 줄을 "완료"로 고친다.
+**자동 시험 완료, 수동 확인 수행, 한 항목이 기대와 다름 (2026-11-13)**: 구현과 자동 시험은 끝났고 수동 확인 9개(M1~M7, M8, M8b)를 모두 수행했다(데스크톱을 조작하는 에이전트가 수행, 결과는 [phase1-manual-checks.md](./phase1-manual-checks.md)). 8개는 기대대로였다. **M5(다운로드 경로)가 기대와 다르다**: 세션에서 받은 파일이 세션 디렉터리가 아니라 macOS 사용자의 `~/Downloads`에 생긴다. 그래서 이 줄을 "완료"로 바꾸지 않았다. 이것을 알려진 한계로 두고 1단계를 닫을지, 고친 뒤 닫을지는 사용자가 정한다. 그 밖에 남은 것: M2는 전체 화면 Space로만 확인했다(창 모드로 두 번째 일반 데스크탑에 둔 경우는 하지 않았다). M8b의 타이핑은 사람이 아니라 합성 키 입력이었다.
 
 **목적**: 핵심 고리 하나를 끝까지 잇는다. 에이전트가 세션을 만들고, 탭그룹 안에서만 작업하고, 그 기록이 남는다.
 
@@ -75,11 +75,11 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 11. 0단계에서 못 한 확인: 화면 잠금과 다른 데스크톱 공간에서의 동작, 브라우저 설정과 다운로드 경로의 프로필 간 누출.
 
 **동작하는 것** (각 줄 끝: 자동 시험 / 수동 확인 대기)
-- `pegboard session create --name "조사"`를 실행하면 에이전트 프로필의 창에 "조사" 탭그룹이 생긴다. → 자동 시험: `create_opens_group_in_agent_window`, `two_sessions_with_the_same_name_get_separate_groups`(e2e_session), `full_flow`(e2e_cli). 화면 잠금, 다른 공간, 절전 중의 동작은 수동 확인 M1~M3 대기.
+- `pegboard session create --name "조사"`를 실행하면 에이전트 프로필의 창에 "조사" 탭그룹이 생긴다. → 자동 시험: `create_opens_group_in_agent_window`, `two_sessions_with_the_same_name_get_separate_groups`(e2e_session), `full_flow`(e2e_cli). 화면 잠금, 다른 공간, 절전 중의 동작은 수동 확인 M1~M3에서 기대대로였다(2026-11-13).
 - `pegboard --session s_x open ...`, `snapshot -i`, `click @e1`, `fill @e2 ...`가 그 탭그룹 안에서 동작한다. → 자동 시험: `drives_the_session_tab`(e2e_runner), `full_flow`. 가려진 탭에서의 속도는 `hidden_session_tab_click_is_fast`, `session_tab_stays_responsive_when_hidden`.
-- 세션 두 개를 동시에 돌려도 서로의 탭이 보이지 않는다. 사람 프로필의 탭과 로그인 상태는 에이전트에게 닿지 않는다. → 자동 시험: 격리 시험 묶음 e2e_isolation의 `agent_cannot_list_or_switch_to_human_tabs`, `agent_cannot_read_human_cookies_or_storage`, `new_tabs_always_open_in_the_agent_profile`, `sessions_in_one_profile_share_cookies_but_not_tabs`, `agent_cannot_reach_other_sessions_tabs_by_id`, `session_cannot_use_another_sessions_handle`, `escape_flags_and_commands_are_refused`, `agent_actions_do_not_change_the_humans_active_tab`(브라우저 안의 활성 탭과 `hasFocus`만 증명, OS 포커스는 M8b), `stream_port_is_closed_for_every_session`, e2e_isolated_world의 `universal_access_isolated_world_cannot_escape`, e2e_proxy의 `browser_level_cookie_read_is_refused_and_page_level_is_scoped`와 `created_tab_lands_in_agent_profile_even_when_human_window_is_active`("사람 창이 마지막 활성" 전제는 Chrome을 다시 실행해 새 사람 창을 여는 방식으로 만들고 컨텍스트 없는 `createTarget`으로 확인한다. 사람의 실제 클릭은 M8), `tab_created_in_another_context_is_refused`(프록시가 다른 프로필에 생긴 탭을 거부함). 사람이 탭그룹 사이로 탭을 끄는 경우는 수동 확인 M6 대기.
+- 세션 두 개를 동시에 돌려도 서로의 탭이 보이지 않는다. 사람 프로필의 탭과 로그인 상태는 에이전트에게 닿지 않는다. → 자동 시험: 격리 시험 묶음 e2e_isolation의 `agent_cannot_list_or_switch_to_human_tabs`, `agent_cannot_read_human_cookies_or_storage`, `new_tabs_always_open_in_the_agent_profile`, `sessions_in_one_profile_share_cookies_but_not_tabs`, `agent_cannot_reach_other_sessions_tabs_by_id`, `session_cannot_use_another_sessions_handle`, `escape_flags_and_commands_are_refused`, `agent_actions_do_not_change_the_humans_active_tab`(브라우저 안의 활성 탭과 `hasFocus`만 증명, OS 포커스는 M8b), `stream_port_is_closed_for_every_session`, e2e_isolated_world의 `universal_access_isolated_world_cannot_escape`, e2e_proxy의 `browser_level_cookie_read_is_refused_and_page_level_is_scoped`와 `created_tab_lands_in_agent_profile_even_when_human_window_is_active`("사람 창이 마지막 활성" 전제는 Chrome을 다시 실행해 새 사람 창을 여는 방식으로 만들고 컨텍스트 없는 `createTarget`으로 확인한다. 사람의 실제 클릭은 M8), `tab_created_in_another_context_is_refused`(프록시가 다른 프로필에 생긴 탭을 거부함). 사람이 탭그룹 사이로 탭을 끄는 경우(M6), 에이전트 창 닫기(M7), 사람 창 클릭 뒤의 `tab new`(M8), 에이전트 동작 중 맨 앞 앱(M8b)은 수동 확인에서 기대대로였다(2026-11-13).
 - 세션에서 한 동작이 `actions.jsonl`에 남고 `pegboard recording show`로 읽을 수 있다. → 자동 시험: `every_command_is_logged_with_url_and_outcome`, `password_text_never_reaches_the_log`와 가림 시험들(e2e_actionlog), `full_flow`.
-- `pegboard profile create work`로 프로필을 만들고 `session create --profile work`로 그 프로필의 창에서 세션을 연다. 기본 프로필과 로그인 상태가 섞이지 않는다. → 자동 시험: `named_profile_is_isolated_from_default`(e2e_session), `sessions_in_different_profiles_share_nothing`(e2e_isolation). 설정과 다운로드 경로의 누출은 수동 확인 M4, M5 대기.
+- `pegboard profile create work`로 프로필을 만들고 `session create --profile work`로 그 프로필의 창에서 세션을 연다. 기본 프로필과 로그인 상태가 섞이지 않는다. → 자동 시험: `named_profile_is_isolated_from_default`(e2e_session), `sessions_in_different_profiles_share_nothing`(e2e_isolation). 설정은 수동 확인 M4에서 새지 않았다(2026-11-13). 다운로드 경로는 M5에서 기대와 달랐다: 받은 파일이 사람이 쓰는 `~/Downloads`에 생긴다.
 - macOS에서만.
 
 **아직 안 되는 것**: MCP, 화면 녹화, 정책, 사람이 평소 쓰는 브라우저로서의 사용(순정 Chromium이라), 원격.
@@ -120,6 +120,11 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 - 토큰 없는 API(`session list`, 기록 조회, `profile delete`, `browser stop`)에 권한 모델을 둘지.
 - 브라우저 수준 자동 연결을 넘기지 않고 프록시가 흉내 내는 방식.
 - 열린 파일 기술자 정리, 기록 보존 기간, 유휴 세션 만료.
+
+**수동 확인에서 넘어온 것 (2026-11-13)**
+- 다운로드 경로(M5): 세션에서 받은 파일이 `~/Downloads`에 확인 창 없이 저장된다. architecture.md 6절과 11절의 "다운로드는 세션별 디렉터리로"가 구현되어 있지 않다. 세션 디렉터리로 보내거나(CDP `Browser.setDownloadBehavior`는 브라우저 수준 메서드라 프록시의 기본 거부 규칙과 함께 정해야 한다) 다운로드를 막는다.
+- `pegboard tab new 'data:...'`은 성공으로 끝나지만 탭은 `about:blank`다(M6 중 관찰, 두 번 재현). `open`으로 여는 data 주소는 동작한다. 원인은 조사하지 않았다.
+- 그룹에 탭이 하나뿐이면 사람이 그 탭을 끌 때 그룹 전체가 움직인다(Chrome의 동작). 그룹을 따라 소속을 바꿀지 정할 때 참고한다.
 
 ---
 
