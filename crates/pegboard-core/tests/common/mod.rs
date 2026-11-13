@@ -432,8 +432,11 @@ use pegboard_core::profiles::Profiles;
 use pegboard_core::proxy::server::{Endpoint, ProxyServer, WsUpstream};
 use pegboard_core::runner::Runner;
 use pegboard_core::session::SessionManager;
-use pegboard_protocol::{SessionCreateParams, SessionInfo};
+use pegboard_protocol::{CommandExecResult, SessionCreateParams, SessionId, SessionInfo};
+use serde_json::{json, Value};
+use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -585,4 +588,184 @@ fn guard_leftovers(env: &Env) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+// ---- per-test view of the shared state, for suites that drive agent-browser ----
+
+/// A test's view of the binary's shared browser, proxy, session manager and runner: it owns the
+/// sessions and agent-browser daemons the test starts. Dropping it (also on test failure) kills
+/// those daemons and closes those sessions; `finish` does so and checks that nothing is left.
+pub struct Harness {
+    pub sh: &'static Shared,
+    pub daemons: Daemons,
+    sessions: Mutex<Vec<SessionId>>,
+}
+
+impl std::ops::Deref for Harness {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        self.sh
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let ids = std::mem::take(&mut *self.sessions.lock().unwrap());
+        if ids.is_empty() {
+            return;
+        }
+        let sh = self.sh;
+        spawn_shared(async move {
+            for id in ids {
+                sh.close_session(&id).await;
+            }
+        });
+    }
+}
+
+/// Sessions attached in a test, with their daemon's pid; kills those daemons when dropped.
+pub struct Daemons {
+    runner: Arc<Runner>,
+    list: Mutex<Vec<(SessionId, i32)>>,
+}
+
+impl Daemons {
+    fn add(&self, id: &SessionId) {
+        if let Some(pid) = self.runner.daemon_pid(id) {
+            self.list.lock().unwrap().push((id.clone(), pid));
+        }
+    }
+
+    fn get(&self) -> Vec<(SessionId, i32)> {
+        self.list.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Daemons {
+    fn drop(&mut self) {
+        for (id, _) in self.list.lock().unwrap().iter() {
+            self.runner.kill_daemon(id);
+        }
+    }
+}
+
+impl Harness {
+    /// Call inside `common::run`.
+    pub fn start() -> Harness {
+        let sh = shared();
+        Harness {
+            sh,
+            daemons: Daemons {
+                runner: sh.runner.clone(),
+                list: Mutex::new(Vec::new()),
+            },
+            sessions: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.fixture.origin)
+    }
+
+    /// A session on `path`, without agent-browser.
+    pub async fn create(&self, path: &str) -> (SessionInfo, Endpoint) {
+        let (info, ep) = self.sh.session(path).await;
+        self.sessions.lock().unwrap().push(info.id.clone());
+        (info, ep)
+    }
+
+    /// A session on `path` with agent-browser attached.
+    pub async fn session(&self, path: &str) -> (SessionInfo, Endpoint) {
+        let (info, ep) = self.create(path).await;
+        self.attach(&info.id, &ep).await;
+        (info, ep)
+    }
+
+    pub async fn attach(&self, id: &SessionId, ep: &Endpoint) {
+        let attached = self.runner.attach(id, ep).await;
+        self.daemons.add(id);
+        attached.unwrap();
+    }
+
+    pub async fn exec(
+        &self,
+        info: &SessionInfo,
+        ep: &Endpoint,
+        argv: &[&str],
+    ) -> CommandExecResult {
+        self.runner
+            .exec(&info.id, ep, &s(argv), 30_000)
+            .await
+            .unwrap_or_else(|e| panic!("{argv:?}: {e:?}"))
+    }
+
+    /// Evaluates on a fresh session of the test's own (browser-level) connection.
+    pub async fn eval(&self, target: &str, expr: &str) -> Value {
+        let conn = &self.browser.conn;
+        let s = conn.attach(target).await.unwrap();
+        let v = conn.evaluate(&s, expr).await.unwrap();
+        let _ = conn
+            .send("Target.detachFromTarget", json!({ "sessionId": s }), None)
+            .await;
+        v
+    }
+
+    /// Detaches every daemon, closes the test's sessions and checks that no daemon of this
+    /// test and no tab of this test's sessions is left.
+    pub async fn finish(self) {
+        let daemons = self.daemons.get();
+        for (id, _) in &daemons {
+            self.runner.detach(id).await.unwrap();
+        }
+        let ids = std::mem::take(&mut *self.sessions.lock().unwrap());
+        let mut targets = Vec::new();
+        for id in &ids {
+            targets.extend(self.sh.close_session(id).await);
+        }
+        let conn = &self.browser.conn;
+        let gone = eventually(5, || async {
+            daemons.iter().all(|(_, pid)| !alive(*pid))
+                && pegboard_core::cdp::page_targets(conn)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|t| !targets.contains(&t.target_id))
+        })
+        .await;
+        assert!(
+            gone,
+            "left behind: daemons {daemons:?}, tabs {targets:?} of the test's sessions"
+        );
+    }
+}
+
+pub fn s(v: &[&str]) -> Vec<String> {
+    v.iter().map(|x| x.to_string()).collect()
+}
+
+pub fn ok(r: &CommandExecResult) -> bool {
+    r.exit_code == 0 && r.output["success"] == json!(true)
+}
+
+pub fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks for existence.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Polls `check` every 100 ms for up to `secs` seconds.
+pub async fn eventually<F, Fut>(secs: u64, mut check: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if check().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
