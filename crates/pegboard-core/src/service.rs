@@ -153,8 +153,9 @@ struct SessionIdParams {
     token: Option<String>,
 }
 
+/// Unknown fields are refused: a misspelt `keepTabs` would close the tabs.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CloseParams {
     session_id: SessionId,
     #[serde(default)]
@@ -627,6 +628,25 @@ impl crate::api::Handler for Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn misspelt_fields_of_create_and_close_are_invalid_params() {
+        let e = params::<SessionCreateParams>(&json!({"policy": {"denny": ["eval"]}}))
+            .err()
+            .unwrap();
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        let e = params::<SessionCreateParams>(&json!({"policy": {"allow_domains": ["a.test"]}}))
+            .err()
+            .unwrap();
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        let e = params::<CloseParams>(&json!({"sessionId": "s_abcdefgh", "keepTab": true}))
+            .err()
+            .unwrap();
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        assert!(
+            params::<CloseParams>(&json!({"sessionId": "s_abcdefgh", "keepTabs": true})).is_ok()
+        );
+    }
 
     #[test]
     fn command_timeout_is_bounded() {

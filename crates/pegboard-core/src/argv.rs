@@ -506,7 +506,8 @@ pub fn check(argv: &[String], files_dir: &Path) -> Result<Checked, RpcError> {
 ///
 /// Every form carries a class (`form` takes it). Two are decided by the words as well:
 /// `wait --fn <expr>` evaluates script (`eval`), and `find <locator> <value> <action>` is
-/// what its action is (`fill` is `fill`, `hover` is `interact`, `text` is `get`; `click`,
+/// what its action is (`a11y <url>` and `vitals <url>` navigate first, so they are `navigate`;
+/// `fill` is `fill`, `hover` is `interact`, `text` is `get`; `click`,
 /// `check` and no action at all are `click`).
 pub fn class_of(argv: &[String]) -> Option<ActionClass> {
     let form = form_of(argv)?;
@@ -515,6 +516,8 @@ pub fn class_of(argv: &[String]) -> Option<ActionClass> {
     parse(form, words, Path::new("/")).ok()?;
     Some(match form.words {
         ["wait"] if words.iter().any(|w| w == "--fn") => ActionClass::Eval,
+        // With a URL they go there first.
+        ["a11y"] | ["vitals"] if !positionals(form, words).is_empty() => ActionClass::Navigate,
         ["find", ..] => match find_action(form, words) {
             Some("fill") => ActionClass::Fill,
             Some("hover") => ActionClass::Interact,
@@ -525,9 +528,8 @@ pub fn class_of(argv: &[String]) -> Option<ActionClass> {
     })
 }
 
-/// The action word of a `find` command line (words after `find <locator>`), if given: the
-/// last positional argument of the form, when it is one of the actions.
-fn find_action<'a>(form: &Form, words: &'a [String]) -> Option<&'a str> {
+/// The positional words (not flags, not flag values) of a line the grammar accepted.
+fn positionals<'a>(form: &Form, words: &'a [String]) -> Vec<&'a str> {
     let mut positional = Vec::new();
     let mut i = 0;
     while i < words.len() {
@@ -544,7 +546,13 @@ fn find_action<'a>(form: &Form, words: &'a [String]) -> Option<&'a str> {
             positional.push(w.as_str());
         }
     }
-    let action = *positional.get(form.args.len() - 1)?;
+    positional
+}
+
+/// The action word of a `find` command line (words after `find <locator>`), if given: the
+/// last positional argument of the form, when it is one of the actions.
+fn find_action<'a>(form: &Form, words: &'a [String]) -> Option<&'a str> {
+    let action = *positionals(form, words).get(form.args.len() - 1)?;
     matches!(FIND_ACTIONS, Choice(options) if options.contains(&action)).then_some(action)
 }
 
@@ -976,6 +984,10 @@ mod tests {
             (&["screenshot"], Snapshot),
             (&["pdf", "a.pdf"], Snapshot),
             (&["a11y"], Snapshot),
+            (&["a11y", "--tags", "wcag2a"], Snapshot),
+            (&["a11y", "https://a.test"], Navigate),
+            (&["a11y", "https://a.test", "-s", "#a"], Navigate),
+            (&["vitals", "https://a.test"], Navigate),
             (&["highlight", "#a"], Snapshot),
             (&["scrollintoview", "#a"], Scroll),
             (&["scroll", "down"], Scroll),
@@ -1038,9 +1050,10 @@ mod tests {
     }
 
     #[test]
-    fn no_grammar_form_is_left_without_a_class_at_its_own_words() {
-        // Each form reached by its own words gets the class its form carries, except the
-        // two that `class_of` refines.
+    fn a_minimal_line_of_every_form_parses_and_refinements_do_not_leak_to_other_forms() {
+        // A minimal line of each form parses (so has a class) and, but for `find`, gets the
+        // class its form carries: the per-flag refinements (`wait --fn`, `a11y <url>`) do not
+        // apply to other forms.
         for f in GRAMMAR {
             let class = {
                 let mut argv: Vec<String> = f.words.iter().map(|w| w.to_string()).collect();

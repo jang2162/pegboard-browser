@@ -109,27 +109,54 @@ pub fn validate(policy: &SessionPolicy) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// The policy as it is kept: domains lower-cased, sorted and without duplicates.
+/// The policy as it is kept: domains lower-cased (IP literals in `IpAddr` form), sorted and
+/// without duplicates; `allow` and `deny` without duplicates, in the order given.
 pub fn normalized(policy: &SessionPolicy) -> SessionPolicy {
     let mut policy = policy.clone();
     policy.allow_domains = normalized_domains(&policy.allow_domains);
+    dedup_keeping_order(&mut policy.allow);
+    dedup_keeping_order(&mut policy.deny);
     policy
 }
 
+fn dedup_keeping_order(classes: &mut Vec<ActionClass>) {
+    let mut seen = Vec::new();
+    classes.retain(|c| {
+        let fresh = !seen.contains(c);
+        seen.push(*c);
+        fresh
+    });
+}
+
 fn normalized_domains(domains: &[String]) -> Vec<String> {
-    let mut list: Vec<String> = domains.iter().map(|d| d.to_ascii_lowercase()).collect();
+    let mut list: Vec<String> = domains
+        .iter()
+        .map(|d| match d.parse::<IpAddr>() {
+            Ok(ip) => ip.to_string(),
+            Err(_) => d.to_ascii_lowercase(),
+        })
+        .collect();
     list.sort();
     list.dedup();
     list
 }
 
-/// One host name (letters, digits, '-' and '.') or one IP address.
+/// An allow-list entry: an IP literal `std` parses (no brackets), or a DNS name. A name is
+/// dot-separated labels of ASCII letters, digits and hyphens (punycode included), none empty
+/// or starting or ending with a hyphen, at most 253 characters in all; its last label is not
+/// all digits and does not start with `0x`, because resolvers and URL parsers read such names
+/// as numbers (`1`, `127.1`, `2130706433`, `0x7f.0.0.1` are all 127.0.0.1 or near it).
 fn is_host(s: &str) -> bool {
     if s.parse::<IpAddr>().is_ok() {
         return true;
     }
+    let Some(last) = s.rsplit('.').next() else {
+        return false;
+    };
     !s.is_empty()
         && s.len() <= 253
+        && !last.bytes().all(|b| b.is_ascii_digit())
+        && !last.to_ascii_lowercase().starts_with("0x")
         && s.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= 63
@@ -374,6 +401,65 @@ mod tests {
         ] {
             bad(domains(&[d]));
         }
+    }
+
+    #[test]
+    fn host_rules() {
+        for ok in [
+            "a.test",
+            "xn--bcher-kva.example",
+            "localhost",
+            "10.0.0.1",
+            "::1",
+            "0:0:0:0:0:0:0:1",
+            "A.Test",
+        ] {
+            assert!(validate(&domains(&[ok])).is_ok(), "{ok:?} was refused");
+        }
+        for bad in [
+            "1",
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "a.0x1",
+            "a.test.",
+            "-a.test",
+            "a-.test",
+            "a..test",
+            "[::1]",
+            "a.test:80",
+            "https://a.test",
+            "*.a.test",
+            "bücher.example",
+            "",
+        ] {
+            let e = validate(&domains(&[bad])).expect_err(&format!("{bad:?} was accepted"));
+            assert_eq!(e.code, codes::INVALID_PARAMS, "{bad:?}");
+        }
+        assert_eq!(
+            normalized(&domains(&["0:0:0:0:0:0:0:1"])).allow_domains,
+            ["::1"]
+        );
+        assert_eq!(
+            pins_of(&domains(&["0:0:0:0:0:0:0:1"])),
+            pins_of(&domains(&["::1"]))
+        );
+        assert!(validate(&domains(&[&"a".repeat(64)])).is_err());
+        assert!(validate(&domains(&[&format!("{}.test", "a.".repeat(130))])).is_err());
+    }
+
+    #[test]
+    fn normalized_dedups_classes_in_order() {
+        let p = normalized(&policy(
+            &[
+                ActionClass::State,
+                ActionClass::Clipboard,
+                ActionClass::State,
+            ],
+            &[ActionClass::Eval, ActionClass::Eval, ActionClass::Download],
+        ));
+        assert_eq!(p.allow, [ActionClass::State, ActionClass::Clipboard]);
+        assert_eq!(p.deny, [ActionClass::Eval, ActionClass::Download]);
     }
 
     #[test]

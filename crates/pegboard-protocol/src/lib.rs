@@ -151,7 +151,7 @@ impl std::str::FromStr for ActionClass {
 
 /// What a session may do. Fixed when the session is created.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct SessionPolicy {
     /// Opens a class that is denied by default.
     pub allow: Vec<ActionClass>,
@@ -195,7 +195,9 @@ pub enum SessionState {
     Closed,
 }
 
+/// Unknown fields are refused: a misspelt policy field must not become a wider session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionCreateParams {
     pub name: Option<String>,
     pub url: Option<String>,
@@ -313,6 +315,31 @@ mod tests {
             assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
         }
         assert!("Eval".parse::<ActionClass>().is_err());
+    }
+
+    #[test]
+    fn unknown_policy_fields_are_refused() {
+        for raw in [
+            r#"{"denny":["eval"]}"#,
+            r#"{"allow_domains":["a.test"]}"#,
+            r#"{"allowDomain":["a.test"]}"#,
+        ] {
+            assert!(serde_json::from_str::<SessionPolicy>(raw).is_err(), "{raw}");
+        }
+        for raw in [
+            r#"{"policy":{"denny":["eval"]}}"#,
+            r#"{"policy":{}, "polcy":{}}"#,
+            r#"{"name":"x","profil":"p"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SessionCreateParams>(raw).is_err(),
+                "{raw}"
+            );
+        }
+        let ok: SessionCreateParams =
+            serde_json::from_str(r#"{"policy":{"deny":["eval"]},"url":"http://a.test/"}"#).unwrap();
+        assert_eq!(ok.policy.deny, vec![ActionClass::Eval]);
+        assert!(serde_json::from_str::<SessionCreateParams>("{}").is_ok());
     }
 
     #[test]

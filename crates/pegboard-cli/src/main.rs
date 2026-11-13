@@ -285,6 +285,32 @@ fn profile(paths: &Paths, command: ProfileCmd, json: bool) -> Result<(), RpcErro
     Ok(())
 }
 
+/// What is in force for localhost and for private networks (spec D7): with an allow-list the
+/// list alone decides (localhost only when listed; a private address only when listed and
+/// `--allow-private-network` is given); without one, localhost is open unless
+/// `--no-localhost`, and private networks are closed unless `--allow-private-network`.
+fn address_rules(p: &SessionPolicy) -> (&'static str, &'static str) {
+    if p.allow_domains.is_empty() {
+        (
+            if p.no_localhost { "blocked" } else { "allowed" },
+            if p.allow_private_network {
+                "allowed"
+            } else {
+                "blocked"
+            },
+        )
+    } else {
+        (
+            "only if listed",
+            if p.allow_private_network {
+                "only if listed"
+            } else {
+                "blocked"
+            },
+        )
+    }
+}
+
 fn describe_policy(p: &SessionPolicy) -> String {
     let names = |list: &[ActionClass]| {
         if list.is_empty() {
@@ -296,9 +322,10 @@ fn describe_policy(p: &SessionPolicy) -> String {
                 .join(",")
         }
     };
+    let (localhost, private) = address_rules(p);
     format!(
-        "policy: allow {}; deny {}; allow-domain {}; private network {}; localhost {}; \
-         upload-dir {}; expires {}",
+        "policy: allow {}; deny {}; allow-domain {}; localhost {localhost}; \
+         private network {private}; upload-dir {}; expires {}",
         names(&p.allow),
         names(&p.deny),
         if p.allow_domains.is_empty() {
@@ -306,12 +333,6 @@ fn describe_policy(p: &SessionPolicy) -> String {
         } else {
             p.allow_domains.join(",")
         },
-        if p.allow_private_network {
-            "allowed"
-        } else {
-            "blocked"
-        },
-        if p.no_localhost { "blocked" } else { "allowed" },
         p.upload_dir.as_deref().unwrap_or("-"),
         if p.no_expire { "never" } else { "when idle" },
     )
@@ -719,4 +740,47 @@ fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
     });
     let _ = std::fs::remove_file(&pid_file);
     result.map_err(|e: anyhow::Error| error(codes::INTERNAL, format!("{e:#}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(domains: &[&str], private: bool, no_localhost: bool) -> SessionPolicy {
+        SessionPolicy {
+            allow_domains: domains.iter().map(|d| d.to_string()).collect(),
+            allow_private_network: private,
+            no_localhost,
+            ..SessionPolicy::default()
+        }
+    }
+
+    #[test]
+    fn address_rules_say_what_is_in_force() {
+        // No list: localhost open unless --no-localhost; private closed unless allowed.
+        assert_eq!(
+            address_rules(&policy(&[], false, false)),
+            ("allowed", "blocked")
+        );
+        assert_eq!(
+            address_rules(&policy(&[], true, false)),
+            ("allowed", "allowed")
+        );
+        assert_eq!(
+            address_rules(&policy(&[], false, true)),
+            ("blocked", "blocked")
+        );
+        // A list: it alone decides, localhost included.
+        assert_eq!(
+            address_rules(&policy(&["a.test"], false, false)),
+            ("only if listed", "blocked")
+        );
+        assert_eq!(
+            address_rules(&policy(&["a.test"], true, false)),
+            ("only if listed", "only if listed")
+        );
+        let line = describe_policy(&policy(&["a.test"], false, false));
+        assert!(line.contains("localhost only if listed"), "{line}");
+        assert!(!line.contains("localhost allowed"), "{line}");
+    }
 }
