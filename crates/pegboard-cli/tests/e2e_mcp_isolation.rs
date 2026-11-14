@@ -1637,11 +1637,16 @@ fn mcp_session_closed_under_allow_domain_leaves_no_tab_outside_it() {
     let origin = fixture();
     let home = Home::new();
     // Test hooks make the daemon say when a pin is released.
-    let mcp = Mcp::start_env(
+    let mut mcp = Mcp::start_env(
         &home,
         &[("PEGBOARD_TEST_HOOKS", "1")],
         &["--tools", "all", "--allow-domain", "127.0.0.1"],
     );
+    // The first call starts the daemon and the browser; the human attaches while the
+    // browser's only page is theirs (before any session exists).
+    let (err, status) = mcp.call("pegboard_browser_status", json!({}));
+    assert!(!err && status.starts_with("running"), "{status}");
+    let human = Human::attach(&home);
     let page = format!("{origin}/counter");
     let port = origin.rsplit(':').next().unwrap().to_string();
     let mut a = Agent::with(mcp, json!({ "url": page }));
@@ -1666,7 +1671,6 @@ fn mcp_session_closed_under_allow_domain_leaves_no_tab_outside_it() {
     assert!(cli_listed(&home, &a.id));
     assert_eq!(a.tabs().len(), 2);
 
-    let human = Human::attach(&home);
     let before = human.agent_pages().len();
     let (err, text) = a.call("pegboard_session_close", json!({}));
     assert!(!err, "{text}");
