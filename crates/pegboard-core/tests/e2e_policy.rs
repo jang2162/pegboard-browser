@@ -879,9 +879,36 @@ fn parallel_downloads_over_the_session_limit_are_cut_while_running() {
     });
 }
 
-/// Measurement and check: with the human's profile the browser's default context, a running
-/// download of the agent profile over the limit is still cut. Prints which way the cancel
-/// went (at once, or after making the agent profile the default).
+/// The application macOS has in front (`System Events`), or why it could not be read.
+fn frontmost() -> String {
+    std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to get name of first process whose frontmost is true",
+        ])
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if out.is_empty() {
+                format!("? {}", String::from_utf8_lossy(&o.stderr).trim())
+            } else {
+                out
+            }
+        })
+        .unwrap_or_else(|e| format!("? {e}"))
+}
+
+async fn default_context(conn: &CdpConn) -> String {
+    conn.send("Target.getBrowserContexts", json!({}), None)
+        .await
+        .map(|r| r["defaultBrowserContextId"].to_string())
+        .unwrap_or_else(|e| format!("{e:#}"))
+}
+
+/// With the human's profile the default context, a running download of the agent profile
+/// over the limit is dropped, cancelled without bringing anything forward (the front
+/// application does not change), and leaves nothing behind. Prints the cancel counts
+/// `[at once, after a background tab, failed]`.
 #[test]
 #[ignore]
 fn a_limit_cancel_works_when_the_agent_profile_is_not_the_default() {
@@ -900,24 +927,126 @@ fn a_limit_cancel_works_when_the_agent_profile_is_not_the_default() {
             common::establish_human_premise(&h.env, conn, &h.browser.human_context, &human).await,
             "premise: the human's profile could not be made the default context"
         );
-        let default = conn
-            .send("Target.getBrowserContexts", json!({}), None)
-            .await
-            .unwrap()["defaultBrowserContextId"]
-            .clone();
-        assert_eq!(default, json!(h.browser.human_context), "premise");
+        assert_eq!(
+            default_context(conn).await,
+            json!(h.browser.human_context).to_string(),
+            "premise"
+        );
+        let front = frontmost();
         let before = h.browser.downloads.cancel_counts();
         click_go(&h, &tab).await;
-        assert_eq!(stream_end(&name, 20).await, Some("cut"));
+        let outcome = stream_end(&name, 25).await;
         let after = h.browser.downloads.cancel_counts();
-        eprintln!("cancels [at once, after activation, failed]: before {before:?} after {after:?}");
+        let front_after = frontmost();
+        eprintln!(
+            "MEASURE stream {outcome:?}; cancels [at once, background tab, failed] before \
+             {before:?} after {after:?}; front {front:?} -> {front_after:?}"
+        );
+        assert_eq!(front_after, front, "a window came forward");
         let seen = told(&h, &mut log, &info, 1).await;
         assert_eq!(
             seen,
             [json!({ "name": name, "dropped": "file larger than 4 MiB" })]
         );
         assert!(staging_empties(&h).await);
+        assert!(!h.env.paths.session_files(&info.id).join(&name).exists());
         assert!(probe.in_real_downloads().is_empty());
+        h.finish().await;
+    });
+}
+
+/// Measurement for the cancel fallback (prints `MEASURE` lines, asserts only its premises):
+/// with the human's profile the default context and a download of the agent profile
+/// running, does `Browser.cancelDownload` with the agent's context id work; does a
+/// background tab created in the agent profile make it the default, change the front
+/// application, and let the cancel work; and does `Target.activateTarget` on an agent tab.
+#[test]
+#[ignore]
+fn measure_making_the_agent_profile_default_without_focus() {
+    common::run(async {
+        let h = Harness::start();
+        let conn = &h.browser.conn;
+        let human = human_page(&h.browser).await;
+        for method in ["background-tab", "activate"] {
+            let probe = common::DownloadProbe::new();
+            let name = format!("{}-{method}", probe.token);
+            let (info, _) = h
+                .session(&format!("/linkto/slow/{}/nolen/{name}", 3584 << 10))
+                .await;
+            let tab = h.manager.info(&info.id).unwrap().targets[0].clone();
+            let agent = common::context_of(conn, &tab).await;
+            assert!(
+                common::establish_human_premise(&h.env, conn, &h.browser.human_context, &human)
+                    .await,
+                "premise: human default"
+            );
+            let front0 = frontmost();
+            click_go(&h, &tab).await;
+            let staging = h.browser.downloads.staging_dir("PegboardAgent");
+            let mut guid = None;
+            for _ in 0..50 {
+                guid = std::fs::read_dir(&staging)
+                    .ok()
+                    .and_then(|mut d| d.next())
+                    .and_then(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned());
+                if guid.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let guid = guid.expect("premise: the download did not start");
+            let cancel = || {
+                conn.send(
+                    "Browser.cancelDownload",
+                    json!({ "guid": guid, "browserContextId": agent }),
+                    None,
+                )
+            };
+            let plain = cancel().await.map(drop).map_err(|e| format!("{e:#}"));
+            eprintln!(
+                "MEASURE {method}: default {} front {front0:?}; cancel while human default: {plain:?}",
+                default_context(conn).await
+            );
+            let mut made = None;
+            match method {
+                "background-tab" => {
+                    let r = conn
+                        .send(
+                            "Target.createTarget",
+                            json!({ "url": "about:blank", "browserContextId": agent, "background": true }),
+                            None,
+                        )
+                        .await;
+                    eprintln!("MEASURE background-tab: createTarget {r:?}");
+                    made = r
+                        .ok()
+                        .and_then(|r| r["targetId"].as_str().map(String::from));
+                }
+                _ => {
+                    let r = conn
+                        .send("Target.activateTarget", json!({ "targetId": tab }), None)
+                        .await;
+                    eprintln!("MEASURE activate: activateTarget {r:?}");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let front1 = frontmost();
+            let again = cancel().await.map(drop).map_err(|e| format!("{e:#}"));
+            eprintln!(
+                "MEASURE {method}: after: default {} (agent {agent:?}) front {front1:?} \
+                 (changed: {}); cancel: {again:?}; stream {:?}",
+                default_context(conn).await,
+                front1 != front0,
+                stream_end(&name, 10).await
+            );
+            if let Some(t) = made {
+                let _ = conn
+                    .send("Target.closeTarget", json!({ "targetId": t }), None)
+                    .await;
+            }
+            assert!(probe.in_real_downloads().is_empty());
+        }
         h.finish().await;
     });
 }
@@ -964,9 +1093,11 @@ fn a_download_from_a_cross_site_frame_belongs_to_its_tabs_session() {
     });
 }
 
-/// A new tab whose first navigation is a download closes (spike F4); its download is still
-/// the session's: through the agent's `tab new <url>` (a client-made tab) and through the
-/// manager's own `new_tab`.
+/// A tab whose only navigation is a download is still the session's.
+/// - The agent's `tab new <download-url>` (the bridge makes the tab blank and then sends it
+///   to the URL): prints whether that tab survived; the download is the session's.
+/// - A popup the session's tab opens on the download URL, which closes again (spike F4,
+///   asserted): the download is the session's.
 #[test]
 #[ignore]
 fn a_new_tab_that_only_downloads_is_its_sessions() {
@@ -975,7 +1106,16 @@ fn a_new_tab_that_only_downloads_is_its_sessions() {
         let (info, _) = h.session("/counter").await;
         let mut log = log_for(&h, &info);
         let files = h.env.paths.session_files(&info.id);
+        let conn = &h.browser.conn;
+        let first = h.manager.info(&info.id).unwrap().targets[0].clone();
+
         let via_agent = common::DownloadProbe::new();
+        let before: Vec<String> = page_targets(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.target_id)
+            .collect();
         let r = run_command(
             &h.manager,
             &h.runner,
@@ -995,21 +1135,67 @@ fn a_new_tab_that_only_downloads_is_its_sessions() {
             common::eventually(15, || async { files.join(&via_agent.token).exists() }).await,
             "tab new: not saved for the session"
         );
-        let via_manager = common::DownloadProbe::new();
-        let r = h
-            .manager
-            .new_tab(
-                &info.id,
-                &format!("{}/dl/{}", h.fixture.origin, via_manager.token),
-            )
+        let new: Vec<String> = page_targets(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.target_id)
+            .filter(|t| !before.contains(t))
+            .collect();
+        eprintln!("MEASURE tab new <download>: tabs that stayed {new:?}");
+
+        // A popup on the download URL: it closes (premise) and its download is the
+        // session's.
+        let via_popup = common::DownloadProbe::new();
+        let mut events = conn.events();
+        let s = conn.attach(&first).await.unwrap();
+        conn.send(
+            "Runtime.evaluate",
+            json!({
+                "expression": format!("window.open('/dl/{}'); 1", via_popup.token),
+                "userGesture": true,
+            }),
+            Some(&s),
+        )
+        .await
+        .unwrap();
+        let _ = conn
+            .send("Target.detachFromTarget", json!({ "sessionId": s }), None)
             .await;
-        eprintln!("new_tab: {r:?}");
+        let popup = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(e) = events.recv().await {
+                    if e.method == "Target.targetCreated"
+                        && e.params["targetInfo"]["openerId"] == first.as_str()
+                    {
+                        return e.params["targetInfo"]["targetId"]
+                            .as_str()
+                            .unwrap()
+                            .to_string();
+                    }
+                }
+            }
+        })
+        .await
+        .expect("premise: no popup was opened");
         assert!(
-            common::eventually(15, || async { files.join(&via_manager.token).exists() }).await,
-            "new_tab: not saved for the session"
+            common::eventually(15, || async { files.join(&via_popup.token).exists() }).await,
+            "popup: not saved for the session"
+        );
+        let closed = common::eventually(5, || async {
+            page_targets(conn)
+                .await
+                .unwrap()
+                .iter()
+                .all(|t| t.target_id != popup)
+        })
+        .await;
+        assert!(
+            closed,
+            "premise (F4): the download-only popup did not close"
         );
         assert!(via_agent.in_real_downloads().is_empty());
-        assert!(via_manager.in_real_downloads().is_empty());
+        assert!(via_popup.in_real_downloads().is_empty());
         h.finish().await;
     });
 }

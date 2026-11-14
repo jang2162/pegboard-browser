@@ -19,6 +19,10 @@ use crate::paths::{ensure_owned_private_dir, ensure_session_files, Paths};
 pub const MAX_FILE_BYTES: u64 = 200 << 20;
 /// Most bytes one session may download in all.
 pub const MAX_SESSION_BYTES: u64 = 1 << 30;
+/// Most bytes the running downloads of one profile may hold at once in its staging
+/// directory, all its sessions (and unattributed downloads) together. One session's running
+/// downloads can use it up for the other sessions of the profile.
+pub const MAX_PROFILE_RUNNING_BYTES: u64 = 2 << 30;
 /// Longest file name (bytes) a download is saved under, before a `-N` that keeps it unique.
 const MAX_NAME_BYTES: usize = 200;
 const FALLBACK_NAME: &str = "download";
@@ -138,11 +142,13 @@ pub fn move_into(src: &Path, dir: &Path, name: &str) -> std::io::Result<(String,
     ))
 }
 
-/// The download limits: one file, and one session's downloads in all.
+/// The download limits: one file, one session's downloads in all, and one profile's
+/// running downloads at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub file: u64,
     pub session: u64,
+    pub profile: u64,
 }
 
 impl Default for Limits {
@@ -150,6 +156,7 @@ impl Default for Limits {
         Limits {
             file: MAX_FILE_BYTES,
             session: MAX_SESSION_BYTES,
+            profile: MAX_PROFILE_RUNNING_BYTES,
         }
     }
 }
@@ -164,17 +171,24 @@ impl Limits {
         )
     }
 
-    /// `"<file bytes>,<session bytes>"` lowers the limits (never raises them); anything
-    /// else, or nothing, leaves them as they are.
+    /// `"<file bytes>,<session bytes>[,<profile bytes>]"` lowers the limits (never raises
+    /// them); anything else, or nothing, leaves them as they are.
     pub fn parse(spec: Option<&str>) -> Limits {
         let default = Limits::default();
         let parsed = spec.and_then(|spec| {
-            let (file, session) = spec.split_once(',')?;
-            let file: u64 = file.trim().parse().ok().filter(|n| *n > 0)?;
-            let session: u64 = session.trim().parse().ok().filter(|n| *n > 0)?;
+            let values: Vec<u64> = spec
+                .split(',')
+                .map(|v| v.trim().parse().ok().filter(|n| *n > 0))
+                .collect::<Option<_>>()?;
+            let (file, session, profile) = match values.as_slice() {
+                [f, s] => (*f, *s, default.profile),
+                [f, s, p] => (*f, *s, *p),
+                _ => return None,
+            };
             Some(Limits {
                 file: file.min(default.file),
                 session: session.min(default.session),
+                profile: profile.min(default.profile),
             })
         });
         parsed.unwrap_or(default)
@@ -207,7 +221,7 @@ pub struct Running {
 
 /// Why the running download `me` is dropped: over the file limit; with its session's saved
 /// bytes (`used`) and the session's other running downloads over the session limit; or with
-/// the other running downloads of its profile over the session limit too (what one profile's
+/// the other running downloads of its profile over the profile limit (what one profile's
 /// staging directory may hold at once). `others` are the other running downloads not
 /// already dropped.
 pub fn judge_running(
@@ -238,10 +252,10 @@ pub fn judge_running(
             .filter(|o| o.context.as_ref() == Some(context))
             .map(|o| o.bytes)
             .sum();
-        if me.bytes.saturating_add(running) > limits.session {
+        if me.bytes.saturating_add(running) > limits.profile {
             return Some(format!(
                 "downloads running in the profile exceed {}",
-                size_text(limits.session)
+                size_text(limits.profile)
             ));
         }
     }
@@ -489,7 +503,7 @@ struct State {
     /// this is the second check).
     gone: HashSet<SessionId>,
     gone_order: std::collections::VecDeque<SessionId>,
-    /// Cancels that worked at once, worked after the profile was made the default context,
+    /// Cancels that worked at once, worked after a background tab made the profile default,
     /// and failed (diagnostics: `cancel_counts`).
     cancels: [u64; 3],
     /// Guids settled lately: every policy connection reports every download (L1), so a
@@ -704,7 +718,7 @@ impl Downloads {
         *entry = reports;
     }
 
-    /// Cancels that worked at once, after the profile was made the default context, and
+    /// Cancels that worked at once, after a background tab made the profile default, and
     /// that failed (diagnostics and tests).
     #[doc(hidden)]
     pub fn cancel_counts(&self) -> [u64; 3] {
@@ -800,13 +814,19 @@ impl Inner {
             if attempt > 0 {
                 tokio::time::sleep(RETRY_PAUSE).await;
             }
+            // Not page-triggered (a lost connection, a new window): the quiet way first, then
+            // activating a tab, which may bring the agent window forward.
+            let mut quiet = None;
             if !self.is_default(context).await {
-                if let Err(e) = self.activate(context).await {
-                    last = e;
-                    continue;
-                }
-                if !self.is_default(context).await {
-                    continue;
+                quiet = self.make_default_quietly(context).await;
+                if quiet.is_none() {
+                    if let Err(e) = self.activate(context).await {
+                        last = e;
+                        continue;
+                    }
+                    if !self.is_default(context).await {
+                        continue;
+                    }
                 }
             }
             self.cancel_running(context, &staging).await;
@@ -822,6 +842,9 @@ impl Inner {
                     None,
                 )
                 .await;
+            if let Some(tab) = quiet {
+                self.close_quiet_tab(&tab).await;
+            }
             match set {
                 Ok(_) => {
                     self.install(context, profile_dir, staging, conn, events);
@@ -832,6 +855,51 @@ impl Inner {
         }
         conn.close();
         Err(last)
+    }
+
+    /// Makes the agent profile `context` the default context without bringing anything
+    /// forward: a blank background tab is created in it (creating a tab in a profile makes
+    /// it the default, spike E3). Returns that tab (the caller closes it with
+    /// `close_quiet_tab`) when the profile is the default afterwards.
+    async fn make_default_quietly(&self, context: &str) -> Option<String> {
+        if context.is_empty() || context == self.human_context {
+            return None;
+        }
+        let r = self
+            .conn
+            .send(
+                "Target.createTarget",
+                json!({ "url": "about:blank", "browserContextId": context, "background": true }),
+                None,
+            )
+            .await;
+        let tab = match r {
+            Ok(r) => r["targetId"].as_str()?.to_string(),
+            Err(e) => {
+                eprintln!(
+                    "pegboard: a background tab could not be made in the agent profile: {e:#}"
+                );
+                return None;
+            }
+        };
+        if self.agent_context_of(&tab).await.as_deref() != Some(context) {
+            // Never left in another profile.
+            self.close_quiet_tab(&tab).await;
+            return None;
+        }
+        if self.is_default(context).await {
+            Some(tab)
+        } else {
+            self.close_quiet_tab(&tab).await;
+            None
+        }
+    }
+
+    async fn close_quiet_tab(&self, tab: &str) {
+        let _ = self
+            .conn
+            .send("Target.closeTarget", json!({ "targetId": tab }), None)
+            .await;
     }
 
     /// Whether `context` is the browser's default context now.
@@ -964,11 +1032,11 @@ impl Inner {
         }
     }
 
-    /// Cancels a download of the agent profile `context`. Chrome may take a context id only
-    /// for the profile that is the default context (E, measured for setting the policy, not
-    /// for cancelling): when the cancel is refused, the profile is made the default as
-    /// re-applying does and the cancel tried once more. Each outcome is counted
-    /// (`cancel_counts`) and logged.
+    /// Cancels a download of the agent profile `context`. Chrome takes a context id only for
+    /// the profile that is the default context (measured for cancelling too, Task 5 run at
+    /// cb39d0c): when the cancel is refused, the profile is made the default with a
+    /// background tab (`make_default_quietly`), never by activating a tab, and the cancel is
+    /// tried once more. Each outcome is counted (`cancel_counts`) and logged.
     async fn cancel(&self, guid: &str, context: &str) {
         if context.is_empty() || context == self.human_context {
             return;
@@ -998,21 +1066,31 @@ impl Inner {
         if ended {
             return;
         }
-        let again = match self.activate(context).await {
-            Ok(()) => send().await.map(drop),
-            Err(e) => Err(e),
+        // A page can start this path at will, so it never brings a window forward (a person
+        // typing in their own window must not have keys land in an agent tab): only the
+        // quiet way is tried.
+        let again = match self.make_default_quietly(context).await {
+            Some(tab) => {
+                let r = send().await.map(drop);
+                self.close_quiet_tab(&tab).await;
+                r
+            }
+            None => Err(anyhow!(
+                "the profile could not be made the default context quietly"
+            )),
         };
         match again {
             Ok(()) => {
                 self.state.lock().unwrap().cancels[1] += 1;
                 eprintln!(
                     "pegboard: a download was cancelled after its profile was made the default \
-                     context (the first cancel was refused: {first:#})"
+                     context with a background tab (the first cancel was refused: {first:#})"
                 );
             }
             Err(e) => {
                 self.state.lock().unwrap().cancels[2] += 1;
-                // The staged file is deleted when the download ends, or by the sweeper.
+                // It runs on into staging (within the profile's running cap) and is deleted
+                // when it ends, or by the sweeper.
                 eprintln!("pegboard: could not cancel a download: {first:#}; then: {e:#}");
             }
         }
@@ -1664,6 +1742,7 @@ mod tests {
         let small = Limits {
             file: 1024,
             session: 4096,
+            profile: MAX_PROFILE_RUNNING_BYTES,
         };
         assert_eq!(
             small.judge(1025, 0).as_deref(),
@@ -1711,7 +1790,16 @@ mod tests {
             Limits::parse(Some("1024,4096")),
             Limits {
                 file: 1024,
-                session: 4096
+                session: 4096,
+                profile: MAX_PROFILE_RUNNING_BYTES,
+            }
+        );
+        assert_eq!(
+            Limits::parse(Some("1024,4096,8192")),
+            Limits {
+                file: 1024,
+                session: 4096,
+                profile: 8192,
             }
         );
         let huge = format!("{},{}", u64::MAX, u64::MAX);
@@ -1722,7 +1810,8 @@ mod tests {
             "1024,",
             "0,5",
             "5,0",
-            "1,2,3",
+            "1,2,3,4",
+            "1,2,0",
             " , ",
             huge.as_str(),
         ] {
@@ -1813,6 +1902,7 @@ mod tests {
         let l = Limits {
             file: 100,
             session: 250,
+            profile: 260,
         };
         let (a, b) = (
             SessionId("s_aaaaaaaa".into()),
@@ -1845,8 +1935,10 @@ mod tests {
         ];
         assert_eq!(
             judge_running(&l, &me, &crowd, 0).as_deref(),
-            Some("downloads running in the profile exceed 250 bytes")
+            Some("downloads running in the profile exceed 260 bytes")
         );
+        // The profile's cap is its own value, above the session limit.
+        assert!(judge_running(&l, &run(Some(&a), "P", 75), &crowd, 0).is_none());
         let unattributed = run(None, "P", 10);
         assert!(judge_running(&l, &unattributed, &crowd, 0).is_none());
     }

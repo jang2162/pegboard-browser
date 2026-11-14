@@ -261,11 +261,10 @@ impl SessionManager {
                     // Known as the session's at once: its first navigation may be a
                     // download, which closes the tab (spike F4) before it joins the scope.
                     inner.browser.downloads.own(&target, &id);
-                    let guarded = inner.guard.wait_guarded(&target, GUARD_TIMEOUT).await;
-                    if guarded.is_err() {
-                        inner.browser.downloads.disown(&target);
-                    }
-                    guarded
+                    // Kept when the wait fails: a tab whose download closed it is gone, and its
+                    // download is still the session's. (The proxy checks the profile after
+                    // this; a human tab's download is never attributed, see `downloads`.)
+                    inner.guard.wait_guarded(&target, GUARD_TIMEOUT).await
                 })
             }));
         let watcher = tokio::spawn(watch(Arc::downgrade(&inner), events));
@@ -534,7 +533,11 @@ impl SessionManager {
             Ok(())
         };
         if let Err(e) = added.await {
-            inner.browser.downloads.disown(&target);
+            // Only a tab outside the profile stops being the session's; one that is gone
+            // (its first navigation was a download, spike F4) keeps its download.
+            if e.message == CONTEXT_MISMATCH {
+                inner.browser.downloads.disown(&target);
+            }
             inner.release_focus(&target).await;
             // Through the bridge, which refuses a tab outside its profile.
             let tabs = BTreeSet::from([target]);
@@ -828,6 +831,8 @@ fn check_profile(profiles: &Profiles, name: &str) -> Result<(), RpcError> {
     }
 }
 
+const CONTEXT_MISMATCH: &str = "the bridge reported a tab that is not in the session's profile";
+
 /// The browser's word on which profile a tab is in; ids reported by the bridge are only
 /// trusted after this.
 async fn require_context(conn: &CdpConn, target: &str, context: &str) -> Result<(), RpcError> {
@@ -841,10 +846,7 @@ async fn require_context(conn: &CdpConn, target: &str, context: &str) -> Result<
     {
         Ok(())
     } else {
-        Err(rpc_error(
-            codes::BROWSER_FAILED,
-            "the bridge reported a tab that is not in the session's profile",
-        ))
+        Err(rpc_error(codes::BROWSER_FAILED, CONTEXT_MISMATCH))
     }
 }
 
