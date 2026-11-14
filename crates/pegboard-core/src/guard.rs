@@ -12,10 +12,11 @@
 //! - Each paused request is judged by `judge_request`: the URL first, then every address the
 //!   daemon resolves its host name to (2 s limit; no answer fails the request).
 //! - WebSocket handshakes never reach `Fetch` (spike B1). Documents from public addresses
-//!   that may run script are served again with a `Content-Security-Policy: connect-src`
-//!   header derived from the address policy (`connect_src`; spike B2, round 3), their bodies
-//!   read in pieces up to `MAX_BODY`. Documents from allowed loopback and private addresses
-//!   pass unchanged (owner's ruling, `serves_again`).
+//!   (every response but a download) are served again with a
+//!   `Content-Security-Policy: connect-src` header derived from the address policy
+//!   (`connect_src`; spike B2, round 3), their bodies read in pieces up to `MAX_BODY`, all
+//!   bodies together within `BODY_BUDGET`. Documents from allowed loopback and private
+//!   addresses pass unchanged (owner's ruling, `serves_again`).
 //! - A target the guard cannot set up is closed (a tab) or left waiting (a frame or worker):
 //!   it never runs unguarded. If the connection ends, Chrome lifts the interception (G5):
 //!   `ready()` is false until the guard has reconnected and the daemon refuses commands
@@ -47,6 +48,12 @@ const RECONNECT_PAUSE: Duration = Duration::from_millis(500);
 /// failed. Read in `BODY_PIECE` pieces, so no single CDP message gets big.
 pub const MAX_BODY: usize = 16 << 20;
 const BODY_PIECE: usize = 1 << 20;
+/// All document bodies held at once, across every tab: past this, a document is failed
+/// rather than read (re-review N2: many large documents at once must not exhaust the
+/// daemon's memory and take the guard down).
+pub const BODY_BUDGET: usize = 128 << 20;
+/// Longest time reading one document body may take; past it the document is failed.
+const BODY_DEADLINE: Duration = Duration::from_secs(20);
 /// Request-stage resolutions of documents kept for their response stage; past this many
 /// the table is emptied (those documents are then served again: fail closed).
 const MAX_PENDING_DOCUMENTS: usize = 4096;
@@ -248,37 +255,27 @@ fn local_and_allowed(
     })
 }
 
-/// Types a navigation never turns into a document that runs script: Chrome shows them as
-/// they are (images other than SVG, media, fonts, plain text, CSS, JSON, PDF in its viewer)
-/// or saves them (`application/octet-stream`, archives). Chrome does not sniff `text/plain`
-/// or `application/octet-stream` into HTML for a navigation.
-fn is_inert_type(mime: &str) -> bool {
-    let inert_family = ["image/", "audio/", "video/", "font/"]
-        .iter()
-        .any(|f| mime.starts_with(f));
-    (inert_family && !mime.contains("svg"))
-        || matches!(
-            mime,
-            "text/plain"
-                | "text/css"
-                | "text/csv"
-                | "application/json"
-                | "application/pdf"
-                | "application/octet-stream"
-                | "application/zip"
-                | "application/gzip"
-                | "application/x-gzip"
-                | "application/x-tar"
-                | "application/x-7z-compressed"
-                | "application/wasm"
-        )
+/// Types a navigation saves as a download instead of showing: no document is made from
+/// them. Chrome does not sniff `application/octet-stream` into a document.
+fn is_download_type(mime: &str) -> bool {
+    matches!(
+        mime,
+        "application/octet-stream"
+            | "application/zip"
+            | "application/gzip"
+            | "application/x-gzip"
+            | "application/x-tar"
+            | "application/x-7z-compressed"
+    )
 }
 
-/// Whether a document response may run script (and so gets the CSP). Fail closed: yes,
-/// unless every `Content-Type` value (all headers, each comma-separated item; Chrome uses
-/// the last valid one) is a known inert type. A missing or unparseable type, and the types
-/// Chrome sniffs (`unknown/unknown`, `application/unknown`, `*/*`), may become HTML.
-fn runs_script(headers: &[(String, String)]) -> bool {
+/// Whether a response is a download rather than a document: every `Content-Type` value (all
+/// headers, each comma-separated item) is a download type. Every other response, whatever
+/// its type, becomes a document and gets the CSP: an image, a text or a PDF document has no
+/// script of its own, but a same-origin page can run script in it (`frames[0].eval`, `new
+/// frames[0].WebSocket(...)`) under that document's policy (re-review N1). A missing,
+/// unknown or sniffed type is a document too.
+fn is_download(headers: &[(String, String)]) -> bool {
     let types: Vec<String> = headers
         .iter()
         .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
@@ -291,7 +288,7 @@ fn runs_script(headers: &[(String, String)]) -> bool {
                 .to_ascii_lowercase()
         })
         .collect();
-    types.is_empty() || types.iter().any(|t| !is_inert_type(t))
+    !types.is_empty() && types.iter().all(|t| is_download_type(t))
 }
 
 fn is_attachment(headers: &[(String, String)]) -> bool {
@@ -368,6 +365,8 @@ struct Inner {
     ready: watch::Sender<bool>,
     /// Test hook (`drop_connection_for_test`): no reconnect before this instant.
     hold_until: Mutex<Option<tokio::time::Instant>>,
+    /// Pieces (`BODY_PIECE` each) of document bodies that may be held at once.
+    body_budget: Arc<tokio::sync::Semaphore>,
 }
 
 pub struct Guard {
@@ -405,6 +404,7 @@ impl Guard {
             changed: watch::channel(0).0,
             ready: watch::channel(false).0,
             hold_until: Mutex::new(None),
+            body_budget: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET / BODY_PIECE)),
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner)));
         Guard { inner, supervisor }
@@ -505,7 +505,11 @@ async fn supervise(inner: Weak<Inner>) {
         if let Ok((conn, events)) = guard.connect().await {
             *guard.conn.lock().unwrap() = Some(conn.clone());
             guard.state.lock().unwrap().connections += 1;
-            guard.clone().run(conn, events).await;
+            guard.clone().run(conn.clone(), events).await;
+            // Closed in every case: a connection left open would keep auto-attach on with
+            // `waitForDebuggerOnStart`, holding new targets (the human's too) that nobody
+            // resumes.
+            conn.close();
             guard.conn.lock().unwrap().take();
         }
         guard.ready.send_replace(false);
@@ -795,8 +799,8 @@ impl Inner {
         }
     }
 
-    /// A document's response: served again with the CSP when the document can run script;
-    /// passed on otherwise.
+    /// A document's response: served again with the CSP unless it is a download, a redirect
+    /// or empty, or comes from an allowed local address; passed on otherwise.
     async fn on_response(
         &self,
         conn: &CdpConn,
@@ -857,7 +861,7 @@ impl Inner {
             || (matches!(status, 301 | 302 | 303 | 307 | 308) && has_location)
             || matches!(status, 204 | 205)
             || is_attachment(&headers)
-            || !runs_script(&headers);
+            || is_download(&headers);
         if no_document {
             return pass().await;
         }
@@ -866,8 +870,17 @@ impl Inner {
             return pass().await;
         }
         let served = async {
-            let Some(body) =
-                read_body_capped(conn, session, request_id, &headers, MAX_BODY).await?
+            let read = read_body_capped(
+                conn,
+                session,
+                request_id,
+                &headers,
+                MAX_BODY,
+                &self.body_budget,
+            );
+            let Some((body, _held)) = tokio::time::timeout(BODY_DEADLINE, read)
+                .await
+                .map_err(|_| anyhow!("reading the document took too long"))??
             else {
                 bail!("the document is larger than {MAX_BODY} bytes");
             };
@@ -903,17 +916,24 @@ impl Inner {
 /// Diagnostics key for documents failed because they could not be served again.
 pub const NOT_SERVED: &str = "document could not be served again";
 
+/// A body read under the budget, with the budget pieces it holds until dropped.
+type HeldBody = (Vec<u8>, Vec<tokio::sync::OwnedSemaphorePermit>);
+
 /// The body of a paused response, at most `limit` bytes, or `None` when it is larger.
 /// A declared `Content-Length` over the limit is refused without reading; otherwise the body
-/// is taken as a stream and read in `BODY_PIECE` pieces (as Chrome decodes it, so a small
-/// compressed body that grows past the limit is caught too).
+/// is taken as a stream and read in pieces of at most `BODY_PIECE` (as Chrome decodes it, so
+/// a small compressed body that grows past the limit is caught too). Each piece takes one
+/// permit of `budget`; when none is left the read fails (the bodies read at the same time
+/// are bounded together). The permits come back with the body and are released when the
+/// caller drops them.
 async fn read_body_capped(
     conn: &CdpConn,
     session: &str,
     request_id: &str,
     headers: &[(String, String)],
     limit: usize,
-) -> Result<Option<Vec<u8>>> {
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> Result<Option<HeldBody>> {
     let declared = headers
         .iter()
         .filter(|(n, _)| n.eq_ignore_ascii_case("content-length"))
@@ -935,7 +955,12 @@ async fn read_body_capped(
         .ok_or_else(|| anyhow!("no stream handle"))?
         .to_string();
     let mut body = Vec::new();
+    let mut held = Vec::new();
     let result = loop {
+        match budget.clone().try_acquire_owned() {
+            Ok(permit) => held.push(permit),
+            Err(_) => break Err(anyhow!("over the guard's budget for document bodies")),
+        }
         let piece = match conn
             .send(
                 "IO.read",
@@ -960,7 +985,7 @@ async fn read_body_capped(
             break Ok(None);
         }
         if piece["eof"].as_bool().unwrap_or(false) {
-            break Ok(Some(std::mem::take(&mut body)));
+            break Ok(Some((std::mem::take(&mut body), std::mem::take(&mut held))));
         }
     };
     let _ = conn.send("IO.close", json!({ "handle": handle }), s).await;
@@ -1230,15 +1255,16 @@ mod tests {
         // Under the limit: the whole body.
         let (url, _) = body_server(limit - 5, piece).await;
         let conn = CdpConn::connect(&url).await.unwrap();
-        let body = read_body_capped(&conn, "S", "r1", &[], limit)
+        let budget = Arc::new(tokio::sync::Semaphore::new(1000));
+        let body = read_body_capped(&conn, "S", "r1", &[], limit, &budget)
             .await
             .unwrap();
-        assert_eq!(body.map(|b| b.len()), Some(limit - 5));
+        assert_eq!(body.map(|(b, _)| b.len()), Some(limit - 5));
         // Over the limit, with no length declared (a compressed body grows when decoded):
         // reading stops just past the limit.
         let (url, reads) = body_server(limit * 100, piece).await;
         let conn = CdpConn::connect(&url).await.unwrap();
-        let body = read_body_capped(&conn, "S", "r2", &[], limit)
+        let body = read_body_capped(&conn, "S", "r2", &[], limit, &budget)
             .await
             .unwrap();
         assert!(body.is_none());
@@ -1247,11 +1273,43 @@ mod tests {
         let (url, reads) = body_server(10, piece).await;
         let conn = CdpConn::connect(&url).await.unwrap();
         let too_long = vec![("Content-Length".to_string(), (limit + 1).to_string())];
-        let body = read_body_capped(&conn, "S", "r3", &too_long, limit)
+        let body = read_body_capped(&conn, "S", "r3", &too_long, limit, &budget)
             .await
             .unwrap();
         assert!(body.is_none());
         assert_eq!(reads.load(ordinal), 0);
+    }
+
+    #[tokio::test]
+    async fn bodies_read_at_the_same_time_share_one_budget() {
+        let piece = 1000;
+        // A budget of 5 pieces. A first body of 3 pieces is held (its permits not dropped).
+        let budget = Arc::new(tokio::sync::Semaphore::new(5));
+        let (url, _) = body_server(3 * piece, piece).await;
+        let conn = CdpConn::connect(&url).await.unwrap();
+        let first = read_body_capped(&conn, "S", "a", &[], 1 << 20, &budget)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.0.len(), 3 * piece);
+        assert_eq!(budget.available_permits(), 2);
+        // A second body of 3 pieces does not fit beside it: refused, and what it had taken
+        // is given back.
+        let (url, _) = body_server(3 * piece, piece).await;
+        let conn = CdpConn::connect(&url).await.unwrap();
+        let second = read_body_capped(&conn, "S", "b", &[], 1 << 20, &budget).await;
+        let e = format!("{:#}", second.unwrap_err());
+        assert!(e.contains("budget"), "{e}");
+        assert_eq!(budget.available_permits(), 2);
+        // Once the first is released, it fits.
+        drop(first);
+        let (url, _) = body_server(3 * piece, piece).await;
+        let conn = CdpConn::connect(&url).await.unwrap();
+        let third = read_body_capped(&conn, "S", "c", &[], 1 << 20, &budget)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.0.len(), 3 * piece);
     }
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -1262,54 +1320,41 @@ mod tests {
     }
 
     #[test]
-    fn which_documents_get_the_csp() {
-        assert!(runs_script(&h(&[(
-            "Content-Type",
-            "text/html; charset=utf-8"
-        )])));
-        assert!(runs_script(&h(&[("content-type", "image/svg+xml")])));
-        assert!(runs_script(&h(&[(
-            "content-type",
-            "application/xhtml+xml"
-        )])));
-        assert!(runs_script(&h(&[])));
-        assert!(!runs_script(&h(&[("content-type", "application/pdf")])));
-        assert!(!runs_script(&h(&[("content-type", "text/plain")])));
-        assert!(!runs_script(&h(&[("content-type", "image/png")])));
-        assert!(!runs_script(&h(&[(
-            "content-type",
-            "application/octet-stream"
-        )])));
-        // Types Chrome sniffs, unknown and unparseable types: may become HTML.
+    fn every_response_but_a_download_is_a_document() {
+        // Documents, whatever their type: script can run in an image or text document
+        // through a same-origin page.
         for t in [
+            "text/html; charset=utf-8",
+            "image/svg+xml",
+            "image/png",
+            "text/plain",
+            "application/pdf",
+            "application/json",
+            "video/mp4",
             "unknown/unknown",
-            "application/unknown",
             "*/*",
             "",
             "nonsense",
-            "application/x-whatever",
-            "text/xml",
-            "multipart/x-mixed-replace",
         ] {
-            assert!(runs_script(&h(&[("content-type", t)])), "{t}");
+            assert!(!is_download(&h(&[("content-type", t)])), "{t}");
         }
-        // Every Content-Type value counts, in any header and any comma-separated item.
-        assert!(runs_script(&h(&[
-            ("content-type", "text/plain"),
-            ("Content-Type", "text/html")
+        assert!(!is_download(&h(&[])));
+        // Downloads: every Content-Type value a download type.
+        for t in [
+            "application/octet-stream",
+            "application/zip",
+            "application/x-gzip",
+        ] {
+            assert!(is_download(&h(&[("Content-Type", t)])), "{t}");
+        }
+        assert!(!is_download(&h(&[
+            ("content-type", "application/octet-stream"),
+            ("content-type", "text/html")
         ])));
-        assert!(runs_script(&h(&[
-            ("content-type", "text/html"),
-            ("Content-Type", "text/plain")
-        ])));
-        assert!(runs_script(&h(&[(
+        assert!(!is_download(&h(&[(
             "content-type",
-            "text/plain, text/html"
+            "application/zip, text/html"
         )])));
-        assert!(!runs_script(&h(&[
-            ("content-type", "text/plain"),
-            ("content-type", "image/png")
-        ])));
         assert!(is_attachment(&h(&[(
             "Content-Disposition",
             "attachment; filename=a.html"
