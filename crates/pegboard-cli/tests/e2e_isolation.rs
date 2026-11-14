@@ -795,22 +795,45 @@ impl Rig {
         std::thread::sleep(Duration::from_secs(4));
     }
 
-    /// Nothing carrying the probe's token exists in the real `~/Downloads` or anywhere under
-    /// the test's pegboard home (session files, profile directories).
-    fn assert_no_download_written(&self, probe: &DownloadProbe) {
+    /// Nothing carrying the probe's token is in the real `~/Downloads`, and under the test's
+    /// pegboard home the two downloads of `click_download_links` are in the session's files
+    /// directory and nowhere else under their names (not in another session's files).
+    fn assert_downloaded_only_into(&self, handle: &str, probe: &DownloadProbe) {
         let in_downloads = probe.in_real_downloads();
         assert!(
             in_downloads.is_empty(),
             "a download was saved to ~/Downloads: {in_downloads:?}"
         );
-        let in_home = probe.find_under(self.home.path());
-        assert!(
-            in_home.is_empty(),
-            "a download was saved under the pegboard home: {in_home:?}"
+        let files = self
+            .home
+            .path()
+            .join("sessions")
+            .join(id_of(handle))
+            .join("files");
+        let mut found = Vec::new();
+        for _ in 0..50 {
+            found = probe.find_under(self.home.path());
+            if found.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        found.sort();
+        let want = vec![
+            files.join(&probe.token),
+            files.join(format!("{}.zip", probe.token)),
+        ];
+        assert_eq!(
+            found, want,
+            "the downloads are not (only) in the session's files"
         );
     }
 }
 
+/// Phase 1 found agent downloads saved into the user's `~/Downloads` (M5). They now go to
+/// the session's files directory, never to `~/Downloads`, in the default and a named
+/// profile. (That a session with `--deny download` writes no file anywhere is
+/// `e2e_policy::deny_download_writes_no_file_anywhere`.)
 #[test]
 #[ignore]
 fn agent_download_writes_no_file() {
@@ -819,7 +842,7 @@ fn agent_download_writes_no_file() {
         let probe = DownloadProbe::new();
         eprintln!("profile {profile}, token {}", probe.token);
         rig.click_download_links(handle, &probe);
-        rig.assert_no_download_written(&probe);
+        rig.assert_downloaded_only_into(handle, &probe);
     }
 }
 
@@ -834,7 +857,7 @@ fn download_policy_survives_reconnects() {
         rig.ok(&rig.a, &["open", &rig.url("/counter")]);
     }
     rig.click_download_links(&rig.a, &probe);
-    rig.assert_no_download_written(&probe);
+    rig.assert_downloaded_only_into(&rig.a, &probe);
 
     // A new tab of the same session.
     let probe = DownloadProbe::new();
@@ -846,7 +869,7 @@ fn download_policy_survives_reconnects() {
         rig.ab(&rig.a, &["click", selector]);
     }
     std::thread::sleep(Duration::from_secs(4));
-    rig.assert_no_download_written(&probe);
+    rig.assert_downloaded_only_into(&rig.a, &probe);
 
     // Closing the session ends its proxy connections; a later session of the same profile
     // is still covered.
@@ -857,7 +880,7 @@ fn download_policy_survives_reconnects() {
     let again = session_handle(&out);
     let probe = DownloadProbe::new();
     rig.click_download_links(&again, &probe);
-    rig.assert_no_download_written(&probe);
+    rig.assert_downloaded_only_into(&again, &probe);
 
     // The named profile, after its first session closed and a new one opened.
     let (code, _, err) = rig.home.run(&["session", "close", &rig.c]);
@@ -869,7 +892,7 @@ fn download_policy_survives_reconnects() {
     let c2 = session_handle(&out);
     let probe = DownloadProbe::new();
     rig.click_download_links(&c2, &probe);
-    rig.assert_no_download_written(&probe);
+    rig.assert_downloaded_only_into(&c2, &probe);
 }
 
 /// The human profile keeps Chrome's normal download behaviour: nothing pegboard does denies it.
@@ -924,4 +947,85 @@ fn human_downloads_still_work() {
     eprintln!("human download: {done}");
     assert!(dir.path().join(&probe.token).exists());
     assert!(probe.in_real_downloads().is_empty());
+}
+
+/// A download in the agent profile from a tab no session owns (the human-side helper opens
+/// it there) is deleted: it lands in no session's files, not in ~/Downloads, and the
+/// profile's staging directory is empty afterwards.
+#[test]
+#[ignore]
+fn unattributed_download_is_deleted() {
+    let rig = Rig::new();
+    let probe = DownloadProbe::new();
+    // A tab of session a makes the agent profile the last active one; a context-less
+    // `Target.createTarget` then opens a tab in it that belongs to no session.
+    let tab = rig.tabs(&rig.a)[0].0.clone();
+    rig.human
+        .send(
+            "Target.activateTarget",
+            serde_json::json!({ "targetId": tab }),
+        )
+        .unwrap();
+    let agent_ctx = rig
+        .human
+        .agent_pages()
+        .into_iter()
+        .find(|t| t.target_id == tab)
+        .and_then(|t| t.browser_context_id)
+        .unwrap();
+    let created = rig
+        .human
+        .send(
+            "Target.createTarget",
+            serde_json::json!({ "url": "about:blank" }),
+        )
+        .unwrap();
+    let stray = created["targetId"].as_str().unwrap().to_string();
+    let ctx = rig
+        .human
+        .pages()
+        .into_iter()
+        .find(|t| t.target_id == stray)
+        .and_then(|t| t.browser_context_id);
+    assert_eq!(
+        ctx.as_deref(),
+        Some(agent_ctx.as_str()),
+        "premise: the tab is in the agent profile"
+    );
+    for t in [&rig.a, &rig.b, &rig.c] {
+        assert!(
+            rig.tabs(t).iter().all(|(id, _)| *id != stray),
+            "premise: no session owns it"
+        );
+    }
+    // A page of its own first, so the tab stays when the download starts (spike F4).
+    rig.human.navigate(&stray, &rig.url("/counter"));
+    rig.human.evaluate(
+        &stray,
+        &format!(
+            "location.href = '{}'; 1",
+            rig.url(&format!("/dl/{}", probe.token))
+        ),
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let staging = rig.home.path().join("downloads").join("PegboardAgent");
+    let mut empty = false;
+    for _ in 0..50 {
+        if std::fs::read_dir(&staging)
+            .map(|d| d.count() == 0)
+            .unwrap_or(false)
+        {
+            empty = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(empty, "the staging directory kept a file");
+    let anywhere = probe.find_under(rig.home.path());
+    assert!(anywhere.is_empty(), "{anywhere:?}");
+    assert!(probe.in_real_downloads().is_empty());
+    let _ = rig.human.send(
+        "Target.closeTarget",
+        serde_json::json!({ "targetId": stray }),
+    );
 }

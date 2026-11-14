@@ -80,6 +80,36 @@ fn download_route(path: &str) -> Option<(String, String)> {
         );
         return Some(("content-type: text/html\r\n".into(), body));
     }
+    // A page whose `#go` links to `/<rest>`.
+    if let Some(rest) = path.strip_prefix("/linkto/") {
+        let body = page("link", &format!(r#"<a id="go" href="/{rest}">go</a>"#));
+        return Some(("content-type: text/html\r\n".into(), body));
+    }
+    // An attachment named `<name>` whose body names the variant.
+    if let Some((variant, name)) = path
+        .strip_prefix("/dlas/")
+        .and_then(|rest| rest.split_once('/'))
+    {
+        return Some((
+            format!(
+                "content-type: application/octet-stream\r\ncontent-disposition: attachment; filename=\"{name}\"\r\n"
+            ),
+            format!("variant {variant}"),
+        ));
+    }
+    // An attachment named `<name>` of `<bytes>` bytes (at most 16 MiB).
+    if let Some((bytes, name)) = path
+        .strip_prefix("/sized/")
+        .and_then(|rest| rest.split_once('/'))
+    {
+        let n: usize = bytes.parse().ok()?;
+        return Some((
+            format!(
+                "content-type: application/octet-stream\r\ncontent-disposition: attachment; filename=\"{name}\"\r\n"
+            ),
+            "x".repeat(n.min(16 << 20)),
+        ));
+    }
     if let Some(name) = path.strip_prefix("/dl/") {
         return Some((
             format!(

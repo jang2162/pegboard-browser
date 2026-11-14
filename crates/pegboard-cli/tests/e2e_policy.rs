@@ -644,6 +644,18 @@ fn serve_one(mut stream: std::net::TcpStream, hits: Arc<Mutex<Vec<String>>>) {
             let _ = stream.write_all(&body);
             return;
         }
+        "/dl" => {
+            // An attachment named by `n`.
+            let name = query_param(query, "n").unwrap_or_else(|| "download.bin".into());
+            let body = b"private download";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-disposition: attachment; filename=\"{name}\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(body);
+            return;
+        }
         "/img" => ("200 OK", "image/gif", GIF.to_vec()),
         "/txt" => ("200 OK", "text/plain", b"plain text".to_vec()),
         "/sjis" => {
@@ -1636,3 +1648,351 @@ fn served_again_bodies_keep_their_bytes() {
 /// byte of "日" is the last byte before 1 MiB.
 const UTF8_PREFIX: &str = "<!doctype html><meta charset=utf-8><title>u8</title><p id=a>";
 const UTF8_FILLER: usize = (1 << 20) - 1 - UTF8_PREFIX.len();
+
+// ---------------------------------------------------------------------------------------------
+// Downloads: they land in the session's files directory.
+// ---------------------------------------------------------------------------------------------
+
+/// Runs an agent command with `--json` and returns its output (a failing command too).
+fn run_json(home: &Home, handle: &str, args: &[&str]) -> serde_json::Value {
+    let mut full = vec!["--session", handle, "--json"];
+    full.extend_from_slice(args);
+    let (_, out, err) = home.run(&full);
+    serde_json::from_str(out.trim()).unwrap_or_else(|_| json!({ "stderr": err }))
+}
+
+/// The downloads a command's output tells about.
+fn told(output: &serde_json::Value) -> Vec<serde_json::Value> {
+    output["downloads"].as_array().cloned().unwrap_or_default()
+}
+
+/// `files list --json` of the session.
+fn files_list(home: &Home, handle: &str) -> Vec<serde_json::Value> {
+    let (code, out, err) = home.run(&["--session", handle, "--json", "files", "list"]);
+    assert_eq!(code, 0, "{err}");
+    json(&out).as_array().cloned().unwrap()
+}
+
+/// Waits up to 15 s for `name` to be listed in the session's files.
+fn wait_listed(home: &Home, handle: &str, name: &str) -> serde_json::Value {
+    for _ in 0..150 {
+        if let Some(f) = files_list(home, handle)
+            .into_iter()
+            .find(|f| f["name"] == name)
+        {
+            return f;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("{name} was not listed: {:?}", files_list(home, handle));
+}
+
+/// Runs `get url` until the outputs have told about `n` downloads (15 s at most); returns
+/// them, sorted by name.
+fn collect_told(
+    home: &Home,
+    handle: &str,
+    mut seen: Vec<serde_json::Value>,
+    n: usize,
+) -> Vec<serde_json::Value> {
+    for _ in 0..30 {
+        if seen.len() >= n {
+            break;
+        }
+        seen.extend(told(&run_json(home, handle, &["get", "url"])));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    // A few more results: nothing is told twice.
+    for _ in 0..2 {
+        seen.extend(told(&run_json(home, handle, &["get", "url"])));
+    }
+    seen.sort_by_key(|d| d["name"].as_str().unwrap_or_default().to_string());
+    seen
+}
+
+/// Paths under the pegboard home carrying the token, outside `allowed`.
+fn stray_files(
+    home: &Home,
+    probe: &DownloadProbe,
+    allowed: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    probe
+        .find_under(home.path())
+        .into_iter()
+        .filter(|p| !p.starts_with(allowed))
+        .collect()
+}
+
+#[test]
+#[ignore]
+fn download_lands_in_the_session_files_dir_only() {
+    let origin = fixture();
+    let home = shared_home();
+    let probe = DownloadProbe::new();
+    let t = probe.token.clone();
+    let handle = create(&["--url", &format!("{origin}/dlpage/{t}")]);
+    let mut seen = Vec::new();
+    for sel in ["#att", "#zip"] {
+        seen.extend(told(&run_json(home, &handle, &["click", sel])));
+    }
+    let zip = format!("{t}.zip");
+    for name in [&t, &zip] {
+        let f = wait_listed(home, &handle, name);
+        assert_eq!(f["bytes"], 22, "{f}");
+        assert!(f["modifiedAt"].as_str().unwrap().ends_with('Z'), "{f}");
+    }
+    // The guard let the attachment through unchanged.
+    let files = files_dir_of(&handle);
+    assert_eq!(
+        std::fs::read_to_string(files.join(&t)).unwrap(),
+        "pegboard download test"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(files.join(&t))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    // Each download is told once, in the results that follow.
+    let seen = collect_told(home, &handle, seen, 2);
+    assert_eq!(
+        seen,
+        [
+            json!({ "name": t, "bytes": 22 }),
+            json!({ "name": zip, "bytes": 22 })
+        ],
+    );
+    assert!(probe.in_real_downloads().is_empty(), "saved to ~/Downloads");
+    let stray = stray_files(home, &probe, &files);
+    assert!(stray.is_empty(), "outside the session's files: {stray:?}");
+    // The action log has one entry per download, with the URL cleaned.
+    let rid = format!("r_{}", &id_of(&handle)[2..]);
+    let (code, shown, _) = home.run(&["recording", "show", &rid, "--json"]);
+    assert_eq!(code, 0);
+    let entries: Vec<serde_json::Value> = json(&shown)["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["command"] == "download")
+        .cloned()
+        .collect();
+    assert_eq!(entries.len(), 2, "{shown}");
+    for e in &entries {
+        assert_eq!(e["ok"], true, "{e}");
+        assert_eq!(e["args"][1], "22", "{e}");
+        assert!(e["url"].as_str().unwrap().starts_with(&origin), "{e}");
+    }
+    close(&handle);
+    // Closing the session takes its files with it.
+    assert!(!files.exists());
+}
+
+#[test]
+#[ignore]
+fn two_sessions_downloading_the_same_name_keep_their_own_file() {
+    let origin = fixture();
+    let home = shared_home();
+    let probe = DownloadProbe::new();
+    let t = probe.token.clone();
+    let a = create(&["--url", &format!("{origin}/linkto/dlas/a/{t}")]);
+    let b = create(&["--url", &format!("{origin}/linkto/dlas/b/{t}")]);
+    for h in [&a, &b] {
+        run_json(home, h, &["click", "#go"]);
+    }
+    for (h, variant) in [(&a, "variant a"), (&b, "variant b")] {
+        wait_listed(home, h, &t);
+        let body = std::fs::read_to_string(files_dir_of(h).join(&t)).unwrap();
+        assert_eq!(body, variant);
+    }
+    // The same name again in one session: a numbered name, the first file untouched.
+    run_json(home, &a, &["click", "#go"]);
+    let again = format!("{t}-1");
+    wait_listed(home, &a, &again);
+    assert_eq!(
+        std::fs::read_to_string(files_dir_of(&a).join(&t)).unwrap(),
+        "variant a"
+    );
+    let names: Vec<String> = files_list(home, &b)
+        .iter()
+        .map(|f| f["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, [t.as_str()], "session b got a's download");
+    assert!(probe.in_real_downloads().is_empty());
+    close(&a);
+    close(&b);
+}
+
+#[test]
+#[ignore]
+fn deny_download_writes_no_file_anywhere() {
+    let origin = fixture();
+    let home = shared_home();
+    let probe = DownloadProbe::new();
+    let t = probe.token.clone();
+    let handle = create(&[
+        "--deny",
+        "download",
+        "--url",
+        &format!("{origin}/dlpage/{t}"),
+    ]);
+    let mut seen = Vec::new();
+    for sel in ["#att", "#zip"] {
+        seen.extend(told(&run_json(home, &handle, &["click", sel])));
+    }
+    let seen = collect_told(home, &handle, seen, 2);
+    let zip = format!("{t}.zip");
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for (d, name) in seen.iter().zip([&t, &zip]) {
+        assert_eq!(d["name"], name.as_str(), "{d}");
+        assert!(
+            d["dropped"].as_str().unwrap().contains("--deny download"),
+            "{d}"
+        );
+        assert!(d.get("bytes").is_none(), "{d}");
+    }
+    // Not in the session's files, the staging directory, anywhere under the home, nor in
+    // ~/Downloads.
+    assert!(files_list(home, &handle).is_empty());
+    let anywhere = probe.find_under(home.path());
+    assert!(anywhere.is_empty(), "{anywhere:?}");
+    assert!(probe.in_real_downloads().is_empty());
+    close(&handle);
+}
+
+#[test]
+#[ignore]
+fn oversized_download_is_dropped_and_reported() {
+    // A browser of its own, with the limits lowered (1 KiB a file, 4 KiB a session).
+    let home = Home::new();
+    let (code, _, err) = home.run_env(
+        &[("PEGBOARD_TEST_DOWNLOAD_LIMITS", "1024,4096")],
+        &["browser", "start"],
+    );
+    assert_eq!(code, 0, "{err}");
+    let origin = fixture();
+    let probe = DownloadProbe::new();
+    let t = probe.token.clone();
+    let (code, out, err) = home.run(&[
+        "session",
+        "create",
+        "--url",
+        &format!("{origin}/linkto/sized/2000/{t}-big"),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let handle = session_handle(&out);
+    let seen = told(&run_json(&home, &handle, &["click", "#go"]));
+    let seen = collect_told(&home, &handle, seen, 1);
+    assert_eq!(
+        seen,
+        [json!({ "name": format!("{t}-big"), "dropped": "file larger than 1 KiB" })]
+    );
+    // Five of 900 bytes: four fit in 4 KiB, the fifth does not.
+    let mut seen = Vec::new();
+    for i in 1..=5 {
+        let url = format!("{origin}/linkto/sized/900/{t}-{i}");
+        let (code, _, err) = home.run(&["--session", &handle, "open", &url]);
+        assert_eq!(code, 0, "{err}");
+        seen.extend(told(&run_json(&home, &handle, &["click", "#go"])));
+        // One at a time, so the order of the totals is fixed.
+        if i < 5 {
+            wait_listed(&home, &handle, &format!("{t}-{i}"));
+        }
+    }
+    let seen = collect_told(&home, &handle, seen, 5);
+    let saved: Vec<&serde_json::Value> = seen.iter().filter(|d| d["bytes"] == 900).collect();
+    assert_eq!(saved.len(), 4, "{seen:?}");
+    let fifth = seen.iter().find(|d| d["name"] == format!("{t}-5")).unwrap();
+    assert_eq!(fifth["dropped"], "session download limit of 4 KiB reached");
+    let total: u64 = files_list(&home, &handle)
+        .iter()
+        .map(|f| f["bytes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 3600);
+    let files = home
+        .path()
+        .join("sessions")
+        .join(id_of(&handle))
+        .join("files");
+    let stray = stray_files(&home, &probe, &files);
+    assert!(stray.is_empty(), "{stray:?}");
+    assert!(!files.join(format!("{t}-big")).exists());
+    assert!(probe.in_real_downloads().is_empty());
+}
+
+#[test]
+#[ignore]
+fn files_list_needs_the_session_token() {
+    let home = shared_home();
+    let a = create(&[]);
+    let b = create(&[]);
+    // No token: a usage error before the daemon is asked.
+    let (code, _, err) = home.run(&["--session", id_of(&a), "files", "list"]);
+    assert_eq!(code, 2, "{err}");
+    // A wrong token and another session's token: the same "no session".
+    let wrong = format!("{}.{}", id_of(&a), "a".repeat(26));
+    let others = format!("{}.{}", id_of(&a), token_of(&b));
+    for handle in [&wrong, &others] {
+        let (code, out, err) = home.run(&["--session", handle, "files", "list"]);
+        assert_eq!(code, 1, "{out} {err}");
+        assert!(err.contains("session_not_found"), "{err}");
+    }
+    // The right one, also through the environment.
+    std::fs::create_dir_all(files_dir_of(&a)).unwrap();
+    std::fs::write(files_dir_of(&a).join("mine.txt"), "mine").unwrap();
+    let (code, out, err) = home.run_env(&[("PEGBOARD_SESSION", a.as_str())], &["files", "list"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("mine.txt"), "{out}");
+    assert!(files_list(home, &b).is_empty());
+    close(&a);
+    close(&b);
+}
+
+/// A download is a request like any other: one to a private address is refused by the guard
+/// at the request stage (nothing reaches the server, no file anywhere); allowed, the same
+/// download from a popup lands in the session's files.
+#[test]
+#[ignore]
+fn download_from_a_private_address_is_judged_at_the_request_stage() {
+    let srv = AddressServer::start();
+    let lan = srv.lan();
+    let probe = DownloadProbe::new();
+    let t = probe.token.clone();
+    let page = |m: &str| {
+        let to = format!("http://{PRIVATE_NAME}:{lan}/dl?m={m}&n={t}");
+        format!("http://localhost:{}/page?to={}", srv.a, enc(&to))
+    };
+    let home = shared_home();
+
+    let m = marker("dl-closed");
+    let h = create(&["--profile", profile("pol-dl-closed"), "--url", &page(&m)]);
+    run_json(home, &h, &["click", "#pop"]);
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert!(
+        !srv.reached(&m),
+        "the download request reached the private server"
+    );
+    assert!(files_list(home, &h).is_empty());
+    let anywhere = probe.find_under(home.path());
+    assert!(anywhere.is_empty(), "{anywhere:?}");
+    assert!(probe.in_real_downloads().is_empty());
+    close(&h);
+
+    // Control: allowed, the same download (from a popup that closes, spike F4) is the
+    // session's.
+    let m = marker("dl-open");
+    let h = create(&[
+        "--profile",
+        profile("pol-dl-open"),
+        "--allow-private-network",
+        "--url",
+        &page(&m),
+    ]);
+    run_json(home, &h, &["click", "#pop"]);
+    let f = wait_listed(home, &h, &t);
+    assert_eq!(f["bytes"], 16, "{f}");
+    assert!(srv.reached(&m));
+    assert!(probe.in_real_downloads().is_empty());
+    close(&h);
+}

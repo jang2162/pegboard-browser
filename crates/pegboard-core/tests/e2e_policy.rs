@@ -639,3 +639,87 @@ fn framed_documents_of_a_public_page_get_the_csp() {
         assert!(failures.is_empty(), "{failures:#?}");
     });
 }
+
+/// Runs `get url` in the session through `run_command` (the daemon's path).
+async fn get_url(
+    h: &Harness,
+    log: &mut ActionLog,
+    info: &SessionInfo,
+) -> Result<pegboard_protocol::CommandExecResult, pegboard_protocol::RpcError> {
+    run_command(
+        &h.manager,
+        &h.runner,
+        &h.env.paths,
+        log,
+        &info.id,
+        &common::s(&["get", "url"]),
+        Some(30_000),
+    )
+    .await
+}
+
+/// The download policy of a profile lives on one connection (Chrome lifts it when that
+/// connection closes, spike L5). When it closes, the session's commands are refused (not run
+/// unprotected) until pegboard has set the policy again; a download afterwards still lands
+/// in the session's files directory and never in ~/Downloads.
+#[test]
+#[ignore]
+fn download_policy_is_reapplied_after_its_connection_drops() {
+    common::run(async {
+        let h = Harness::start();
+        let (info, _) = h.session("/counter").await;
+        let manifest = Manifest::new(
+            &info.recording_id,
+            &info.id.0,
+            &info.name,
+            &info.profile,
+            &info.created_at,
+            "test",
+            "0.42.0",
+        );
+        let mut log = ActionLog::open(&h.env.paths, manifest).unwrap();
+        assert!(h.manager.require_downloads(&info.id).is_ok());
+        assert!(h
+            .manager
+            .drop_download_policy_for_test(&info.id, Duration::from_secs(3)));
+        // While it is down: refused with browser_failed, before anything runs.
+        let e = get_url(&h, &mut log, &info).await.unwrap_err();
+        assert_eq!(e.code, codes::BROWSER_FAILED, "{e:?}");
+        assert!(e.message.contains("download policy"), "{e:?}");
+        let back = common::eventually(20, || async {
+            h.manager.require_downloads(&info.id).is_ok()
+        })
+        .await;
+        assert!(back, "the download policy was not set again");
+        let r = get_url(&h, &mut log, &info).await.unwrap();
+        assert!(common::ok(&r), "{r:?}");
+
+        // A download from the session's tab lands in its files directory only.
+        let probe = common::DownloadProbe::new();
+        let tab = h.manager.info(&info.id).unwrap().targets[0].clone();
+        h.eval(&tab, &format!("location.href = '/dl/{}'; 1", probe.token))
+            .await;
+        let files = h.env.paths.session_files(&info.id);
+        let saved = files.join(&probe.token);
+        let landed = common::eventually(15, || async { saved.exists() }).await;
+        assert!(landed, "the download did not reach {files:?}");
+        assert_eq!(
+            std::fs::read_to_string(&saved).unwrap(),
+            "pegboard download test"
+        );
+        assert!(probe.in_real_downloads().is_empty(), "saved to ~/Downloads");
+        // The next result tells about it, once.
+        let r = get_url(&h, &mut log, &info).await.unwrap();
+        assert_eq!(
+            r.output["downloads"],
+            json!([{ "name": probe.token, "bytes": 22 }]),
+            "{r:?}"
+        );
+        let r = get_url(&h, &mut log, &info).await.unwrap();
+        assert!(r.output.get("downloads").is_none(), "{r:?}");
+        // Nothing is left in the profile's staging directory.
+        let staging = h.browser.downloads.staging_dir("PegboardAgent");
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+        h.finish().await;
+    });
+}
