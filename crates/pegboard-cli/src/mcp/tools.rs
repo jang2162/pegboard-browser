@@ -20,7 +20,7 @@ use pegboard_protocol::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 
-use super::{lock, Bundle, Core, Options, Owned};
+use super::{lock, shown, Bundle, Core, Options, Owned};
 
 /// Sessions one MCP server may have open (created by it) at once.
 pub const MAX_CREATED_SESSIONS: usize = 16;
@@ -640,7 +640,7 @@ pub fn to_argv(tool: &str, arguments: &Map<String, Value>) -> Result<Vec<String>
         .filter(|f| f.words[0] == word)
         .collect();
     if forms.is_empty() {
-        return Err(invalid(format!("unknown tool {tool:?}")));
+        return Err(invalid(format!("unknown tool {}", shown(tool))));
     }
     let arg = |key: &str| arguments.get(key).filter(|v| !v.is_null());
     let commands: Vec<String> = forms
@@ -656,7 +656,10 @@ pub fn to_argv(tool: &str, arguments: &Map<String, Value>) -> Result<Vec<String>
     if let Some(bad) = arguments.keys().find(|k| {
         !(*k == "sessionId" || (*k == "command" && !commands.is_empty()) || all.contains(k))
     }) {
-        return Err(invalid(format!("unknown argument {bad:?} for {tool}")));
+        return Err(invalid(format!(
+            "unknown argument {} for {tool}",
+            shown(bad)
+        )));
     }
     let form = match arg("command") {
         _ if commands.is_empty() => &forms[0],
@@ -686,7 +689,8 @@ pub fn to_argv(tool: &str, arguments: &Map<String, Value>) -> Result<Vec<String>
             takes.join(", ")
         };
         return Err(invalid(format!(
-            "argument {bad:?} does not go with `{name}` (it takes {takes})"
+            "argument {} does not go with `{name}` (it takes {takes})",
+            shown(bad)
         )));
     }
 
@@ -803,6 +807,12 @@ fn invalid(message: impl Into<String>) -> RpcError {
     error(codes::INVALID_PARAMS, message)
 }
 
+/// The answer for a `sessionId` that is not an id. It does not repeat the value: a client
+/// may pass a handle (`<id>.<token>`) there, and no answer may hold a token.
+fn not_a_session_id() -> RpcError {
+    invalid("sessionId is not a session id (s_ and 8 characters; never a handle)")
+}
+
 /// The answer for a session that does not exist, word for word the daemon's.
 pub fn no_session(id: &SessionId) -> RpcError {
     error(codes::SESSION_NOT_FOUND, format!("no session {}", id.0))
@@ -826,7 +836,8 @@ impl<'a> Args<'a> {
                 keys.join(", ")
             };
             return Err(invalid(format!(
-                "unknown argument {bad:?} (this tool takes {takes}){hint}"
+                "unknown argument {} (this tool takes {takes}){hint}",
+                shown(bad)
             )));
         }
         Ok(Args(map))
@@ -855,7 +866,7 @@ impl<'a> Args<'a> {
 
     fn session_id(&self) -> Result<SessionId, RpcError> {
         let id = self.required("sessionId")?;
-        SessionId::parse(&id).ok_or_else(|| invalid(format!("{id:?} is not a session id")))
+        SessionId::parse(&id).ok_or_else(not_a_session_id)
     }
 }
 
@@ -1168,7 +1179,9 @@ impl Registry {
 
     fn recording_get(&self, ctx: &mut Ctx, id: &str) -> Result<String, RpcError> {
         if !valid_recording_id(id) {
-            return Err(invalid(format!("{id:?} is not a recording id")));
+            return Err(invalid(
+                "recordingId is not a recording id (r_ and 8 characters)",
+            ));
         }
         // A recording is its session's: `r_<x>` belongs to `s_<x>`.
         let session = SessionId(format!("s_{}", &id[2..]));
@@ -1240,8 +1253,7 @@ fn session_for_action(
     let owned = lock(ctx.owned);
     match args.get("sessionId").filter(|v| !v.is_null()) {
         Some(Value::String(text)) => {
-            let id = SessionId::parse(text)
-                .ok_or_else(|| invalid(format!("{text:?} is not a session id")))?;
+            let id = SessionId::parse(text).ok_or_else(not_a_session_id)?;
             let token = owned.token(&id).ok_or_else(|| no_session(&id))?.to_string();
             Ok((id, token))
         }
@@ -1332,7 +1344,8 @@ fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Resul
 
 /// Whether what a command line answers comes from the page: what it reads (`get`, `is`,
 /// `find ... text`, the console, cookies, storage, tabs, dialogs), evaluates, or the page's
-/// tree and audits (`snapshot`, `a11y`, `vitals`).
+/// tree and audits (`snapshot`, `a11y`, `vitals`). These are wrapped even when agent-browser
+/// gives no `_boundary`; any result it gives one for (a click, measured) is wrapped too.
 fn is_page_content(argv: &[String]) -> bool {
     use pegboard_protocol::ActionClass::*;
     matches!(argv::class_of(argv), Some(Get | Read | Eval))

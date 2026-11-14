@@ -60,6 +60,22 @@ struct Held {
 /// Length of a session token (16 random bytes in base32).
 const TOKEN_LEN: usize = 26;
 
+/// A name the client sent (a method, tool or argument name), quoted for an error message
+/// only when it is short and plain: anything else could carry a session handle or token
+/// (a token is 26 characters), which no answer may hold, whoever's it is.
+pub(crate) fn shown(name: &str) -> String {
+    let plain = !name.is_empty()
+        && name.len() <= 24
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'/'));
+    if plain {
+        format!("{name:?}")
+    } else {
+        "(not shown)".to_string()
+    }
+}
+
 /// The lock of `Owned`, also after a call panicked while holding it.
 pub(crate) fn lock(owned: &Mutex<Owned>) -> MutexGuard<'_, Owned> {
     owned.lock().unwrap_or_else(|e| e.into_inner())
@@ -301,7 +317,7 @@ impl Server {
             "tools/call" => self.tools_call(&params),
             _ => Err((
                 METHOD_NOT_FOUND,
-                format!("method {method:?} is not supported"),
+                format!("method {} is not supported", shown(method)),
             )),
         };
         Some(match result {
@@ -354,7 +370,7 @@ impl Server {
             Some(_) => return Err((INVALID_PARAMS, "arguments must be an object".to_string())),
         };
         if !self.registry.list().any(|t| t.name == name) {
-            return Err((INVALID_PARAMS, format!("unknown tool {name:?}")));
+            return Err((INVALID_PARAMS, format!("unknown tool {}", shown(name))));
         }
         if let Err(why) = self.core.ensure_running() {
             let text = format!(
