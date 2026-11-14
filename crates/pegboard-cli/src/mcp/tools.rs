@@ -473,25 +473,23 @@ impl Registry {
         let Some((token, s)) = decoded else {
             // The daemon made a session this server cannot hold: close it if the reply
             // gives the way, and say which one it was.
-            let id = raw["id"].as_str().unwrap_or("?").to_string();
-            let closed = match raw["token"].as_str() {
-                Some(token) => ctx
+            let id = raw["id"].as_str().and_then(SessionId::parse);
+            let closed = match (&id, raw["token"].as_str()) {
+                (Some(id), Some(token)) => ctx
                     .core
                     .call(
                         "session.close",
                         json!({ "sessionId": id, "token": token, "keepTabs": false }),
                     )
                     .is_ok(),
-                None => false,
+                _ => false,
             };
-            eprintln!(
-                "pegboard mcp: the answer to session.create could not be read; session {id} {}",
-                if closed {
-                    "was closed"
-                } else {
-                    "may still be open"
-                }
-            );
+            let what = match (&id, closed) {
+                (Some(id), true) => format!("session {} was closed", id.0),
+                (Some(id), false) => format!("session {} may still be open", id.0),
+                (None, _) => "a session may still be open".to_string(),
+            };
+            eprintln!("pegboard mcp: the answer to session.create could not be read; {what}");
             return Err(error(
                 codes::INTERNAL,
                 "the daemon's answer to session.create could not be read",

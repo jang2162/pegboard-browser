@@ -142,8 +142,12 @@ impl Owned {
         self.known.remove(id);
     }
 
+    /// The token of an open session; none for an adopted one the daemon has not confirmed.
     pub fn token(&self, id: &SessionId) -> Option<&str> {
-        self.open.get(id).map(|h| h.token.as_str())
+        self.open
+            .get(id)
+            .filter(|h| h.verified)
+            .map(|h| h.token.as_str())
     }
 
     /// The open sessions, sorted. (Task 10 uses it for a call that names no session.)
@@ -156,7 +160,7 @@ impl Owned {
 
     /// Whether this server has ever held the session.
     fn knows(&self, id: &SessionId) -> bool {
-        self.known.contains(id)
+        self.known.contains(id) && self.open.get(id).is_none_or(|h| h.verified)
     }
 
     /// The session is closed (it stays known).
@@ -512,9 +516,10 @@ impl ClientCore {
             client: None,
             start: Start::Pending(std::thread::spawn(move || crate::browser_start(&p))),
             limit: None,
+            // Debug builds only: a release binary has no such hook.
             slow_create: std::env::var("PEGBOARD_TEST_MCP_SLOW_CREATE")
                 .ok()
-                .filter(|name| !name.is_empty()),
+                .filter(|name| cfg!(debug_assertions) && !name.is_empty()),
         }
     }
 
@@ -610,9 +615,12 @@ fn stdin_lines() -> (
 
 /// Writes answers to stdout on a thread of its own: a client that stops reading blocks
 /// that thread, never the server's loop (which keeps watching signals and stdin).
-fn stdout_writer() -> tokio::sync::mpsc::Sender<String> {
+fn stdout_writer() -> (
+    tokio::sync::mpsc::Sender<String>,
+    std::thread::JoinHandle<()>,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-    std::thread::spawn(move || {
+    let writer = std::thread::spawn(move || {
         while let Some(text) = rx.blocking_recv() {
             let mut out = std::io::stdout().lock();
             let written = out
@@ -625,46 +633,51 @@ fn stdout_writer() -> tokio::sync::mpsc::Sender<String> {
             }
         }
     });
-    tx
+    (tx, writer)
 }
 
-/// What ends the server: SIGTERM, SIGHUP, SIGINT, or (where watched) the end of stdin.
+/// The signals that end the server: SIGTERM, SIGHUP, SIGINT.
 struct Stops {
     term: tokio::signal::unix::Signal,
     hup: tokio::signal::unix::Signal,
     int: tokio::signal::unix::Signal,
-    eof: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Stops {
-    fn new(eof: tokio::sync::watch::Receiver<bool>) -> std::io::Result<Stops> {
+    fn new() -> std::io::Result<Stops> {
         use tokio::signal::unix::{signal, SignalKind};
         Ok(Stops {
             term: signal(SignalKind::terminate())?,
             hup: signal(SignalKind::hangup())?,
             int: signal(SignalKind::interrupt())?,
-            eof,
         })
     }
 
-    /// Resolves when a signal comes, or stdin ends (if `watch_eof`).
-    async fn next(&mut self, watch_eof: bool) {
-        let eof = async {
-            if watch_eof {
-                // An error means the reader is gone, which is an end too.
-                let _ = self.eof.wait_for(|end| *end).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
+    async fn next(&mut self) {
         tokio::select! {
             _ = self.term.recv() => {}
             _ = self.hup.recv() => {}
             _ = self.int.recv() => {}
-            _ = eof => {}
         }
     }
 }
+
+/// Resolves when stdin ends from now on; never if it had already ended (the lines read
+/// before that are still answered, each call running to its deadline).
+async fn stdin_ends_now(eof: &mut tokio::sync::watch::Receiver<bool>) {
+    if *eof.borrow_and_update() {
+        return std::future::pending().await;
+    }
+    loop {
+        // An error means the reader is gone, which is an end too.
+        if eof.changed().await.is_err() || *eof.borrow_and_update() {
+            return;
+        }
+    }
+}
+
+/// How long the end waits for the answers already queued to be written.
+const FLUSH_LIMIT: Duration = Duration::from_secs(5);
 
 /// How long the end waits for a call that was running (a session being created).
 const IN_FLIGHT_LIMIT: Duration = Duration::from_secs(10);
@@ -691,8 +704,8 @@ pub fn run(opts: Options, paths: Paths) -> i32 {
 }
 
 pub async fn serve(opts: Options, paths: Paths, owned: Owned) -> i32 {
-    let (mut lines, eof) = stdin_lines();
-    let mut stops = match Stops::new(eof) {
+    let (mut lines, mut eof) = stdin_lines();
+    let mut stops = match Stops::new() {
         Ok(stops) => stops,
         Err(e) => {
             eprintln!("pegboard mcp: could not handle signals: {e}");
@@ -706,13 +719,14 @@ pub async fn serve(opts: Options, paths: Paths, owned: Owned) -> i32 {
         Box::new(core),
         owned.clone(),
     )));
-    let out = stdout_writer();
+    let (out, writer) = stdout_writer();
     let mut in_flight = None;
     loop {
-        // Lines already read are answered before the end of stdin is acted on.
+        // The end of stdin shows here as the end of `lines`, after every line read before
+        // it: those are all answered.
         let next = tokio::select! {
             next = lines.recv() => next,
-            _ = stops.next(false) => break,
+            _ = stops.next() => break,
         };
         let reply = match next {
             None => break,
@@ -725,22 +739,26 @@ pub async fn serve(opts: Options, paths: Paths, owned: Owned) -> i32 {
                         .unwrap_or_else(|e| e.into_inner())
                         .handle_line(&line)
                 });
+                // A client that closes stdin while this call runs wants the server gone;
+                // one that closed it before sent this call to be answered.
                 tokio::select! {
                     r = &mut task => r.unwrap_or(None),
-                    _ = stops.next(true) => { in_flight = Some(task); break }
+                    _ = stops.next() => { in_flight = Some(task); break }
+                    _ = stdin_ends_now(&mut eof) => { in_flight = Some(task); break }
                 }
             }
         };
         if let Some(reply) = reply {
             tokio::select! {
+                biased;
                 sent = out.send(reply) => if sent.is_err() { break },
-                _ = stops.next(true) => break,
+                _ = stops.next() => break,
             }
         }
     }
 
-    // Ending: close what this server created, and give a call that was running a little
-    // time to close what it makes; a second SIGINT ends at once.
+    // Ending: close what this server created, give a call that was running a little time
+    // to close what it makes, and let the queued answers out; a second SIGINT ends at once.
     let closing = {
         let owned = owned.clone();
         tokio::task::spawn_blocking(move || {
@@ -753,10 +771,16 @@ pub async fn serve(opts: Options, paths: Paths, owned: Owned) -> i32 {
             let _ = tokio::time::timeout(IN_FLIGHT_LIMIT, task).await;
         }
     };
+    // Without senders the writer ends once the queue is written (or stdout is gone).
+    drop(out);
+    let flushed = async {
+        let join = tokio::task::spawn_blocking(move || writer.join());
+        let _ = tokio::time::timeout(FLUSH_LIMIT, join).await;
+    };
     // If that call does not return in time, the daemon drops a session whose creation
     // nobody received.
     tokio::select! {
-        _ = async { tokio::join!(closing, running) } => 0,
+        _ = async { tokio::join!(closing, running, flushed) } => 0,
         _ = stops.int.recv() => 130,
     }
 }

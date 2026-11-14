@@ -564,3 +564,60 @@ fn a_second_sigint_ends_at_once() {
     assert_eq!(mcp.wait_exit(3), 130, "{}", mcp.stderr());
     assert!(started.elapsed() < Duration::from_secs(3));
 }
+
+/// A client that writes its requests and closes stdin at once (`printf ... | pegboard mcp`)
+/// gets every answer. Needs no browser: `PEGBOARD_CHROME` names nothing, so the daemon the
+/// server starts in the background fails on its own; these requests never need it.
+#[test]
+fn requests_written_before_stdin_closes_are_all_answered() {
+    for round in 0..20 {
+        let home = Home::new();
+        let no_chrome = home.path().join("no-chrome");
+        let mut child = home
+            .command(&["mcp"])
+            .env("PEGBOARD_CHROME", &no_chrome)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = [
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                                "clientInfo": { "name": "e2e", "version": "1" } } }),
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }),
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
+        ]
+        .iter()
+        .map(|m| format!("{m}\n"))
+        .collect::<String>();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.as_bytes()).unwrap();
+        drop(stdin);
+        let mut out = String::new();
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let _ = stdout.read_to_string(&mut out);
+            out
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("round {round}: pegboard mcp did not exit after stdin closed");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(0), "round {round}");
+        let out = reader.join().unwrap();
+        let ids: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap()["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!(1), json!(2), json!(3)], "round {round}: {out}");
+    }
+}

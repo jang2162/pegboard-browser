@@ -16,6 +16,8 @@ struct StubState {
     ended: Vec<String>,
     next: usize,
     calls: Vec<(String, Value)>,
+    /// When set, session.info fails with this code (the daemon in trouble).
+    info_error: Option<&'static str>,
 }
 
 /// A core API that answers like the daemon, and puts tokens everywhere it can: a `token`
@@ -134,6 +136,11 @@ impl Core for Stub {
                 Ok(Stub::info(&s))
             }
             "session.list" => Ok(Value::Array(st.sessions.iter().map(Stub::info).collect())),
+            "session.info" if st.info_error.is_some() => Err(RpcError {
+                code: st.info_error.unwrap().into(),
+                message: "trouble".into(),
+                data: None,
+            }),
             "session.info" => match with_token(&st) {
                 Some(i) => Ok(Stub::info(&st.sessions[i])),
                 None => Err(not_found(&id)),
@@ -804,6 +811,9 @@ fn handles_are_adopted_only_when_well_formed() {
     let good = format!("s_adoptedd.{}", token_of("s_adoptedd"));
     owned.adopt(&good).unwrap();
     let id = SessionId("s_adoptedd".into());
+    // Not usable before the daemon confirms it.
+    assert_eq!(owned.token(&id), None);
+    owned.mark_verified(&id);
     assert_eq!(owned.token(&id), Some(token_of("s_adoptedd").as_str()));
     assert_eq!(owned.created_count(), 0);
     let short = format!("s_adoptedd.{}", &token_of("s_adoptedd")[1..]);
@@ -993,4 +1003,39 @@ fn an_overlong_line_is_not_held() {
         Some(false)
     );
     assert_eq!(line, b"ok");
+}
+
+#[test]
+fn an_adopted_handle_stays_hidden_until_the_daemon_confirms_it() {
+    let adopted = "s_adoptedd";
+    let mut owned = Owned::default();
+    owned
+        .adopt(&format!("{adopted}.{}", token_of(adopted)))
+        .unwrap();
+    let stub = Stub::new();
+    {
+        let mut st = stub.state.lock().unwrap();
+        st.sessions
+            .push((adopted.into(), token_of(adopted), "given".into(), json!({})));
+        st.info_error = Some(codes::INTERNAL);
+    }
+    let mut h = Harness::with(opts(false, SessionPolicy::default()), stub, owned);
+    let (_, list) = h.call("pegboard_session_list", json!({}));
+    assert!(!list.contains(adopted), "{list}");
+    let (err, text) = h.call("pegboard_files_list", json!({ "sessionId": adopted }));
+    assert!(
+        err && text == format!("session_not_found: no session {adopted}"),
+        "{text}"
+    );
+    let (err, text) = h.call(
+        "pegboard_recording_get",
+        json!({ "recordingId": "r_adoptedd" }),
+    );
+    assert!(err && text.starts_with("recording_not_found: "), "{text}");
+    // The daemon recovers: confirmed at the next call, and usable.
+    h.stub.state.lock().unwrap().info_error = None;
+    let (_, list) = h.call("pegboard_session_list", json!({}));
+    assert!(list.contains(adopted), "{list}");
+    let (err, text) = h.call("pegboard_files_list", json!({ "sessionId": adopted }));
+    assert!(!err, "{text}");
 }
