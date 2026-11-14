@@ -18,6 +18,10 @@ pub struct Scope {
     /// The directories `DOM.setFileInputFiles` may take files from: the session's upload
     /// directory and files directory when its policy allows upload, else none.
     pub upload_dirs: Vec<PathBuf>,
+    /// Whether the client may add scripts that run in the session's pages before their own
+    /// (`PAGE_SCRIPT_METHODS`): only when the session's policy allows the clipboard. Such a
+    /// script could disarm the clipboard shield if it ran first (spike C12a).
+    pub page_scripts_allowed: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -155,6 +159,18 @@ pub const GUARD_METHODS: &[&str] = &[
 pub const GUARD_PREFIXES: &[&str] = &["Fetch."];
 pub const GUARD_REFUSED: &str = "not allowed in a pegboard session: it would change pegboard's checks of the session's requests";
 
+/// Methods that add a script to the session's pages that runs before the page's own. Refused
+/// in sessions whose policy denies the clipboard (the default; plan K3, owner's choice A):
+/// the clipboard shield must be the first script of every document. agent-browser 0.42.0
+/// sends `Page.addScriptToEvaluateOnNewDocument` once for `vitals` and works without it
+/// (second machine, Task 11). The others are not in `ALLOWED_METHODS` either way.
+pub const PAGE_SCRIPT_METHODS: &[&str] = &[
+    "Page.addScriptToEvaluateOnNewDocument",
+    "Page.addScriptToEvaluateOnLoad",
+    "Runtime.addBinding",
+];
+pub const PAGE_SCRIPT_REFUSED: &str = "not allowed in a pegboard session whose policy denies the clipboard: it would run before pegboard's clipboard protection (--allow clipboard opens it)";
+
 pub fn is_guard_method(method: &str) -> bool {
     GUARD_METHODS.contains(&method) || GUARD_PREFIXES.iter().any(|p| method.starts_with(p))
 }
@@ -245,6 +261,11 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
     // 2b. Calls that could switch off or hide the daemon's request checks.
     if is_guard_method(method) {
         return error(-32000, GUARD_REFUSED);
+    }
+
+    // 2c. Scripts that would run before the clipboard shield, unless the clipboard is open.
+    if PAGE_SCRIPT_METHODS.contains(&method) && !scope.page_scripts_allowed {
+        return error(-32000, PAGE_SCRIPT_REFUSED);
     }
 
     // 3. Target-addressed calls must name one of the session's targets.
@@ -567,7 +588,50 @@ mod tests {
             targets: ["T1".to_string()].into(),
             cdp_sessions: ["S1".to_string()].into(),
             upload_dirs: Vec::new(),
+            page_scripts_allowed: false,
         }
+    }
+
+    #[test]
+    fn page_scripts_need_the_clipboard_open() {
+        let add = |sid: Option<&str>| {
+            let mut m = json!({ "id": 1, "method": "Page.addScriptToEvaluateOnNewDocument",
+                "params": { "source": "1" } });
+            if let Some(s) = sid {
+                m["sessionId"] = json!(s);
+            }
+            m
+        };
+        let denied = scope();
+        for sid in [Some("S1"), None] {
+            match client_message(&add(sid), &denied) {
+                ClientDecision::Error { message, .. } => {
+                    assert_eq!(message, PAGE_SCRIPT_REFUSED)
+                }
+                other => panic!("{sid:?}: {other:?}"),
+            }
+        }
+        for method in PAGE_SCRIPT_METHODS {
+            let m = json!({ "id": 1, "method": method, "params": {}, "sessionId": "S1" });
+            assert!(
+                matches!(client_message(&m, &denied), ClientDecision::Error { .. }),
+                "{method}"
+            );
+        }
+        let allowed = Scope {
+            page_scripts_allowed: true,
+            ..scope()
+        };
+        assert_eq!(
+            client_message(&add(Some("S1")), &allowed),
+            ClientDecision::Forward
+        );
+        // Unlisted ones stay refused by the allow-list.
+        let binding = json!({ "id": 1, "method": "Runtime.addBinding", "params": { "name": "x" }, "sessionId": "S1" });
+        assert!(matches!(
+            client_message(&binding, &allowed),
+            ClientDecision::Error { .. }
+        ));
     }
 
     fn err_code(d: &ClientDecision) -> i64 {

@@ -189,7 +189,7 @@ pegboard profile delete work                            # 열린 세션이 있�
 - `--allow clipboard`가 없는 세션의 프로필에는 세 가지를 건다: 데몬의 전용 연결로 `clipboard-read`/`clipboard-write` 권한 거부(`navigator.clipboard`), 요청 가드가 모든 탭과 프레임의 첫 스크립트보다 먼저 넣는 `copy`/`cut`/`paste` 캡처 리스너(`execCommand`, 키의 편집 명령, 페이지의 `copy` 처리기), `press`의 복사·잘라내기·붙여넣기 조합 거부(`Meta`/`Control` + `c`/`x`/`v`, `Control+Insert`, `Shift+Insert`, `Shift+Delete`). 방법은 architecture.md 11절.
 - 권한 거부를 다시 걸 때와 열린 프로필에서 클립보드 설정이 바뀔 때, 그 프로필이 기본 컨텍스트가 아니면 탭 하나를 활성화한다. **이때 에이전트 창이 앞으로 나와 사람의 키보드 초점을 가져갈 수 있다**(페이지가 일으킬 수 없다). 처음 보는 프로필에 클립보드를 허용하는 첫 세션이 올 때(이전 데몬의 거부가 남았을 수 있어 초기화한다)도 같다.
 - 가드가 다시 붙으면 클립보드를 거부하는 세션들의 에이전트 연결을 먼저 끊고(에이전트는 다시 붙는다) 그 세션들의 옛 탭에 리스너를 넣은 뒤 새로 고친다. 그 탭의 입력 중이던 내용은 사라지고, 그 일이 끝날 때까지 그 세션들의 명령은 거부된다.
-- 에이전트 연결의 `Page.addScriptToEvaluateOnNewDocument`는 막지 않는다(agent-browser의 `vitals`가 쓴다). 새 탭과 프레임에서는 가드가 먼저 붙어 리스너가 먼저 돈다.
+- 클립보드를 거부하는 세션(기본)에서는 에이전트 연결의 `Page.addScriptToEvaluateOnNewDocument`(페이지보다 먼저 도는 스크립트)를 프록시가 거부한다. agent-browser의 `vitals`는 이것을 한 번 보내지만 거부되어도 결과를 낸다(측정). `--allow clipboard` 세션은 쓸 수 있다. 그래도 새 탭과 프레임에서는 가드가 먼저 붙어 리스너가 먼저 돈다(두 번째 방어).
 - 실행 중인 채로 붙는 프레임(`sandbox`의 `srcdoc` iframe)은 리스너를 넣은 뒤 그 프레임을 다시 읽게 하므로 그 프레임의 상태가 사라진다. 같은 프레임이 3번을 넘거나 리스너를 넣지 못하면 그 탭을 닫는다.
 - `document.open()`은 리스너를 지운다. 리스너 스크립트가 `open`/`write`를 감싸 다시 달고, 가드가 `Page.documentOpened`마다 첫 리스너가 자기 것인지 확인해 아니면 문서를 새로 고치거나 탭을 닫는다. 이 확인은 비동기라 그 사이(한 번의 `eval` 안에서 `open`, `write`, 복사를 다 하는 경우)는 감싼 함수만 지킨다. 읽기가 끝난 뒤에도 계속 `document.write`를 하는 페이지에서는 그때마다 클립보드를 거부하는 세션의 명령이 잠깐씩 거부된다.
 - 가드는 새 탭과 팝업에 리스너를 넣는 명령을 재개 전에 보내고 답은 재개 뒤에 기다린다(15초 안에 답이 없으면 그 탭을 닫는다). 브라우저가 그 명령을 첫 스크립트보다 먼저 처리한다는 것은 시험 `new_tabs_popups_and_frames_are_covered`로 확인한다.

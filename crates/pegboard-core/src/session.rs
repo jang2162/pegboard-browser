@@ -370,6 +370,10 @@ impl SessionManager {
                 .proxy
                 .set_upload_dirs(&id, dirs.into_iter().flatten().collect());
         }
+        // Scripts that run before a page's own could disarm the clipboard shield (K3).
+        inner
+            .proxy
+            .set_page_scripts_allowed(&id, session_policy.allow.contains(&ActionClass::Clipboard));
         let created_at = now();
         let info = SessionInfo {
             id: id.clone(),
@@ -756,6 +760,18 @@ impl SessionManager {
             return false;
         }
         self.inner.guard.set_early_delay_for_test(delay);
+        true
+    }
+
+    /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: lets a session's clients add page
+    /// scripts although its policy denies the clipboard, to test the shield's second layer
+    /// (the guard's session is older). Returns whether it did.
+    #[doc(hidden)]
+    pub fn allow_page_scripts_for_test(&self, id: &SessionId) -> bool {
+        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+            return false;
+        }
+        self.inner.proxy.set_page_scripts_allowed(id, true);
         true
     }
 

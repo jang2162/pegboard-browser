@@ -157,6 +157,7 @@ impl SessionEntry {
                 targets: targets.into_iter().collect(),
                 cdp_sessions: HashSet::new(),
                 upload_dirs: Vec::new(),
+                page_scripts_allowed: false,
             }),
             closed: watch::channel(false).0,
             kick: watch::channel(0).0,
@@ -289,6 +290,14 @@ impl ProxyServer {
         let entry = self.shared.sessions.lock().unwrap().remove(&id.0);
         if let Some(entry) = entry {
             entry.closed.send_replace(true);
+        }
+    }
+
+    /// Lets the session's clients add scripts that run before the pages' own
+    /// (`filter::PAGE_SCRIPT_METHODS`): for sessions whose policy allows the clipboard.
+    pub fn set_page_scripts_allowed(&self, id: &SessionId, allowed: bool) {
+        if let Some(entry) = self.shared.entry(id) {
+            entry.scope.lock().unwrap().page_scripts_allowed = allowed;
         }
     }
 

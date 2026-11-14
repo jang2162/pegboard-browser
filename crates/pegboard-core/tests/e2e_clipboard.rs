@@ -986,11 +986,50 @@ const ATTACK: &str = "(()=>{window.__agentRan=1;const noop=function(){};\
     Event.prototype.preventDefault=noop;Event.prototype.stopImmediatePropagation=noop;\
     Function.prototype.call=noop;EventTarget.prototype.addEventListener=noop})()";
 
-/// Replaces K3's refusal of the agent's `Page.addScriptToEvaluateOnNewDocument` (agent-browser's
-/// `vitals` needs it): the agent's own new-document script cannot run before the shield, so it
-/// cannot disarm it (spike C12a: the older session's script runs first, and the guard holds
-/// every new target until its own session has set the shield). Tried on the agent's tab and on
-/// a popup the agent is attached to from its start.
+/// K3: in a session whose policy denies the clipboard, the proxy refuses the agent's
+/// `Page.addScriptToEvaluateOnNewDocument`; with `--allow clipboard` it runs (and there is no
+/// shield to disarm).
+#[test]
+#[ignore]
+fn agent_page_scripts_are_refused_unless_the_clipboard_is_allowed() {
+    common::run(async {
+        let h = Harness::start();
+        for allow in [false, true] {
+            let a = agent(&h, allow).await;
+            let tab = a.tab(&a.first()).await;
+            let r =
+                a.c.send(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": "window.__agentRan=1" }),
+                    Some(&tab.sid),
+                )
+                .await;
+            if allow {
+                r.unwrap();
+                tab.load("/clip").await;
+                assert_eq!(tab.eval("String(window.__agentRan)", false).await, "1");
+            } else {
+                let e = format!("{:#}", r.expect_err("the script was taken"));
+                assert!(
+                    e.contains(pegboard_core::proxy::filter::PAGE_SCRIPT_REFUSED),
+                    "{e}"
+                );
+                tab.load("/clip").await;
+                assert_eq!(
+                    tab.eval("String(window.__agentRan)", false).await,
+                    "undefined"
+                );
+            }
+            h.close_session(&a.info.id).await;
+        }
+    });
+}
+
+/// The second layer, should a page script get past K3 (here let through by a test hook): the
+/// agent's own new-document script cannot run before the shield, so it cannot disarm it
+/// (spike C12a: the older session's script runs first, and the guard holds every new target
+/// until its own session has set the shield). Tried on the agent's tab and on a popup the
+/// agent is attached to from its start.
 #[test]
 #[ignore]
 fn agent_scripts_cannot_run_before_the_shield() {
@@ -998,6 +1037,7 @@ fn agent_scripts_cannot_run_before_the_shield() {
         let clip = Clipboard::take();
         let h = Harness::start();
         let a = agent(&h, false).await;
+        assert!(h.manager.allow_page_scripts_for_test(&a.info.id));
         let first = a.first();
         let tab = a.tab(&first).await;
         a.c.send("Page.enable", json!({}), Some(&tab.sid))
@@ -1009,7 +1049,7 @@ fn agent_scripts_cannot_run_before_the_shield() {
             Some(&tab.sid),
         )
         .await
-        .expect("the agent's own script is refused; K3 was dropped on purpose");
+        .expect("the test hook did not let the script through");
         tab.load("/clip").await;
         assert_eq!(tab.eval("String(window.__agentRan)", false).await, "1");
         assert!(
@@ -1180,6 +1220,8 @@ fn after_a_guard_reconnect_agent_connections_are_dropped_and_tabs_reloaded() {
         let profile = "clip-reconnect";
         h.manager.create_profile(profile).await.unwrap();
         let denied = agent(&h, false).await;
+        // The second layer (K3 would refuse the agent's script): let through by a test hook.
+        assert!(h.manager.allow_page_scripts_for_test(&denied.info.id));
         let allowed = create(&h, true, Some(profile)).await.unwrap();
         let (d, k) = (denied.first(), allowed.first());
         let tab = denied.tab(&d).await;
