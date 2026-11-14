@@ -621,3 +621,632 @@ fn requests_written_before_stdin_closes_are_all_answered() {
         assert_eq!(ids, [json!(1), json!(2), json!(3)], "round {round}: {out}");
     }
 }
+
+// ---- browser action tools: the same path as the CLI ----
+
+impl Mcp {
+    /// The `result` of a tool call (null when the call was refused as a JSON-RPC error).
+    fn call_result(&mut self, tool: &str, args: Value) -> Value {
+        let r = self.request("tools/call", json!({ "name": tool, "arguments": args }));
+        r["result"].clone()
+    }
+
+    /// Whether a call was refused one way or another: a JSON-RPC error (no such tool) or a
+    /// tool error.
+    fn refused(&mut self, tool: &str, args: Value) -> (bool, String) {
+        let r = self.request("tools/call", json!({ "name": tool, "arguments": args }));
+        if r["error"].is_object() {
+            return (
+                true,
+                r["error"]["message"].as_str().unwrap_or("").to_string(),
+            );
+        }
+        (
+            r["result"]["isError"] == true,
+            r["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+}
+
+/// The action log entries of a session, as `recording show --json` gives them.
+fn entries(home: &Home, id: &str) -> Vec<Value> {
+    let rid = format!("r_{}", &id[2..]);
+    let (code, out, err) = home.run(&["recording", "show", &rid, "--json"]);
+    assert_eq!(code, 0, "{err}");
+    json(&out)["actions"].as_array().unwrap().clone()
+}
+
+/// What two runs of one command may differ in: the nonce of agent-browser's page-content
+/// markers and the name pegboard picks for an unnamed screenshot.
+fn normalized(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let next = ["nonce=", "shot-"]
+            .iter()
+            .filter_map(|m| rest.find(m).map(|i| (i, *m)))
+            .min();
+        let Some((i, marker)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..i + marker.len()]);
+        out.push('X');
+        rest = rest[i + marker.len()..].trim_start_matches(|c: char| c.is_ascii_alphanumeric());
+    }
+}
+
+/// One command, as the CLI takes it and as the MCP tool takes it.
+struct Same {
+    cli: Vec<String>,
+    tool: &'static str,
+    args: Value,
+    /// Whether the two outputs must be equal (not for lists that grow between the runs).
+    same_text: bool,
+}
+
+fn same(cli: &[&str], tool: &'static str, args: Value) -> Same {
+    Same {
+        cli: cli.iter().map(|w| w.to_string()).collect(),
+        tool,
+        args,
+        same_text: true,
+    }
+}
+
+#[test]
+#[ignore]
+fn cli_and_mcp_run_the_same_command_the_same_way() {
+    let origin = fixture();
+    let home = shared_home();
+    let counter = format!("{origin}/counter");
+    let form = format!("{origin}/form");
+    let cookie_page = format!("{origin}/cookie/get");
+    let handle = cli_create(home, &["--url", &counter]);
+    let id = id_of(&handle).to_string();
+    let mut mcp = Mcp::start_env(
+        home,
+        &[("PEGBOARD_SESSION", handle.as_str())],
+        &["--tools", "all"],
+    );
+    // Every first word but: a11y and vitals (they fetch outside the fixture), frame (no
+    // iframe), upload (needs a wider policy; e2e_policy covers it), drag, check, uncheck,
+    // select and dialog accept (no fitting element in the fixture pages).
+    let mut cases = vec![
+        same(
+            &["open", &counter],
+            "pegboard_open",
+            json!({ "url": counter }),
+        ),
+        same(
+            &["snapshot", "-i"],
+            "pegboard_snapshot",
+            json!({ "interactive": true }),
+        ),
+        same(&["snapshot"], "pegboard_snapshot", json!({})),
+        same(&["get", "url"], "pegboard_get", json!({ "command": "url" })),
+        same(
+            &["get", "title"],
+            "pegboard_get",
+            json!({ "command": "title" }),
+        ),
+        same(
+            &["get", "text", "#clicks"],
+            "pegboard_get",
+            json!({ "command": "text", "selector": "#clicks" }),
+        ),
+        same(
+            &["is", "visible", "#btn"],
+            "pegboard_is",
+            json!({ "command": "visible", "selector": "#btn" }),
+        ),
+        same(
+            &["hover", "#btn"],
+            "pegboard_hover",
+            json!({ "selector": "#btn" }),
+        ),
+        same(
+            &["focus", "#btn"],
+            "pegboard_focus",
+            json!({ "selector": "#btn" }),
+        ),
+        same(
+            &["scrollintoview", "#btn"],
+            "pegboard_scrollintoview",
+            json!({ "selector": "#btn" }),
+        ),
+        same(
+            &["highlight", "#btn"],
+            "pegboard_highlight",
+            json!({ "selector": "#btn" }),
+        ),
+        same(
+            &["click", "#btn"],
+            "pegboard_click",
+            json!({ "selector": "#btn" }),
+        ),
+        same(
+            &["dblclick", "#btn"],
+            "pegboard_dblclick",
+            json!({ "selector": "#btn" }),
+        ),
+        same(
+            &["find", "role", "button"],
+            "pegboard_find",
+            json!({ "command": "role", "query": "button" }),
+        ),
+        same(
+            &["get", "text", "#clicks"],
+            "pegboard_get",
+            json!({ "command": "text", "selector": "#clicks" }),
+        ),
+        same(
+            &["press", "Enter"],
+            "pegboard_press",
+            json!({ "key": "Enter" }),
+        ),
+        same(
+            &["wait", "100"],
+            "pegboard_wait",
+            json!({ "target": "100" }),
+        ),
+        same(
+            &["eval", "1+1"],
+            "pegboard_eval",
+            json!({ "expression": "1+1" }),
+        ),
+        same(
+            &["tab", "list"],
+            "pegboard_tab",
+            json!({ "command": "list" }),
+        ),
+        same(&["screenshot"], "pegboard_screenshot", json!({})),
+        same(
+            &["pdf", "page.pdf"],
+            "pegboard_pdf",
+            json!({ "file": "page.pdf" }),
+        ),
+        same(
+            &["scroll", "down", "100"],
+            "pegboard_scroll",
+            json!({ "direction": "down", "amount": 100 }),
+        ),
+        same(
+            &["mouse", "move", "10", "20"],
+            "pegboard_mouse",
+            json!({ "command": "move", "x": 10, "y": 20 }),
+        ),
+        same(
+            &["set", "viewport", "900", "700"],
+            "pegboard_set",
+            json!({ "command": "viewport", "width": 900, "height": 700 }),
+        ),
+        same(
+            &["dialog", "status"],
+            "pegboard_dialog",
+            json!({ "command": "status" }),
+        ),
+        same(&["console"], "pegboard_console", json!({})),
+        same(&["errors"], "pegboard_errors", json!({})),
+        Same {
+            same_text: false,
+            ..same(
+                &["network", "requests"],
+                "pegboard_network",
+                json!({ "command": "requests" }),
+            )
+        },
+        same(
+            &["open", &cookie_page],
+            "pegboard_open",
+            json!({ "url": cookie_page }),
+        ),
+        same(
+            &["get", "text", "#out"],
+            "pegboard_get",
+            json!({ "command": "text", "selector": "#out" }),
+        ),
+        same(&["cookies"], "pegboard_cookies", json!({})),
+        same(
+            &["cookies", "get"],
+            "pegboard_cookies",
+            json!({ "command": "get" }),
+        ),
+        same(
+            &["storage", "local"],
+            "pegboard_storage",
+            json!({ "command": "local" }),
+        ),
+        same(&["back"], "pegboard_back", json!({})),
+        same(&["forward"], "pegboard_forward", json!({})),
+        same(&["reload"], "pegboard_reload", json!({})),
+        same(&["open", &form], "pegboard_open", json!({ "url": form })),
+        same(
+            &["fill", "#name", "a b"],
+            "pegboard_fill",
+            json!({ "selector": "#name", "text": "a b" }),
+        ),
+        same(
+            &["type", "#name", "c"],
+            "pegboard_type",
+            json!({ "selector": "#name", "text": "c" }),
+        ),
+        same(
+            &["keyboard", "type", "d"],
+            "pegboard_keyboard",
+            json!({ "command": "type", "text": "d" }),
+        ),
+        same(&["tab"], "pegboard_tab", json!({})),
+        // A command that fails, the same way.
+        same(
+            &["click", "#nothing-here"],
+            "pegboard_click",
+            json!({ "selector": "#nothing-here" }),
+        ),
+    ];
+    for case in cases.drain(..) {
+        let what = case.cli.join(" ");
+        let argv: Vec<&str> = case.cli.iter().map(String::as_str).collect();
+        let (code, out, err) = home.run_env(&[("PEGBOARD_SESSION", handle.as_str())], &argv);
+        let by_cli = entries(home, &id).last().unwrap().clone();
+        let (is_error, text) = mcp.call(case.tool, case.args.clone());
+        let by_mcp = entries(home, &id).last().unwrap().clone();
+        assert_eq!(
+            code == 0,
+            !is_error,
+            "{what}: cli {code} {err} / mcp {text}"
+        );
+        for key in ["command", "args", "ok", "redacted", "url"] {
+            assert_eq!(
+                by_cli[key], by_mcp[key],
+                "{what}: {key}: {by_cli} / {by_mcp}"
+            );
+        }
+        assert_ne!(
+            by_cli["seq"], by_mcp["seq"],
+            "{what}: the MCP call was logged"
+        );
+        if case.same_text {
+            let cli_text = if code == 0 {
+                let t = out.trim_end_matches('\n');
+                if t.is_empty() {
+                    "ok".to_string()
+                } else {
+                    t.to_string()
+                }
+            } else {
+                // "pegboard: command failed: <why>" or "pegboard: <code>: <message>".
+                let line = err
+                    .lines()
+                    .find_map(|l| l.strip_prefix("pegboard: "))
+                    .unwrap_or_else(|| panic!("{what}: {err}"));
+                match line.strip_prefix("command failed: ") {
+                    Some(why) => format!("command_failed: {why}"),
+                    None => line.to_string(),
+                }
+            };
+            assert_eq!(normalized(&cli_text), normalized(&text), "{what}");
+        }
+    }
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+    assert_no_token(&mcp, home, &handle);
+    // An adopted session stays open; close it.
+    assert_eq!(home.run(&["session", "close", &handle]).0, 0);
+}
+
+#[test]
+#[ignore]
+fn the_same_inputs_are_rejected_by_both() {
+    let origin = fixture();
+    let home = shared_home();
+    let counter = format!("{origin}/counter");
+    let port = std::fs::read_to_string(home.path().join("chrome/DevToolsActivePort"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let a = cli_create(home, &["--url", &counter]);
+    let b = cli_create(home, &["--url", &counter]);
+    let (a_id, b_id) = (id_of(&a).to_string(), id_of(&b).to_string());
+    let mut mcp = Mcp::start_env(
+        home,
+        &[("PEGBOARD_SESSION", a.as_str())],
+        &["--tools", "all"],
+    );
+    // Positive control: the session can be driven.
+    let (err, text) = mcp.call("pegboard_get", json!({ "command": "url" }));
+    assert!(!err && text.contains("/counter"), "{text}");
+    let b_before = entries(home, &b_id).len();
+    let ok_entries = |home: &Home| {
+        entries(home, &a_id)
+            .iter()
+            .filter(|e| e["ok"] == true)
+            .count()
+    };
+    let ok_before = ok_entries(home);
+    let cases: Vec<(&str, Value)> = vec![
+        ("pegboard_snapshot", json!({ "cdp": port })),
+        ("pegboard_snapshot", json!({ "autoConnect": true })),
+        ("pegboard_connect", json!({ "port": port })),
+        (
+            "pegboard_open",
+            json!({ "url": counter, "profile": "Default" }),
+        ),
+        ("pegboard_close", json!({})),
+        ("pegboard_stream", json!({ "command": "enable" })),
+        ("pegboard_snapshot", json!({ "session": b })),
+        (
+            "pegboard_snapshot",
+            json!({ "selector": format!("--cdp {port}") }),
+        ),
+        ("pegboard_snapshot", json!({ "selector": "--" })),
+        ("pegboard_open", json!({ "url": "file:///etc/hosts" })),
+        ("pegboard_open", json!({ "url": "chrome://settings" })),
+        (
+            "pegboard_tab",
+            json!({ "command": "new", "url": "file:///etc/hosts" }),
+        ),
+        ("pegboard_inspect", json!({})),
+        ("pegboard_read", json!({})),
+        (
+            "pegboard_set",
+            json!({ "command": "credentials", "width": 1, "height": 1 }),
+        ),
+        ("pegboard_get", json!({ "command": "cdp-url" })),
+        // Another session: by id (not held), by handle (not an id).
+        (
+            "pegboard_click",
+            json!({ "sessionId": b_id, "selector": "#btn" }),
+        ),
+        (
+            "pegboard_click",
+            json!({ "sessionId": b, "selector": "#btn" }),
+        ),
+        (
+            "pegboard_upload",
+            json!({ "selector": "#f", "files": ["/etc/hosts"] }),
+        ),
+    ];
+    for (tool, args) in &cases {
+        let (refused, why) = mcp.refused(tool, args.clone());
+        assert!(refused, "{tool} {args} was not refused: {why}");
+    }
+    // The same through the CLI, where the line can be typed.
+    for argv in [
+        vec!["open", "file:///etc/hosts"],
+        vec!["open", "chrome://settings"],
+        vec!["tab", "new", "file:///etc/hosts"],
+        vec!["snapshot", "--cdp", &port],
+        vec!["get", "cdp-url"],
+    ] {
+        let (code, _, err) = home.run_env(&[("PEGBOARD_SESSION", a.as_str())], &argv);
+        assert_eq!(code, 2, "{argv:?}: {err}");
+        assert!(err.contains("argv_rejected"), "{argv:?}: {err}");
+    }
+    assert_eq!(ok_entries(home), ok_before, "a refused input ran");
+    assert_eq!(entries(home, &b_id).len(), b_before, "B was touched");
+    // `fill` takes text after `--`: what follows is literal text for the field.
+    let form = format!("{origin}/form");
+    let (err, text) = mcp.call("pegboard_open", json!({ "url": form }));
+    assert!(!err, "{text}");
+    let typed = format!("--cdp {port}");
+    let (err, text) = mcp.call(
+        "pegboard_fill",
+        json!({ "selector": "#name", "text": typed }),
+    );
+    assert!(!err, "{text}");
+    let (err, text) = mcp.call(
+        "pegboard_eval",
+        json!({ "expression": "document.getElementById('name').value" }),
+    );
+    assert!(!err && text.contains(&typed), "{text}");
+    // Still alone in its one tab.
+    let (_, tabs) = mcp.call("pegboard_tab", json!({ "command": "list" }));
+    assert_eq!(tabs.matches("/form").count(), 1, "{tabs}");
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+    assert_no_token(&mcp, home, &a);
+    assert_no_token(&mcp, home, &b);
+    for h in [&a, &b] {
+        assert_eq!(home.run(&["session", "close", h]).0, 0);
+    }
+}
+
+#[test]
+#[ignore]
+fn the_session_policy_applies_to_mcp_actions() {
+    let origin = fixture();
+    let home = shared_home();
+    let mut mcp = Mcp::start(home, &["--deny", "eval", "--tools", "all"]);
+    let id = mcp.create(json!({ "url": format!("{origin}/counter") }));
+    for (tool, args) in [
+        ("pegboard_eval", json!({ "expression": "1" })),
+        ("pegboard_wait", json!({ "fn": "true" })),
+        // State is denied by default.
+        (
+            "pegboard_cookies",
+            json!({ "command": "set", "name": "n", "value": "v" }),
+        ),
+        ("pegboard_storage", json!({ "command": "local clear" })),
+    ] {
+        let (err, text) = mcp.call(tool, args.clone());
+        assert!(
+            err && text.starts_with("policy_denied: "),
+            "{tool} {args}: {text}"
+        );
+    }
+    // Allowed classes run.
+    let (err, text) = mcp.call("pegboard_cookies", json!({}));
+    assert!(!err, "{text}");
+    let log = entries(home, &id);
+    assert!(
+        log.iter().filter(|e| e["ok"] == false).count() >= 4,
+        "{log:?}"
+    );
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+}
+
+#[test]
+#[ignore]
+fn secrets_typed_over_mcp_are_redacted_like_the_cli() {
+    const SECRET: &str = "hunter2-over-mcp";
+    let origin = fixture();
+    let home = shared_home();
+    let mut mcp = Mcp::start(home, &[]);
+    let id = mcp.create(json!({ "url": format!("{origin}/form") }));
+    for (tool, args) in [
+        (
+            "pegboard_fill",
+            json!({ "selector": "#pw", "text": SECRET }),
+        ),
+        (
+            "pegboard_fill",
+            json!({ "selector": "#pw", "text": format!("-{SECRET}") }),
+        ),
+        (
+            "pegboard_type",
+            json!({ "selector": "#pw", "text": SECRET, "clear": true }),
+        ),
+        ("pegboard_click", json!({ "selector": "#pw" })),
+        (
+            "pegboard_keyboard",
+            json!({ "command": "type", "text": SECRET }),
+        ),
+    ] {
+        let (err, text) = mcp.call(tool, args.clone());
+        assert!(!err, "{tool} {args}: {text}");
+    }
+    // The field did get the text.
+    let (_, value) = mcp.call(
+        "pegboard_eval",
+        json!({ "expression": "document.getElementById('pw').value.length > 0" }),
+    );
+    assert!(value.contains("true"), "{value}");
+    let log = entries(home, &id);
+    let typed: Vec<&Value> = log
+        .iter()
+        .filter(|e| ["fill", "type", "keyboard"].contains(&e["command"].as_str().unwrap()))
+        .collect();
+    assert_eq!(typed.len(), 4, "{log:?}");
+    for e in &typed {
+        assert_eq!(e["redacted"], true, "{e}");
+    }
+    let rid = format!("r_{}", &id[2..]);
+    let (err, shown) = mcp.call("pegboard_recording_get", json!({ "recordingId": rid }));
+    assert!(!err, "{shown}");
+    assert!(!shown.contains(SECRET), "{shown}");
+    let mut stack = vec![home.path().join("recordings")];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            if e.path().is_dir() {
+                stack.push(e.path());
+            } else {
+                let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+                assert!(!text.contains(SECRET), "{:?}", e.path());
+            }
+        }
+    }
+    let daemon_log = std::fs::read_to_string(home.path().join("daemon.log")).unwrap_or_default();
+    assert!(!daemon_log.contains(SECRET), "in daemon.log");
+    assert!(!mcp.stderr().contains(SECRET), "in the server's stderr");
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+}
+
+#[test]
+#[ignore]
+fn screenshot_returns_an_image() {
+    let origin = fixture();
+    let home = shared_home();
+    let mut mcp = Mcp::start(home, &[]);
+    let id = mcp.create(json!({ "url": format!("{origin}/counter") }));
+    for args in [
+        json!({}),
+        json!({ "file": "page.png", "full": true }),
+        json!({ "selector": "#btn" }),
+    ] {
+        let r = mcp.call_result("pegboard_screenshot", args.clone());
+        assert_eq!(r["isError"], false, "{args}: {r}");
+        let content = r["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text", "{args}");
+        assert_eq!(content.len(), 2, "{args}: {:?}", content[0]);
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        let png = data_encoding::BASE64
+            .decode(content[1]["data"].as_str().unwrap().as_bytes())
+            .unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{args}");
+    }
+    let (err, files) = mcp.call("pegboard_files_list", json!({ "sessionId": id }));
+    assert!(!err && files.contains("page.png"), "{files}");
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+}
+
+#[test]
+#[ignore]
+fn page_text_carries_boundary_markers() {
+    let origin = fixture();
+    let home = shared_home();
+    let handle = cli_create(home, &["--url", &format!("{origin}/counter")]);
+    let mut mcp = Mcp::start_env(home, &[("PEGBOARD_SESSION", handle.as_str())], &[]);
+    for (cli, tool, args) in [
+        (vec!["snapshot"], "pegboard_snapshot", json!({})),
+        (
+            vec!["get", "text", "#clicks"],
+            "pegboard_get",
+            json!({ "command": "text", "selector": "#clicks" }),
+        ),
+    ] {
+        let (err, text) = mcp.call(tool, args);
+        assert!(!err, "{text}");
+        assert!(
+            text.contains("AGENT_BROWSER_PAGE_CONTENT nonce=")
+                && text.contains("END_AGENT_BROWSER_PAGE_CONTENT nonce="),
+            "{tool}: {text}"
+        );
+        // As the CLI prints it: the markers are agent-browser's, kept as they are.
+        let (code, out, err) = home.run_env(&[("PEGBOARD_SESSION", handle.as_str())], &cli);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("AGENT_BROWSER_PAGE_CONTENT nonce="), "{out}");
+    }
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+    assert_eq!(home.run(&["session", "close", &handle]).0, 0);
+}
+
+#[test]
+#[ignore]
+fn downloads_are_told_in_mcp_results() {
+    let origin = fixture();
+    let home = shared_home();
+    let probe = DownloadProbe::new();
+    let t = probe.token.clone();
+    let mut mcp = Mcp::start(home, &[]);
+    let id = mcp.create(json!({ "url": format!("{origin}/dlpage/{t}") }));
+    let (err, text) = mcp.call("pegboard_click", json!({ "selector": "#att" }));
+    assert!(!err, "{text}");
+    let mut told = text.matches(&format!("downloaded {t} ")).count();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while told == 0 {
+        assert!(Instant::now() < deadline, "the download was not told");
+        std::thread::sleep(Duration::from_millis(300));
+        let (_, text) = mcp.call("pegboard_get", json!({ "command": "url" }));
+        told += text.matches(&format!("downloaded {t} ")).count();
+    }
+    assert_eq!(told, 1);
+    // Told once only.
+    let (_, text) = mcp.call("pegboard_get", json!({ "command": "url" }));
+    assert!(!text.contains("downloaded"), "{text}");
+    let (err, files) = mcp.call("pegboard_files_list", json!({ "sessionId": id }));
+    assert!(!err && files.contains(&t), "{files}");
+    assert!(probe.in_real_downloads().is_empty());
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+}
