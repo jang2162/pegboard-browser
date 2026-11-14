@@ -16,4 +16,5 @@ pub mod proxy;
 pub mod runner;
 pub mod service;
 pub mod session;
+pub mod testenv;
 pub mod upload;

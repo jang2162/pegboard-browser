@@ -501,13 +501,22 @@ impl SessionManager {
         for t in &targets {
             inner.release_focus(t).await;
         }
+        // Only now, with its tabs closed (or out of its group), does the session let go of
+        // its profile's pin: until then the guard judges them by the session's allow-list.
+        let SessionRecord {
+            mut info,
+            bridge,
+            group,
+            _pin: pin,
+            ..
+        } = record;
+        inner.release_pin(id, pin, &bridge, &group, &targets).await;
         result.map_err(|e| {
             rpc_error(
                 codes::BROWSER_FAILED,
                 format!("session {} closed, but its tabs may remain: {e:#}", id.0),
             )
         })?;
-        let mut info = record.info;
         info.targets = targets.into_iter().collect();
         info.state = SessionState::Closed;
         Ok(info)
@@ -1199,16 +1208,60 @@ impl Inner {
         let mut targets: BTreeSet<String> = self.proxy.targets(id).into_iter().collect();
         targets.insert(first.to_string());
         self.proxy.unregister(id);
-        self.table.lock().unwrap().records.remove(id);
+        // Held (with its pin) until the tabs are closed.
+        let record = self.table.lock().unwrap().records.remove(id);
         self.browser.downloads.forget_session(id);
         if let Ok(members) = bridge.members(group).await {
             targets.extend(members);
         }
         let _ = close_tabs(&self.browser.conn, bridge, &targets).await;
-        let mut focus = self.focus.lock().unwrap();
-        for t in &targets {
-            focus.remove(t);
+        {
+            let mut focus = self.focus.lock().unwrap();
+            for t in &targets {
+                focus.remove(t);
+            }
         }
+        if let Some(record) = record {
+            self.release_pin(id, record._pin, bridge, group, &targets)
+                .await;
+        }
+    }
+
+    /// Lets go of a closed session's hold on its profile's pin. With test hooks on, says on
+    /// stderr how many of the session's tabs were still open and how many still in its group
+    /// at that moment (tests read the order from it).
+    async fn release_pin(
+        &self,
+        id: &SessionId,
+        pin: PinGuard,
+        bridge: &Bridge,
+        group: &GroupId,
+        targets: &BTreeSet<String>,
+    ) {
+        if crate::testenv::hooks() {
+            let open = match page_targets(&self.browser.conn).await {
+                Ok(live) => live
+                    .iter()
+                    .filter(|t| targets.contains(&t.target_id))
+                    .count()
+                    .to_string(),
+                Err(_) => "?".into(),
+            };
+            let grouped = match bridge.members(group).await {
+                Ok(members) => members
+                    .iter()
+                    .filter(|t| targets.contains(*t))
+                    .count()
+                    .to_string(),
+                Err(_) => "?".into(),
+            };
+            eprintln!(
+                "pegboard: session {} released its profile pin with {open} of its tabs open, \
+                 {grouped} in its group",
+                id.0
+            );
+        }
+        drop(pin);
     }
 
     /// Sessions and their browser contexts, including ones still being created.

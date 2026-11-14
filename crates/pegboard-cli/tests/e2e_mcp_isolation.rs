@@ -1600,3 +1600,81 @@ fn mcp_operator_mode_cannot_drive_other_sessions() {
     );
     assert!(!err, "{text}");
 }
+
+/// The daemon's line (test hooks on) for when session `id` let go of its profile's pin:
+/// (its tabs still open, its tabs still in its group) at that moment.
+fn pin_release(home: &Home, id: &str) -> (String, String) {
+    let log = std::fs::read_to_string(home.path().join("daemon.log")).unwrap_or_default();
+    let head = format!("pegboard: session {id} released its profile pin with ");
+    let line = log
+        .lines()
+        .find_map(|l| l.strip_prefix(head.as_str()))
+        .unwrap_or_else(|| panic!("no pin release of {id} in daemon.log:\n{log}"));
+    let words: Vec<&str> = line.split_whitespace().collect();
+    // "<n> of its tabs open, <m> in its group"
+    assert_eq!(
+        words.get(1..5),
+        Some(&["of", "its", "tabs", "open,"][..]),
+        "{line}"
+    );
+    (words[0].to_string(), words[5].to_string())
+}
+
+/// A session under `--allow-domain` leaves no tab behind that could reach an unlisted host
+/// under the profile's default policy: an MCP agent cannot keep its tabs, and its tabs are
+/// closed before the session lets go of the profile's pin. The human (CLI) may keep tabs;
+/// they are out of the group before the pin goes.
+#[test]
+#[ignore]
+fn mcp_session_closed_under_allow_domain_leaves_no_tab_outside_it() {
+    let origin = fixture();
+    let home = Home::new();
+    // Test hooks make the daemon say when a pin is released.
+    let mcp = Mcp::start_env(
+        &home,
+        &[("PEGBOARD_TEST_HOOKS", "1")],
+        &["--tools", "all", "--allow-domain", "127.0.0.1"],
+    );
+    let page = format!("{origin}/counter");
+    let port = origin.rsplit(':').next().unwrap().to_string();
+    let mut a = Agent::with(mcp, json!({ "url": page }));
+    // The allow-list holds while the session is open.
+    a.denied(
+        "pegboard_open",
+        json!({ "url": format!("http://localhost:{port}/counter") }),
+        "not in the session's allowed domains",
+    );
+    let (_, more) = a.call("pegboard_tab", json!({ "command": "new", "url": page }));
+    assert_eq!(a.tabs().len(), 2, "{more}");
+
+    // keepTabs is refused, and the session stays as it was.
+    let (err, text) = a.call("pegboard_session_close", json!({ "keepTabs": true }));
+    assert_eq!(
+        (err, text.as_str()),
+        (
+            true,
+            "invalid_params: keeping tabs is only for operator mode or the CLI"
+        )
+    );
+    assert!(cli_listed(&home, &a.id));
+    assert_eq!(a.tabs().len(), 2);
+
+    let human = Human::attach(&home);
+    let before = human.agent_pages().len();
+    let (err, text) = a.call("pegboard_session_close", json!({}));
+    assert!(!err, "{text}");
+    // When the pin went, none of the session's tabs was open any more.
+    assert_eq!(pin_release(&home, &a.id), ("0".into(), "0".into()));
+    assert!(!cli_listed(&home, &a.id));
+    assert_eq!(human.agent_pages().len(), before - 2);
+
+    // The human keeps tabs with the CLI: they are out of the group before the pin goes.
+    let kept = cli_create(&home, &["--allow-domain", "127.0.0.1", "--url", &page]);
+    let (code, _, err) = home.run(&["session", "close", &kept, "--keep-tabs"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(pin_release(&home, id_of(&kept)), ("1".into(), "0".into()));
+    // The server's exit closed nothing it was not given (its session is gone already).
+    let mut mcp = a.mcp;
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+}
