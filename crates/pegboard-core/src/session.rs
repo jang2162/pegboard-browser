@@ -250,15 +250,24 @@ impl SessionManager {
             }
         });
         let weak = Arc::downgrade(&inner);
-        inner.proxy.set_tab_gate(Arc::new(move |target: String| {
-            let weak = weak.clone();
-            Box::pin(async move {
-                let inner = weak
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("the daemon is stopping"))?;
-                inner.guard.wait_guarded(&target, GUARD_TIMEOUT).await
-            })
-        }));
+        inner
+            .proxy
+            .set_tab_gate(Arc::new(move |id: SessionId, target: String| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let inner = weak
+                        .upgrade()
+                        .ok_or_else(|| anyhow::anyhow!("the daemon is stopping"))?;
+                    // Known as the session's at once: its first navigation may be a
+                    // download, which closes the tab (spike F4) before it joins the scope.
+                    inner.browser.downloads.own(&target, &id);
+                    let guarded = inner.guard.wait_guarded(&target, GUARD_TIMEOUT).await;
+                    if guarded.is_err() {
+                        inner.browser.downloads.disown(&target);
+                    }
+                    guarded
+                })
+            }));
         let watcher = tokio::spawn(watch(Arc::downgrade(&inner), events));
         SessionManager { inner, watcher }
     }
@@ -568,6 +577,11 @@ impl SessionManager {
     /// The session's download reports since the last call (see `downloads::Report`).
     pub fn take_download_reports(&self, id: &SessionId) -> Vec<Report> {
         self.inner.browser.downloads.take_reports(id)
+    }
+
+    /// Reports taken but not delivered: they come first next time.
+    pub fn put_back_download_reports(&self, id: &SessionId, reports: Vec<Report>) {
+        self.inner.browser.downloads.put_back_reports(id, reports);
     }
 
     /// The open sessions in a browser context.

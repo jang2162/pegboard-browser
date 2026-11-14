@@ -274,6 +274,15 @@ fn no_session(id: &SessionId) -> RpcError {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DropPolicyParams {
+    session_id: SessionId,
+    #[serde(default)]
+    token: Option<String>,
+    hold_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RecordingParams {
     recording_id: String,
 }
@@ -501,6 +510,16 @@ impl Daemon {
                 to_value(self.close_session(p).await?)
             }
             "command.exec" => to_value(self.exec(params(p)?).await?),
+            // Test hook, only when the daemon was started with `PEGBOARD_TEST_HOOKS`: drops
+            // the download policy connection of the session's profile and keeps it down for
+            // `holdMs`. Needs the session's token; unknown otherwise.
+            "test.dropDownloadPolicy" if std::env::var_os("PEGBOARD_TEST_HOOKS").is_some() => {
+                let p: DropPolicyParams = params(p)?;
+                let id = checked_session(&p.session_id)?;
+                self.authorize(&id, p.token.as_deref())?;
+                let hold = Duration::from_millis(p.hold_ms.min(60_000));
+                Ok(json!({ "dropped": self.sessions.drop_download_policy_for_test(&id, hold) }))
+            }
             "files.list" => {
                 let p: SessionIdParams = params(p)?;
                 let id = checked_session(&p.session_id)?;
@@ -708,13 +727,15 @@ impl Daemon {
         if let Err(e) = self.runner.detach(&id).await {
             eprintln!("pegboard: {}: {}", e.code, e.message);
         }
-        // Downloads no command result told about yet go to the log before it ends.
-        let reports = self.sessions.take_download_reports(&id);
         let result = if close_tabs {
             self.sessions.close(p).await
         } else {
             self.sessions.info(&id)
         };
+        // Downloads no command result told about go to the log before it ends: taken after
+        // the close, so one that ended while the session closed is not missed (none is
+        // reported once the session is closed).
+        let reports = self.sessions.take_download_reports(&id);
         // Taken after `detach` stopped the running command, which releases the lock.
         {
             let mut log = log.lock().await;

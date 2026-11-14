@@ -170,8 +170,9 @@ pub type GroupChanged = Arc<dyn Fn(&SessionId, &GroupId) + Send + Sync>;
 
 /// Called with a tab the bridge made for a client's `Target.createTarget`, before the tab
 /// joins the scope; an error keeps it out (the tab is closed and the client gets the error).
-pub type TabGate =
-    Arc<dyn Fn(String) -> futures_util::future::BoxFuture<'static, Result<()>> + Send + Sync>;
+pub type TabGate = Arc<
+    dyn Fn(SessionId, String) -> futures_util::future::BoxFuture<'static, Result<()>> + Send + Sync,
+>;
 
 struct Shared {
     upstream: Arc<dyn Upstream>,
@@ -966,11 +967,12 @@ impl ClientConn {
                 let tx = self.tab_tx.clone();
                 let delay = self.tab_delay;
                 let gate = self.shared.tab_gate.lock().unwrap().clone();
+                let session = self.entry.id.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
                     let mut result = bridge.create_tab(&group, &url, &title, &color).await;
                     if let (Ok((target_id, _)), Some(gate)) = (&result, gate) {
-                        if let Err(e) = gate(target_id.clone()).await {
+                        if let Err(e) = gate(session, target_id.clone()).await {
                             let _ = bridge.close_targets(std::slice::from_ref(target_id)).await;
                             result = Err(e);
                         }

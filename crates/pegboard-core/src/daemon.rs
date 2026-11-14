@@ -289,13 +289,17 @@ fn report_downloads(
     if reports.is_empty() {
         return Ok(());
     }
+    for (i, r) in reports.iter().enumerate() {
+        if let Err(e) = append(log, r.log_entry(id)) {
+            // Neither logged nor told: they wait for the next result.
+            sessions.put_back_download_reports(id, reports[i..].to_vec());
+            return Err(e);
+        }
+    }
     output.insert(
         "downloads".to_string(),
         Value::Array(reports.iter().map(Report::to_json).collect()),
     );
-    for r in &reports {
-        append(log, r.log_entry(id))?;
-    }
     Ok(())
 }
 

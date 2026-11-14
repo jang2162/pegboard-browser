@@ -24,12 +24,21 @@ const MAX_NAME_BYTES: usize = 200;
 const FALLBACK_NAME: &str = "download";
 
 /// The name a download is saved under, from the name the browser suggests: the last path
-/// component, without control characters, at most `MAX_NAME_BYTES` bytes (keeping a short
-/// extension); `download` when nothing usable is left.
+/// component, without control and invisible format characters (bidi overrides, zero-width),
+/// without leading `-`, `.` or spaces (as upload names start with a letter or digit), at
+/// most `MAX_NAME_BYTES` bytes (keeping a short extension); `download` when nothing usable
+/// is left. Non-ASCII letters are kept (such a name cannot be uploaded again, whose rule is
+/// ASCII only).
 pub fn safe_name(suggested: &str) -> String {
     let last = suggested.rsplit(['/', '\\']).next().unwrap_or("");
-    let clean: String = last.chars().filter(|c| !c.is_control()).collect();
-    if clean.is_empty() || clean == "." || clean == ".." {
+    let clean: String = last
+        .chars()
+        .filter(|c| !c.is_control() && !is_format_char(*c))
+        .collect();
+    let clean = clean
+        .trim_start_matches(|c: char| c == '-' || c == '.' || c.is_whitespace())
+        .to_string();
+    if clean.is_empty() {
         return FALLBACK_NAME.to_string();
     }
     if clean.len() <= MAX_NAME_BYTES {
@@ -41,6 +50,15 @@ pub fn safe_name(suggested: &str) -> String {
         }
         _ => cut(&clean, MAX_NAME_BYTES).to_string(),
     }
+}
+
+/// Unicode format characters (category Cf) that change how a name looks without showing.
+fn is_format_char(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2
+        | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
 }
 
 /// Longest extension `safe_name` keeps when it shortens a name.
@@ -100,8 +118,14 @@ pub fn move_into(src: &Path, dir: &Path, name: &str) -> std::io::Result<(String,
         let dst = dir.join(&chosen);
         match std::fs::hard_link(src, &dst) {
             Ok(()) => {
-                std::fs::remove_file(src)?;
-                std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))?;
+                let done = std::fs::remove_file(src).and_then(|()| {
+                    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))
+                });
+                if let Err(e) = done {
+                    // Nothing half-moved stays in the files directory.
+                    let _ = std::fs::remove_file(&dst);
+                    return Err(e);
+                }
                 return Ok((chosen, meta.len()));
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
@@ -169,6 +193,59 @@ impl Limits {
         }
         None
     }
+}
+
+/// A running download as the limits see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Running {
+    pub session: Option<SessionId>,
+    /// The browser context (profile) it is saved in, when known.
+    pub context: Option<String>,
+    /// Bytes it has (or has declared, whichever is more).
+    pub bytes: u64,
+}
+
+/// Why the running download `me` is dropped: over the file limit; with its session's saved
+/// bytes (`used`) and the session's other running downloads over the session limit; or with
+/// the other running downloads of its profile over the session limit too (what one profile's
+/// staging directory may hold at once). `others` are the other running downloads not
+/// already dropped.
+pub fn judge_running(
+    limits: &Limits,
+    me: &Running,
+    others: &[Running],
+    used: u64,
+) -> Option<String> {
+    if me.bytes > limits.file {
+        return Some(format!("file larger than {}", size_text(limits.file)));
+    }
+    if let Some(session) = &me.session {
+        let running: u64 = others
+            .iter()
+            .filter(|o| o.session.as_ref() == Some(session))
+            .map(|o| o.bytes)
+            .sum();
+        if used.saturating_add(running).saturating_add(me.bytes) > limits.session {
+            return Some(format!(
+                "session download limit of {} reached",
+                size_text(limits.session)
+            ));
+        }
+    }
+    if let Some(context) = &me.context {
+        let running: u64 = others
+            .iter()
+            .filter(|o| o.context.as_ref() == Some(context))
+            .map(|o| o.bytes)
+            .sum();
+        if me.bytes.saturating_add(running) > limits.session {
+            return Some(format!(
+                "downloads running in the profile exceed {}",
+                size_text(limits.session)
+            ));
+        }
+    }
+    None
 }
 
 /// `200 MiB`, `1 GiB`, `1 KiB`, or a count of bytes.
@@ -264,8 +341,6 @@ pub fn list_files(dir: &Path) -> Vec<FileInfo> {
 /// How long a profile may be without its download policy before its sessions are closed.
 const REAPPLY_LIMIT: Duration = Duration::from_secs(5);
 const RETRY_PAUSE: Duration = Duration::from_millis(250);
-/// Pause between attempts once the profile's sessions were closed for it.
-const SLOW_RETRY_PAUSE: Duration = Duration::from_secs(1);
 /// Attempts at `Browser.setDownloadBehavior` when a profile's window was just opened (it
 /// takes a moment to become the default context), and when the policy is set again.
 const FIRST_TRIES: u32 = 20;
@@ -279,6 +354,11 @@ const STALE: Duration = Duration::from_secs(6 * 3600);
 /// first navigation is the download): finding it is tried this often, this far apart.
 const RESOLVE_TRIES: u32 = 4;
 const RESOLVE_PAUSE: Duration = Duration::from_millis(500);
+/// Looking for a dropped download's staged file (to learn its profile and cancel it).
+const LOCATE_TRIES: u32 = 10;
+const LOCATE_PAUSE: Duration = Duration::from_millis(200);
+/// Ended sessions remembered (`State::gone`).
+const MAX_GONE: usize = 4096;
 /// Settled guids remembered (`State::settled`).
 const MAX_SETTLED: usize = 1024;
 /// Longest time spent looking through tabs' frame trees for one download.
@@ -291,6 +371,7 @@ pub const NOT_A_SESSION_TAB: &str = "not started by a tab of a session";
 pub const DENIED: &str = "the session's policy denies downloads (--deny download)";
 pub const POLICY_LOST: &str = "pegboard lost its download policy while the download ran";
 pub const CANCELED: &str = "canceled";
+pub const SESSION_CLOSED: &str = "the session was closed";
 pub const NOT_SAVED: &str = "the file could not be saved";
 
 /// What became of a download.
@@ -404,7 +485,13 @@ struct State {
     /// Bytes saved into each open session's files directory.
     used: HashMap<SessionId, u64>,
     /// Sessions that ended (ids are never reused): nothing is saved or reported for them.
+    /// The oldest are forgotten past `MAX_GONE` (a closed session has no view any more, so
+    /// this is the second check).
     gone: HashSet<SessionId>,
+    gone_order: std::collections::VecDeque<SessionId>,
+    /// Cancels that worked at once, worked after the profile was made the default context,
+    /// and failed (diagnostics: `cancel_counts`).
+    cancels: [u64; 3],
     /// Guids settled lately: every policy connection reports every download (L1), so a
     /// late copy of an event must not start a settled download again.
     settled: HashSet<String>,
@@ -572,14 +659,56 @@ impl Downloads {
             .opened(target, opener);
     }
 
-    /// The session ended: its downloads still running are deleted when they end, and its
-    /// reports not yet taken are dropped.
+    /// The session ended: its downloads still running are cancelled and deleted, nothing
+    /// is saved for it from now on. Reports not yet taken stay for `take_reports` (the
+    /// daemon writes them to the closing session's log).
     pub fn forget_session(&self, session: &SessionId) {
+        let running: Vec<(String, String)> = {
+            let mut state = self.inner.state.lock().unwrap();
+            state.owners.forget_session(session);
+            state.used.remove(session);
+            if state.gone.insert(session.clone()) {
+                state.gone_order.push_back(session.clone());
+            }
+            if state.gone_order.len() > MAX_GONE {
+                if let Some(old) = state.gone_order.pop_front() {
+                    state.gone.remove(&old);
+                    state.reports.remove(&old);
+                }
+            }
+            state
+                .downloads
+                .iter_mut()
+                .filter(|(_, d)| d.session.as_ref() == Some(session) && d.end.is_none())
+                .filter_map(|(guid, d)| {
+                    d.dropped.get_or_insert_with(|| SESSION_CLOSED.to_string());
+                    d.context.clone().map(|c| (guid.clone(), c))
+                })
+                .collect()
+        };
+        for (guid, context) in running {
+            let inner = self.inner.clone();
+            tokio::spawn(async move { inner.cancel(&guid, &context).await });
+        }
+    }
+
+    /// Reports taken but not delivered (the log could not be written): they come first
+    /// next time.
+    pub fn put_back_reports(&self, session: &SessionId, mut reports: Vec<Report>) {
         let mut state = self.inner.state.lock().unwrap();
-        state.owners.forget_session(session);
-        state.used.remove(session);
-        state.reports.remove(session);
-        state.gone.insert(session.clone());
+        if state.gone.contains(session) && !state.reports.contains_key(session) {
+            return;
+        }
+        let entry = state.reports.entry(session.clone()).or_default();
+        reports.append(entry);
+        *entry = reports;
+    }
+
+    /// Cancels that worked at once, after the profile was made the default context, and
+    /// that failed (diagnostics and tests).
+    #[doc(hidden)]
+    pub fn cancel_counts(&self) -> [u64; 3] {
+        self.inner.state.lock().unwrap().cancels
     }
 
     /// The session's reports since the last call, oldest first.
@@ -805,46 +934,87 @@ impl Inner {
     /// Cancels the downloads of `context` that are still running (they would finish
     /// without telling anyone, L5) and settles them as dropped.
     async fn cancel_running(self: &Arc<Self>, context: &str, staging: &Path) {
-        let running: Vec<String> = {
-            let mut state = self.state.lock().unwrap();
-            let guids: Vec<String> = state
+        let candidates: Vec<(String, bool)> = {
+            let state = self.state.lock().unwrap();
+            state
                 .downloads
                 .iter()
-                .filter(|(guid, d)| {
-                    d.end.is_none()
-                        && (d.context.as_deref() == Some(context) || staging.join(guid).exists())
-                })
-                .map(|(guid, _)| guid.clone())
-                .collect();
-            for guid in &guids {
+                .filter(|(_, d)| d.end.is_none())
+                .map(|(guid, d)| (guid.clone(), d.context.as_deref() == Some(context)))
+                .collect()
+        };
+        // Looked at outside the lock: a download of this profile has its file here.
+        let running: Vec<String> = candidates
+            .into_iter()
+            .filter(|(guid, ours)| *ours || staging.join(guid).exists())
+            .map(|(guid, _)| guid)
+            .collect();
+        {
+            let mut state = self.state.lock().unwrap();
+            for guid in &running {
                 if let Some(d) = state.downloads.get_mut(guid) {
                     d.dropped.get_or_insert_with(|| POLICY_LOST.to_string());
                     d.end = Some(End::Canceled);
                 }
             }
-            guids
-        };
+        }
         for guid in running {
             self.cancel(&guid, context).await;
             self.settle(&guid);
         }
     }
 
+    /// Cancels a download of the agent profile `context`. Chrome may take a context id only
+    /// for the profile that is the default context (E, measured for setting the policy, not
+    /// for cancelling): when the cancel is refused, the profile is made the default as
+    /// re-applying does and the cancel tried once more. Each outcome is counted
+    /// (`cancel_counts`) and logged.
     async fn cancel(&self, guid: &str, context: &str) {
-        if context == self.human_context {
+        if context.is_empty() || context == self.human_context {
             return;
         }
-        let r = self
-            .conn
-            .send(
+        let send = || {
+            self.conn.send(
                 "Browser.cancelDownload",
                 json!({ "guid": guid, "browserContextId": context }),
                 None,
             )
-            .await;
-        if let Err(e) = r {
-            // The staged file is deleted when the download ends or by the sweeper.
-            eprintln!("pegboard: could not cancel a download: {e:#}");
+        };
+        let first = match send().await {
+            Ok(_) => {
+                self.state.lock().unwrap().cancels[0] += 1;
+                return;
+            }
+            Err(e) => e,
+        };
+        // Ended meanwhile: nothing to cancel, and no reason to bring a window forward.
+        let ended = self
+            .state
+            .lock()
+            .unwrap()
+            .downloads
+            .get(guid)
+            .is_none_or(|d| d.end.is_some());
+        if ended {
+            return;
+        }
+        let again = match self.activate(context).await {
+            Ok(()) => send().await.map(drop),
+            Err(e) => Err(e),
+        };
+        match again {
+            Ok(()) => {
+                self.state.lock().unwrap().cancels[1] += 1;
+                eprintln!(
+                    "pegboard: a download was cancelled after its profile was made the default \
+                     context (the first cancel was refused: {first:#})"
+                );
+            }
+            Err(e) => {
+                self.state.lock().unwrap().cancels[2] += 1;
+                // The staged file is deleted when the download ends, or by the sweeper.
+                eprintln!("pegboard: could not cancel a download: {first:#}; then: {e:#}");
+            }
         }
     }
 
@@ -866,7 +1036,8 @@ impl Inner {
                             guid.clone(),
                             Download {
                                 name: safe_name(&text("suggestedFilename")),
-                                url: text("url"),
+                                // Kept only in the form the action log takes.
+                                url: url_for_log(&text("url")),
                                 started: Instant::now(),
                                 resolved: false,
                                 session: None,
@@ -899,31 +1070,52 @@ impl Inner {
         }
     }
 
+    /// Why the running download `guid` must be dropped, judged with every other running
+    /// download (`judge_running`). The caller holds the state.
+    fn over_limit(&self, state: &State, guid: &str) -> Option<String> {
+        let d = state.downloads.get(guid)?;
+        let running = |d: &Download| Running {
+            session: d.session.clone(),
+            context: d.context.clone(),
+            bytes: d.received.max(d.total),
+        };
+        let others: Vec<Running> = state
+            .downloads
+            .iter()
+            .filter(|(g, o)| g.as_str() != guid && o.end.is_none() && o.dropped.is_none())
+            .map(|(_, o)| running(o))
+            .collect();
+        let used = d
+            .session
+            .as_ref()
+            .and_then(|s| state.used.get(s).copied())
+            .unwrap_or(0);
+        judge_running(&self.limits, &running(d), &others, used)
+    }
+
     fn on_progress(self: &Arc<Self>, guid: &str, received: u64, total: u64, end: Option<End>) {
         let (cancel, settle) = {
             let mut state = self.state.lock().unwrap();
-            let used_of = |state: &State, s: &Option<SessionId>| {
-                s.as_ref()
-                    .and_then(|s| state.used.get(s).copied())
-                    .unwrap_or(0)
-            };
-            let Some(session) = state.downloads.get(guid).map(|d| d.session.clone()) else {
+            let Some(d) = state.downloads.get_mut(guid) else {
                 return;
             };
-            let used = used_of(&state, &session);
-            let d = state.downloads.get_mut(guid).unwrap();
             if d.end.is_some() {
                 return;
             }
             d.received = received;
             d.total = total;
             d.end = end;
+            let judged = end.is_none() && d.resolved && d.dropped.is_none();
+            let why = if judged {
+                self.over_limit(&state, guid)
+            } else {
+                None
+            };
+            let d = state.downloads.get_mut(guid).unwrap();
             let mut cancel = None;
-            if end.is_none() && d.resolved && d.dropped.is_none() && session.is_some() {
-                if let Some(why) = self.limits.judge(received.max(total), used) {
-                    d.dropped = Some(why);
-                    cancel = d.context.clone();
-                }
+            if let Some(why) = why {
+                d.dropped = Some(why);
+                cancel = d.context.clone();
             }
             (cancel, d.end.is_some() && d.resolved)
         };
@@ -937,15 +1129,14 @@ impl Inner {
         }
     }
 
-    /// Finds the download's session and decides whether it may be kept.
+    /// Finds the download's session and decides whether it may be kept. A download that is
+    /// dropped while it runs is cancelled at once, unattributed ones too (in the profile
+    /// their tab or their staged file is in); the human's are never touched.
     async fn judge(self: &Arc<Self>, guid: &str, frame: &str) {
         let mut session = None;
         // A download of the human's own tab is not looked for any further.
-        let tries = if self.in_human_tab(frame).await {
-            0
-        } else {
-            RESOLVE_TRIES
-        };
+        let human = self.in_human_tab(frame).await;
+        let tries = if human { 0 } else { RESOLVE_TRIES };
         for attempt in 0..tries {
             if attempt > 0 {
                 tokio::time::sleep(RESOLVE_PAUSE).await;
@@ -956,38 +1147,90 @@ impl Inner {
             }
         }
         let view = session.as_ref().and_then(|s| self.lookup(s));
-        let (cancel, settle) = {
+        let frame_context = match (&session, human) {
+            (None, false) => self.agent_context_of(frame).await,
+            _ => None,
+        };
+        let (cancel, locate, settle) = {
             let mut state = self.state.lock().unwrap();
-            let used = session
+            let ready = view
                 .as_ref()
-                .and_then(|s| state.used.get(s).copied())
-                .unwrap_or(0);
+                .is_some_and(|v| state.policies.get(&v.context).is_some_and(|p| p.ready));
             let Some(d) = state.downloads.get_mut(guid) else {
                 return;
             };
             let why = match (&session, &view) {
                 (None, _) => Some(NOT_A_SESSION_TAB.to_string()),
-                (Some(_), None) => Some(NOT_A_SESSION_TAB.to_string()),
+                (Some(_), None) => Some(SESSION_CLOSED.to_string()),
                 (Some(_), Some(v)) if !v.allows_downloads => Some(DENIED.to_string()),
-                (Some(_), Some(_)) => self.limits.judge(d.received.max(d.total), used),
+                // Its profile is without its policy right now: the file may not land in
+                // staging at all.
+                (Some(_), Some(_)) if !ready => Some(POLICY_LOST.to_string()),
+                (Some(_), Some(_)) => None,
             };
             d.resolved = true;
             d.session = session;
-            d.context = view.map(|v| v.context);
+            d.context = view.map(|v| v.context).or(frame_context);
             if d.dropped.is_none() {
                 d.dropped = why;
             }
-            let cancel = match (&d.dropped, d.end) {
-                (Some(_), None) => d.context.clone(),
-                _ => None,
-            };
-            (cancel, d.end.is_some())
+            if d.dropped.is_none() && d.end.is_none() {
+                if let Some(why) = self.over_limit(&state, guid) {
+                    state.downloads.get_mut(guid).unwrap().dropped = Some(why);
+                }
+            }
+            let d = &state.downloads[guid];
+            let running_dropped = d.dropped.is_some() && d.end.is_none();
+            let cancel = d.context.clone().filter(|_| running_dropped);
+            let locate = running_dropped && d.context.is_none() && !human;
+            (cancel, locate, d.end.is_some())
         };
         if let Some(context) = cancel {
             self.cancel(guid, &context).await;
+        } else if locate {
+            self.locate_and_cancel(guid).await;
         }
         if settle {
             self.settle(guid);
+        }
+    }
+
+    /// The agent profile of a tab or frame target (`None` for the human's or an unknown one).
+    async fn agent_context_of(&self, target: &str) -> Option<String> {
+        let r = self
+            .conn
+            .send("Target.getTargetInfo", json!({ "targetId": target }), None)
+            .await
+            .ok()?;
+        let context = r["targetInfo"]["browserContextId"].as_str()?;
+        (!context.is_empty() && context != self.human_context).then(|| context.to_string())
+    }
+
+    /// A dropped download whose profile is not known yet (its frame is no target): its
+    /// profile is the one whose staging directory its file appears in.
+    async fn locate_and_cancel(&self, guid: &str) {
+        for _ in 0..LOCATE_TRIES {
+            let (dirs, running) = {
+                let state = self.state.lock().unwrap();
+                let running = state.downloads.get(guid).is_some_and(|d| d.end.is_none());
+                let dirs: Vec<(String, PathBuf)> = state
+                    .policies
+                    .iter()
+                    .map(|(c, p)| (c.clone(), p.staging.clone()))
+                    .collect();
+                (dirs, running)
+            };
+            if !running {
+                return;
+            }
+            if let Some((context, _)) = dirs.iter().find(|(_, dir)| dir.join(guid).exists()) {
+                if let Some(d) = self.state.lock().unwrap().downloads.get_mut(guid) {
+                    d.context = Some(context.clone());
+                }
+                self.cancel(guid, context).await;
+                return;
+            }
+            tokio::time::sleep(LOCATE_PAUSE).await;
         }
     }
 
@@ -1076,17 +1319,10 @@ impl Inner {
         None
     }
 
-    /// The staged file of a download, in whichever profile's staging directory it is.
-    fn staged(state: &State, guid: &str) -> Option<PathBuf> {
-        state
-            .policies
-            .values()
-            .map(|p| p.staging.join(guid))
-            .find(|path| std::fs::symlink_metadata(path).is_ok())
-    }
-
     /// A download that is decided and has ended: its file is moved into its session's files
-    /// directory or deleted, and its session (if it is still open) gets a report.
+    /// directory or deleted, and its session (if it is still open) gets a report. Files are
+    /// touched outside the state lock; the session's bytes are reserved under it first, and
+    /// a session that ended while its file was moved gets the file deleted again.
     fn settle(&self, guid: &str) {
         // Looked up before the state is locked (the lookup takes the session table's lock).
         let session = {
@@ -1097,71 +1333,116 @@ impl Inner {
             }
         };
         let view = session.as_ref().and_then(|s| self.lookup(s));
-        let mut state = self.state.lock().unwrap();
-        let Some(d) = state.downloads.remove(guid) else {
-            return;
-        };
-        if state.settled_order.len() >= MAX_SETTLED {
-            if let Some(old) = state.settled_order.pop_front() {
-                state.settled.remove(&old);
+        let (d, dirs, open) = {
+            let mut state = self.state.lock().unwrap();
+            let Some(d) = state.downloads.remove(guid) else {
+                return;
+            };
+            if state.settled_order.len() >= MAX_SETTLED {
+                if let Some(old) = state.settled_order.pop_front() {
+                    state.settled.remove(&old);
+                }
             }
-        }
-        state.settled.insert(guid.to_string());
-        state.settled_order.push_back(guid.to_string());
-        let staged = Self::staged(&state, guid);
-        let open = session
-            .as_ref()
-            .filter(|s| view.is_some() && !state.gone.contains(*s))
-            .cloned();
+            state.settled.insert(guid.to_string());
+            state.settled_order.push_back(guid.to_string());
+            let dirs: Vec<PathBuf> = state.policies.values().map(|p| p.staging.clone()).collect();
+            let open = session
+                .as_ref()
+                .filter(|s| view.is_some() && !state.gone.contains(*s))
+                .cloned();
+            (d, dirs, open)
+        };
+        let staged = dirs
+            .iter()
+            .map(|dir| dir.join(guid))
+            .find(|path| std::fs::symlink_metadata(path).is_ok());
+        let delete_staged = || {
+            if let Some(path) = &staged {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        let keep = matches!(
+            (d.end, &d.dropped, &open, &view),
+            (Some(End::Completed), None, Some(_), Some(v)) if v.allows_downloads
+        );
         let mut name = d.name.clone();
-        let outcome = match (d.end, d.dropped, &open, &view) {
-            (Some(End::Completed), None, Some(s), Some(v)) if v.allows_downloads => match staged {
-                Some(path) => {
-                    let used = state.used.get(s).copied().unwrap_or(0);
-                    let size = std::fs::symlink_metadata(&path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    match self.limits.judge(size, used) {
-                        Some(why) => {
-                            let _ = std::fs::remove_file(&path);
-                            Outcome::Dropped(why)
+        let outcome = match (keep, &open, &staged) {
+            (true, Some(s), Some(path)) => {
+                let size = std::fs::symlink_metadata(path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                // Reserved under the lock, so two downloads of one session cannot both fit.
+                let reserved = {
+                    let mut state = self.state.lock().unwrap();
+                    if state.gone.contains(s) {
+                        Err(None)
+                    } else {
+                        let used = state.used.get(s).copied().unwrap_or(0);
+                        match self.limits.judge(size, used) {
+                            Some(why) => Err(Some(why)),
+                            None => {
+                                *state.used.entry(s.clone()).or_default() += size;
+                                Ok(())
+                            }
                         }
-                        None => match ensure_session_files(&self.paths, s)
-                            .and_then(|dir| move_into(&path, &dir, &d.name))
-                        {
-                            Ok((saved, bytes)) => {
-                                name = saved;
-                                *state.used.entry(s.clone()).or_default() += bytes;
-                                Outcome::Saved { bytes }
-                            }
-                            Err(e) => {
-                                eprintln!("pegboard: saving a download failed: {e}");
-                                let _ = std::fs::remove_file(&path);
-                                Outcome::Dropped(NOT_SAVED.to_string())
-                            }
-                        },
                     }
+                };
+                match reserved {
+                    Err(why) => {
+                        delete_staged();
+                        why.map(Outcome::Dropped)
+                    }
+                    Ok(()) => match ensure_session_files(&self.paths, s)
+                        .and_then(|dir| move_into(path, &dir, &d.name).map(|r| (dir, r)))
+                    {
+                        Ok((dir, (saved, bytes))) => {
+                            let gone = self.state.lock().unwrap().gone.contains(s);
+                            if gone {
+                                // Closed while the file moved: its files go with it.
+                                let _ = std::fs::remove_file(dir.join(&saved));
+                                let _ = std::fs::remove_dir(&dir);
+                                if let Some(parent) = dir.parent() {
+                                    let _ = std::fs::remove_dir(parent);
+                                }
+                                None
+                            } else {
+                                name = saved;
+                                Some(Outcome::Saved { bytes })
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("pegboard: saving a download failed: {e}");
+                            delete_staged();
+                            if let Some(n) = self.state.lock().unwrap().used.get_mut(s) {
+                                *n = n.saturating_sub(size);
+                            }
+                            Some(Outcome::Dropped(NOT_SAVED.to_string()))
+                        }
+                    },
                 }
-                None => Outcome::Dropped(NOT_SAVED.to_string()),
-            },
-            (end, dropped, _, view) => {
-                if let Some(path) = staged {
-                    let _ = std::fs::remove_file(path);
-                }
-                Outcome::Dropped(dropped.unwrap_or_else(|| match (end, view) {
-                    (Some(End::Canceled), _) => CANCELED.to_string(),
-                    (_, Some(v)) if !v.allows_downloads => DENIED.to_string(),
-                    _ => NOT_A_SESSION_TAB.to_string(),
-                }))
+            }
+            (true, _, _) => Some(Outcome::Dropped(NOT_SAVED.to_string())),
+            (false, _, _) => {
+                delete_staged();
+                Some(Outcome::Dropped(d.dropped.clone().unwrap_or_else(
+                    || match (d.end, &view) {
+                        (Some(End::Canceled), _) => CANCELED.to_string(),
+                        (_, Some(v)) if !v.allows_downloads => DENIED.to_string(),
+                        _ => NOT_A_SESSION_TAB.to_string(),
+                    },
+                )))
             }
         };
-        if let Some(s) = open {
-            state.reports.entry(s).or_default().push(Report {
-                name,
-                url: d.url,
-                outcome,
-                ended_at: now(),
-            });
+        if let (Some(s), Some(outcome)) = (open, outcome) {
+            let mut state = self.state.lock().unwrap();
+            if !state.gone.contains(&s) {
+                state.reports.entry(s).or_default().push(Report {
+                    name,
+                    url: d.url,
+                    outcome,
+                    ended_at: now(),
+                });
+            }
         }
     }
 }
@@ -1181,25 +1462,17 @@ fn now() -> String {
         .unwrap_or_default()
 }
 
-/// Sets a context's policy again after its connection ended, until it is in place; tells
-/// `PolicyLost` once when that takes longer than `REAPPLY_LIMIT`.
+/// Sets a context's policy again after its connection ended, until it is in place. When
+/// that takes longer than `REAPPLY_LIMIT` it tells `PolicyLost` (the daemon closes the
+/// profile's sessions) and stops: no window is brought forward again and again. The
+/// profile stays not ready; the next session opened in it sets the policy anew (`apply`).
+/// While the test hold lasts, every attempt counts as failed.
 async fn reapply(weak: Weak<Inner>, context: String) {
     let started = tokio::time::Instant::now();
-    let mut told = false;
     loop {
         let Some(inner) = weak.upgrade() else {
             return;
         };
-        let hold = *inner.hold_until.lock().unwrap();
-        if let Some(until) = hold {
-            drop(inner);
-            tokio::time::sleep_until(until).await;
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            inner.hold_until.lock().unwrap().take();
-            continue;
-        }
         let profile_dir = {
             let mut state = inner.state.lock().unwrap();
             match state.policies.get_mut(&context) {
@@ -1211,7 +1484,20 @@ async fn reapply(weak: Weak<Inner>, context: String) {
                 None => return,
             }
         };
-        let result = {
+        let held = {
+            let mut hold = inner.hold_until.lock().unwrap();
+            match *hold {
+                Some(until) if tokio::time::Instant::now() < until => true,
+                Some(_) => {
+                    *hold = None;
+                    false
+                }
+                None => false,
+            }
+        };
+        let result = if held {
+            Err(anyhow!("held by a test"))
+        } else {
             let _one = inner.applying.lock().await;
             if inner.is_ready(&context) {
                 Ok(())
@@ -1224,28 +1510,24 @@ async fn reapply(weak: Weak<Inner>, context: String) {
                 eprintln!("pegboard: the download policy is set again");
                 return;
             }
-            Err(e) => eprintln!("pegboard: setting the download policy again failed: {e:#}"),
+            Err(e) if !held => {
+                eprintln!("pegboard: setting the download policy again failed: {e:#}")
+            }
+            Err(_) => {}
         }
-        if !told && started.elapsed() >= REAPPLY_LIMIT {
-            told = true;
+        if started.elapsed() >= REAPPLY_LIMIT {
+            if let Some(p) = inner.state.lock().unwrap().policies.get_mut(&context) {
+                p.reapplying = false;
+            }
+            eprintln!("pegboard: gave up setting the download policy again");
             let lost = inner.lost.lock().unwrap().clone();
             if let Some(lost) = lost {
                 lost(&context);
             }
-        }
-        // Without a tab the profile has nothing to protect (Chrome may unload it); opening
-        // its window again sets the policy anew (`apply`).
-        let no_tab = page_targets(&inner.conn).await.is_ok_and(|pages| {
-            pages
-                .iter()
-                .all(|t| t.browser_context_id.as_deref() != Some(context.as_str()))
-        });
-        if told && no_tab {
-            inner.state.lock().unwrap().policies.remove(&context);
             return;
         }
         drop(inner);
-        tokio::time::sleep(if told { SLOW_RETRY_PAUSE } else { RETRY_PAUSE }).await;
+        tokio::time::sleep(RETRY_PAUSE).await;
     }
 }
 
@@ -1308,6 +1590,12 @@ mod tests {
         }
         assert_eq!(safe_name("re\nport\0.pdf"), "report.pdf");
         assert_eq!(safe_name("한글-이름.txt"), "한글-이름.txt");
+        // Invisible format characters (bidi overrides, zero-width) and a leading '-' or '.'.
+        assert_eq!(safe_name("evil\u{202e}gpj.exe"), "evilgpj.exe");
+        assert_eq!(safe_name("a\u{200b}b\u{feff}.txt"), "ab.txt");
+        assert_eq!(safe_name("--rf.txt"), "rf.txt");
+        assert_eq!(safe_name(".hidden"), "hidden");
+        assert_eq!(safe_name("-"), "download");
         let long = format!("{}.tar.gz", "a".repeat(300));
         let cut = safe_name(&long);
         assert_eq!(cut.len(), 200, "{cut}");
@@ -1518,5 +1806,48 @@ mod tests {
         for bad in ["", ".x", "a/b", "..", "a b"] {
             assert!(!valid_dir_name(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn running_downloads_count_together() {
+        let l = Limits {
+            file: 100,
+            session: 250,
+        };
+        let (a, b) = (
+            SessionId("s_aaaaaaaa".into()),
+            SessionId("s_bbbbbbbb".into()),
+        );
+        let run = |s: Option<&SessionId>, ctx: &str, bytes: u64| Running {
+            session: s.cloned(),
+            context: Some(ctx.to_string()),
+            bytes,
+        };
+        let me = run(Some(&a), "P", 90);
+        // Alone: fine; over the file limit: dropped.
+        assert_eq!(judge_running(&l, &me, &[], 0), None);
+        assert_eq!(
+            judge_running(&l, &run(Some(&a), "P", 101), &[], 0).as_deref(),
+            Some("file larger than 100 bytes")
+        );
+        // Parallel downloads of one session count together with what it saved.
+        let others = [run(Some(&a), "P", 90), run(Some(&b), "Q", 99)];
+        assert_eq!(judge_running(&l, &me, &others, 70), None);
+        assert_eq!(
+            judge_running(&l, &me, &others, 71).as_deref(),
+            Some("session download limit of 250 bytes reached")
+        );
+        // A profile's running downloads together, whoever's (unattributed ones too).
+        let crowd = [
+            run(Some(&b), "P", 90),
+            run(None, "P", 90),
+            run(Some(&b), "Q", 99),
+        ];
+        assert_eq!(
+            judge_running(&l, &me, &crowd, 0).as_deref(),
+            Some("downloads running in the profile exceed 250 bytes")
+        );
+        let unattributed = run(None, "P", 10);
+        assert!(judge_running(&l, &unattributed, &crowd, 0).is_none());
     }
 }
