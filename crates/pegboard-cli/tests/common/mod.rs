@@ -336,6 +336,8 @@ pub fn shared_home() -> &'static Home {
             &[
                 ("PEGBOARD_TEST_HOST_RULES", rules.as_str()),
                 ("PEGBOARD_TEST_BROWSER_HOST_RULES", browser_rules.as_str()),
+                // The guard traces what it does with documents into daemon.log.
+                ("PEGBOARD_TEST_HOOKS", "1"),
             ],
             &["browser", "start"],
         );

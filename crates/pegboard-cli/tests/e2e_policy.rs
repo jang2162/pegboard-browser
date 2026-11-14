@@ -1413,7 +1413,13 @@ fn sniffed_and_duplicated_content_types_get_the_csp() {
         "--url",
         &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
     ]);
-    for query in ["ct=unknown%2Funknown", "ct=text%2Fplain&ct2=text%2Fhtml"] {
+    // The second case: a download type first and HTML last. Chrome takes the last valid
+    // type and renders HTML; a check that read only the first would pass it as a download
+    // without the CSP.
+    for query in [
+        "ct=unknown%2Funknown",
+        "ct=application%2Foctet-stream&ct2=text%2Fhtml",
+    ] {
         let url = format!("http://{PUBLIC_NAME}:{}/typed?{query}", srv.a);
         let (code, _, err) = open(&h, &url);
         assert_eq!(code, 0, "{query}: {err}");
@@ -1431,6 +1437,9 @@ fn sniffed_and_duplicated_content_types_get_the_csp() {
         eprintln!("{query}: title {title:?}, ws {ws}");
         // However Chrome renders it, the document carries the CSP: a script in it (here the
         // agent's `eval`) is bound by it.
+        // The premise: the document was rendered (not saved as a download), so the WebSocket
+        // below is opened from it, not from the page before.
+        assert_eq!(title, "typed", "{query}: not rendered as a document");
         assert!(
             !ws.starts_with("OPEN") && ws.contains("connect-src"),
             "{query}: {ws}"
@@ -1441,16 +1450,32 @@ fn sniffed_and_duplicated_content_types_get_the_csp() {
 }
 
 /// From the session's page, frames `src` (same origin) and, in the frame's own realm and
-/// under its document's policy, opens a plain WebSocket to `url`; `<outcome>|<violations>`.
+/// under its document's policy, opens a plain WebSocket to `url`. Answers
+/// `<outcome>|<violations>|<what the frame was>`; every step that fails says so instead of
+/// leaving the answer to the time limit.
 fn framed_ws_js(src: &str, url: &str) -> String {
     format!(
         "new Promise(r => {{ const f = document.createElement('iframe'); f.src = '{src}'; \
-         f.onload = () => {{ const w = f.contentWindow; const v = []; \
-         w.document.addEventListener('securitypolicyviolation', e => v.push(e.violatedDirective)); \
-         let out = ''; try {{ const s = new w.WebSocket('{url}'); s.onopen = () => {{ out = 'OPEN'; s.close(); }}; s.onerror = () => {{ out = out || 'ERROR'; }}; }} \
-         catch (e) {{ out = 'THROW:' + e.name; }} setTimeout(() => r((out || 'PENDING') + '|' + v.join(',')), 2000); }}; \
-         document.body.appendChild(f); setTimeout(() => r('TIMEOUT'), 8000); }})"
+         f.onload = () => {{ let frame = ''; \
+           try {{ const d = f.contentWindow.document; frame = [d.URL, d.readyState, d.contentType].join(' '); }} \
+           catch (e) {{ return r('NO-ACCESS|' + e.name + '|frame not readable'); }} \
+           try {{ const w = f.contentWindow; const v = []; \
+             w.document.addEventListener('securitypolicyviolation', e => v.push(e.violatedDirective)); \
+             let out = ''; try {{ const s = new w.WebSocket('{url}'); s.onopen = () => {{ out = 'OPEN'; s.close(); }}; s.onerror = () => {{ out = out || 'ERROR'; }}; }} \
+             catch (e) {{ out = 'THROW:' + e.name; }} \
+             setTimeout(() => r((out || 'PENDING') + '|' + v.join(',') + '|' + frame), 2000); }} \
+           catch (e) {{ r('HANDLER:' + e + '|' + frame); }} }}; \
+         document.body.appendChild(f); setTimeout(() => r('TIMEOUT|no load event'), 8000); }})"
     )
+}
+
+/// The guard's trace lines in daemon.log about documents whose path is `path`.
+fn guard_trace(path: &str) -> Vec<String> {
+    let log = std::fs::read_to_string(shared_home().path().join("daemon.log")).unwrap_or_default();
+    log.lines()
+        .filter(|l| l.starts_with("pegboard guard: document") && l.contains(&format!(" {path} ")))
+        .map(String::from)
+        .collect()
 }
 
 /// An image or text document of a page's own origin, framed by that page, gets the CSP too:
@@ -1466,11 +1491,31 @@ fn inert_documents_get_the_csp_too() {
         "--url",
         &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
     ]);
+    // The same documents opened at the top level, for the record.
+    for src in ["/img", "/txt"] {
+        let _ = open(&h, &format!("http://{PUBLIC_NAME}:{}{src}", srv.a));
+        let (_, out, _) = shared_home().run(&[
+            "--session",
+            &h,
+            "eval",
+            "[document.URL, document.readyState, document.contentType].join(' ')",
+        ]);
+        eprintln!(
+            "top level {src}: {}; guard: {:?}",
+            out.trim(),
+            guard_trace(src)
+        );
+    }
+    let (code, _, err) = open(&h, &format!("http://{PUBLIC_NAME}:{}/page", srv.a));
+    assert_eq!(code, 0, "{err}");
     for src in ["/img", "/txt"] {
         let wm = marker("iw");
         let url = format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b);
         let got = settle(&h, &framed_ws_js(src, &url));
-        eprintln!("public page, framed {src}: {got}");
+        eprintln!(
+            "public page, framed {src}: {got}; guard: {:?}",
+            guard_trace(src)
+        );
         assert!(
             !got.starts_with("OPEN") && got.contains("connect-src"),
             "{src}: {got}"
@@ -1486,7 +1531,10 @@ fn inert_documents_get_the_csp_too() {
     ]);
     let url = format!("ws://{UNLISTED_NAME}:{}/ws?m={}", srv.b, marker("il"));
     let got = settle(&h, &framed_ws_js("/img", &url));
-    eprintln!("local page, framed /img: {got}");
+    eprintln!(
+        "local page, framed /img: {got}; guard: {:?}",
+        guard_trace("/img")
+    );
     assert!(got.starts_with("OPEN|"), "{got}");
     close(&h);
 }

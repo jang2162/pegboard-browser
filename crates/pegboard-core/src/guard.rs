@@ -367,6 +367,9 @@ struct Inner {
     hold_until: Mutex<Option<tokio::time::Instant>>,
     /// Pieces (`BODY_PIECE` each) of document bodies that may be held at once.
     body_budget: Arc<tokio::sync::Semaphore>,
+    /// Tests only (`PEGBOARD_TEST_HOOKS`): what the guard did with each document response is
+    /// written to stderr (the daemon's log), with the URL's path only.
+    trace: bool,
 }
 
 pub struct Guard {
@@ -405,6 +408,7 @@ impl Guard {
             ready: watch::channel(false).0,
             hold_until: Mutex::new(None),
             body_budget: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET / BODY_PIECE)),
+            trace: std::env::var_os("PEGBOARD_TEST_HOOKS").is_some(),
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner)));
         Guard { inner, supervisor }
@@ -851,6 +855,11 @@ impl Inner {
             by_id.or(by_network)
         };
         let Some(csp) = connect_src(policy) else {
+            if self.trace {
+                eprintln!(
+                    "pegboard guard: document status {status} -> passed (no CSP for this policy)"
+                );
+            }
             return pass().await;
         };
         // No document is made from a redirect, an empty answer, an error or a download.
@@ -862,11 +871,31 @@ impl Inner {
             || matches!(status, 204 | 205)
             || is_attachment(&headers)
             || is_download(&headers);
+        let traced = |outcome: &str| {
+            if self.trace {
+                let path = params
+                    .pointer("/request/url")
+                    .and_then(Value::as_str)
+                    .and_then(|u| Url::parse(u).ok())
+                    .map(|u| u.path().to_string())
+                    .unwrap_or_default();
+                let types: Vec<&str> = headers
+                    .iter()
+                    .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                eprintln!(
+                    "pegboard guard: document {path} status {status} type {types:?} -> {outcome}"
+                );
+            }
+        };
         if no_document {
+            traced("passed (no document)");
             return pass().await;
         }
         let own_ports = (self.own_ports)();
         if !serves_again(stored.as_ref(), policy, &own_ports) {
+            traced("passed (allowed local address)");
             return pass().await;
         }
         let served = async {
@@ -898,7 +927,12 @@ impl Inner {
             }
             conn.send("Fetch.fulfillRequest", fulfill, s).await
         };
-        if served.await.is_err() {
+        let served = served.await;
+        match &served {
+            Ok(_) => traced("served again with the CSP"),
+            Err(e) => traced(&format!("failed: {e:#}")),
+        }
+        if served.is_err() {
             // The document cannot get its CSP (too large, or the body could not be read): it
             // does not load.
             *self
