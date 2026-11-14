@@ -1872,7 +1872,10 @@ fn oversized_download_is_dropped_and_reported() {
     // A browser of its own, with the limits lowered (1 KiB a file, 4 KiB a session).
     let home = Home::new();
     let (code, _, err) = home.run_env(
-        &[("PEGBOARD_TEST_DOWNLOAD_LIMITS", "1024,4096")],
+        &[
+            ("PEGBOARD_TEST_DOWNLOAD_LIMITS", "1024,4096"),
+            ("PEGBOARD_TEST_HOOKS", "1"),
+        ],
         &["browser", "start"],
     );
     assert_eq!(code, 0, "{err}");

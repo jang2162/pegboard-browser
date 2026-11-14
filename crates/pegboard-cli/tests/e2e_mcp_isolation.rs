@@ -1248,7 +1248,14 @@ fn killed_mcp_server_leaves_sessions_that_expire() {
     let origin = fixture();
     let home = Home::new();
     // The server starts the daemon, which takes the short idle period from its environment.
-    let mut mcp = Mcp::start_env(&home, &[("PEGBOARD_TEST_IDLE_SECS", "3")], &[]);
+    let mut mcp = Mcp::start_env(
+        &home,
+        &[
+            ("PEGBOARD_TEST_IDLE_SECS", "3"),
+            ("PEGBOARD_TEST_HOOKS", "1"),
+        ],
+        &[],
+    );
     let id = mcp.create(json!({ "url": format!("{origin}/counter") }));
     let (err, text) = mcp.call("pegboard_get", json!({ "sessionId": id, "command": "url" }));
     assert!(!err, "{text}");

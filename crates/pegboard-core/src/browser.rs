@@ -281,7 +281,7 @@ async fn wait_for_first_context(conn: &CdpConn) -> Result<String> {
     bail!("no page target appeared after launch")
 }
 
-/// Test-only: `PEGBOARD_TEST_HOST_RULES` is passed to the browser as `--host-resolver-rules`
+/// Test-only (with `PEGBOARD_TEST_HOOKS`, as every test variable): `PEGBOARD_TEST_HOST_RULES` is passed to the browser as `--host-resolver-rules`
 /// (and read by the guard's resolver), so tests can give names private addresses.
 /// `PEGBOARD_TEST_BROWSER_HOST_RULES` is passed to the browser only, so a test can make the
 /// browser and the daemon disagree (the daemon resolving a name to a public address while the
@@ -293,7 +293,7 @@ fn test_host_rules() -> Vec<String> {
         "PEGBOARD_TEST_HOST_RULES",
     ]
     .iter()
-    .filter_map(|name| std::env::var(name).ok())
+    .filter_map(|name| crate::testenv::var(name))
     .filter(|r| !r.is_empty())
     .collect();
     if rules.is_empty() {
@@ -307,15 +307,15 @@ fn test_host_rules() -> Vec<String> {
 /// (e.g. `127.0.0.1:<port>=public`), so a local test server can play a server on a public
 /// address for Chrome's local-network checks (spike round 2, N2).
 fn test_address_spaces() -> Vec<String> {
-    match std::env::var("PEGBOARD_TEST_IP_SPACE_OVERRIDES") {
-        Ok(v) if !v.is_empty() => vec![format!("--ip-address-space-overrides={v}")],
+    match crate::testenv::var("PEGBOARD_TEST_IP_SPACE_OVERRIDES") {
+        Some(v) if !v.is_empty() => vec![format!("--ip-address-space-overrides={v}")],
         _ => Vec::new(),
     }
 }
 
 /// Test-only counter: when `PEGBOARD_TEST_LAUNCH_LOG` names a file, every launch appends one line to it.
 fn record_launch() {
-    if let Some(path) = std::env::var_os("PEGBOARD_TEST_LAUNCH_LOG") {
+    if let Some(path) = crate::testenv::var("PEGBOARD_TEST_LAUNCH_LOG") {
         append_launch_line(std::path::Path::new(&path));
     }
 }

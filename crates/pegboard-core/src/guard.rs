@@ -331,7 +331,7 @@ pub struct Resolver {
 
 impl Resolver {
     pub fn from_env() -> Resolver {
-        let rules = std::env::var("PEGBOARD_TEST_HOST_RULES").unwrap_or_default();
+        let rules = crate::testenv::var("PEGBOARD_TEST_HOST_RULES").unwrap_or_default();
         Resolver::from_rules(&rules)
     }
 

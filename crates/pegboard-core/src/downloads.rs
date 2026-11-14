@@ -162,13 +162,10 @@ impl Default for Limits {
 }
 
 impl Limits {
-    /// `PEGBOARD_TEST_DOWNLOAD_LIMITS` (tests only, read when the browser starts).
+    /// `PEGBOARD_TEST_DOWNLOAD_LIMITS` (tests only, with `PEGBOARD_TEST_HOOKS`; read when the
+    /// browser starts).
     pub fn from_env() -> Limits {
-        Limits::parse(
-            std::env::var("PEGBOARD_TEST_DOWNLOAD_LIMITS")
-                .ok()
-                .as_deref(),
-        )
+        Limits::parse(crate::testenv::var("PEGBOARD_TEST_DOWNLOAD_LIMITS").as_deref())
     }
 
     /// `"<file bytes>,<session bytes>[,<profile bytes>]"` lowers the limits (never raises

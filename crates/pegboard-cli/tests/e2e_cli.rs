@@ -712,7 +712,13 @@ fn oversized_command_line_exits_2_with_limit_exceeded() {
 #[ignore]
 fn idle_session_is_closed_after_the_expiry() {
     let home = Home::new();
-    let (code, _, err) = home.run_env(&[("PEGBOARD_TEST_IDLE_SECS", "3")], &["browser", "start"]);
+    let (code, _, err) = home.run_env(
+        &[
+            ("PEGBOARD_TEST_IDLE_SECS", "3"),
+            ("PEGBOARD_TEST_HOOKS", "1"),
+        ],
+        &["browser", "start"],
+    );
     assert_eq!(code, 0, "{err}");
     let create = |extra: &[&str]| {
         let mut args = vec!["session", "create"];

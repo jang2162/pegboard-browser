@@ -51,7 +51,7 @@ struct Slot {
 /// How long a session may sit without a command before it is closed.
 const DEFAULT_IDLE: Duration = Duration::from_secs(3600);
 
-/// The idle period: `PEGBOARD_TEST_IDLE_SECS` (a test hook, read once when the daemon
+/// The idle period: `PEGBOARD_TEST_IDLE_SECS` (a test hook, with `PEGBOARD_TEST_HOOKS`, read once when the daemon
 /// starts, so only whoever starts the daemon can set it) or an hour.
 fn idle_period(var: Option<&str>) -> Duration {
     match var.and_then(|v| v.trim().parse::<u64>().ok()) {
@@ -353,7 +353,7 @@ impl Daemon {
         // Once, here: it is what lets the runner tell `tab_gone` from other failures.
         runner.set_session_targets_provider(sessions.targets_fn());
         let (stop, _) = watch::channel(false);
-        let idle = idle_period(std::env::var("PEGBOARD_TEST_IDLE_SECS").ok().as_deref());
+        let idle = idle_period(crate::testenv::var("PEGBOARD_TEST_IDLE_SECS").as_deref());
         let daemon = Arc::new_cyclic(|me| Daemon {
             paths,
             browser,
