@@ -18,7 +18,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1096,141 +1096,19 @@ fn mcp_agent_cannot_reach_pegboards_own_ports_or_the_private_network() {
     own_ports_closed(&mut open);
 }
 
-// ---- the system clipboard, saved and put back (as pegboard-core's e2e_clipboard does) ----
+// ---- the system clipboard, saved once and put back after each test (shared with
+// pegboard-core's e2e_clipboard) ----
 
-fn pasteboard(command: &str, input: Option<&[u8]>) -> Vec<u8> {
-    let mut child = Command::new(command)
-        .env("LC_ALL", "en_US.UTF-8")
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{command}: {e}"));
-    if let Some(bytes) = input {
-        child.stdin.take().unwrap().write_all(bytes).unwrap();
-    }
-    child.wait_with_output().unwrap().stdout
-}
+#[path = "../../pegboard-core/tests/shared/clipboard.rs"]
+mod clipboard;
+use clipboard::Clipboard;
 
-fn clipboard_types() -> String {
-    Command::new("osascript")
-        .args(["-e", "clipboard info"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|e| format!("unreadable: {e}"))
-}
-
-/// Why the clipboard's types show something a text restore would lose, if they do.
-fn non_text(info: &str) -> Option<String> {
-    let classes: Vec<&str> = info
-        .split('«')
-        .skip(1)
-        .filter_map(|rest| rest.split_once('»').map(|(c, _)| c))
-        .collect();
-    if let Some(other) = classes
-        .iter()
-        .find(|c| !matches!(**c, "class utf8" | "class ut16"))
-    {
-        return Some(format!("«{other}»"));
-    }
-    let lower = info.to_ascii_lowercase();
-    ["picture", "png", "tiff", "alias", "furl", "file"]
-        .iter()
-        .find(|w| lower.contains(*w))
-        .map(|w| format!("a {w} type"))
-}
-
-/// The system clipboard for the length of the test: the text it held is put back on drop
-/// (emptied again when it held nothing).
-struct Clipboard {
-    saved: Vec<u8>,
-    was_empty: bool,
-}
-
-impl Clipboard {
-    fn take() -> Clipboard {
-        let info = Command::new("osascript")
-            .args(["-e", "clipboard info"])
-            .output()
-            .unwrap_or_else(|e| panic!("refusing to run: osascript: {e}; nothing was changed"));
-        assert!(
-            info.status.success(),
-            "refusing to run: the clipboard's types could not be read; nothing was changed"
-        );
-        let info = String::from_utf8_lossy(&info.stdout).trim().to_string();
-        if let Some(why) = non_text(&info) {
-            panic!(
-                "refusing to run: the system clipboard holds non-text data ({why}) that a text \
-                 restore would lose; copy some plain text and run again. Nothing was changed."
-            );
-        }
-        Clipboard {
-            saved: pasteboard("pbpaste", None),
-            was_empty: info.is_empty(),
-        }
-    }
-
-    fn get(&self) -> String {
-        String::from_utf8_lossy(&pasteboard("pbpaste", None)).into_owned()
-    }
-
-    /// A marker no other run uses, put into the clipboard.
-    fn mark(&self) -> String {
-        let m = marker("PEGBOARD-CLIP-MARKER-");
-        pasteboard("pbcopy", Some(m.as_bytes()));
-        m
-    }
-
-    fn holds_saved(&self) -> bool {
-        if self.was_empty {
-            clipboard_types().is_empty()
-        } else {
-            pasteboard("pbpaste", None) == self.saved
-        }
-    }
-
-    fn restore(&self) -> bool {
-        for _ in 0..2 {
-            if self.was_empty {
-                let _ = Command::new("osascript")
-                    .args([
-                        "-l",
-                        "JavaScript",
-                        "-e",
-                        "ObjC.import('AppKit'); $.NSPasteboard.generalPasteboard.clearContents(); 1",
-                    ])
-                    .output();
-            } else {
-                pasteboard("pbcopy", Some(&self.saved));
-            }
-            if self.holds_saved() {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-impl Drop for Clipboard {
-    fn drop(&mut self) {
-        // A copy the test started may still land: restored after it, and checked again.
-        std::thread::sleep(Duration::from_millis(1000));
-        let mut restored = self.restore();
-        std::thread::sleep(Duration::from_millis(500));
-        if restored && !self.holds_saved() {
-            restored = self.restore();
-        }
-        if !restored {
-            eprintln!(
-                "THE CLIPBOARD WAS NOT PUT BACK: it holds {:?} (types: {})",
-                self.get(),
-                clipboard_types()
-            );
-        }
-    }
+/// Runs last (tests run in name order): the clipboard test gave the clipboard back, and it
+/// holds what it held before this binary's first clipboard test.
+#[test]
+#[ignore]
+fn zz_the_clipboard_is_as_it_was_before_the_run() {
+    clipboard::assert_as_before_the_run();
 }
 
 #[test]
