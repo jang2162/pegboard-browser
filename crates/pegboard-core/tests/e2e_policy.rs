@@ -507,3 +507,114 @@ fn created_tabs_wait_for_the_guard() {
         assert!(h.manager.info(&info.id).unwrap().targets.contains(&created));
     });
 }
+
+/// Frames `src` from the page and, once the frame has loaded, reports from the parent:
+/// whether the frame's document can be read (`frame=` its URL, readyState, contentType, or
+/// the error), and what the attacker's step gives: `new frames[i].WebSocket(url)` created
+/// through the parent, with the CSP violations the frame reported when they can be seen.
+fn frame_probe_js(src: &str, url: &str) -> String {
+    format!(
+        "new Promise(r => {{ const f = document.createElement('iframe'); f.src = '{src}'; \
+         f.onload = () => {{ const i = Array.from(frames).indexOf(f.contentWindow); \
+           let frame = ''; const v = []; \
+           try {{ const d = f.contentWindow.document; frame = [d.URL, d.readyState, d.contentType].join(' '); \
+                  d.addEventListener('securitypolicyviolation', e => v.push(e.violatedDirective)); }} \
+           catch (e) {{ frame = 'unreadable:' + e.name; }} \
+           let out = ''; try {{ const s = new frames[i].WebSocket('{url}'); s.onopen = () => {{ out = 'OPEN'; s.close(); }}; s.onerror = () => {{ out = out || 'ERROR'; }}; }} \
+           catch (e) {{ out = 'THROW:' + e.name; }} \
+           setTimeout(() => r('ws=' + (out || 'PENDING') + ' violations=' + v.join(',') + ' frame=' + frame), 2000); }}; \
+         document.body.appendChild(f); setTimeout(() => r('TIMEOUT no load event'), 8000); }})"
+    )
+}
+
+/// The child frames of the page `session` is attached to: url, unreachableUrl (set when the
+/// frame shows an error page), securityOrigin.
+async fn child_frames(conn: &CdpConn, session: &str) -> Vec<String> {
+    let tree = conn
+        .send("Page.getFrameTree", json!({}), Some(session))
+        .await
+        .unwrap();
+    tree["frameTree"]["childFrames"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|c| {
+            let f = &c["frame"];
+            format!(
+                "url={} unreachable={} origin={}",
+                f["url"], f["unreachableUrl"], f["securityOrigin"]
+            )
+        })
+        .collect()
+}
+
+/// Measurement for the review (an image or text document framed by a public page): what the
+/// frame is in three setups — a local page (not served again), a public page served again
+/// with the CSP, and a public page served again without the CSP header (test hook) — and
+/// what the attacker's step from the parent gives. The guard traces its decisions to stderr
+/// (run with --nocapture). Asserted: from the public page with the CSP, the attacker's
+/// WebSocket does not open, and the framed document is shown (not an error page).
+#[test]
+#[ignore]
+fn framed_documents_of_a_public_page_measurement() {
+    common::run(async {
+        let h = Harness::start();
+        let port = fixture_port(&h);
+        let (info, _, _client, _) = public_session(&h, "/counter").await;
+        let target = info.targets[0].clone();
+        let conn = &h.browser.conn;
+        let s = conn.attach(&target).await.unwrap();
+        conn.send("Page.enable", json!({}), Some(&s)).await.unwrap();
+        let ws = "ws://10.255.255.1:81/ws";
+        let mut public_with_csp = Vec::new();
+        for (label, origin, csp) in [
+            ("local page", format!("http://127.0.0.1:{port}"), true),
+            (
+                "public page, CSP",
+                format!("http://{}:{port}", common::PUBLIC_NAME),
+                true,
+            ),
+            (
+                "public page, served again WITHOUT the CSP header",
+                format!("http://{}:{port}", common::PUBLIC_NAME),
+                false,
+            ),
+        ] {
+            assert!(h.manager.set_guard_csp_header_for_test(csp));
+            conn.navigate(&s, &format!("{origin}/counter"))
+                .await
+                .unwrap();
+            for src in ["/pixel.gif", "/plain.txt"] {
+                eprintln!("--- {label}, framed {src}");
+                let got = conn.evaluate(&s, &frame_probe_js(src, ws)).await.unwrap();
+                let got = got.as_str().unwrap_or_default().to_string();
+                let frames = child_frames(conn, &s).await;
+                eprintln!("{label}, framed {src}: {got}; frames: {frames:?}");
+                if label == "public page, CSP" {
+                    public_with_csp.push((src, got, frames));
+                }
+                // One frame at a time.
+                let _ = conn
+                    .evaluate(
+                        &s,
+                        "document.querySelectorAll('iframe').forEach(f => f.remove()); 1",
+                    )
+                    .await;
+            }
+        }
+        assert!(h.manager.set_guard_csp_header_for_test(true));
+        let _ = conn
+            .send("Target.detachFromTarget", json!({ "sessionId": s }), None)
+            .await;
+        for (src, got, frames) in public_with_csp {
+            assert!(!got.starts_with("ws=OPEN"), "{src}: {got}");
+            // The frame shows its document, not an error page: serving it again must not
+            // break framed images and text.
+            assert!(
+                frames.iter().all(|f| f.contains("unreachable=null")),
+                "{src}: the framed document did not load: {frames:?}"
+            );
+        }
+    });
+}

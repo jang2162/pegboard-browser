@@ -233,6 +233,9 @@ fn gzip_bomb() -> &'static [u8] {
     })
 }
 
+/// A 1x1 GIF (`/pixel.gif`).
+pub const PIXEL_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+
 /// `/big`: an HTML page of `OVERSIZED` bytes with its length declared. `/bomb`: the same
 /// size once decoded, sent gzip-compressed with the compressed length declared.
 fn oversized_route(path: &str) -> Option<Vec<u8>> {
@@ -243,10 +246,17 @@ fn oversized_route(path: &str) -> Option<Vec<u8>> {
             ("", body)
         }
         "/bomb" => ("content-encoding: gzip\r\n", gzip_bomb().to_vec()),
+        "/pixel.gif" => ("", PIXEL_GIF.to_vec()),
+        "/plain.txt" => ("", b"plain text".to_vec()),
         _ => return None,
     };
+    let ctype = match path {
+        "/pixel.gif" => "image/gif",
+        "/plain.txt" => "text/plain",
+        _ => "text/html",
+    };
     let mut out = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();

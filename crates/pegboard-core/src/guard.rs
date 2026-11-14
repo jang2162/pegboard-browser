@@ -302,7 +302,7 @@ fn is_attachment(headers: &[(String, String)]) -> bool {
 
 /// The headers a document is served again with: the original ones without those that
 /// described the bytes as they came over the wire, and the CSP.
-fn reserved_headers(headers: &[(String, String)], csp: &str) -> Vec<Value> {
+fn reserved_headers(headers: &[(String, String)], csp: Option<&str>) -> Vec<Value> {
     let mut out: Vec<Value> = headers
         .iter()
         .filter(|(n, _)| {
@@ -312,7 +312,9 @@ fn reserved_headers(headers: &[(String, String)], csp: &str) -> Vec<Value> {
         })
         .map(|(n, v)| json!({ "name": n, "value": v }))
         .collect();
-    out.push(json!({ "name": "Content-Security-Policy", "value": csp }));
+    if let Some(csp) = csp {
+        out.push(json!({ "name": "Content-Security-Policy", "value": csp }));
+    }
     out
 }
 
@@ -370,6 +372,9 @@ struct Inner {
     /// Tests only (`PEGBOARD_TEST_HOOKS`): what the guard did with each document response is
     /// written to stderr (the daemon's log), with the URL's path only.
     trace: bool,
+    /// Test hook: false serves documents again without adding the CSP header, to tell what
+    /// the header does from what serving again does.
+    csp_header: std::sync::atomic::AtomicBool,
 }
 
 pub struct Guard {
@@ -409,6 +414,7 @@ impl Guard {
             hold_until: Mutex::new(None),
             body_budget: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET / BODY_PIECE)),
             trace: std::env::var_os("PEGBOARD_TEST_HOOKS").is_some(),
+            csp_header: std::sync::atomic::AtomicBool::new(true),
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner)));
         Guard { inner, supervisor }
@@ -482,6 +488,15 @@ impl Guard {
     #[doc(hidden)]
     pub fn connections(&self) -> u64 {
         self.inner.state.lock().unwrap().connections
+    }
+
+    /// Test hook: whether documents served again get the CSP header (`false` only to measure
+    /// what serving again does without it). The caller gates it.
+    #[doc(hidden)]
+    pub fn set_csp_header_for_test(&self, on: bool) {
+        self.inner
+            .csp_header
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test hook: closes the guard's connection as a failure would, and keeps it from
@@ -884,8 +899,12 @@ impl Inner {
                     .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
                     .map(|(_, v)| v.as_str())
                     .collect();
+                let error = params["responseErrorReason"].as_str().unwrap_or("-");
+                let network = params["networkId"].as_str().unwrap_or("-");
+                let kind = params["resourceType"].as_str().unwrap_or("-");
                 eprintln!(
-                    "pegboard guard: document {path} status {status} type {types:?} -> {outcome}"
+                    "pegboard guard: document {path} status {status} type {types:?} \
+                     error {error} resource {kind} network {network} session {session} -> {outcome}"
                 );
             }
         };
@@ -916,7 +935,12 @@ impl Inner {
             let mut fulfill = json!({
                 "requestId": request_id,
                 "responseCode": status,
-                "responseHeaders": reserved_headers(&headers, &csp),
+                "responseHeaders": reserved_headers(
+                    &headers,
+                    self.csp_header
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        .then_some(csp.as_str()),
+                ),
                 "body": data_encoding::BASE64.encode(&body),
             });
             if let Some(phrase) = params["responseStatusText"]
@@ -1407,7 +1431,7 @@ mod tests {
                 ("Content-Security-Policy", "script-src 'self'"),
                 ("Set-Cookie", "a=1"),
             ]),
-            "connect-src data:",
+            Some("connect-src data:"),
         );
         let names: Vec<&str> = out.iter().map(|h| h["name"].as_str().unwrap()).collect();
         assert_eq!(

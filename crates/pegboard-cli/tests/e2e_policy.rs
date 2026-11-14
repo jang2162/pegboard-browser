@@ -1449,23 +1449,23 @@ fn sniffed_and_duplicated_content_types_get_the_csp() {
     close(&h);
 }
 
-/// From the session's page, frames `src` (same origin) and, in the frame's own realm and
-/// under its document's policy, opens a plain WebSocket to `url`. Answers
-/// `<outcome>|<violations>|<what the frame was>`; every step that fails says so instead of
-/// leaving the answer to the time limit.
+/// From the session's page, frames `src` (same origin) and, once it has loaded, takes the
+/// attacker's step from the parent: `new frames[i].WebSocket(url)`, a WebSocket made in the
+/// frame's realm under the frame document's policy. Answers
+/// `ws=<outcome> violations=<CSP violations the frame reported> frame=<URL readyState type,
+/// or unreadable:<error>>`.
 fn framed_ws_js(src: &str, url: &str) -> String {
     format!(
         "new Promise(r => {{ const f = document.createElement('iframe'); f.src = '{src}'; \
-         f.onload = () => {{ let frame = ''; \
-           try {{ const d = f.contentWindow.document; frame = [d.URL, d.readyState, d.contentType].join(' '); }} \
-           catch (e) {{ return r('NO-ACCESS|' + e.name + '|frame not readable'); }} \
-           try {{ const w = f.contentWindow; const v = []; \
-             w.document.addEventListener('securitypolicyviolation', e => v.push(e.violatedDirective)); \
-             let out = ''; try {{ const s = new w.WebSocket('{url}'); s.onopen = () => {{ out = 'OPEN'; s.close(); }}; s.onerror = () => {{ out = out || 'ERROR'; }}; }} \
-             catch (e) {{ out = 'THROW:' + e.name; }} \
-             setTimeout(() => r((out || 'PENDING') + '|' + v.join(',') + '|' + frame), 2000); }} \
-           catch (e) {{ r('HANDLER:' + e + '|' + frame); }} }}; \
-         document.body.appendChild(f); setTimeout(() => r('TIMEOUT|no load event'), 8000); }})"
+         f.onload = () => {{ const i = Array.from(frames).indexOf(f.contentWindow); \
+           let frame = ''; const v = []; \
+           try {{ const d = f.contentWindow.document; frame = [d.URL, d.readyState, d.contentType].join(' '); \
+                  d.addEventListener('securitypolicyviolation', e => v.push(e.violatedDirective)); }} \
+           catch (e) {{ frame = 'unreadable:' + e.name; }} \
+           let out = ''; try {{ const s = new frames[i].WebSocket('{url}'); s.onopen = () => {{ out = 'OPEN'; s.close(); }}; s.onerror = () => {{ out = out || 'ERROR'; }}; }} \
+           catch (e) {{ out = 'THROW:' + e.name; }} \
+           setTimeout(() => r('ws=' + (out || 'PENDING') + ' violations=' + v.join(',') + ' frame=' + frame), 2000); }}; \
+         document.body.appendChild(f); setTimeout(() => r('TIMEOUT no load event'), 8000); }})"
     )
 }
 
@@ -1516,10 +1516,15 @@ fn inert_documents_get_the_csp_too() {
             "public page, framed {src}: {got}; guard: {:?}",
             guard_trace(src)
         );
-        assert!(
-            !got.starts_with("OPEN") && got.contains("connect-src"),
-            "{src}: {got}"
-        );
+        // The attacker's WebSocket does not open and never reaches the server. Either the
+        // frame's CSP refused it (a connect-src violation), or the parent cannot reach the
+        // frame's realm at all (the step throws).
+        assert!(!got.starts_with("ws=OPEN"), "{src}: {got}");
+        assert!(!got.starts_with("TIMEOUT"), "{src}: {got}");
+        let refused_by_csp = got.contains("violations=connect-src");
+        let realm_unreachable =
+            got.starts_with("ws=THROW:SecurityError") && got.contains("frame=unreadable");
+        assert!(refused_by_csp || realm_unreachable, "{src}: {got}");
         assert!(!srv.reached(&wm));
     }
     close(&h);
@@ -1535,7 +1540,8 @@ fn inert_documents_get_the_csp_too() {
         "local page, framed /img: {got}; guard: {:?}",
         guard_trace("/img")
     );
-    assert!(got.starts_with("OPEN|"), "{got}");
+    // Control: the probe can see a WebSocket open from a framed image document.
+    assert!(got.starts_with("ws=OPEN"), "{got}");
     close(&h);
 }
 

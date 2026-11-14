@@ -548,6 +548,17 @@ impl SessionManager {
         self.inner.guard.connections()
     }
 
+    /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: whether documents served again get
+    /// the CSP header. Returns whether it did anything.
+    #[doc(hidden)]
+    pub fn set_guard_csp_header_for_test(&self, on: bool) -> bool {
+        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+            return false;
+        }
+        self.inner.guard.set_csp_header_for_test(on);
+        true
+    }
+
     /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: drops the guard's connection as a
     /// failure would and keeps it down for `hold`. Returns whether it did.
     #[doc(hidden)]
