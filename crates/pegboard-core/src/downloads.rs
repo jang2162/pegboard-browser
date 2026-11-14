@@ -481,6 +481,24 @@ struct Policy {
 }
 
 impl Policy {
+    /// A profile's policy as first seen by this daemon. Its clipboard counts as maybe denied:
+    /// the browser may have outlived an earlier daemon that denied it (a denial outlives the
+    /// connection that set it), so the first session allowing the clipboard resets it.
+    fn new(profile_dir: &str, staging: PathBuf) -> Policy {
+        Policy {
+            profile_dir: profile_dir.to_string(),
+            staging,
+            conn: None,
+            ready: false,
+            generation: 0,
+            reapplying: false,
+            clipboard_denied: false,
+            clipboard: None,
+            clipboard_generation: 0,
+            clipboard_maybe_denied: true,
+        }
+    }
+
     /// Whether the clipboard is as the profile's sessions want it.
     fn clipboard_ready(&self) -> bool {
         !self.clipboard_denied || self.clipboard.is_some()
@@ -1041,18 +1059,7 @@ impl Inner {
             let policy = state
                 .policies
                 .entry(context.to_string())
-                .or_insert_with(|| Policy {
-                    profile_dir: profile_dir.to_string(),
-                    staging: staging.clone(),
-                    conn: None,
-                    ready: false,
-                    generation: 0,
-                    reapplying: false,
-                    clipboard_denied: false,
-                    clipboard: None,
-                    clipboard_generation: 0,
-                    clipboard_maybe_denied: false,
-                });
+                .or_insert_with(|| Policy::new(profile_dir, staging.clone()));
             policy.generation += 1;
             policy.staging = staging;
             policy.ready = true;
@@ -1862,6 +1869,16 @@ async fn sweep(weak: Weak<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_profile_first_seen_may_carry_a_clipboard_denial() {
+        let p = Policy::new("Agent", PathBuf::from("/x"));
+        assert!(
+            p.clipboard_maybe_denied,
+            "an allowed session must reset it first"
+        );
+        assert!(!p.clipboard_denied && p.clipboard_ready());
+    }
 
     #[test]
     fn file_names_are_made_safe() {

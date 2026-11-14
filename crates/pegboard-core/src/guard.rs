@@ -87,7 +87,7 @@ pub type ClipboardOf = Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
 /// went through). So each shield leaves its own `on` on its document under a key of the
 /// guard's (a second secret, not the nonce: a page that finds it can only add the shield's
 /// listeners), and every wrapper adds the listeners of the document's own realm.
-pub const CLIPBOARD_SHIELD: &str = r#"(()=>{const ap=Reflect.apply,gd=Object.getOwnPropertyDescriptor,dp=Object.defineProperty,pd=Event.prototype.preventDefault,sip=Event.prototype.stopImmediatePropagation,ael=EventTarget.prototype.addEventListener,D=Document.prototype,op=D.open,wr=D.write,wl=D.writeln,rs=gd(D,"readyState").get,dv=gd(D,"defaultView").get,N=["copy","cut","paste","beforecopy","beforecut","beforepaste"],L=N.length;const f=(e)=>{ap(pd,e,[]);ap(sip,e,[]);"__PEGBOARD_NONCE__"};const on=(d)=>{const T=[ap(dv,d,[]),d];for(let i=0;i<2;i++){const t=T[i];if(t)for(let j=0;j<L;j++)ap(ael,t,[N[j],f,true])}};on(document);const K="pegboard.__PEGBOARD_KEY__";dp(document,K,{value:on,writable:false,configurable:false,enumerable:false});const own=(d)=>{const g=d[K];ap(typeof g==="function"?g:on,undefined,[d])};const lock=(k,v)=>dp(D,k,{value:v,writable:true,configurable:false,enumerable:true});const opened=(d)=>{if(ap(rs,d,[])!=="loading"){ap(op,d,[]);own(d)}};lock("open",function open(){const r=ap(op,this,arguments);own(this);return r});lock("write",function write(){opened(this);return ap(wr,this,arguments)});lock("writeln",function writeln(){opened(this);return ap(wl,this,arguments)})})()"#;
+pub const CLIPBOARD_SHIELD: &str = r#"(()=>{const ap=Reflect.apply,gd=Object.getOwnPropertyDescriptor,dp=Object.defineProperty,pd=Event.prototype.preventDefault,sip=Event.prototype.stopImmediatePropagation,ael=EventTarget.prototype.addEventListener,D=Document.prototype,op=D.open,wr=D.write,wl=D.writeln,rs=gd(D,"readyState").get,dv=gd(D,"defaultView").get,N=["copy","cut","paste","beforecopy","beforecut","beforepaste"],L=N.length;const f=(e)=>{ap(pd,e,[]);ap(sip,e,[]);"__PEGBOARD_NONCE__"};const on=(d)=>{const T=[ap(dv,d,[]),d];for(let i=0;i<2;i++){const t=T[i];if(t)for(let j=0;j<L;j++)ap(ael,t,[N[j],f,true])}};on(document);const K="__PEGBOARD_KEY__";dp(document,K,{value:on,writable:false,configurable:false,enumerable:false});const own=(d)=>{const g=d[K];ap(typeof g==="function"?g:on,undefined,[d])};const lock=(k,v)=>dp(D,k,{value:v,writable:true,configurable:false,enumerable:true});const opened=(d)=>{if(ap(rs,d,[])!=="loading"){ap(op,d,[]);own(d)}};lock("open",function open(){const r=ap(op,this,arguments);own(this);return r});lock("write",function write(){opened(this);return ap(wr,this,arguments)});lock("writeln",function writeln(){opened(this);return ap(wl,this,arguments)})})()"#;
 
 fn random_hex() -> String {
     use rand::RngCore;
@@ -202,6 +202,20 @@ pub fn describe_listeners(listeners: &[Value], nonce: &str) -> String {
     format!("{} listeners: {}", listeners.len(), shown.join("; "))
 }
 
+/// The guard's session of the tab that holds the target of `session` (itself for a tab),
+/// through the sessions the guard attached them by.
+fn tab_session_of(sessions: &HashMap<String, Attached>, session: &str) -> Option<String> {
+    let mut at = session;
+    for _ in 0..32 {
+        let a = sessions.get(at)?;
+        if a.kind == "page" {
+            return Some(at.to_string());
+        }
+        at = a.parent.as_deref()?;
+    }
+    None
+}
+
 /// How long the shield's replies may take after the resume before a tab is closed.
 const SHIELD_LIMIT: Duration = Duration::from_secs(15);
 
@@ -209,8 +223,67 @@ const SHIELD_LIMIT: Duration = Duration::from_secs(15);
 /// coming back running (a reload or navigation that attaches it again) beyond this has its
 /// tab closed (fail closed) rather than being reloaded forever or left unshielded.
 const FRAME_RELOADS: u32 = 3;
-/// Frame targets whose reloads are counted at once; the counts start again past it.
+/// Frame reload counts kept at once; past it, those of tabs the guard no longer holds go.
 const MAX_FRAME_RELOADS_KEPT: usize = 4096;
+
+/// Work in progress per key (a target being set up, a frame being checked after
+/// `document.open()`), with its browser context. A key may be started again before an earlier
+/// start is done (two `open`s in a row): it stays until each start is done.
+#[derive(Default)]
+struct Pending(HashMap<String, (String, u32)>);
+
+impl Pending {
+    fn start(&mut self, key: &str, context: &str) {
+        let entry = self
+            .0
+            .entry(key.to_string())
+            .or_insert_with(|| (context.to_string(), 0));
+        entry.1 += 1;
+    }
+
+    fn done(&mut self, key: &str) {
+        if let Some(entry) = self.0.get_mut(key) {
+            entry.1 -= 1;
+            if entry.1 == 0 {
+                self.0.remove(key);
+            }
+        }
+    }
+
+    fn any_in(&self, context: &str) -> bool {
+        self.0.values().any(|(c, _)| c == context)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// How often each frame was reloaded for the clipboard, with the guard's session of the tab
+/// it sits in: the counts of a tab go when the tab's session ends.
+#[derive(Default)]
+struct Reloads(HashMap<String, (u32, Option<String>)>);
+
+impl Reloads {
+    /// Counts one more reload of `key` (in the tab whose guard session is `tab`); returns the
+    /// count. When full, the counts of tabs `live` says are gone are dropped first.
+    fn bump(&mut self, key: &str, tab: Option<String>, live: impl Fn(&str) -> bool) -> u32 {
+        if self.0.len() >= MAX_FRAME_RELOADS_KEPT && !self.0.contains_key(key) {
+            self.0.retain(|_, (_, t)| t.as_deref().is_some_and(&live));
+        }
+        let entry = self.0.entry(key.to_string()).or_insert((0, tab));
+        entry.0 += 1;
+        entry.0
+    }
+
+    fn forget_tab(&mut self, tab: &str) {
+        self.0.retain(|_, (_, t)| t.as_deref() != Some(tab));
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
 
 /// Called once a reconnected guard has turned auto-attach on and before it sets up the
 /// targets that are there: drops the agents' connections of profiles whose sessions deny the
@@ -549,11 +622,11 @@ struct State {
     /// Refused requests per reason, since the daemon started (diagnostics, no URLs).
     denied: BTreeMap<&'static str, u64>,
     /// Frame target -> how often it was attached running and reloaded (`FRAME_RELOADS`).
-    frame_reloads: HashMap<String, u32>,
+    frame_reloads: Reloads,
     /// Targets attached when the guard (re)connected whose set-up is not done, with their
     /// context: commands of the context's clipboard-denied sessions wait for them
     /// (`early_pending`).
-    early_pending: HashMap<String, String>,
+    early_pending: Pending,
     /// The current connection's event loop runs (`ready` is set only while it does).
     live: bool,
 }
@@ -753,8 +826,7 @@ impl Guard {
             .lock()
             .unwrap()
             .early_pending
-            .values()
-            .any(|c| c == context)
+            .any_in(context)
     }
 
     /// Test hook: the set-up of the targets there at the next (re)connect waits `delay`
@@ -966,12 +1038,12 @@ impl Inner {
             .lock()
             .unwrap()
             .early_pending
-            .insert(key.clone(), attached.context.clone());
+            .start(&key, &attached.context);
         let me = self.clone();
         let conn = conn.clone();
         tokio::spawn(async move {
             let outcome = me.check_opened(&conn, &session, &attached, &frame).await;
-            me.state.lock().unwrap().early_pending.remove(&key);
+            me.state.lock().unwrap().early_pending.done(&key);
             me.changed.send_modify(|n| *n += 1);
             me.log_attach(format!(
                 "{} {} document opened in frame {frame} -> {outcome}",
@@ -1021,18 +1093,7 @@ impl Inner {
                 )
             }
         };
-        let allowed = {
-            let mut state = self.state.lock().unwrap();
-            if state.frame_reloads.len() >= MAX_FRAME_RELOADS_KEPT {
-                state.frame_reloads.clear();
-            }
-            let n = state
-                .frame_reloads
-                .entry(format!("opened:{frame}"))
-                .or_insert(0);
-            *n += 1;
-            *n <= FRAME_RELOADS
-        };
+        let allowed = self.count_reload(&format!("opened:{frame}"), session) <= FRAME_RELOADS;
         if !allowed {
             return format!(
                 "page first [{seen}], limit, {}",
@@ -1207,7 +1268,7 @@ impl Inner {
                 .lock()
                 .unwrap()
                 .early_pending
-                .insert(target.clone(), context.clone());
+                .start(&target, &context);
         }
         let me = self.clone();
         let conn = conn.clone();
@@ -1233,7 +1294,7 @@ impl Inner {
                 me.set_up(&conn, attached).await
             };
             if early {
-                me.state.lock().unwrap().early_pending.remove(&target);
+                me.state.lock().unwrap().early_pending.done(&target);
                 me.changed.send_modify(|n| *n += 1);
             }
             me.log_attach(format!(
@@ -1393,15 +1454,7 @@ impl Inner {
                 ),
             },
             ClipboardStep::ShieldAndReloadFrame => {
-                let allowed = {
-                    let mut state = self.state.lock().unwrap();
-                    if state.frame_reloads.len() >= MAX_FRAME_RELOADS_KEPT {
-                        state.frame_reloads.clear();
-                    }
-                    let n = state.frame_reloads.entry(a.target.to_string()).or_insert(0);
-                    *n += 1;
-                    *n <= FRAME_RELOADS
-                };
+                let allowed = self.count_reload(a.target, a.session) <= FRAME_RELOADS;
                 if !allowed {
                     return format!(
                         " frame-reload=limit, {}",
@@ -1427,6 +1480,18 @@ impl Inner {
             }
             _ => String::new(),
         }
+    }
+
+    /// Counts one more clipboard reload of `key`, under the tab of the guard's `session`.
+    fn count_reload(&self, key: &str, session: &str) -> u32 {
+        let mut state = self.state.lock().unwrap();
+        let tab = tab_session_of(&state.sessions, session);
+        let State {
+            frame_reloads,
+            sessions,
+            ..
+        } = &mut *state;
+        frame_reloads.bump(key, tab, |t| sessions.contains_key(t))
     }
 
     /// Closes the tab that holds the guard's `session` (the tab itself, or the tab a frame
@@ -1478,6 +1543,7 @@ impl Inner {
             return;
         };
         let mut state = self.state.lock().unwrap();
+        state.frame_reloads.forget_tab(session);
         if let Some(gone) = state.sessions.remove(session) {
             // A tab's session ends with the tab; a failure stays visible to a waiter for a
             // while (`FAILED_KEPT`).
@@ -1955,7 +2021,11 @@ mod tests {
         assert_eq!(source.matches("n0nce").count(), 1);
         // Each shield leaves its `on` on its document under the key; wrappers use the
         // document's own (another realm's listeners would die with that realm).
-        assert!(source.contains(r#"const K="pegboard.k3y";dp(document,K,{value:on,"#));
+        assert!(source.contains(r#"const K="k3y";dp(document,K,{value:on,"#));
+        assert!(
+            !source.contains("pegboard"),
+            "no name of pegboard's in the page"
+        );
         assert!(source.contains("own(this)") && source.contains("own(d)"));
         assert!(!source.contains("on(this)"));
         assert!(source.contains(r#"ap(sip,e,[]);"n0nce"}"#));
@@ -1991,6 +2061,64 @@ mod tests {
         assert!(!first_capture_listeners_hold(&all[1..], "N1"));
         // Another nonce.
         assert!(!first_capture_listeners_hold(&all, "N2"));
+    }
+
+    #[test]
+    fn overlapping_work_on_one_key_keeps_it_pending_until_all_is_done() {
+        let mut p = Pending::default();
+        p.start("opened:F", "ctx");
+        p.start("opened:F", "ctx");
+        p.done("opened:F");
+        assert!(p.any_in("ctx"), "the second check still runs");
+        p.done("opened:F");
+        assert!(!p.any_in("ctx"));
+        p.done("opened:F");
+        assert!(!p.any_in("ctx"), "a done too many does not underflow");
+        p.start("T", "a");
+        assert!(p.any_in("a") && !p.any_in("b"));
+    }
+
+    #[test]
+    fn reload_counts_go_with_their_tab() {
+        let mut r = Reloads::default();
+        let all = |_: &str| true;
+        assert_eq!(r.bump("F1", Some("tab1".into()), all), 1);
+        assert_eq!(r.bump("F1", Some("tab1".into()), all), 2);
+        assert_eq!(r.bump("F2", Some("tab2".into()), all), 1);
+        r.forget_tab("tab1");
+        assert_eq!(r.bump("F1", Some("tab1".into()), all), 1, "its tab ended");
+        assert_eq!(
+            r.bump("F2", Some("tab2".into()), all),
+            2,
+            "another tab's stays"
+        );
+        // Full: the counts of tabs that are gone make room; a live tab's count stays.
+        let mut full = Reloads::default();
+        for i in 0..MAX_FRAME_RELOADS_KEPT {
+            full.bump(&format!("dead{i}"), Some("gone".into()), all);
+        }
+        full.0.insert("live".into(), (2, Some("here".into())));
+        assert_eq!(full.bump("new", Some("here".into()), |t| t == "here"), 1);
+        assert_eq!(full.0["live"].0, 2);
+        assert!(full.0.len() <= 2);
+    }
+
+    #[test]
+    fn a_frame_is_counted_under_its_tab() {
+        let a = |kind: &str, parent: Option<&str>| Attached {
+            target: String::new(),
+            context: String::new(),
+            kind: kind.into(),
+            parent: parent.map(String::from),
+        };
+        let sessions = HashMap::from([
+            ("P".to_string(), a("page", None)),
+            ("F".to_string(), a("iframe", Some("P"))),
+            ("G".to_string(), a("iframe", Some("F"))),
+        ]);
+        assert_eq!(tab_session_of(&sessions, "G").as_deref(), Some("P"));
+        assert_eq!(tab_session_of(&sessions, "P").as_deref(), Some("P"));
+        assert_eq!(tab_session_of(&sessions, "X"), None);
     }
 
     fn words(csp: &str) -> Vec<&str> {
