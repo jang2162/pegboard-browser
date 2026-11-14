@@ -92,8 +92,8 @@ impl Rig {
     }
 
     fn page_state(&self, handle: &str) -> String {
-        let out = self.ok(handle, &["get", "text", "#out"]);
-        json(&out)["text"]
+        let out = self.ok(handle, &["--json", "get", "text", "#out"]);
+        json(&out)["data"]["text"]
             .as_str()
             .unwrap_or_else(|| panic!("no text in {out}"))
             .to_string()
@@ -171,10 +171,10 @@ fn agent_cannot_read_human_cookies_or_storage() {
         "{cookies}"
     );
 
-    let out = rig.ok(&rig.a, &["eval", "document.cookie"]);
-    assert_eq!(json(&out)["result"], "", "{out}");
-    let out = rig.ok(&rig.a, &["eval", "localStorage.getItem('spike')"]);
-    assert!(json(&out)["result"].is_null(), "{out}");
+    let out = rig.ok(&rig.a, &["--json", "eval", "document.cookie"]);
+    assert_eq!(json(&out)["data"]["result"], "", "{out}");
+    let out = rig.ok(&rig.a, &["--json", "eval", "localStorage.getItem('spike')"]);
+    assert!(json(&out)["data"]["result"].is_null(), "{out}");
 
     // The human's data is untouched.
     assert_eq!(
@@ -304,7 +304,10 @@ fn sessions_in_one_profile_share_cookies_but_not_tabs() {
     let rig = Rig::new();
     rig.ok(&rig.a, &["open", &rig.url("/counter")]);
     // The agent's own cookie, so it cannot be mistaken for the human's `spike=1`.
-    rig.ok(&rig.a, &["eval", "document.cookie = 'agentck=1; path=/'"]);
+    rig.ok(
+        &rig.a,
+        &["--json", "eval", "document.cookie = 'agentck=1; path=/'"],
+    );
     rig.ok(&rig.b, &["open", &rig.url("/cookie/get")]);
     let seen = rig.page_state(&rig.b);
     assert!(
@@ -326,10 +329,16 @@ fn sessions_in_one_profile_share_cookies_but_not_tabs() {
 fn sessions_in_different_profiles_share_nothing() {
     let rig = Rig::new();
     rig.ok(&rig.a, &["open", &rig.url("/cookie/set")]);
-    rig.ok(&rig.a, &["eval", "document.cookie = 'agentck=1; path=/'"]);
+    rig.ok(
+        &rig.a,
+        &["--json", "eval", "document.cookie = 'agentck=1; path=/'"],
+    );
     // A really holds cookies, so C's emptiness is not an empty fixture.
-    let a_cookie = rig.ok(&rig.a, &["eval", "document.cookie"]);
-    let a_cookie = json(&a_cookie)["result"].as_str().unwrap().to_string();
+    let a_cookie = rig.ok(&rig.a, &["--json", "eval", "document.cookie"]);
+    let a_cookie = json(&a_cookie)["data"]["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(
         a_cookie.contains("spike=1") && a_cookie.contains("agentck=1"),
         "{a_cookie}"
@@ -417,8 +426,15 @@ fn escape_flags_and_commands_are_refused() {
     // `fill` honours `--`: what follows is literal text for the field, not a flag.
     rig.ok(&rig.a, &["open", &rig.url("/form")]);
     rig.ok(&rig.a, &["fill", "#name", "--", "--cdp", &port]);
-    let out = rig.ok(&rig.a, &["eval", "document.getElementById('name').value"]);
-    assert_eq!(json(&out)["result"], format!("--cdp {port}"), "{out}");
+    let out = rig.ok(
+        &rig.a,
+        &["--json", "eval", "document.getElementById('name').value"],
+    );
+    assert_eq!(
+        json(&out)["data"]["result"],
+        format!("--cdp {port}"),
+        "{out}"
+    );
     // `session list` is a pegboard command, not an escape: it answers with ids and names only,
     // never a token, so it gives no way into another session (see "알려진 한계" in the README).
     for args in [&["session", "list"][..], &["session", "list", "--json"][..]] {
@@ -431,7 +447,7 @@ fn escape_flags_and_commands_are_refused() {
     }
     // `eval` is allowed (it runs in the agent's page); it is deliberately not in the list.
     rig.ok(&rig.a, &["open", &rig.url("/counter")]);
-    rig.ok(&rig.a, &["eval", "1 + 1"]);
+    rig.ok(&rig.a, &["--json", "eval", "1 + 1"]);
 
     // Nothing leaked from the refused attempts: A is intact and still alone in its tabs.
     rig.ok(&rig.a, &["snapshot"]);
@@ -652,11 +668,11 @@ fn eval_runs_in_the_main_world_and_a11y_works() {
     // command that creates a universal-access world, and it must keep working.
     let rig = Rig::new();
     rig.ok(&rig.a, &["open", &rig.url("/marker")]);
-    let out = rig.ok(&rig.a, &["eval", "window.pageMarker"]);
-    assert_eq!(json(&out)["result"], "main", "{out}");
-    rig.ok(&rig.a, &["eval", "window.pegboardMarker = 42"]);
-    let out = rig.ok(&rig.a, &["eval", "window.pegboardMarker"]);
-    assert_eq!(json(&out)["result"], 42, "{out}");
+    let out = rig.ok(&rig.a, &["--json", "eval", "window.pageMarker"]);
+    assert_eq!(json(&out)["data"]["result"], "main", "{out}");
+    rig.ok(&rig.a, &["--json", "eval", "window.pegboardMarker = 42"]);
+    let out = rig.ok(&rig.a, &["--json", "eval", "window.pegboardMarker"]);
+    assert_eq!(json(&out)["data"]["result"], 42, "{out}");
     rig.ok(&rig.a, &["a11y"]);
 }
 

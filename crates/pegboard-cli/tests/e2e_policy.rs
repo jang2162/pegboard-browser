@@ -106,7 +106,7 @@ fn deny_eval_blocks_eval_and_wait_fn() {
 
     // Without --deny both run.
     let open = create(&["--url", &url]);
-    let (code, _, err) = home.run(&["--session", &open, "eval", "1+1"]);
+    let (code, _, err) = home.run(&["--session", &open, "--json", "eval", "1+1"]);
     assert_eq!(code, 0, "{err}");
     let (code, _, err) = home.run(&["--session", &open, "wait", "--fn", "true"]);
     assert_eq!(code, 0, "{err}");
@@ -234,11 +234,12 @@ fn chosen(handle: &str) -> String {
     let (code, out, err) = shared_home().run(&[
         "--session",
         handle,
+        "--json",
         "eval",
         "Array.from(document.getElementById('f').files).map(f => f.name + ':' + f.size).join(',')",
     ]);
     assert_eq!(code, 0, "{err}");
-    json(&out)["result"].as_str().unwrap().to_string()
+    json(&out)["data"]["result"].as_str().unwrap().to_string()
 }
 
 /// A session with an upload directory of its own, opened on the upload page.
@@ -721,15 +722,15 @@ fn settle(handle: &str, promise: &str) -> String {
         "(() => {{ window.__peg = window.__peg || {{}}; const k = 'k' + Math.random().toString(36).slice(2); \
          Promise.resolve().then(() => ({promise})).then(v => {{ window.__peg[k] = String(v); }}, e => {{ window.__peg[k] = 'THROW:' + e; }}); return k; }})()"
     );
-    let (code, out, err) = shared_home().run(&["--session", handle, "eval", &start]);
+    let (code, out, err) = shared_home().run(&["--session", handle, "--json", "eval", &start]);
     assert_eq!(code, 0, "{err}");
-    let key = json(&out)["result"].as_str().unwrap().to_string();
+    let key = json(&out)["data"]["result"].as_str().unwrap().to_string();
     let read = format!("(window.__peg && window.__peg['{key}']) || null");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        let (code, out, err) = shared_home().run(&["--session", handle, "eval", &read]);
+        let (code, out, err) = shared_home().run(&["--session", handle, "--json", "eval", &read]);
         assert_eq!(code, 0, "{err}");
-        if let Some(v) = json(&out)["result"].as_str() {
+        if let Some(v) = json(&out)["data"]["result"].as_str() {
             return v.to_string();
         }
         assert!(
@@ -978,10 +979,15 @@ fn redirect_to_private_address_is_blocked() {
 }
 
 fn is_secure_context(handle: &str) -> bool {
-    let (code, out, err) =
-        shared_home().run(&["--session", handle, "eval", "window.isSecureContext"]);
+    let (code, out, err) = shared_home().run(&[
+        "--session",
+        handle,
+        "--json",
+        "eval",
+        "window.isSecureContext",
+    ]);
     assert_eq!(code, 0, "{err}");
-    json(&out)["result"] == true
+    json(&out)["data"]["result"] == true
 }
 
 #[test]
@@ -1459,9 +1465,10 @@ fn sniffed_and_duplicated_content_types_get_the_csp() {
         let url = format!("http://{PUBLIC_NAME}:{}/typed?{query}", srv.p);
         let (code, _, err) = open(&h, &url);
         assert_eq!(code, 0, "{query}: {err}");
-        let (code, out, err) = shared_home().run(&["--session", &h, "eval", "document.title"]);
+        let (code, out, err) =
+            shared_home().run(&["--session", &h, "--json", "eval", "document.title"]);
         assert_eq!(code, 0, "{err}");
-        let title = json(&out)["result"]
+        let title = json(&out)["data"]["result"]
             .as_str()
             .unwrap_or_default()
             .to_string();
@@ -1508,9 +1515,14 @@ fn framed_ws_js(src: &str, url: &str) -> String {
 /// Asserts that the session's tab shows the document titled `want` (the document loaded:
 /// what follows is not run against an error page or the page before).
 fn assert_title(handle: &str, want: &str) {
-    let (code, out, err) = shared_home().run(&["--session", handle, "eval", "document.title"]);
+    let (code, out, err) =
+        shared_home().run(&["--session", handle, "--json", "eval", "document.title"]);
     assert_eq!(code, 0, "{err}");
-    assert_eq!(json(&out)["result"], want, "the page did not load: {out}");
+    assert_eq!(
+        json(&out)["data"]["result"],
+        want,
+        "the page did not load: {out}"
+    );
 }
 
 /// The guard's trace lines in daemon.log about documents whose path is `path`.
@@ -1542,14 +1554,18 @@ fn inert_documents_get_the_csp_too() {
         let (code, _, err) = open(&h, &format!("http://{PUBLIC_NAME}:{}{src}", srv.p));
         assert_eq!(code, 0, "{src}: {err}");
         let (code, out, err) =
-            shared_home().run(&["--session", &h, "eval", "document.contentType"]);
+            shared_home().run(&["--session", &h, "--json", "eval", "document.contentType"]);
         assert_eq!(code, 0, "{err}");
         eprintln!(
             "top level {src}: {}; guard: {:?}",
             out.trim(),
             guard_trace(src)
         );
-        assert_eq!(json(&out)["result"], ctype, "{src} did not load: {out}");
+        assert_eq!(
+            json(&out)["data"]["result"],
+            ctype,
+            "{src} did not load: {out}"
+        );
     }
     let (code, _, err) = open(&h, &format!("http://{PUBLIC_NAME}:{}/page", srv.p));
     assert_eq!(code, 0, "{err}");
@@ -1614,19 +1630,20 @@ fn served_again_bodies_keep_their_bytes() {
         let (code, out, err) = shared_home().run(&[
             "--session",
             &h,
+            "--json",
             "eval",
             "document.getElementById('a').textContent",
         ]);
         assert_eq!(code, 0, "{err}");
-        let sjis = json(&out)["result"]
+        let sjis = json(&out)["data"]["result"]
             .as_str()
             .unwrap_or_default()
             .to_string();
         let (code, _, err) = open(&h, &format!("http://{host}:{}/utf8big", srv.port_of(host)));
         assert_eq!(code, 0, "{err}");
-        let (code, out, err) = shared_home().run(&["--session", &h, "eval", probe]);
+        let (code, out, err) = shared_home().run(&["--session", &h, "--json", "eval", probe]);
         assert_eq!(code, 0, "{err}");
-        let big = json(&out)["result"]
+        let big = json(&out)["data"]["result"]
             .as_str()
             .unwrap_or_default()
             .to_string();

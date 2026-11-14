@@ -619,11 +619,28 @@ fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), Rpc
     Ok(())
 }
 
-/// The text of an agent-browser result: its data when that is one text, else JSON.
+/// The fields of agent-browser's `data` that are the answer of a command (eval's `result`,
+/// `get text`/`value`/`title`/`url`), in the order one is chosen when several are there.
+/// Whatever else `data` holds (`lifecycle`, `origin`, the selector) is not shown.
+const PRIMARY_FIELDS: [&str; 5] = ["result", "text", "value", "title", "url"];
+
+/// The text of an agent-browser result: its primary value when its data has one (a string as
+/// it is, anything else as JSON), its data when that is one text, else JSON. `--json` shows
+/// the whole output instead.
 pub(crate) fn render_output(output: &Value) -> String {
     let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
     match output.get("data") {
         Some(Value::String(s)) => s.clone(),
+        Some(Value::Object(map)) if PRIMARY_FIELDS.iter().any(|k| map.contains_key(*k)) => {
+            let value = PRIMARY_FIELDS
+                .iter()
+                .find_map(|k| map.get(*k))
+                .unwrap_or(&Value::Null);
+            match value {
+                Value::String(s) => s.clone(),
+                other => pretty(other),
+            }
+        }
         Some(Value::Object(map)) => {
             let texts: Vec<&str> = map.values().filter_map(Value::as_str).collect();
             match (map.len(), texts.as_slice()) {
@@ -876,6 +893,45 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn output_shows_the_primary_value_only() {
+        let r = |data: Value| render_output(&json!({ "success": true, "data": data }));
+        // Lifecycle and other fields next to the value are left out.
+        let noise = json!({ "restarted": false });
+        assert_eq!(
+            r(json!({ "url": "https://a.test/", "lifecycle": noise })),
+            "https://a.test/"
+        );
+        assert_eq!(r(json!({ "title": "T", "lifecycle": noise })), "T");
+        assert_eq!(
+            r(json!({ "text": "0", "selector": "#a", "lifecycle": noise })),
+            "0"
+        );
+        assert_eq!(r(json!({ "value": "v", "lifecycle": noise })), "v");
+        // An eval result: a string as it is, anything else as JSON.
+        assert_eq!(
+            r(json!({ "result": "main", "origin": "o", "lifecycle": noise })),
+            "main"
+        );
+        assert_eq!(r(json!({ "result": "", "lifecycle": noise })), "");
+        assert_eq!(r(json!({ "result": 42, "lifecycle": noise })), "42");
+        assert_eq!(r(json!({ "result": null, "lifecycle": noise })), "null");
+        assert_eq!(
+            r(json!({ "result": { "a": [1] }, "lifecycle": noise })),
+            "{\n  \"a\": [\n    1\n  ]\n}"
+        );
+        // The result of eval comes before what else it tells.
+        assert_eq!(r(json!({ "result": "r", "url": "u", "title": "t" })), "r");
+        // Without a primary value: as before.
+        assert_eq!(r(json!({ "snapshot": "- a", "refs": {} })), "- a");
+        assert_eq!(r(json!({ "only": "one" })), "one");
+        assert_eq!(
+            r(json!({ "tabs": [], "lifecycle": noise })),
+            "{\n  \"lifecycle\": {\n    \"restarted\": false\n  },\n  \"tabs\": []\n}"
+        );
+        assert_eq!(r(json!("plain")), "plain");
+    }
 
     fn policy(domains: &[&str], private: bool, no_localhost: bool) -> SessionPolicy {
         SessionPolicy {
