@@ -8,6 +8,8 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod mcp;
+
 use clap::{Parser, Subcommand};
 use pegboard_core::actionlog::{valid_recording_id, ActionEntry, Manifest};
 use pegboard_core::api::{serve, Client};
@@ -79,6 +81,25 @@ enum Cmd {
         #[command(subcommand)]
         command: FilesCmd,
     },
+    /// Serve MCP over stdin and stdout (for MCP clients).
+    Mcp {
+        /// Act on every session (list, info, close, recordings) and manage profiles and
+        /// the browser; drive only the sessions this server created or was given.
+        #[arg(long)]
+        operator: bool,
+        /// Tool bundles to offer.
+        #[arg(
+            long,
+            value_enum,
+            value_delimiter = ',',
+            value_name = "BUNDLE,...",
+            default_value = "core,tabs"
+        )]
+        tools: Vec<mcp::Bundle>,
+        /// The policy of every session this server creates.
+        #[command(flatten)]
+        policy: PolicyArgs,
+    },
     #[command(hide = true)]
     Daemon,
     #[command(external_subcommand)]
@@ -100,6 +121,51 @@ enum ProfileCmd {
     Delete { name: String },
 }
 
+/// The session policy options, the same for `session create` and `mcp`.
+#[derive(clap::Args, Debug, Default)]
+pub(crate) struct PolicyArgs {
+    /// Open command classes that are denied by default (upload, state, clipboard).
+    #[arg(long, value_delimiter = ',', value_name = "CLASS,...")]
+    allow: Vec<ActionClass>,
+    /// Close command classes that are allowed by default (e.g. eval, download).
+    #[arg(long, value_delimiter = ',', value_name = "CLASS,...")]
+    deny: Vec<ActionClass>,
+    /// Only these hosts (and their subdomains) can be reached.
+    #[arg(long, value_delimiter = ',', value_name = "DOMAIN,...")]
+    allow_domain: Vec<String>,
+    /// Allow addresses on private networks.
+    #[arg(long)]
+    allow_private_network: bool,
+    /// Do not allow localhost.
+    #[arg(long)]
+    no_localhost: bool,
+    /// Directory the session may upload files from (needs --allow upload).
+    #[arg(long, value_name = "DIR")]
+    upload_dir: Option<String>,
+    /// Do not expire the session after it has been idle.
+    #[arg(long)]
+    no_expire: bool,
+}
+
+impl PolicyArgs {
+    /// The policy, checked as the daemon will check it again (usage error otherwise).
+    fn checked(self) -> SessionPolicy {
+        let policy = SessionPolicy {
+            allow: self.allow,
+            deny: self.deny,
+            allow_domains: self.allow_domain,
+            allow_private_network: self.allow_private_network,
+            no_localhost: self.no_localhost,
+            upload_dir: self.upload_dir,
+            no_expire: self.no_expire,
+        };
+        if let Err(e) = policy::validate(&policy) {
+            usage(&e.message);
+        }
+        policy
+    }
+}
+
 #[derive(Subcommand)]
 enum SessionCmd {
     /// Create a session and print its id.
@@ -110,27 +176,8 @@ enum SessionCmd {
         url: Option<String>,
         #[arg(long)]
         profile: Option<String>,
-        /// Open command classes that are denied by default (upload, state, clipboard).
-        #[arg(long, value_delimiter = ',', value_name = "CLASS,...")]
-        allow: Vec<ActionClass>,
-        /// Close command classes that are allowed by default (e.g. eval, download).
-        #[arg(long, value_delimiter = ',', value_name = "CLASS,...")]
-        deny: Vec<ActionClass>,
-        /// Only these hosts (and their subdomains) can be reached.
-        #[arg(long, value_delimiter = ',', value_name = "DOMAIN,...")]
-        allow_domain: Vec<String>,
-        /// Allow addresses on private networks.
-        #[arg(long)]
-        allow_private_network: bool,
-        /// Do not allow localhost.
-        #[arg(long)]
-        no_localhost: bool,
-        /// Directory the session may upload files from (needs --allow upload).
-        #[arg(long, value_name = "DIR")]
-        upload_dir: Option<String>,
-        /// Do not expire the session after it has been idle.
-        #[arg(long)]
-        no_expire: bool,
+        #[command(flatten)]
+        policy: PolicyArgs,
     },
     List,
     Info {
@@ -228,8 +275,31 @@ fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
     let json = cli.json;
     match cli.command {
         Cmd::Daemon => daemon_main(paths),
+        Cmd::Mcp {
+            operator,
+            tools,
+            policy,
+        } => {
+            let opts = mcp::Options {
+                operator,
+                tools,
+                policy: policy.checked(),
+            };
+            std::process::exit(mcp::run(opts, paths.clone()))
+        }
         Cmd::Browser { command } => match command {
-            BrowserCmd::Start => browser_start(paths),
+            BrowserCmd::Start => {
+                let started = browser_start(paths)?;
+                println!(
+                    "{}",
+                    if started {
+                        "started"
+                    } else {
+                        "already running"
+                    }
+                );
+                Ok(())
+            }
             BrowserCmd::Stop => browser_stop(paths),
             BrowserCmd::Status => {
                 let s: BrowserStatus = call(paths, "browser.status", json!({}))?;
@@ -410,27 +480,10 @@ fn session(paths: &Paths, command: SessionCmd, json: bool) -> Result<(), RpcErro
             name,
             url,
             profile,
-            allow,
-            deny,
-            allow_domain,
-            allow_private_network,
-            no_localhost,
-            upload_dir,
-            no_expire,
+            policy,
         } => {
-            let policy = SessionPolicy {
-                allow,
-                deny,
-                allow_domains: allow_domain,
-                allow_private_network,
-                no_localhost,
-                upload_dir,
-                no_expire,
-            };
             // The daemon judges it again; this saves a round trip and works without one.
-            if let Err(e) = policy::validate(&policy) {
-                usage(&e.message);
-            }
+            let policy = policy.checked();
             let s: SessionInfo = call(
                 paths,
                 "session.create",
@@ -668,7 +721,8 @@ fn daemon_is_usable(paths: &Paths) -> bool {
         .is_ok_and(|s| !s.stopping)
 }
 
-fn browser_start(paths: &Paths) -> Result<(), RpcError> {
+/// Starts the daemon unless one is usable; `true` when this call started it.
+pub(crate) fn browser_start(paths: &Paths) -> Result<bool, RpcError> {
     ensure_home(paths).map_err(|e| io_failure("creating the pegboard home", e))?;
     let log_path = paths.home.join("daemon.log");
     let deadline = Instant::now() + START_TIMEOUT;
@@ -678,15 +732,7 @@ fn browser_start(paths: &Paths) -> Result<(), RpcError> {
         if socket_answers(paths) {
             // A daemon that is shutting down is waited out, then replaced.
             if daemon_is_usable(paths) {
-                println!(
-                    "{}",
-                    if spawned {
-                        "started"
-                    } else {
-                        "already running"
-                    }
-                );
-                return Ok(());
+                return Ok(spawned);
             }
         } else if !spawned && !lock_is_held(paths) {
             // Nobody serves and nobody is starting (or the one that was has gone): start one.
