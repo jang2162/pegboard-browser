@@ -121,10 +121,12 @@ pegboard profile delete work                            # 열린 세션이 있�
 | `state` | 거부 (1단계와 다르다) | `cookies set`, `storage local set`, `storage session clear` |
 | `clipboard` | 거부 | 페이지의 복사·잘라내기·붙여넣기, `navigator.clipboard`, `press Control+c` 같은 키 |
 
+- 분류는 명령마다 붙는다. `eval`이 허용된 세션에서는 스크립트로 쿠키와 저장소를 쓰고(`document.cookie`, `localStorage`) 다른 주소로 탐색할 수 있다(주소 규칙은 그대로 적용된다). `state`를 거부하거나 `navigate`를 `--deny`해도 스크립트로 하는 같은 일은 막히지 않는다. 막으려면 `--deny eval`도 준다.
+
 - 거부된 명령은 `policy_denied`와 함께 어떤 분류가 막혔는지, 사람이 어떤 옵션으로 열 수 있는지를 알려 준다.
-- pegboard 자신의 포트(브라우저 디버깅 포트, 세션 프록시)는 어떤 정책으로도 열리지 않는다. 자세한 주소 규칙과 닿지 않는 곳은 아래 "알려진 한계"의 주소 규칙 항목.
+- pegboard 자신의 포트(브라우저 디버깅 포트, 세션 프록시)로 가는 HTTP 요청은 어떤 정책에서도 요청 가드가 거부한다. CSP가 붙지 않는 문서(`data:`, `about:blank`, 정책이 허용한 로컬 주소의 문서)에서 연 웹소켓은 가드를 거치지 않고, 세션 프록시의 베어러 토큰과 Chrome 디버깅 포트의 Origin 검사가 막는다. 자세한 주소 규칙과 닿지 않는 곳은 아래 "알려진 한계"의 주소 규칙 항목.
 - 클립보드 허용 여부와 주소 정책(`--allow-domain`, `--allow-private-network`, `--no-localhost`)은 프로필 단위로만 걸린다. 그 프로필에 열린 세션이 있는 동안 첫 세션의 값으로 고정되고, 다른 값을 원하는 세션은 `profile_policy_conflict`로 거부된다. 다른 값이 필요하면 다른 프로필(`--profile`)을 쓴다.
-- 업로드 파일은 `--upload-dir` 폴더(없으면 세션 파일 디렉터리)의 맨 파일 이름으로만 고른다. 경로, 심볼릭 링크, 폴더 밖의 파일은 거부한다. 프록시도 `DOM.setFileInputFiles`의 경로가 그 두 폴더 바로 안의 파일인지 다시 검사한다.
+- 업로드는 `--allow upload`와 `--upload-dir`이 둘 다 있어야 열린다(하나만 주면 세션을 만들 때 거부된다). 파일은 맨 파일 이름으로만 고르며, `--upload-dir` 폴더에서 먼저 찾고 거기 없으면 세션 파일 디렉터리(받은 파일, 스크린샷)에서 찾는다. 경로, 심볼릭 링크, 폴더 밖의 파일은 거부한다. 프록시도 `DOM.setFileInputFiles`의 경로가 그 두 폴더 바로 안의 파일인지 다시 검사한다.
 - 받은 파일은 `<PEGBOARD_HOME>/sessions/<id>/files`에 생기고(파일 하나 200 MiB, 세션 합계 1 GiB까지) `pegboard files list`나 `pegboard_files_list`로 본다. 세션을 닫으면 지워진다.
 
 ## 아직 안 되는 것
@@ -141,6 +143,9 @@ pegboard profile delete work                            # 열린 세션이 있�
 
 ### 연결과 권한
 
+- 에이전트에 대한 정책 강제는 MCP 기본 모드에서만 성립한다. CLI(`pegboard`)를 쓸 수 있는 에이전트는 사람과 같은 권한을 가진다: 더 넓은 정책의 세션을 만들고, `browser stop`, `profile delete`, 운영자용 메서드를 부를 수 있다. 에이전트에게는 CLI가 아니라 MCP 서버(`pegboard mcp`, `--operator` 없이)를 준다.
+- MCP 기본 모드의 에이전트는 `pegboard_session_create`의 `profile`로 이미 있는 에이전트 프로필을 이름으로 아무것이나 고를 수 있다(로그인해 둔 프로필 포함). 사람 프로필은 고를 수 없다. 로그인해 둔 프로필이 있으면 그 계정은 에이전트가 쓸 수 있는 것으로 본다.
+- 세션 정책(`SessionPolicy`)은 모르는 필드를 거부한다. CLI(또는 MCP 서버)와 데몬은 같은 버전이어야 하고, 버전이 다르면 세션 만들기가 `invalid_params`로 거부될 수 있다. 바꾼 뒤에는 `pegboard browser stop`으로 옛 데몬을 끈다.
 - 1~2단계는 루프백 디버깅 포트를 쓴다. 같은 사용자로 도는 로컬 프로세스는 브라우저 전체에 붙을 수 있다. 격리가 막는 것은 제공된 도구(CLI, MCP)를 통해 조종당한 에이전트이고, 셸을 가진 악의적 프로세스가 아니다. 이 브라우저의 데이터 디렉터리에는 실제 계정을 넣지 않는다.
 - `--session`으로 넘긴 핸들은 프로세스 목록에 보인다. `PEGBOARD_SESSION`을 쓴다.
 - `session list`, 기록 조회(가려진 로그), `profile delete`, `browser stop`, 운영자용 `session.info_any`/`session.close_any`는 토큰이 필요 없다. 소켓에 닿는 로컬 클라이언트는 누구나 다른 세션을 닫거나 그 (가려진) 기록과 정책(업로드 폴더, 허용 도메인 포함)을 읽거나 브라우저를 끌 수 있다. MCP 기본 모드는 이 메서드들을 자기 세션에만 쓴다.
@@ -153,6 +158,7 @@ pegboard profile delete work                            # 열린 세션이 있�
 - 도구 호출은 한 번에 하나씩 처리한다. 오래 걸리는 명령은 다른 세션의 호출까지 늦춘다.
 - 사람이 `browser stop`으로 데몬을 끈 뒤에는 MCP 서버가 다시 띄우지 않는다(`not_running`). 서버를 다시 띄운다.
 - 강제로 죽은(`kill -9`) MCP 서버가 만든 세션은 닫히지 않고, 쉬는 세션 닫기(1시간)로 닫힌다(시험 `killed_mcp_server_leaves_sessions_that_expire`).
+- `pegboard_session_close`의 `keepTabs`는 기본 모드에서 `invalid_params`로 거부된다(운영자 모드와 CLI의 `--keep-tabs`만 된다). 아래 "세션, 탭, 기록"의 남긴 탭 항목.
 - 결과 안에서 세션 핸들처럼 생긴 글(`s_` 8자, 점, base32 26자)은 페이지의 글이라도 토큰 부분이 `[redacted]`로 바뀐다.
 - 이름이 `list`, `new`, `close`인 탭은 `pegboard_tab`에서 이름으로 고를 수 없다(`tab list` 같은 다른 명령으로 읽히므로 거부한다). `t1` 같은 탭 ID를 쓴다.
 
@@ -172,6 +178,7 @@ pegboard profile delete work                            # 열린 세션이 있�
 
 ### 다운로드 (2a)
 
+- 받은 파일의 이름은 페이지가 정한다. MCP 결과(다운로드 알림, `pegboard_files_list`)에서는 페이지 내용 표식 안에 넣는다.
 - 받는 동안에는 데몬만 아는 프로필별 임시 폴더(`<PEGBOARD_HOME>/downloads/<프로필 디렉터리>`)에 있다. 어느 세션의 탭에서 시작됐는지 알 수 없는 것, `--deny download` 세션의 것, 한도를 넘은 것, 받는 사이 세션이 닫힌 것은 지운다. 결과는 그 세션의 다음 명령 결과와 동작 기록에 한 번 남는다. 사람 프로필의 다운로드는 그대로다.
 - 한도는 진행 이벤트(약 0.5초 간격)마다 검사하므로 넘은 뒤 그만큼 더 받을 수 있다(파일은 지워진다). 한 프로필에서 동시에 받는 중인 다운로드는 합쳐 2 GiB까지라, 한 세션이 같은 프로필의 다른 세션 몫을 다 쓸 수 있다.
 - Chrome은 그 순간 기본 컨텍스트인 프로필의 다운로드만 취소한다. 에이전트 창을 앞으로 가져오지 않고 기본으로 만드는 방법을 찾지 못해, 사람이 자기 창을 쓰는 동안 지우기로 한 다운로드는 임시 폴더에 끝까지 받아진 뒤 지워진다(디스크와 대역폭을 쓴다).
@@ -182,13 +189,14 @@ pegboard profile delete work                            # 열린 세션이 있�
 
 - 파일 이름은 영문자, 숫자, `.`, `_`, `-`만 된다(공백이 든 이름은 업로드할 수 없다).
 - 프록시의 경로 검사는 맨 이름 규칙을 다시 적용하지 않는다. 세션 엔드포인트에 직접 붙은 클라이언트는 업로드 폴더 바로 안의 점 파일이나 공백이 든 이름의 파일을 올릴 수 있다(폴더 밖은 안 된다).
+- 명령 결과에 나온 업로드 파일의 경로는 이름으로 바꾸지만, URL 인코딩되거나 이스케이프된 경로와 폴더만 가리키는 경로는 바꾸지 못한다. 업로드 폴더의 경로 자체는 비밀이 아니다(`session info`의 정책에 보인다). 에이전트가 넘길 수 있는 것은 맨 이름뿐이다.
 - 업로드 폴더가 pegboard 데이터 디렉터리와 겹치는지는 세션을 만들 때 한 번 본다. 그 뒤 사람이 폴더의 심볼릭 링크를 바꾸면 넓어진다. 검사와 Chrome이 파일을 읽는 사이에 폴더의 파일이 바뀔 수도 있다(사람의 폴더다).
 
 ### 클립보드 (2a)
 
 - `--allow clipboard`가 없는 세션의 프로필에는 세 가지를 건다: 데몬의 전용 연결로 `clipboard-read`/`clipboard-write` 권한 거부(`navigator.clipboard`), 요청 가드가 모든 탭과 프레임의 첫 스크립트보다 먼저 넣는 `copy`/`cut`/`paste` 캡처 리스너(`execCommand`, 키의 편집 명령, 페이지의 `copy` 처리기), `press`의 복사·잘라내기·붙여넣기 조합 거부(`Meta`/`Control` + `c`/`x`/`v`, `Control+Insert`, `Shift+Insert`, `Shift+Delete`). 방법은 architecture.md 11절.
-- 권한 거부를 다시 걸 때와 열린 프로필에서 클립보드 설정이 바뀔 때, 그 프로필이 기본 컨텍스트가 아니면 탭 하나를 활성화한다. **이때 에이전트 창이 앞으로 나와 사람의 키보드 초점을 가져갈 수 있다**(페이지가 일으킬 수 없다). 처음 보는 프로필에 클립보드를 허용하는 첫 세션이 올 때(이전 데몬의 거부가 남았을 수 있어 초기화한다)도 같다.
-- 가드가 다시 붙으면 클립보드를 거부하는 세션들의 에이전트 연결을 먼저 끊고(에이전트는 다시 붙는다) 그 세션들의 옛 탭에 리스너를 넣은 뒤 새로 고친다. 그 탭의 입력 중이던 내용은 사라지고, 그 일이 끝날 때까지 그 세션들의 명령은 거부된다.
+- 클립보드 권한 거부를 걸거나 풀 때 그 프로필이 기본 컨텍스트가 아니면 그 프로필의 탭 하나를 활성화한다. **이때 에이전트 창이 앞으로 나와 사람의 키보드 초점을 가져갈 수 있다.** 그런 때는 넷이다: 거부를 건 연결이 끊겨 다시 걸 때, 세션을 만들 때 그 프로필에 거부가 아직 걸려 있지 않을 때(그 프로필의 첫 거부 세션, 앞의 거부를 잃은 뒤), 클립보드를 허용하는 세션을 만들 때 그 프로필에 거부가 걸려 있을 때, 처음 보는 프로필에 클립보드를 허용하는 첫 세션이 올 때(이전 데몬의 거부가 남았을 수 있어 초기화한다). 아직 창이 없는 프로필에 세션을 만들면 새 창이 열린다. 페이지는 이 중 어느 것도 일으킬 수 없지만, MCP 에이전트는 세션을 만들어 일으킬 수 있다(운영자 모드에서 클립보드를 허용하는 세션과 거부하는 세션을 번갈아 만들면 매번). 세션 만들기의 횟수 제한은 없다.
+- 가드가 다시 붙으면 클립보드를 거부하는 세션들의 에이전트 연결을 먼저 끊고(에이전트는 다시 붙는다) 그 세션들의 옛 탭에 리스너를 넣은 뒤 새로 고친다. 그 탭의 입력 중이던 내용은 사라진다. 옛 탭의 처리가 끝날 때까지 그 프로필의 모든 세션(클립보드를 허용하는 세션 포함)의 명령은 거부된다.
 - 클립보드를 거부하는 세션(기본)에서는 에이전트 연결의 `Page.addScriptToEvaluateOnNewDocument`(페이지보다 먼저 도는 스크립트)를 프록시가 거부한다. agent-browser의 `vitals`는 이것을 한 번 보내지만 거부되어도 결과를 낸다(측정). `--allow clipboard` 세션은 쓸 수 있다. 그래도 새 탭과 프레임에서는 가드가 먼저 붙어 리스너가 먼저 돈다(두 번째 방어).
 - 실행 중인 채로 붙는 프레임(`sandbox`의 `srcdoc` iframe)은 리스너를 넣은 뒤 그 프레임을 다시 읽게 하므로 그 프레임의 상태가 사라진다. 같은 프레임이 3번을 넘거나 리스너를 넣지 못하면 그 탭을 닫는다.
 - `document.open()`은 리스너를 지운다. 리스너 스크립트가 `open`/`write`를 감싸 다시 달고, 가드가 `Page.documentOpened`마다 첫 리스너가 자기 것인지 확인해 아니면 문서를 새로 고치거나 탭을 닫는다. 이 확인은 비동기라 그 사이(한 번의 `eval` 안에서 `open`, `write`, 복사를 다 하는 경우)는 감싼 함수만 지킨다. 읽기가 끝난 뒤에도 계속 `document.write`를 하는 페이지에서는 그때마다 클립보드를 거부하는 세션의 명령이 잠깐씩 거부된다.
@@ -200,7 +208,8 @@ pegboard profile delete work                            # 열린 세션이 있�
 
 - 세션의 탭이 하나도 남지 않으면 `open`과 `tab` 명령만 실행되고, 나머지 명령은 `tab_gone` 오류로 끝난다. `tab new <url>`이나 `open <url>`로 탭을 다시 연다. 그때 새 탭그룹이 생기고, 에이전트 프로필 창이 여럿이면 원래 창이 아닌 창에 생길 수 있다.
 - 탭을 사람이 다른 세션의 그룹으로 끌어도 소속은 바뀌지 않는다(소속은 탭을 따라간다). 그 그룹의 세션을 닫아도 그 탭은 닫히지 않고 그룹에 남는다.
-- 세션 닫기가 실패하면 세션 없이 탭만 에이전트 창에 남을 수 있다. 두 세션을 동시에 닫으면 한쪽의 `--keep-tabs`가 지켜지지 않을 수 있다.
+- 주소 정책(`--allow-domain` 허용목록 포함)은 세션별이 아니라 프로필 단위로 걸린다. 그 프로필을 고정한(pin) 세션이 하나라도 열려 있는 동안만 그 값이고, 마지막 세션이 닫히면 그 프로필은 기본 주소 정책으로 돌아간다. 세션을 닫을 때는 탭을 다 닫거나(`--keep-tabs`면 그룹에서 뺀) 뒤에 고정을 푼다. 그래서 `--keep-tabs`(CLI, 운영자 모드 MCP)로 남긴 탭은 그 뒤 그 프로필의 기본 주소 정책을 따른다(허용목록 밖에 닿을 수 있다). 사람이 고르는 일이라 MCP 기본 모드는 `keepTabs`를 거부한다.
+- 세션 닫기가 실패하면 세션 없이 탭만 에이전트 창에 남을 수 있다. 그 탭도 고정이 풀린 뒤에는 기본 주소 정책을 따른다. 두 세션을 동시에 닫으면 한쪽의 `--keep-tabs`가 지켜지지 않을 수 있다.
 - 브리지가 세션의 프로필이 아닌 곳에 탭을 만들면 프록시는 그 탭을 닫고 확인한 뒤 요청을 거부한다(2초까지 재시도). 그래도 닫히지 않으면 오류 메시지와 데몬 로그에 남기며, 다른 프로필에 탭이 남을 수 있다.
 - `screenshot`과 `pdf`가 쓴 파일과 받은 파일은 세션을 닫을 때 지워진다. 필요하면 닫기 전에 가져간다.
 - 동작 기록은 공격적으로 가린다. 실패한 입력 명령, 거부된 명령, `/`나 템플릿 치환이 든 `eval`은 내용 없이 기록된다. 반대로 그 밖의 `eval`, `wait --url`, `wait --text`, `network requests --filter`의 인자는 준 그대로 기록되므로 비밀을 넣지 않는다.
@@ -220,7 +229,9 @@ cargo test -p pegboard-core --test e2e_clipboard -- --ignored --test-threads=1  
 
 격리 시험 묶음의 `agent_actions_do_not_change_the_humans_active_tab`은 시험용 브라우저 창이 완전히 가려지거나, 최소화되거나, 다른 Space에 있거나, 화면이 잠긴 상태면 "cannot determine"으로 실패한다(활성 탭을 `visibilityState`로 판정하기 때문이다). 시험 중에는 그 창을 가리지 않는다. `mcp_agent_cannot_reach_pegboards_own_ports_or_the_private_network`는 기본 경로의 네트워크 인터페이스에 사설(RFC 1918) IPv4 주소가 있어야 돈다.
 
-실제 브라우저를 띄우는 시험은 `#[ignore]`가 붙어 있고, 임시 `PEGBOARD_HOME`에서 돌며 끝나면 브라우저를 정리한다. 격리 시험 묶음 둘(`crates/pegboard-cli/tests/e2e_isolation.rs`, `e2e_mcp_isolation.rs`)은 CLI만으로, 또 MCP 도구만으로 에이전트가 할 수 있는 일을 시도해 사람 프로필, 다른 세션, 세션 밖의 브라우저, 더 넓은 정책, 토큰에 닿지 못함을 확인한다. 시험마다 새 브라우저를 띄우며, 이후 모든 단계에서 유지한다. 손으로 하는 확인은 [docs/phase1-manual-checks.md](docs/phase1-manual-checks.md)와 [docs/phase2a-manual-checks.md](docs/phase2a-manual-checks.md).
+실제 브라우저를 띄우는 시험은 `#[ignore]`가 붙어 있고, 임시 `PEGBOARD_HOME`에서 돌며 끝나면 브라우저를 정리한다. 격리 시험 묶음 둘은 에이전트가 할 수 있는 일을 시도한다. CLI 묶음(`crates/pegboard-cli/tests/e2e_isolation.rs`)은 세션 핸들 하나로 agent-browser 명령만 쓰는 에이전트가 사람 프로필, 다른 세션, 세션 밖의 브라우저, 토큰에 닿지 못함을 확인한다(CLI 전체를 가진 에이전트는 사람의 권한이라 정책을 넓히는 시도는 다루지 않는다). MCP 묶음(`e2e_mcp_isolation.rs`)은 MCP 도구만으로 같은 것에 더해 더 넓은 정책과 세션 밖에 남는 탭에 닿지 못함을 확인한다. 시험마다 새 브라우저를 띄우며, 이후 모든 단계에서 유지한다. 손으로 하는 확인은 [docs/phase1-manual-checks.md](docs/phase1-manual-checks.md)와 [docs/phase2a-manual-checks.md](docs/phase2a-manual-checks.md).
+
+시험용 환경 변수는 모두 `PEGBOARD_TEST_HOOKS`를 함께 줄 때만 읽는다(실제 사용에서는 주지 않는다): `PEGBOARD_TEST_HOST_RULES`, `PEGBOARD_TEST_BROWSER_HOST_RULES`, `PEGBOARD_TEST_IP_SPACE_OVERRIDES`, `PEGBOARD_TEST_LAUNCH_LOG`, `PEGBOARD_TEST_IDLE_SECS`, `PEGBOARD_TEST_DOWNLOAD_LIMITS`, `PEGBOARD_TEST_NO_CLIPBOARD_SHIELD`. `PEGBOARD_TEST_HOOKS`는 데몬의 시험용 메서드와 진단 기록(daemon.log)도 켠다. `PEGBOARD_TEST_MCP_SLOW_CREATE`는 디버그 빌드의 MCP 서버에만 있다.
 
 ## 라이선스
 
