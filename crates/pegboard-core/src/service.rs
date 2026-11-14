@@ -247,6 +247,22 @@ struct CloseParams {
     token: Option<String>,
 }
 
+/// `session.close_any` (operator use): no token; the socket's owner check is the only check.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CloseAnyParams {
+    session_id: SessionId,
+    #[serde(default)]
+    keep_tabs: bool,
+}
+
+/// `session.info_any` (operator use): no token.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InfoAnyParams {
+    session_id: SessionId,
+}
+
 /// 16 random bytes from the OS generator as 26 lowercase base32 characters.
 fn new_token() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -509,6 +525,21 @@ impl Daemon {
                 let p: CloseParams = params(p)?;
                 to_value(self.close_session(p).await?)
             }
+            // Operator methods (`pegboard mcp --operator`): like `session.info` and
+            // `session.close` without the token. Whoever reaches the socket is its owner
+            // (the same level as `browser.stop`); the CLI does not offer them.
+            "session.info_any" => {
+                let p: InfoAnyParams = params(p)?;
+                let id = checked_session(&p.session_id)?;
+                self.open_slot(&id)?;
+                to_value(self.sessions.info(&id)?)
+            }
+            "session.close_any" => {
+                let p: CloseAnyParams = params(p)?;
+                let id = checked_session(&p.session_id)?;
+                let slot = self.open_slot(&id)?;
+                to_value(self.close_open_slot(id, slot, p.keep_tabs).await?)
+            }
             "command.exec" => to_value(self.exec(params(p)?).await?),
             // Test hook, only when the daemon was started with `PEGBOARD_TEST_HOOKS`: drops
             // the download policy connection of the session's profile and keeps it down for
@@ -676,14 +707,33 @@ impl Daemon {
         }
     }
 
+    /// The session's slot without a token (operator methods).
+    fn open_slot(&self, id: &SessionId) -> Result<Arc<Slot>, RpcError> {
+        self.slots
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| no_session(id))
+    }
+
     async fn close_session(&self, p: CloseParams) -> Result<SessionInfo, RpcError> {
         let id = checked_session(&p.session_id)?;
         let slot = self.authorize(&id, p.token.as_deref())?;
+        self.close_open_slot(id, slot, p.keep_tabs).await
+    }
+
+    async fn close_open_slot(
+        &self,
+        id: SessionId,
+        slot: Arc<Slot>,
+        keep_tabs: bool,
+    ) -> Result<SessionInfo, RpcError> {
         // One close at a time.
         if slot.closing.swap(true, Ordering::SeqCst) {
             return Err(no_session(&id));
         }
-        self.close_slot(id, slot, p.keep_tabs).await
+        self.close_slot(id, slot, keep_tabs).await
     }
 
     /// Closes a session whose slot has `closing` set by the caller.
@@ -857,6 +907,19 @@ mod tests {
         assert!(
             params::<CloseParams>(&json!({"sessionId": "s_abcdefgh", "keepTabs": true})).is_ok()
         );
+        // The operator methods take no token, and refuse one rather than ignore it.
+        for bad in [
+            json!({"sessionId": "s_abcdefgh", "keepTab": true}),
+            json!({"sessionId": "s_abcdefgh", "token": "t"}),
+        ] {
+            let e = params::<CloseAnyParams>(&bad).err().unwrap();
+            assert_eq!(e.code, codes::INVALID_PARAMS, "{bad}");
+        }
+        assert!(params::<CloseAnyParams>(&json!({"sessionId": "s_abcdefgh"})).is_ok());
+        let e = params::<InfoAnyParams>(&json!({"sessionId": "s_abcdefgh", "token": "t"}))
+            .err()
+            .unwrap();
+        assert_eq!(e.code, codes::INVALID_PARAMS);
     }
 
     #[test]
