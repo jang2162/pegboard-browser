@@ -5,7 +5,8 @@
 //! and results carry session ids, never a token. In the default mode it sees only those
 //! sessions; with `--operator` it may list, inspect and close any session and read any
 //! recording, but still drives only its own. Standard output carries protocol messages
-//! only; logs go to standard error.
+//! only; logs go to standard error. Tool calls run one at a time (one connection to the
+//! daemon): a long command delays the next call, also one for another session.
 
 mod tools;
 
@@ -202,9 +203,10 @@ impl Owned {
         self.shutting_down
     }
 
-    /// `text` with every token this server has held replaced.
+    /// `text` with every token this server has held replaced, and the token of anything
+    /// shaped like a handle (`s_<8>.<26 base32>`), whoever's it is.
     fn scrub(&self, text: &str) -> String {
-        let mut text = text.to_string();
+        let mut text = scrub_handles(text);
         for token in &self.spent {
             if text.contains(token.as_str()) {
                 text = text.replace(token.as_str(), "[redacted]");
@@ -212,6 +214,35 @@ impl Owned {
         }
         text
     }
+}
+
+/// `text` with the token part of every handle-shaped string (`s_<id>.<token>`) replaced.
+fn scrub_handles(text: &str) -> String {
+    const ID: usize = 2 + 8;
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while let Some(at) = text[i..].find("s_").map(|k| i + k) {
+        let token_at = at + ID + 1;
+        let is_handle = text.len() >= token_at + TOKEN_LEN
+            && text.is_char_boundary(at + ID)
+            && SessionId::parse(&text[at..at + ID]).is_some()
+            && bytes[at + ID] == b'.'
+            && bytes[token_at..token_at + TOKEN_LEN]
+                .iter()
+                .all(|b| b.is_ascii_alphabetic() || (b'2'..=b'7').contains(b));
+        if is_handle {
+            out.push_str(&text[copied..token_at]);
+            out.push_str("[redacted]");
+            copied = token_at + TOKEN_LEN;
+            i = copied;
+        } else {
+            i = at + 2;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// The core API as the server uses it (a stub in tests).

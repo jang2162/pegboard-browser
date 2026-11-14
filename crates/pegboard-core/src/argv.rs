@@ -885,6 +885,12 @@ pub fn is_command_word(word: &str) -> bool {
     GRAMMAR.iter().any(|f| f.words[0] == word)
 }
 
+/// The words of the form a command line is read as (the longest form whose words begin
+/// it), whether or not the rest of the line is accepted.
+pub fn form_words_of(argv: &[String]) -> Option<&'static [&'static str]> {
+    form_of(argv).map(|f| f.words)
+}
+
 fn form_of(argv: &[String]) -> Option<&'static Form> {
     GRAMMAR
         .iter()
@@ -1792,6 +1798,20 @@ mod tests {
             find(&["mouse", "down"]).args[0].kind,
             ArgKind::Choice(o) if o == ["left", "right", "middle"]
         ));
+    }
+
+    #[test]
+    fn a_line_is_read_as_its_longest_form() {
+        assert_eq!(
+            form_words_of(&s(&["tab", "close"])),
+            Some(&["tab", "close"][..])
+        );
+        assert_eq!(form_words_of(&s(&["tab", "t1"])), Some(&["tab"][..]));
+        assert_eq!(
+            form_words_of(&s(&["storage", "local", "clear"])),
+            Some(&["storage", "local", "clear"][..])
+        );
+        assert_eq!(form_words_of(&s(&["nope"])), None);
     }
 
     /// A new form that takes free text must be classified: either its text is hidden, or it

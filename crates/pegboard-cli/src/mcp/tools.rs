@@ -407,7 +407,7 @@ fn flag_name(names: &[&str]) -> String {
 }
 
 /// What a tool argument holds.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Prop {
     One(ArgKind),
     Many(ArgKind),
@@ -642,6 +642,26 @@ pub fn to_argv(tool: &str, arguments: &Map<String, Value>) -> Result<Vec<String>
     if forms.is_empty() {
         return Err(invalid(format!("unknown tool {}", shown(tool))));
     }
+    let (words, out) = build_argv(&forms, tool, arguments)?;
+    // A value equal to the next word of a longer form makes the line that form
+    // (`tab` with tab "close" is `tab close`): refused, whatever the value came from.
+    let read_as = argv::form_words_of(&out);
+    if read_as != Some(words) {
+        let read_as = read_as.map(|w| w.join(" ")).unwrap_or_default();
+        return Err(invalid(format!(
+            "these arguments would run `{read_as}`, not `{}`: use command for that",
+            words.join(" ")
+        )));
+    }
+    Ok(out)
+}
+
+/// The words of the chosen form and the command line, from the forms of one first word.
+fn build_argv(
+    forms: &[FormSpec],
+    tool: &str,
+    arguments: &Map<String, Value>,
+) -> Result<(&'static [&'static str], Vec<String>), RpcError> {
     let arg = |key: &str| arguments.get(key).filter(|v| !v.is_null());
     let commands: Vec<String> = forms
         .iter()
@@ -771,7 +791,7 @@ pub fn to_argv(tool: &str, arguments: &Map<String, Value>) -> Result<Vec<String>
             }
         }
     }
-    Ok(out)
+    Ok((form.words, out))
 }
 
 /// One word from a JSON value of `kind`. A positional number may be negative; nothing else
@@ -1291,7 +1311,6 @@ fn session_for_action(
 fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Result<Reply, RpcError> {
     let argv = to_argv(&format!("pegboard_{word}"), args)?;
     let (id, token) = session_for_action(ctx, args)?;
-    let page_content = is_page_content(&argv);
     let params = CommandExecParams {
         session_id: id.clone(),
         argv,
@@ -1308,30 +1327,34 @@ fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Resul
         other => other?,
     };
     let ok = succeeded(&r);
+    // Whatever agent-browser says may come from the page (text, titles, dialog messages,
+    // error messages quoting page values): all of it goes between markers. Only pegboard's
+    // own words stay outside: "ok" for an empty answer, the error code, the notes below.
+    let origin = origin_of(&r.output);
     let mut text = if ok {
-        crate::render_output(&r.output)
+        match crate::render_output(&r.output) {
+            t if t.is_empty() => "ok".to_string(),
+            t => wrap_page_content(&t, origin.as_deref()),
+        }
     } else {
-        format!("command_failed: {}", crate::failure_reason(&r))
+        format!(
+            "command_failed:\n{}",
+            wrap_page_content(&crate::failure_reason(&r), origin.as_deref())
+        )
     };
-    if text.is_empty() {
-        text = "ok".to_string();
-    }
-    if ok && (page_content || boundary_of(&r.output).is_some()) {
-        text = wrap_page_content(&text, boundary_of(&r.output));
-    }
     let mut image = None;
     if ok && word == "screenshot" {
         match screenshot_image(&ctx.core.files_dir(&id), &r.output) {
             Shot::Image(i) => image = Some(i),
             Shot::TooLarge { name, bytes } => text.push_str(&format!(
                 "\nthe image ({bytes} bytes) is larger than 5 MiB and is not included; it is \
-                 saved in the session's files as {name}"
+                 saved in the session's files as {name:?}"
             )),
             Shot::Missing => {}
         }
     }
     // Each download is told once, in whatever result comes next: it must reach the agent.
-    for line in crate::download_lines(&r.output) {
+    for line in download_notes(&r.output) {
         text.push('\n');
         text.push_str(&line);
     }
@@ -1342,54 +1365,49 @@ fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Resul
     })
 }
 
-/// Whether what a command line answers comes from the page: what it reads (`get`, `is`,
-/// `find ... text`, the console, cookies, storage, tabs, dialogs), evaluates, or the page's
-/// tree and audits (`snapshot`, `a11y`, `vitals`). These are wrapped even when agent-browser
-/// gives no `_boundary`; any result it gives one for (a click, measured) is wrapped too.
-fn is_page_content(argv: &[String]) -> bool {
-    use pegboard_protocol::ActionClass::*;
-    matches!(argv::class_of(argv), Some(Get | Read | Eval))
-        || matches!(
-            argv.first().map(String::as_str),
-            Some("snapshot" | "a11y" | "vitals")
-        )
-}
-
-/// agent-browser's content boundary of an output (`_boundary`, at the top or in `data`):
-/// its nonce, and the page's origin when it says.
-fn boundary_of(output: &Value) -> Option<(String, Option<String>)> {
-    let b = [&output["_boundary"], &output["data"]["_boundary"]]
-        .into_iter()
-        .find(|b| !b.is_null())?;
-    let (nonce, origin) = match b {
-        Value::String(nonce) => (nonce.as_str(), None),
-        Value::Object(_) => (b["nonce"].as_str()?, b["origin"].as_str()),
-        _ => return None,
+/// The downloads a result tells of. A name comes from the page, so it is quoted (on one
+/// line: it cannot start a marker line); pegboard_files_list has the files.
+fn download_notes(output: &Value) -> Vec<String> {
+    let Some(list) = output.get("downloads").and_then(Value::as_array) else {
+        return Vec::new();
     };
-    let usable = !nonce.is_empty()
-        && nonce.len() <= 128
-        && nonce
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
-    usable.then(|| (nonce.to_string(), origin.map(str::to_string)))
+    list.iter()
+        .filter_map(|d| {
+            let name = d["name"].as_str().unwrap_or("?");
+            match (d["bytes"].as_u64(), d["dropped"].as_str()) {
+                (Some(bytes), _) => Some(format!(
+                    "downloaded {name:?} ({bytes} bytes; see pegboard_files_list)"
+                )),
+                (_, Some(why)) => Some(format!("download {name:?} was deleted: {why}")),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
-/// Page text between agent-browser's page-content markers, so the agent can tell it from
-/// pegboard's own words and the page cannot fake the end (it does not know the nonce). The
-/// nonce is agent-browser's when the output carries one, else a fresh random one.
-/// (agent-browser's `--json` output keeps the text bare and tells the nonce in `_boundary`.)
-fn wrap_page_content(text: &str, boundary: Option<(String, Option<String>)>) -> String {
-    // Always, even when the text holds markers already: the page could have written them.
-    let (nonce, origin) = boundary.unwrap_or_else(|| {
-        use rand::RngCore;
-        let mut bytes = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        (data_encoding::HEXLOWER.encode(&bytes), None)
-    });
-    let origin = origin
-        .filter(|o| !o.chars().any(|c| c.is_whitespace() || c.is_control()))
-        .map(|o| format!(" origin={o}"))
-        .unwrap_or_default();
+/// The page origin agent-browser tells in the output's top-level `_boundary` (where it puts
+/// its content boundary), when it is a plain origin. Its nonce is never used: pegboard picks
+/// its own, which nothing in the browser can know.
+fn origin_of(output: &Value) -> Option<String> {
+    let origin = output.get("_boundary")?.get("origin")?.as_str()?;
+    let plain = !origin.is_empty()
+        && origin.len() <= 200
+        && origin.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b':' | b'/' | b'.' | b'-' | b'_' | b'[' | b']')
+        })
+        && !origin.contains("--");
+    plain.then(|| origin.to_string())
+}
+
+/// Text between page-content markers with a fresh random nonce, so the agent can tell it
+/// from pegboard's own words and nothing in it can end the block early. Always wrapped, even
+/// when it holds markers already: the page could have written them.
+fn wrap_page_content(text: &str, origin: Option<&str>) -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let nonce = data_encoding::HEXLOWER.encode(&bytes);
+    let origin = origin.map(|o| format!(" origin={o}")).unwrap_or_default();
     format!(
         "--- AGENT_BROWSER_PAGE_CONTENT nonce={nonce}{origin} ---\n{text}\n\
          --- END_AGENT_BROWSER_PAGE_CONTENT nonce={nonce} ---"
@@ -1736,6 +1754,114 @@ mod tests {
     }
 
     #[test]
+    fn a_value_cannot_turn_the_command_into_another_form() {
+        for (tool, args, would) in [
+            ("pegboard_tab", json!({ "tab": "close" }), "tab close"),
+            ("pegboard_tab", json!({ "tab": "new" }), "tab new"),
+            ("pegboard_tab", json!({ "tab": "list" }), "tab list"),
+            (
+                "pegboard_storage",
+                json!({ "command": "local", "key": "clear" }),
+                "storage local clear",
+            ),
+            (
+                "pegboard_storage",
+                json!({ "command": "local", "key": "set" }),
+                "storage local set",
+            ),
+            (
+                "pegboard_storage",
+                json!({ "command": "session", "key": "clear" }),
+                "storage session clear",
+            ),
+            (
+                "pegboard_storage",
+                json!({ "command": "session", "key": "get" }),
+                "storage session get",
+            ),
+        ] {
+            let e = to_argv(tool, &obj(args.clone())).expect_err(&format!("{tool} {args}"));
+            assert_eq!(e.code, codes::INVALID_PARAMS);
+            assert!(e.message.contains(would), "{}", e.message);
+        }
+        // The same values where they are no other form's word are fine.
+        for (tool, args) in [
+            ("pegboard_tab", json!({ "tab": "t2" })),
+            ("pegboard_tab", json!({ "command": "close", "tab": "list" })),
+            (
+                "pegboard_storage",
+                json!({ "command": "local get", "key": "clear" }),
+            ),
+            (
+                "pegboard_storage",
+                json!({ "command": "local", "key": "theme" }),
+            ),
+        ] {
+            let argv = to_argv(tool, &obj(args.clone())).unwrap();
+            checked(&argv).unwrap_or_else(|e| panic!("{args}: {}", e.message));
+        }
+    }
+
+    #[test]
+    fn a_value_an_omitted_choice_would_take_is_refused() {
+        // No form of the grammar today has an optional choice before another positional
+        // that could take its words, so the check is shown on a form of its own.
+        let form = FormSpec {
+            words: &["x"],
+            class: pegboard_protocol::ActionClass::Click,
+            args: vec![
+                ArgSpec {
+                    name: "mode",
+                    kind: ArgKind::Choice(&["a", "b"]),
+                    required: false,
+                    secret: false,
+                },
+                ArgSpec {
+                    name: "value",
+                    kind: ArgKind::Text,
+                    required: false,
+                    secret: false,
+                },
+            ],
+            rest: None,
+            flags: Vec::new(),
+        };
+        let forms = [form];
+        let built = |v: Value| build_argv(&forms, "pegboard_x", &obj(v)).map(|(_, a)| a);
+        assert!(built(json!({ "value": "a" })).is_err());
+        assert_eq!(built(json!({ "value": "c" })).unwrap(), words(&["x", "c"]));
+        assert_eq!(
+            built(json!({ "mode": "b", "value": "a" })).unwrap(),
+            words(&["x", "b", "a"])
+        );
+    }
+
+    #[test]
+    fn flag_values_are_never_negative() {
+        for (tool, args) in [
+            ("pegboard_snapshot", json!({ "depth": -1 })),
+            ("pegboard_wait", json!({ "timeout": -5 })),
+            (
+                "pegboard_mouse",
+                json!({ "command": "move", "x": 1, "y": 1, "steps": -2 }),
+            ),
+        ] {
+            let e = to_argv(tool, &obj(args.clone())).expect_err(&format!("{args}"));
+            assert!(
+                e.message.contains("must not start with '-'"),
+                "{}",
+                e.message
+            );
+        }
+        // Positional numbers may be.
+        assert!(to_argv(
+            "pegboard_mouse",
+            &obj(json!({ "command": "wheel", "deltaY": -3 }))
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn fill_text_starting_with_a_dash_is_sent_as_text() {
         for tool in ["pegboard_fill", "pegboard_type"] {
             let argv = to_argv(
@@ -1918,12 +2044,16 @@ mod tests {
         // `action_tools` would otherwise describe a property by its first use only.
         for t in action_tools(&[Bundle::All]) {
             let word = &t.def.name["pegboard_".len()..];
-            let mut seen: Vec<(String, &'static str)> = Vec::new();
+            // The whole kind (choices, file extensions), not only the JSON type.
+            let mut seen: Vec<(String, Prop)> = Vec::new();
             for f in argv::forms().iter().filter(|f| f.words[0] == word) {
-                for (name, ty) in properties_of(f) {
+                for (name, p) in properties_of(f) {
                     match seen.iter().find(|(n, _)| *n == name) {
-                        Some((_, t0)) => assert_eq!(*t0, json_type(&ty), "{word}: {name}"),
-                        None => seen.push((name, json_type(&ty))),
+                        Some((_, p0)) => {
+                            assert_eq!(*p0, p, "{word}: {name}");
+                            assert_eq!(json_type(p0), json_type(&p));
+                        }
+                        None => seen.push((name, p)),
                     }
                 }
             }
