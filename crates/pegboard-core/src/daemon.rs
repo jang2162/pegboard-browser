@@ -273,8 +273,10 @@ pub async fn run_command_with_hook(
     entry.ok = succeeded;
     // An expression's error can quote page values (a JSON parse error shows the text).
     entry.error = error_text(entry.redacted, is_expression_command(argv), &outcome);
-    report_downloads(sessions, log, id, &mut outcome)?;
+    // The command's own entry first: a failure to write a download report cannot drop it
+    // (the reports wait for the next result).
     append(log, entry)?;
+    report_downloads(sessions, log, id, &mut outcome)?;
     sessions.touch(id);
     outcome
 }
@@ -384,7 +386,9 @@ fn resolve_names(
 }
 
 /// Replaces the paths of uploaded files in what the command answered with their names:
-/// agent-browser may echo them, and the agent never learns where the person's folder is.
+/// agent-browser may echo them. The agent can learn the upload directory's path (the
+/// session's policy shows it) but not how a name resolved, and a name is all it may pass:
+/// anything but a bare file name is refused (`argv`).
 fn hide_paths(outcome: &mut Result<CommandExecResult, RpcError>, names: &[(String, String)]) {
     if names.is_empty() {
         return;
