@@ -15,8 +15,9 @@
 //!   (every response but a download) are served again with a
 //!   `Content-Security-Policy: connect-src` header derived from the address policy
 //!   (`connect_src`; spike B2, round 3), their bodies read in pieces up to `MAX_BODY`, all
-//!   bodies together within `BODY_BUDGET`. Documents from allowed loopback and private
-//!   addresses pass unchanged (owner's ruling, `serves_again`).
+//!   bodies together within `BODY_BUDGET` and one profile's within `PROFILE_SHARE`.
+//!   Documents from allowed loopback and private addresses pass unchanged (owner's ruling,
+//!   `serves_again`).
 //! - A target the guard cannot set up is closed (a tab) or left waiting (a frame or worker):
 //!   it never runs unguarded. If the connection ends, Chrome lifts the interception (G5):
 //!   `ready()` is false until the guard has reconnected and the daemon refuses commands
@@ -50,8 +51,13 @@ pub const MAX_BODY: usize = 16 << 20;
 const BODY_PIECE: usize = 1 << 20;
 /// All document bodies held at once, across every tab: past this, a document is failed
 /// rather than read (re-review N2: many large documents at once must not exhaust the
-/// daemon's memory and take the guard down).
+/// daemon's memory and take the guard down). Counted in bytes, in `BODY_UNIT` steps.
 pub const BODY_BUDGET: usize = 128 << 20;
+/// What one profile's documents may hold of `BODY_BUDGET` at once, so that one agent's
+/// pages cannot take the whole budget from the other profiles' sessions.
+pub const PROFILE_SHARE: usize = 32 << 20;
+/// The step the body budget is counted in.
+const BODY_UNIT: usize = 64 << 10;
 /// Longest time reading one document body may take; past it the document is failed.
 const BODY_DEADLINE: Duration = Duration::from_secs(20);
 /// Request-stage resolutions of documents kept for their response stage; past this many
@@ -369,8 +375,10 @@ struct Inner {
     ready: watch::Sender<bool>,
     /// Test hook (`drop_connection_for_test`): no reconnect before this instant.
     hold_until: Mutex<Option<tokio::time::Instant>>,
-    /// Pieces (`BODY_PIECE` each) of document bodies that may be held at once.
+    /// `BODY_UNIT`s of document bodies that may be held at once, all profiles together.
     body_budget: Arc<tokio::sync::Semaphore>,
+    /// Browser context -> the `BODY_UNIT`s its documents may hold at once (`PROFILE_SHARE`).
+    profile_budgets: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Tests only (`PEGBOARD_TEST_HOOKS`): what the guard did with each document response is
     /// written to stderr (the daemon's log), with the URL's path only.
     trace: bool,
@@ -414,7 +422,8 @@ impl Guard {
             changed: watch::channel(0).0,
             ready: watch::channel(false).0,
             hold_until: Mutex::new(None),
-            body_budget: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET / BODY_PIECE)),
+            body_budget: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET / BODY_UNIT)),
+            profile_budgets: Mutex::new(HashMap::new()),
             trace: std::env::var_os("PEGBOARD_TEST_HOOKS").is_some(),
             csp_header: std::sync::atomic::AtomicBool::new(true),
         });
@@ -785,7 +794,9 @@ impl Inner {
         let response_stage = params.get("responseStatusCode").is_some()
             || params.get("responseErrorReason").is_some();
         if response_stage {
-            return self.on_response(conn, session, &policy, params).await;
+            return self
+                .on_response(conn, session, &context, &policy, params)
+                .await;
         }
         let url = params
             .pointer("/request/url")
@@ -832,6 +843,7 @@ impl Inner {
         &self,
         conn: &CdpConn,
         session: &str,
+        context: &str,
         policy: &SessionPolicy,
         params: &Value,
     ) {
@@ -925,6 +937,17 @@ impl Inner {
             traced("passed (allowed local address)");
             return pass().await;
         }
+        let budget = Budget {
+            global: self.body_budget.clone(),
+            profile: self
+                .profile_budgets
+                .lock()
+                .unwrap()
+                .entry(context.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(PROFILE_SHARE / BODY_UNIT)))
+                .clone(),
+            unit: BODY_UNIT,
+        };
         let served = async {
             let read = read_body_capped(
                 conn,
@@ -932,12 +955,10 @@ impl Inner {
                 request_id,
                 &headers,
                 MAX_BODY,
-                &self.body_budget,
+                &budget,
+                BODY_DEADLINE,
             );
-            let Some((body, _held)) = tokio::time::timeout(BODY_DEADLINE, read)
-                .await
-                .map_err(|_| anyhow!("reading the document took too long"))??
-            else {
+            let Some((body, _held)) = read.await? else {
                 bail!("the document is larger than {MAX_BODY} bytes");
             };
             let mut fulfill = json!({
@@ -985,23 +1006,35 @@ impl Inner {
 /// Diagnostics key for documents failed because they could not be served again.
 pub const NOT_SERVED: &str = "document could not be served again";
 
-/// A body read under the budget, with the budget pieces it holds until dropped.
+/// The budgets a body is read under: all profiles together (`global`) and the document's
+/// own profile (`profile`), each a count of `unit`-byte steps.
+pub struct Budget {
+    pub global: Arc<tokio::sync::Semaphore>,
+    pub profile: Arc<tokio::sync::Semaphore>,
+    pub unit: usize,
+}
+
+/// A body read under the budget, with the budget it holds until dropped.
 type HeldBody = (Vec<u8>, Vec<tokio::sync::OwnedSemaphorePermit>);
 
 /// The body of a paused response, at most `limit` bytes, or `None` when it is larger.
 /// A declared `Content-Length` over the limit is refused without reading; otherwise the body
 /// is taken as a stream and read in pieces of at most `BODY_PIECE` (as Chrome decodes it, so
-/// a small compressed body that grows past the limit is caught too). Each piece takes one
-/// permit of `budget`; when none is left the read fails (the bodies read at the same time
-/// are bounded together). The permits come back with the body and are released when the
-/// caller drops them.
+/// a small compressed body that grows past the limit is caught too).
+///
+/// The bytes read so far are held against `budget`, in `unit` steps, from both the global
+/// and the profile's semaphore, never waiting: when either has no room the read fails (fail
+/// closed). Counted in bytes, so many small pieces cost what their bytes cost. The permits
+/// come back with the body and are released when the caller drops them. Reading stops after
+/// `deadline`; the stream is closed whatever happened.
 async fn read_body_capped(
     conn: &CdpConn,
     session: &str,
     request_id: &str,
     headers: &[(String, String)],
     limit: usize,
-    budget: &Arc<tokio::sync::Semaphore>,
+    budget: &Budget,
+    deadline: Duration,
 ) -> Result<Option<HeldBody>> {
     let declared = headers
         .iter()
@@ -1023,42 +1056,56 @@ async fn read_body_capped(
         .as_str()
         .ok_or_else(|| anyhow!("no stream handle"))?
         .to_string();
-    let mut body = Vec::new();
-    let mut held = Vec::new();
-    let result = loop {
-        match budget.clone().try_acquire_owned() {
-            Ok(permit) => held.push(permit),
-            Err(_) => break Err(anyhow!("over the guard's budget for document bodies")),
-        }
-        let piece = match conn
-            .send(
-                "IO.read",
-                json!({ "handle": handle, "size": BODY_PIECE }),
-                s,
-            )
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => break Err(e),
-        };
-        let data = piece["data"].as_str().unwrap_or_default();
-        if piece["base64Encoded"].as_bool().unwrap_or(false) {
-            match data_encoding::BASE64.decode(data.as_bytes()) {
-                Ok(bytes) => body.extend_from_slice(&bytes),
-                Err(e) => break Err(anyhow!("bad base64 from IO.read: {e}")),
+    let read = async {
+        let mut body = Vec::new();
+        let mut held = Vec::new();
+        let mut held_units = 0usize;
+        loop {
+            let piece = conn
+                .send(
+                    "IO.read",
+                    json!({ "handle": handle, "size": BODY_PIECE }),
+                    s,
+                )
+                .await?;
+            let data = piece["data"].as_str().unwrap_or_default();
+            if piece["base64Encoded"].as_bool().unwrap_or(false) {
+                let bytes = data_encoding::BASE64
+                    .decode(data.as_bytes())
+                    .map_err(|e| anyhow!("bad base64 from IO.read: {e}"))?;
+                body.extend_from_slice(&bytes);
+            } else {
+                body.extend_from_slice(data.as_bytes());
             }
-        } else {
-            body.extend_from_slice(data.as_bytes());
-        }
-        if body.len() > limit {
-            break Ok(None);
-        }
-        if piece["eof"].as_bool().unwrap_or(false) {
-            break Ok(Some((std::mem::take(&mut body), std::mem::take(&mut held))));
+            if body.len() > limit {
+                return Ok(None);
+            }
+            let needed = body.len().div_ceil(budget.unit);
+            if needed > held_units {
+                let more = u32::try_from(needed - held_units)?;
+                let global = budget
+                    .global
+                    .clone()
+                    .try_acquire_many_owned(more)
+                    .map_err(|_| anyhow!("over the guard's budget for document bodies"))?;
+                let profile = budget
+                    .profile
+                    .clone()
+                    .try_acquire_many_owned(more)
+                    .map_err(|_| anyhow!("over the profile's share of the body budget"))?;
+                held.push(global);
+                held.push(profile);
+                held_units = needed;
+            }
+            if piece["eof"].as_bool().unwrap_or(false) {
+                return Ok(Some((body, held)));
+            }
         }
     };
+    let result = tokio::time::timeout(deadline, read).await;
+    // Outside the time limit, so a read that ran out of time still closes its stream.
     let _ = conn.send("IO.close", json!({ "handle": handle }), s).await;
-    result
+    result.map_err(|_| anyhow!("reading the document took too long"))?
 }
 
 /// Lets go of a target the guard does not judge: resumes it (Chrome holds a target an
@@ -1280,17 +1327,24 @@ mod tests {
     }
 
     /// A CDP endpoint that answers `Fetch.takeResponseBodyAsStream` and `IO.read` with a body
-    /// of `total` bytes in pieces of `piece`, and counts the reads.
+    /// of `total` bytes in pieces of `piece`, counts the reads and records `IO.close`. With
+    /// `stall`, it never answers `IO.read`.
     async fn body_server(
         total: usize,
         piece: usize,
-    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        stall: bool,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/", listener.local_addr().unwrap());
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = reads.clone();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (counted, seen_close) = (reads.clone(), closed.clone());
         tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
@@ -1301,10 +1355,17 @@ mod tests {
                     "Fetch.takeResponseBodyAsStream" => json!({ "stream": "s1" }),
                     "IO.read" => {
                         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if stall {
+                            continue;
+                        }
                         let n = piece.min(total - sent);
                         sent += n;
                         let data = data_encoding::BASE64.encode(&vec![b'a'; n]);
                         json!({ "data": data, "base64Encoded": true, "eof": sent == total })
+                    }
+                    "IO.close" => {
+                        seen_close.store(true, std::sync::atomic::Ordering::SeqCst);
+                        json!({})
                     }
                     _ => json!({}),
                 };
@@ -1314,71 +1375,138 @@ mod tests {
                 }
             }
         });
-        (url, reads)
+        (url, reads, closed)
+    }
+
+    /// A budget of `global` and `profile` steps of `unit` bytes.
+    fn budget(global: usize, profile: usize, unit: usize) -> Budget {
+        Budget {
+            global: Arc::new(tokio::sync::Semaphore::new(global)),
+            profile: Arc::new(tokio::sync::Semaphore::new(profile)),
+            unit,
+        }
+    }
+
+    const NO_DEADLINE: Duration = Duration::from_secs(30);
+
+    async fn read(
+        total: usize,
+        piece: usize,
+        limit: usize,
+        headers: &[(String, String)],
+        b: &Budget,
+    ) -> (Result<Option<HeldBody>>, usize) {
+        let (url, reads, _) = body_server(total, piece, false).await;
+        let conn = CdpConn::connect(&url).await.unwrap();
+        let r = read_body_capped(&conn, "S", "r", headers, limit, b, NO_DEADLINE).await;
+        (r, reads.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     #[tokio::test]
     async fn document_bodies_are_read_in_pieces_up_to_the_limit() {
-        let ordinal = std::sync::atomic::Ordering::SeqCst;
         let (piece, limit) = (1000, 10_000);
+        let b = budget(1000, 1000, 100);
         // Under the limit: the whole body.
-        let (url, _) = body_server(limit - 5, piece).await;
-        let conn = CdpConn::connect(&url).await.unwrap();
-        let budget = Arc::new(tokio::sync::Semaphore::new(1000));
-        let body = read_body_capped(&conn, "S", "r1", &[], limit, &budget)
-            .await
-            .unwrap();
-        assert_eq!(body.map(|(b, _)| b.len()), Some(limit - 5));
+        let (r, _) = read(limit - 5, piece, limit, &[], &b).await;
+        assert_eq!(r.unwrap().map(|(b, _)| b.len()), Some(limit - 5));
         // Over the limit, with no length declared (a compressed body grows when decoded):
         // reading stops just past the limit.
-        let (url, reads) = body_server(limit * 100, piece).await;
-        let conn = CdpConn::connect(&url).await.unwrap();
-        let body = read_body_capped(&conn, "S", "r2", &[], limit, &budget)
-            .await
-            .unwrap();
-        assert!(body.is_none());
-        assert_eq!(reads.load(ordinal), limit / piece + 1);
+        let (r, reads) = read(limit * 100, piece, limit, &[], &b).await;
+        assert!(r.unwrap().is_none());
+        assert_eq!(reads, limit / piece + 1);
         // A declared length over the limit: refused without reading.
-        let (url, reads) = body_server(10, piece).await;
-        let conn = CdpConn::connect(&url).await.unwrap();
         let too_long = vec![("Content-Length".to_string(), (limit + 1).to_string())];
-        let body = read_body_capped(&conn, "S", "r3", &too_long, limit, &budget)
-            .await
-            .unwrap();
-        assert!(body.is_none());
-        assert_eq!(reads.load(ordinal), 0);
+        let (r, reads) = read(10, piece, limit, &too_long, &b).await;
+        assert!(r.unwrap().is_none());
+        assert_eq!(reads, 0);
+    }
+
+    #[tokio::test]
+    async fn the_budget_counts_bytes_not_reads() {
+        // 500 bytes in 1-byte pieces under a budget of 10 steps of 100 bytes: 5 steps, not
+        // 500.
+        let b = budget(10, 10, 100);
+        let (r, reads) = read(500, 1, 1 << 20, &[], &b).await;
+        let held = r.unwrap().unwrap();
+        assert_eq!(held.0.len(), 500);
+        assert_eq!(reads, 500);
+        assert_eq!(b.global.available_permits(), 5);
+        assert_eq!(b.profile.available_permits(), 5);
+        drop(held);
+        assert_eq!(b.global.available_permits(), 10);
     }
 
     #[tokio::test]
     async fn bodies_read_at_the_same_time_share_one_budget() {
-        let piece = 1000;
-        // A budget of 5 pieces. A first body of 3 pieces is held (its permits not dropped).
-        let budget = Arc::new(tokio::sync::Semaphore::new(5));
-        let (url, _) = body_server(3 * piece, piece).await;
-        let conn = CdpConn::connect(&url).await.unwrap();
-        let first = read_body_capped(&conn, "S", "a", &[], 1 << 20, &budget)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.0.len(), 3 * piece);
-        assert_eq!(budget.available_permits(), 2);
-        // A second body of 3 pieces does not fit beside it: refused, and what it had taken
+        let unit = 1000;
+        // A global budget of 5 steps. A first body of 3 steps is held.
+        let b = budget(5, 100, unit);
+        let (first, _) = read(3 * unit, unit, 1 << 20, &[], &b).await;
+        let first = first.unwrap().unwrap();
+        assert_eq!(b.global.available_permits(), 2);
+        // A second body of 3 steps does not fit beside it: refused, and what it had taken
         // is given back.
-        let (url, _) = body_server(3 * piece, piece).await;
-        let conn = CdpConn::connect(&url).await.unwrap();
-        let second = read_body_capped(&conn, "S", "b", &[], 1 << 20, &budget).await;
+        let (second, _) = read(3 * unit, unit, 1 << 20, &[], &b).await;
         let e = format!("{:#}", second.unwrap_err());
         assert!(e.contains("budget"), "{e}");
-        assert_eq!(budget.available_permits(), 2);
+        assert_eq!(b.global.available_permits(), 2);
         // Once the first is released, it fits.
         drop(first);
-        let (url, _) = body_server(3 * piece, piece).await;
+        let (third, _) = read(3 * unit, unit, 1 << 20, &[], &b).await;
+        assert_eq!(third.unwrap().unwrap().0.len(), 3 * unit);
+    }
+
+    #[tokio::test]
+    async fn one_profile_at_its_share_does_not_block_another() {
+        let unit = 1000;
+        let global = Arc::new(tokio::sync::Semaphore::new(10));
+        let profile = |share: usize| Budget {
+            global: global.clone(),
+            profile: Arc::new(tokio::sync::Semaphore::new(share)),
+            unit,
+        };
+        let (a, b) = (profile(4), profile(4));
+        // Profile a takes its whole share ...
+        let (held, _) = read(4 * unit, unit, 1 << 20, &[], &a).await;
+        let held = held.unwrap().unwrap();
+        // ... and cannot take more, although the global budget has room.
+        let (more, _) = read(unit, unit, 1 << 20, &[], &a).await;
+        let e = format!("{:#}", more.unwrap_err());
+        assert!(e.contains("share"), "{e}");
+        assert_eq!(global.available_permits(), 6);
+        // Profile b still reads.
+        let (other, _) = read(4 * unit, unit, 1 << 20, &[], &b).await;
+        assert_eq!(other.unwrap().unwrap().0.len(), 4 * unit);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_read_past_its_deadline_fails_and_closes_the_stream() {
+        let b = budget(10, 10, 1000);
+        let (url, _, closed) = body_server(10, 10, true).await;
         let conn = CdpConn::connect(&url).await.unwrap();
-        let third = read_body_capped(&conn, "S", "c", &[], 1 << 20, &budget)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(third.0.len(), 3 * piece);
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_body_capped(
+                &conn,
+                "S",
+                "r",
+                &[],
+                1 << 20,
+                &b,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("the deadline was not kept");
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("too long"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            closed.load(std::sync::atomic::Ordering::SeqCst),
+            "IO.close was not sent"
+        );
     }
 
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
