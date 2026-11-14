@@ -626,6 +626,21 @@ fn serve_one(mut stream: std::net::TcpStream, hits: Arc<Mutex<Vec<String>>>) {
             return;
         }
         "/img" => ("200 OK", "image/gif", GIF.to_vec()),
+        "/txt" => ("200 OK", "text/plain", b"plain text".to_vec()),
+        "/sjis" => {
+            let mut body = b"<!doctype html><title>sjis</title><p id=a>".to_vec();
+            // "日本語テスト" in Shift-JIS.
+            body.extend_from_slice(&[
+                0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea, 0x83, 0x65, 0x83, 0x58, 0x83, 0x67,
+            ]);
+            ("200 OK", "text/html; charset=Shift_JIS", body)
+        }
+        "/utf8big" => {
+            let mut body = UTF8_PREFIX.as_bytes().to_vec();
+            body.resize(UTF8_PREFIX.len() + UTF8_FILLER, b'a');
+            body.extend_from_slice("日本</p>".as_bytes());
+            ("200 OK", "text/html; charset=utf-8", body)
+        }
         "/sw.js" => (
             "200 OK",
             "text/javascript",
@@ -1424,3 +1439,111 @@ fn sniffed_and_duplicated_content_types_get_the_csp() {
     }
     close(&h);
 }
+
+/// From the session's page, frames `src` (same origin) and, in the frame's own realm and
+/// under its document's policy, opens a plain WebSocket to `url`; `<outcome>|<violations>`.
+fn framed_ws_js(src: &str, url: &str) -> String {
+    format!(
+        "new Promise(r => {{ const f = document.createElement('iframe'); f.src = '{src}'; \
+         f.onload = () => {{ const w = f.contentWindow; const v = []; \
+         w.document.addEventListener('securitypolicyviolation', e => v.push(e.violatedDirective)); \
+         let out = ''; try {{ const s = new w.WebSocket('{url}'); s.onopen = () => {{ out = 'OPEN'; s.close(); }}; s.onerror = () => {{ out = out || 'ERROR'; }}; }} \
+         catch (e) {{ out = 'THROW:' + e.name; }} setTimeout(() => r((out || 'PENDING') + '|' + v.join(',')), 2000); }}; \
+         document.body.appendChild(f); setTimeout(() => r('TIMEOUT'), 8000); }})"
+    )
+}
+
+/// An image or text document of a page's own origin, framed by that page, gets the CSP too:
+/// a WebSocket opened in the frame's realm is refused by `connect-src`. On a local page (not
+/// served again) the same WebSocket opens (control).
+#[test]
+#[ignore]
+fn inert_documents_get_the_csp_too() {
+    let srv = AddressServer::start();
+    let h = create(&[
+        "--profile",
+        profile("pol-csp-default"),
+        "--url",
+        &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
+    ]);
+    for src in ["/img", "/txt"] {
+        let wm = marker("iw");
+        let url = format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b);
+        let got = settle(&h, &framed_ws_js(src, &url));
+        eprintln!("public page, framed {src}: {got}");
+        assert!(
+            !got.starts_with("OPEN") && got.contains("connect-src"),
+            "{src}: {got}"
+        );
+        assert!(!srv.reached(&wm));
+    }
+    close(&h);
+    let h = create(&[
+        "--profile",
+        profile("pol-csp-default"),
+        "--url",
+        &format!("http://localhost:{}/page", srv.a),
+    ]);
+    let url = format!("ws://{UNLISTED_NAME}:{}/ws?m={}", srv.b, marker("il"));
+    let got = settle(&h, &framed_ws_js("/img", &url));
+    eprintln!("local page, framed /img: {got}");
+    assert!(got.starts_with("OPEN|"), "{got}");
+    close(&h);
+}
+
+/// Text in the test pages `/sjis` and `/utf8big`, as the page should show it.
+const SJIS_TEXT: &str = "日本語テスト";
+
+/// What a page served again shows of its text: a Shift-JIS page, and a UTF-8 page whose
+/// three-byte character straddles the 1 MiB mark where the guard's reads are cut.
+#[test]
+#[ignore]
+fn served_again_bodies_keep_their_bytes() {
+    let srv = AddressServer::start();
+    let probe = "JSON.stringify((() => { const t = document.getElementById('a').textContent; \
+                 return { len: t.length, tail: t.slice(-2), bad: t.includes('\\uFFFD') }; })())";
+    let mut seen = Vec::new();
+    for host in [PUBLIC_NAME, "localhost"] {
+        let h = create(&[
+            "--profile",
+            profile("pol-csp-default"),
+            "--url",
+            &format!("http://{host}:{}/sjis", srv.a),
+        ]);
+        let (code, out, err) = shared_home().run(&[
+            "--session",
+            &h,
+            "eval",
+            "document.getElementById('a').textContent",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        let sjis = json(&out)["result"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (code, _, err) = open(&h, &format!("http://{host}:{}/utf8big", srv.a));
+        assert_eq!(code, 0, "{err}");
+        let (code, out, err) = shared_home().run(&["--session", &h, "eval", probe]);
+        assert_eq!(code, 0, "{err}");
+        let big = json(&out)["result"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        eprintln!("{host}: sjis {sjis:?}; utf8big {big}");
+        seen.push((host, sjis, big));
+        close(&h);
+    }
+    let want_big = format!(
+        "{{\"len\":{},\"tail\":\"日本\",\"bad\":false}}",
+        UTF8_FILLER + 2
+    );
+    for (host, sjis, big) in &seen {
+        assert_eq!(sjis, SJIS_TEXT, "{host}");
+        assert_eq!(big, &want_big, "{host}");
+    }
+}
+
+/// The page `/utf8big`: this prefix, `UTF8_FILLER` letters, then "日本", so that the first
+/// byte of "日" is the last byte before 1 MiB.
+const UTF8_PREFIX: &str = "<!doctype html><meta charset=utf-8><title>u8</title><p id=a>";
+const UTF8_FILLER: usize = (1 << 20) - 1 - UTF8_PREFIX.len();
