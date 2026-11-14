@@ -280,9 +280,15 @@ fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
             tools,
             policy,
         } => {
+            let mut bundles: Vec<mcp::Bundle> = Vec::new();
+            for b in tools {
+                if !bundles.contains(&b) {
+                    bundles.push(b);
+                }
+            }
             let opts = mcp::Options {
                 operator,
-                tools,
+                tools: bundles,
                 policy: policy.checked(),
             };
             std::process::exit(mcp::run(opts, paths.clone()))

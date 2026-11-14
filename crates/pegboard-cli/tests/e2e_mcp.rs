@@ -11,6 +11,7 @@ mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,6 +28,8 @@ struct Mcp {
     /// Every line it wrote to stdout.
     lines: Vec<String>,
     stderr: Arc<Mutex<String>>,
+    /// While set, nothing reads the server's stdout (a client that stopped reading).
+    paused: Arc<AtomicBool>,
 }
 
 impl Mcp {
@@ -47,9 +50,15 @@ impl Mcp {
             .unwrap();
         let (tx, replies) = channel();
         let stdout = child.stdout.take().unwrap();
+        let paused = Arc::new(AtomicBool::new(false));
+        let hold = paused.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { return };
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                while hold.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let Some(Ok(line)) = lines.next() else { return };
                 if tx.send(line).is_err() {
                     return;
                 }
@@ -76,6 +85,7 @@ impl Mcp {
             next_id: 0,
             lines: Vec::new(),
             stderr,
+            paused,
         };
         let r = mcp.request(
             "initialize",
@@ -91,6 +101,13 @@ impl Mcp {
         let stdin = self.stdin.as_mut().expect("stdin open");
         writeln!(stdin, "{msg}").unwrap();
         stdin.flush().unwrap();
+    }
+
+    /// Sends a request without waiting for its answer.
+    fn request_no_wait(&mut self, method: &str, params: Value) {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -448,4 +465,102 @@ fn adopted_session_keeps_its_own_wider_policy() {
     assert_no_token(&mcp, home, &given);
     assert!(cli_session_ids(home).contains(&id_of(&given).to_string()));
     assert_eq!(home.run(&["session", "close", &given]).0, 0);
+}
+
+/// The name `PEGBOARD_TEST_MCP_SLOW_CREATE` makes a create of wait two minutes.
+const SLOW: &str = "pegboard-test-slow-create";
+
+fn session_names(home: &Home) -> Vec<String> {
+    let (code, out, err) = home.run(&["session", "list", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    json(&out)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[test]
+#[ignore]
+fn a_client_that_stops_reading_still_ends_on_sigterm() {
+    let home = shared_home();
+    let mut mcp = Mcp::start(home, &[]);
+    let a = mcp.create(json!({}));
+    mcp.paused.store(true, Ordering::SeqCst);
+    // Enough answers to fill the stdout pipe and the server's queue behind it.
+    for _ in 0..300 {
+        mcp.request_no_wait("tools/list", json!({}));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let started = Instant::now();
+    mcp.signal(libc::SIGTERM);
+    assert_eq!(mcp.wait_exit(20), 0, "{}", mcp.stderr());
+    eprintln!("ended {:?} after SIGTERM", started.elapsed());
+    assert!(!cli_session_ids(home).contains(&a));
+}
+
+/// A server with one session and a create running (held for two minutes by the hook).
+fn with_a_call_running(home: &Home) -> (Mcp, String) {
+    let mut mcp = Mcp::start_env(home, &[("PEGBOARD_TEST_MCP_SLOW_CREATE", SLOW)], &[]);
+    let a = mcp.create(json!({}));
+    mcp.request_no_wait(
+        "tools/call",
+        json!({ "name": "pegboard_session_create", "arguments": { "name": SLOW } }),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    (mcp, a)
+}
+
+#[test]
+#[ignore]
+fn stdin_end_during_a_running_call_ends_the_server() {
+    let home = shared_home();
+    let (mut mcp, a) = with_a_call_running(home);
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0, "{}", mcp.stderr());
+    assert!(!cli_session_ids(home).contains(&a));
+    assert!(!session_names(home).contains(&SLOW.to_string()));
+}
+
+#[test]
+#[ignore]
+fn sigterm_during_a_running_call_ends_the_server() {
+    let home = shared_home();
+    let (mut mcp, a) = with_a_call_running(home);
+    mcp.signal(libc::SIGTERM);
+    assert_eq!(mcp.wait_exit(20), 0, "{}", mcp.stderr());
+    assert!(!cli_session_ids(home).contains(&a));
+}
+
+#[test]
+#[ignore]
+fn sessions_are_closed_on_sigint_and_sighup() {
+    let home = shared_home();
+    for sig in [libc::SIGINT, libc::SIGHUP] {
+        let mut mcp = Mcp::start(home, &[]);
+        let a = mcp.create(json!({}));
+        mcp.signal(sig);
+        assert_eq!(mcp.wait_exit(20), 0, "signal {sig}: {}", mcp.stderr());
+        assert!(!cli_session_ids(home).contains(&a), "signal {sig}");
+    }
+}
+
+#[test]
+#[ignore]
+fn a_second_sigint_ends_at_once() {
+    let home = shared_home();
+    let (mut mcp, a) = with_a_call_running(home);
+    mcp.signal(libc::SIGINT);
+    // The session is closed; the server now waits (up to 10 s) for the running call.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while cli_session_ids(home).contains(&a) {
+        assert!(Instant::now() < deadline, "the session was not closed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    mcp.signal(libc::SIGINT);
+    assert_eq!(mcp.wait_exit(3), 130, "{}", mcp.stderr());
+    assert!(started.elapsed() < Duration::from_secs(3));
 }

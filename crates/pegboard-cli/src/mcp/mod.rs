@@ -11,7 +11,7 @@ mod tools;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use pegboard_core::api::Client;
@@ -53,6 +53,16 @@ pub enum Bundle {
 struct Held {
     token: String,
     created_here: bool,
+    /// The daemon confirmed the handle (always for a session created here).
+    verified: bool,
+}
+
+/// Length of a session token (16 random bytes in base32).
+const TOKEN_LEN: usize = 26;
+
+/// The lock of `Owned`, also after a call panicked while holding it.
+pub(crate) fn lock(owned: &Mutex<Owned>) -> MutexGuard<'_, Owned> {
+    owned.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Sessions this server may act on. Tokens never leave this type (except to the core API).
@@ -87,7 +97,7 @@ impl Owned {
         };
         let (id, token) = handle.split_once('.').ok_or_else(bad)?;
         let id = SessionId::parse(id).ok_or_else(bad)?;
-        let token_ok = !token.is_empty()
+        let token_ok = token.len() == TOKEN_LEN
             && token
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b));
@@ -106,15 +116,38 @@ impl Owned {
             Held {
                 token,
                 created_here,
+                verified: created_here,
             },
         );
+    }
+
+    /// Adopted handles the daemon has not confirmed yet.
+    fn unverified(&self) -> Vec<(SessionId, String)> {
+        self.open
+            .iter()
+            .filter(|(_, h)| !h.verified)
+            .map(|(id, h)| (id.clone(), h.token.clone()))
+            .collect()
+    }
+
+    fn mark_verified(&mut self, id: &SessionId) {
+        if let Some(h) = self.open.get_mut(id) {
+            h.verified = true;
+        }
+    }
+
+    /// An adopted handle the daemon refused: as if it had never been given.
+    fn drop_adopted(&mut self, id: &SessionId) {
+        self.open.remove(id);
+        self.known.remove(id);
     }
 
     pub fn token(&self, id: &SessionId) -> Option<&str> {
         self.open.get(id).map(|h| h.token.as_str())
     }
 
-    /// The open sessions, sorted.
+    /// The open sessions, sorted. (Task 10 uses it for a call that names no session.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn ids(&self) -> Vec<SessionId> {
         let mut ids: Vec<SessionId> = self.open.keys().cloned().collect();
         ids.sort_by(|a, b| a.0.cmp(&b.0));
@@ -200,7 +233,7 @@ impl Server {
     /// The answer to one line, as the text of one line (none for a notification).
     pub fn handle_line(&mut self, line: &[u8]) -> Option<String> {
         let reply = self.reply(line)?;
-        Some(self.owned.lock().unwrap().scrub(&reply.to_string()))
+        Some(lock(&self.owned).scrub(&reply.to_string()))
     }
 
     fn reply(&mut self, line: &[u8]) -> Option<Value> {
@@ -315,6 +348,7 @@ impl Server {
             );
             return Ok(tool_result(text, true));
         }
+        self.verify_adopted();
         let mut ctx = Ctx {
             core: self.core.as_mut(),
             owned: &self.owned,
@@ -325,6 +359,31 @@ impl Server {
             Some(Err(e)) => tool_result(format!("{}: {}", e.code, e.message), true),
             None => tool_result(format!("{}: unknown tool", codes::INVALID_PARAMS), true),
         })
+    }
+}
+
+impl Server {
+    /// Checks adopted handles with the daemon (once it runs); one it refuses is dropped.
+    fn verify_adopted(&mut self) {
+        let pending = lock(&self.owned).unverified();
+        for (id, token) in pending {
+            let r = self
+                .core
+                .call("session.info", json!({ "sessionId": id, "token": token }));
+            match r {
+                Ok(_) => lock(&self.owned).mark_verified(&id),
+                Err(e) if e.code == codes::SESSION_NOT_FOUND || e.code == codes::INVALID_PARAMS => {
+                    lock(&self.owned).drop_adopted(&id);
+                    eprintln!(
+                        "pegboard mcp: PEGBOARD_SESSION names {}, which is not open or whose \
+                         token is wrong; it was not adopted",
+                        id.0
+                    );
+                }
+                // Asked again at the next call.
+                Err(_) => {}
+            }
+        }
     }
 }
 
@@ -339,6 +398,21 @@ pub enum Line {
 /// Reads up to the next newline, holding at most `max` bytes. `None` at the end.
 pub fn read_line_capped(r: &mut impl BufRead, max: usize) -> std::io::Result<Option<Line>> {
     let mut line = Vec::new();
+    Ok(match read_line_into(r, max, &mut line)? {
+        None => None,
+        Some(true) => Some(Line::TooLong),
+        Some(false) => Some(Line::Text(line)),
+    })
+}
+
+/// Reads the next line into `line` (cleared first); `Some(true)` when it was longer than
+/// `max`, in which case `line` is left empty and never grew past `max` plus one buffer.
+fn read_line_into(
+    r: &mut impl BufRead,
+    max: usize,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Option<bool>> {
+    line.clear();
     let mut too_long = false;
     let mut read_any = false;
     loop {
@@ -358,7 +432,7 @@ pub fn read_line_capped(r: &mut impl BufRead, max: usize) -> std::io::Result<Opt
         if !too_long {
             if line.len() + chunk.len() > max {
                 too_long = true;
-                line = Vec::new();
+                line.clear();
             } else {
                 line.extend_from_slice(chunk);
             }
@@ -369,11 +443,7 @@ pub fn read_line_capped(r: &mut impl BufRead, max: usize) -> std::io::Result<Opt
             break;
         }
     }
-    Ok(match (read_any, too_long) {
-        (false, _) => None,
-        (true, true) => Some(Line::TooLong),
-        (true, false) => Some(Line::Text(line)),
-    })
+    Ok(read_any.then_some(too_long))
 }
 
 /// Closes the sessions this server created (in parallel, each within `CLOSE_LIMIT` as the
@@ -381,7 +451,7 @@ pub fn read_line_capped(r: &mut impl BufRead, max: usize) -> std::io::Result<Opt
 /// session created after this is closed at once. Adopted sessions stay open.
 pub fn close_created(owned: &Mutex<Owned>, connect: &(dyn Fn() -> Box<dyn Core> + Sync)) {
     let created: Vec<(SessionId, String)> = {
-        let mut owned = owned.lock().unwrap();
+        let mut owned = lock(owned);
         owned.shutting_down = true;
         let created: Vec<(SessionId, String)> = owned
             .open
@@ -413,11 +483,18 @@ pub fn close_created(owned: &Mutex<Owned>, connect: &(dyn Fn() -> Box<dyn Core> 
 
 /// The core API through `Client`, connected on first use. The daemon is started in the
 /// background when the server starts; the first tool call waits for that.
+///
+/// Every call has a deadline: `Client` gives each method its own (60 s, `session.create`
+/// 180 s, `browser.stop` 300 s, a command its timeout + 15 s), or `limit` when set.
 struct ClientCore {
     paths: Paths,
     client: Option<Client>,
     start: Start,
     limit: Option<Duration>,
+    /// Test hook (`PEGBOARD_TEST_MCP_SLOW_CREATE`): a `session.create` of a session with
+    /// this name waits two minutes before it is sent, to have a call running while the
+    /// server is told to end.
+    slow_create: Option<String>,
 }
 
 enum Start {
@@ -435,6 +512,9 @@ impl ClientCore {
             client: None,
             start: Start::Pending(std::thread::spawn(move || crate::browser_start(&p))),
             limit: None,
+            slow_create: std::env::var("PEGBOARD_TEST_MCP_SLOW_CREATE")
+                .ok()
+                .filter(|name| !name.is_empty()),
         }
     }
 
@@ -445,6 +525,7 @@ impl ClientCore {
             client: None,
             start: Start::Done,
             limit: Some(CLOSE_LIMIT),
+            slow_create: None,
         }
     }
 }
@@ -473,6 +554,12 @@ impl Core for ClientCore {
     }
 
     fn call(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
+        if method == "session.create"
+            && self.slow_create.is_some()
+            && params["name"].as_str() == self.slow_create.as_deref()
+        {
+            std::thread::sleep(Duration::from_secs(120));
+        }
         if self.client.is_none() {
             let mut client = Client::connect(&self.paths)?;
             if let Some(limit) = self.limit {
@@ -490,9 +577,14 @@ impl Core for ClientCore {
     }
 }
 
-/// Reads stdin on a thread of its own (blocking reads), one line at a time.
-fn stdin_lines() -> tokio::sync::mpsc::Receiver<Option<Line>> {
+/// Reads stdin on a thread of its own (blocking reads), one line at a time. The end of
+/// input is also told on its own channel, so it is seen while a call is running.
+fn stdin_lines() -> (
+    tokio::sync::mpsc::Receiver<Line>,
+    tokio::sync::watch::Receiver<bool>,
+) {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (eof_tx, eof_rx) = tokio::sync::watch::channel(false);
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
@@ -504,24 +596,87 @@ fn stdin_lines() -> tokio::sync::mpsc::Receiver<Option<Line>> {
                     None
                 }
             };
-            let end = next.is_none();
-            if tx.blocking_send(next).is_err() || end {
+            let Some(line) = next else {
+                let _ = eof_tx.send(true);
+                return;
+            };
+            if tx.blocking_send(line).is_err() {
                 return;
             }
         }
     });
-    rx
+    (rx, eof_rx)
 }
 
-fn write_line(text: &str) -> std::io::Result<()> {
-    let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes())?;
-    out.write_all(b"\n")?;
-    out.flush()
+/// Writes answers to stdout on a thread of its own: a client that stops reading blocks
+/// that thread, never the server's loop (which keeps watching signals and stdin).
+fn stdout_writer() -> tokio::sync::mpsc::Sender<String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    std::thread::spawn(move || {
+        while let Some(text) = rx.blocking_recv() {
+            let mut out = std::io::stdout().lock();
+            let written = out
+                .write_all(text.as_bytes())
+                .and_then(|()| out.write_all(b"\n"))
+                .and_then(|()| out.flush());
+            if written.is_err() {
+                // Nobody reads the answers any more; dropping `rx` tells the loop.
+                return;
+            }
+        }
+    });
+    tx
 }
 
-/// Runs the server until stdin ends or SIGTERM/SIGINT; returns the exit code.
+/// What ends the server: SIGTERM, SIGHUP, SIGINT, or (where watched) the end of stdin.
+struct Stops {
+    term: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    eof: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Stops {
+    fn new(eof: tokio::sync::watch::Receiver<bool>) -> std::io::Result<Stops> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Stops {
+            term: signal(SignalKind::terminate())?,
+            hup: signal(SignalKind::hangup())?,
+            int: signal(SignalKind::interrupt())?,
+            eof,
+        })
+    }
+
+    /// Resolves when a signal comes, or stdin ends (if `watch_eof`).
+    async fn next(&mut self, watch_eof: bool) {
+        let eof = async {
+            if watch_eof {
+                // An error means the reader is gone, which is an end too.
+                let _ = self.eof.wait_for(|end| *end).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.hup.recv() => {}
+            _ = self.int.recv() => {}
+            _ = eof => {}
+        }
+    }
+}
+
+/// How long the end waits for a call that was running (a session being created).
+const IN_FLIGHT_LIMIT: Duration = Duration::from_secs(10);
+
+/// Runs the server until stdin ends or SIGTERM, SIGHUP or SIGINT; returns the exit code.
 pub fn run(opts: Options, paths: Paths) -> i32 {
+    let mut owned = Owned::default();
+    // First, while this is the only thread, before anything is started.
+    if let Err(e) = owned.adopt_from_env() {
+        eprintln!("pegboard mcp: {e}");
+        return 2;
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -529,26 +684,20 @@ pub fn run(opts: Options, paths: Paths) -> i32 {
             return 1;
         }
     };
-    let code = runtime.block_on(serve(opts, paths));
-    // A tool call may still be running on a blocking thread: do not wait for it.
+    let code = runtime.block_on(serve(opts, paths, owned));
+    // A tool call or a write may still be blocked on a thread: do not wait for it.
     runtime.shutdown_background();
     code
 }
 
-pub async fn serve(opts: Options, paths: Paths) -> i32 {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut owned = Owned::default();
-    // First, before any thread or process is started.
-    if let Err(e) = owned.adopt_from_env() {
-        eprintln!("pegboard mcp: {e}");
-        return 2;
-    }
-    let (Ok(mut term), Ok(mut int)) = (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) else {
-        eprintln!("pegboard mcp: could not handle signals");
-        return 1;
+pub async fn serve(opts: Options, paths: Paths, owned: Owned) -> i32 {
+    let (mut lines, eof) = stdin_lines();
+    let mut stops = match Stops::new(eof) {
+        Ok(stops) => stops,
+        Err(e) => {
+            eprintln!("pegboard mcp: could not handle signals: {e}");
+            return 1;
+        }
     };
     let owned = Arc::new(Mutex::new(owned));
     let core = ClientCore::starting(paths.clone());
@@ -557,13 +706,13 @@ pub async fn serve(opts: Options, paths: Paths) -> i32 {
         Box::new(core),
         owned.clone(),
     )));
-    let mut lines = stdin_lines();
+    let out = stdout_writer();
     let mut in_flight = None;
     loop {
+        // Lines already read are answered before the end of stdin is acted on.
         let next = tokio::select! {
-            next = lines.recv() => next.flatten(),
-            _ = term.recv() => break,
-            _ = int.recv() => break,
+            next = lines.recv() => next,
+            _ = stops.next(false) => break,
         };
         let reply = match next {
             None => break,
@@ -578,20 +727,20 @@ pub async fn serve(opts: Options, paths: Paths) -> i32 {
                 });
                 tokio::select! {
                     r = &mut task => r.unwrap_or(None),
-                    _ = term.recv() => { in_flight = Some(task); break }
-                    _ = int.recv() => { in_flight = Some(task); break }
+                    _ = stops.next(true) => { in_flight = Some(task); break }
                 }
             }
         };
         if let Some(reply) = reply {
-            if write_line(&reply).is_err() {
-                // Nobody reads the answers any more.
-                break;
+            tokio::select! {
+                sent = out.send(reply) => if sent.is_err() { break },
+                _ = stops.next(true) => break,
             }
         }
     }
 
-    // Ending: close what this server created; a second SIGINT ends at once.
+    // Ending: close what this server created, and give a call that was running a little
+    // time to close what it makes; a second SIGINT ends at once.
     let closing = {
         let owned = owned.clone();
         tokio::task::spawn_blocking(move || {
@@ -599,20 +748,17 @@ pub async fn serve(opts: Options, paths: Paths) -> i32 {
             close_created(&owned, &connect);
         })
     };
-    tokio::select! {
-        _ = closing => {}
-        _ = int.recv() => return 130,
-    }
-    // A call still running (a session being created) closes what it makes once it
-    // returns; if it does not return in time, the daemon drops a session whose creation
-    // nobody received.
-    if let Some(task) = in_flight {
-        tokio::select! {
-            _ = tokio::time::timeout(CLOSE_LIMIT, task) => {}
-            _ = int.recv() => return 130,
+    let running = async {
+        if let Some(task) = in_flight {
+            let _ = tokio::time::timeout(IN_FLIGHT_LIMIT, task).await;
         }
+    };
+    // If that call does not return in time, the daemon drops a session whose creation
+    // nobody received.
+    tokio::select! {
+        _ = async { tokio::join!(closing, running) } => 0,
+        _ = stops.int.recv() => 130,
     }
-    0
 }
 
 #[cfg(test)]

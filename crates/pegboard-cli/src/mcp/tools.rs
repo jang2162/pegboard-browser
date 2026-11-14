@@ -18,7 +18,7 @@ use pegboard_protocol::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 
-use super::{Bundle, Core, Options, Owned};
+use super::{lock, Bundle, Core, Options, Owned};
 
 /// Sessions one MCP server may have open (created by it) at once.
 pub const MAX_CREATED_SESSIONS: usize = 16;
@@ -419,7 +419,7 @@ impl Registry {
             Kind::BrowserStop => {
                 plain(&[])?;
                 let _: Value = call(ctx.core, "browser.stop", json!({}))?;
-                ctx.owned.lock().unwrap().forget_all();
+                lock(ctx.owned).forget_all();
                 Ok("stopped".to_string())
             }
         }
@@ -451,13 +451,13 @@ impl Registry {
             profile: a.string("profile")?,
             policy,
         };
-        if ctx.owned.lock().unwrap().created_count() >= MAX_CREATED_SESSIONS {
+        if lock(ctx.owned).created_count() >= MAX_CREATED_SESSIONS {
             // Sessions closed elsewhere (idle expiry, a person) no longer count.
             let list: Vec<SessionInfo> = call(ctx.core, "session.list", json!({}))?;
             let open: Vec<SessionId> = list.into_iter().map(|s| s.id).collect();
-            ctx.owned.lock().unwrap().retain_open(&open);
+            lock(ctx.owned).retain_open(&open);
         }
-        if ctx.owned.lock().unwrap().created_count() >= MAX_CREATED_SESSIONS {
+        if lock(ctx.owned).created_count() >= MAX_CREATED_SESSIONS {
             return Err(error(
                 codes::LIMIT_EXCEEDED,
                 format!(
@@ -466,15 +466,39 @@ impl Registry {
             ));
         }
         let params = serde_json::to_value(params).map_err(|e| invalid(e.to_string()))?;
-        let mut s: SessionInfo = call(ctx.core, "session.create", params)?;
-        let Some(token) = s.token.take().filter(|t| !t.is_empty()) else {
+        let raw = ctx.core.call("session.create", params)?;
+        let decoded = serde_json::from_value::<SessionInfo>(raw.clone())
+            .ok()
+            .and_then(|mut s| Some((s.token.take().filter(|t| !t.is_empty())?, s)));
+        let Some((token, s)) = decoded else {
+            // The daemon made a session this server cannot hold: close it if the reply
+            // gives the way, and say which one it was.
+            let id = raw["id"].as_str().unwrap_or("?").to_string();
+            let closed = match raw["token"].as_str() {
+                Some(token) => ctx
+                    .core
+                    .call(
+                        "session.close",
+                        json!({ "sessionId": id, "token": token, "keepTabs": false }),
+                    )
+                    .is_ok(),
+                None => false,
+            };
+            eprintln!(
+                "pegboard mcp: the answer to session.create could not be read; session {id} {}",
+                if closed {
+                    "was closed"
+                } else {
+                    "may still be open"
+                }
+            );
             return Err(error(
                 codes::INTERNAL,
-                "the daemon did not hand over the new session",
+                "the daemon's answer to session.create could not be read",
             ));
         };
         let shutting_down = {
-            let mut owned = ctx.owned.lock().unwrap();
+            let mut owned = lock(ctx.owned);
             owned.insert(s.id.clone(), token.clone(), true);
             owned.shutting_down()
         };
@@ -484,7 +508,7 @@ impl Registry {
                 "session.close",
                 json!({ "sessionId": s.id, "token": token, "keepTabs": false }),
             );
-            ctx.owned.lock().unwrap().remove(&s.id);
+            lock(ctx.owned).remove(&s.id);
             return Err(error(codes::NOT_RUNNING, "pegboard mcp is shutting down"));
         }
         Ok(format!(
@@ -499,7 +523,7 @@ impl Registry {
 
     fn session_list(&self, ctx: &mut Ctx) -> Result<String, RpcError> {
         let list: Vec<SessionInfo> = call(ctx.core, "session.list", json!({}))?;
-        let owned = ctx.owned.lock().unwrap();
+        let owned = lock(ctx.owned);
         let lines: Vec<String> = list
             .iter()
             .filter(|s| self.operator || owned.token(&s.id).is_some())
@@ -513,7 +537,7 @@ impl Registry {
     }
 
     fn session_info(&self, ctx: &mut Ctx, id: &SessionId) -> Result<String, RpcError> {
-        let token = ctx.owned.lock().unwrap().token(id).map(str::to_string);
+        let token = lock(ctx.owned).token(id).map(str::to_string);
         let s: SessionInfo = match token {
             Some(token) => call(
                 ctx.core,
@@ -538,7 +562,7 @@ impl Registry {
         id: &SessionId,
         keep_tabs: bool,
     ) -> Result<String, RpcError> {
-        let token = ctx.owned.lock().unwrap().token(id).map(str::to_string);
+        let token = lock(ctx.owned).token(id).map(str::to_string);
         let result: Result<Value, RpcError> = match token {
             Some(token) => call(
                 ctx.core,
@@ -554,13 +578,13 @@ impl Registry {
         };
         match result {
             Ok(_) => {
-                ctx.owned.lock().unwrap().remove(id);
+                lock(ctx.owned).remove(id);
                 Ok(format!("closed {}", id.0))
             }
             Err(e) => {
                 if e.code == codes::SESSION_NOT_FOUND {
                     // Gone already (closed elsewhere or expired).
-                    ctx.owned.lock().unwrap().remove(id);
+                    lock(ctx.owned).remove(id);
                 }
                 Err(e)
             }
@@ -569,7 +593,7 @@ impl Registry {
 
     fn recording_list(&self, ctx: &mut Ctx) -> Result<String, RpcError> {
         let list: Vec<Manifest> = call(ctx.core, "recording.list", json!({}))?;
-        let owned = ctx.owned.lock().unwrap();
+        let owned = lock(ctx.owned);
         let lines: Vec<String> = list
             .iter()
             .filter(|m| {
@@ -599,7 +623,7 @@ impl Registry {
         }
         // A recording is its session's: `r_<x>` belongs to `s_<x>`.
         let session = SessionId(format!("s_{}", &id[2..]));
-        if !self.operator && !ctx.owned.lock().unwrap().knows(&session) {
+        if !self.operator && !lock(ctx.owned).knows(&session) {
             return Err(no_recording(id));
         }
         let v: Value = call(ctx.core, "recording.get", json!({ "recordingId": id }))?;
@@ -660,7 +684,7 @@ impl Registry {
 
 /// Files of a session this server holds (both modes: `files.list` needs the token).
 fn files_list(ctx: &mut Ctx, id: &SessionId) -> Result<String, RpcError> {
-    let Some(token) = ctx.owned.lock().unwrap().token(id).map(str::to_string) else {
+    let Some(token) = lock(ctx.owned).token(id).map(str::to_string) else {
         return Err(no_session(id));
     };
     let files: Vec<FileInfo> = call(

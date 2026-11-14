@@ -25,10 +25,14 @@ struct StubState {
 struct Stub {
     state: Arc<Mutex<StubState>>,
     start: Result<(), String>,
+    /// Put own tokens into the free text of recordings (which only the scrub can catch).
+    leak_in_text: bool,
+    /// Answer session.create with a session but a reply that does not decode.
+    bad_create: bool,
 }
 
 fn token_of(id: &str) -> String {
-    format!("tok{}zzzzzzzzzzzzzz", &id[2..])
+    format!("tok{}zzzzzzzzzzzzzzz", &id[2..])
 }
 
 fn not_found(id: &str) -> RpcError {
@@ -44,6 +48,8 @@ impl Stub {
         let stub = Stub {
             state: Arc::default(),
             start: Ok(()),
+            leak_in_text: true,
+            bad_create: false,
         };
         stub.state.lock().unwrap().sessions.push((
             FOREIGN.into(),
@@ -122,6 +128,9 @@ impl Core for Stub {
                     p["policy"].clone(),
                 );
                 st.sessions.push(s.clone());
+                if self.bad_create {
+                    return Ok(json!({ "id": s.0, "token": s.1, "state": 7 }));
+                }
                 Ok(Stub::info(&s))
             }
             "session.list" => Ok(Value::Array(st.sessions.iter().map(Stub::info).collect())),
@@ -191,7 +200,7 @@ impl Core for Stub {
                     .unwrap_or_else(|| token_of(&sid));
                 // Only an own session's token goes into free text (a foreign one cannot
                 // be known to the server); every token goes into a `token` field.
-                let free = if sid == FOREIGN {
+                let free = if sid == FOREIGN || !self.leak_in_text {
                     "x".to_string()
                 } else {
                     token.clone()
@@ -757,6 +766,12 @@ fn ending_closes_created_sessions_only() {
         .adopt(&format!("{adopted}.{}", token_of(adopted)))
         .unwrap();
     let stub = Stub::new();
+    stub.state.lock().unwrap().sessions.push((
+        adopted.into(),
+        token_of(adopted),
+        "given".into(),
+        json!({}),
+    ));
     let mut h = Harness::with(opts(false, SessionPolicy::default()), stub.clone(), owned);
     let a = h.create(json!({}));
     let b = h.create(json!({}));
@@ -791,7 +806,9 @@ fn handles_are_adopted_only_when_well_formed() {
     let id = SessionId("s_adoptedd".into());
     assert_eq!(owned.token(&id), Some(token_of("s_adoptedd").as_str()));
     assert_eq!(owned.created_count(), 0);
+    let short = format!("s_adoptedd.{}", &token_of("s_adoptedd")[1..]);
     for bad in [
+        short.as_str(),
         "s_adoptedd",
         "s_adoptedd.",
         "nonsense.tok",
@@ -805,20 +822,6 @@ fn handles_are_adopted_only_when_well_formed() {
             "the value is not echoed: {e}"
         );
     }
-}
-
-#[test]
-fn adopt_from_env_takes_the_variable_away() {
-    let handle = format!("s_adoptedd.{}", token_of("s_adoptedd"));
-    std::env::set_var("PEGBOARD_SESSION", &handle);
-    let mut owned = Owned::default();
-    owned.adopt_from_env().unwrap();
-    assert!(std::env::var_os("PEGBOARD_SESSION").is_none());
-    assert_eq!(owned.ids(), [SessionId("s_adoptedd".into())]);
-    // Nothing set: nothing adopted.
-    let mut none = Owned::default();
-    none.adopt_from_env().unwrap();
-    assert!(none.ids().is_empty());
 }
 
 #[test]
@@ -847,4 +850,147 @@ fn bad_arguments_are_tool_errors() {
     // Missing arguments mean none.
     let r = h.request("tools/call", json!({ "name": "pegboard_session_list" }));
     assert_eq!(r["result"]["isError"], false, "{r}");
+}
+
+#[test]
+fn adopted_handles_the_daemon_refuses_are_dropped() {
+    let mut owned = Owned::default();
+    // Open, with its token; open, with a wrong token; not open at all.
+    owned
+        .adopt(&format!("s_adoptedd.{}", token_of("s_adoptedd")))
+        .unwrap();
+    owned
+        .adopt(&format!("s_wrongtok.{}", token_of("s_adoptedd")))
+        .unwrap();
+    owned
+        .adopt(&format!("{MISSING}.{}", token_of(MISSING)))
+        .unwrap();
+    let stub = Stub::new();
+    for id in ["s_adoptedd", "s_wrongtok"] {
+        stub.state.lock().unwrap().sessions.push((
+            id.into(),
+            token_of(id),
+            "given".into(),
+            json!({}),
+        ));
+    }
+    let mut h = Harness::with(opts(false, SessionPolicy::default()), stub, owned);
+    let (err, list) = h.call("pegboard_session_list", json!({}));
+    assert!(!err, "{list}");
+    assert!(list.contains("s_adoptedd"), "{list}");
+    assert!(
+        !list.contains("s_wrongtok") && !list.contains(MISSING),
+        "{list}"
+    );
+    assert_eq!(
+        h.owned.lock().unwrap().ids(),
+        [SessionId("s_adoptedd".into())]
+    );
+    // A dropped one is unknown, recordings included; the check is done once.
+    let (err, text) = h.call(
+        "pegboard_recording_get",
+        json!({ "recordingId": "r_wrongtok" }),
+    );
+    assert!(
+        err && text == "recording_not_found: no recording r_wrongtok",
+        "{text}"
+    );
+    assert_eq!(h.stub.calls_of("session.info").len(), 3);
+}
+
+#[test]
+fn a_create_reply_that_does_not_decode_closes_the_session() {
+    let stub = Stub {
+        bad_create: true,
+        ..Stub::new()
+    };
+    let mut h = Harness::with(
+        opts(false, SessionPolicy::default()),
+        stub,
+        Owned::default(),
+    );
+    let (err, text) = h.call("pegboard_session_create", json!({}));
+    assert!(err && text.starts_with("internal: "), "{text}");
+    let closed = h.stub.calls_of("session.close");
+    assert_eq!(closed.len(), 1);
+    let id = closed[0]["sessionId"].as_str().unwrap().to_string();
+    assert_eq!(closed[0]["token"], token_of(&id));
+    assert!(!text.contains(&token_of(&id)), "{text}");
+}
+
+#[test]
+fn results_hold_no_token_even_before_the_scrub() {
+    for operator in [false, true] {
+        let adopted = "s_adoptedd";
+        let mut owned = Owned::default();
+        owned
+            .adopt(&format!("{adopted}.{}", token_of(adopted)))
+            .unwrap();
+        let stub = Stub {
+            leak_in_text: false,
+            ..Stub::new()
+        };
+        stub.state.lock().unwrap().sessions.push((
+            adopted.into(),
+            token_of(adopted),
+            "given".into(),
+            json!({}),
+        ));
+        let mut h = Harness::with(opts(operator, SessionPolicy::default()), stub, owned);
+        let mut out = Vec::new();
+        let mut ask = |h: &mut Harness, tool: &str, args: Value| {
+            let line = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": { "name": tool, "arguments": args } });
+            // `reply`, not `handle_line`: what the tools produce, unscrubbed.
+            let reply = h.server.reply(line.to_string().as_bytes()).unwrap();
+            out.push(reply.to_string());
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        };
+        let created = ask(&mut h, "pegboard_session_create", json!({}));
+        let a = created
+            .split_whitespace()
+            .find(|w| w.starts_with("s_"))
+            .unwrap()
+            .to_string();
+        ask(&mut h, "pegboard_session_list", json!({}));
+        ask(&mut h, "pegboard_recording_list", json!({}));
+        for id in [a.as_str(), adopted, FOREIGN] {
+            let rid = format!("r_{}", &id[2..]);
+            ask(&mut h, "pegboard_session_info", json!({ "sessionId": id }));
+            ask(&mut h, "pegboard_files_list", json!({ "sessionId": id }));
+            ask(
+                &mut h,
+                "pegboard_recording_get",
+                json!({ "recordingId": rid }),
+            );
+        }
+        ask(&mut h, "pegboard_session_close", json!({ "sessionId": a }));
+        let all = out.join("\n");
+        assert!(all.contains(&a), "{all}");
+        for t in [token_of(&a), token_of(adopted), FOREIGN_TOKEN.to_string()] {
+            assert!(!all.contains(&t), "operator={operator}: {t} in {all}");
+        }
+    }
+}
+
+#[test]
+fn an_overlong_line_is_not_held() {
+    let max = 1024 * 1024;
+    let mut input = vec![b'x'; 5 * max];
+    input.extend_from_slice(b"\nok\n");
+    let mut reader = std::io::BufReader::with_capacity(8192, &input[..]);
+    let mut line = Vec::new();
+    assert_eq!(
+        read_line_into(&mut reader, max, &mut line).unwrap(),
+        Some(true)
+    );
+    assert!(line.capacity() <= 2 * max, "held {} bytes", line.capacity());
+    assert_eq!(
+        read_line_into(&mut reader, max, &mut line).unwrap(),
+        Some(false)
+    );
+    assert_eq!(line, b"ok");
 }
