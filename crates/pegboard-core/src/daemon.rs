@@ -182,6 +182,11 @@ pub async fn run_command_with_hook(
     if let Err(e) = sessions.require_downloads(id) {
         return refuse(log, entry, argv, e, started);
     }
+    // Without its clipboard denial a page of the profile can read and write the system
+    // clipboard through `navigator.clipboard`.
+    if let Err(e) = sessions.require_clipboard(id) {
+        return refuse(log, entry, argv, e, started);
+    }
     let is_tab_new = matches!(checked, Checked::TabNew { .. });
     let mut run_argv = match checked {
         Checked::Run(words) => words,

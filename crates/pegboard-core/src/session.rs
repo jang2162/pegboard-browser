@@ -187,6 +187,11 @@ impl SessionManager {
         let contexts: Arc<Mutex<HashMap<String, String>>> = Arc::default();
         let resolver = Resolver::from_env();
         let guard = {
+            let (clip_pins, clip_contexts) = (pins.clone(), contexts.clone());
+            let clipboard_of = Arc::new(move |context: &str| {
+                let profile = clip_contexts.lock().unwrap().get(context).cloned();
+                profile.and_then(|profile| clip_pins.clipboard(&profile))
+            });
             let (pins, contexts) = (pins.clone(), contexts.clone());
             let policy_of = Arc::new(move |context: &str| {
                 let profile = contexts.lock().unwrap().get(context).cloned();
@@ -200,6 +205,7 @@ impl SessionManager {
                 &browser.ws_url,
                 &browser.human_context,
                 policy_of,
+                clipboard_of,
                 own_ports_fn(&browser, &proxy),
                 resolver.clone(),
             )
@@ -290,6 +296,17 @@ impl SessionManager {
             inner.judge_navigation(&session_policy, url).await?;
         }
         let runtime = inner.runtime(&profile).await?;
+        // The clipboard is denied for the whole profile unless its sessions allow it (they
+        // agree: the pin), before the session's first tab exists.
+        inner
+            .browser
+            .downloads
+            .apply_clipboard(
+                &runtime.context,
+                !session_policy.allow.contains(&ActionClass::Clipboard),
+            )
+            .await
+            .map_err(browser_failed)?;
 
         let title = group_title(p.name.as_deref(), &id);
         let color = group_color(usize::try_from(seq).unwrap_or(0));
@@ -577,6 +594,25 @@ impl SessionManager {
         }
     }
 
+    /// Refuses (`browser_failed`) while the clipboard of the session's profile is not denied
+    /// as its sessions' policies want: Chrome lifts the denial when the connection that set
+    /// it closes (spike C2), so commands wait until it is set again.
+    pub fn require_clipboard(&self, id: &SessionId) -> Result<(), RpcError> {
+        let context = {
+            let table = self.inner.table.lock().unwrap();
+            ready(&table, id)?.context.clone()
+        };
+        if self.inner.browser.downloads.clipboard_ready(&context) {
+            Ok(())
+        } else {
+            Err(rpc_error(
+                codes::BROWSER_FAILED,
+                "pegboard's clipboard policy for the session's profile is not in place; \
+                 commands are refused until it is back",
+            ))
+        }
+    }
+
     /// The session's download reports since the last call (see `downloads::Report`).
     pub fn take_download_reports(&self, id: &SessionId) -> Vec<Report> {
         self.inner.browser.downloads.take_reports(id)
@@ -623,6 +659,27 @@ impl SessionManager {
             .browser
             .downloads
             .drop_connection_for_test(&context, hold)
+    }
+
+    /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: drops the clipboard denial
+    /// connection of the session's profile as a failure would and keeps it down for `hold`.
+    /// Returns whether it did.
+    #[doc(hidden)]
+    pub fn drop_clipboard_policy_for_test(&self, id: &SessionId, hold: Duration) -> bool {
+        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+            return false;
+        }
+        let context = {
+            let table = self.inner.table.lock().unwrap();
+            match ready(&table, id) {
+                Ok(r) => r.context.clone(),
+                Err(_) => return false,
+            }
+        };
+        self.inner
+            .browser
+            .downloads
+            .drop_clipboard_for_test(&context, hold)
     }
 
     /// Judges a URL the session wants to open by its address policy, before anything runs

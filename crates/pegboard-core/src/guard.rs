@@ -21,7 +21,17 @@
 //! - A target the guard cannot set up is closed (a tab) or left waiting (a frame or worker):
 //!   it never runs unguarded. If the connection ends, Chrome lifts the interception (G5):
 //!   `ready()` is false until the guard has reconnected and the daemon refuses commands
-//!   meanwhile.
+//!   meanwhile. After a reconnect the targets that are already there are set up before
+//!   `ready()` is true again.
+//! - The clipboard (phase 2a spikes C6-C12): unless the profile's sessions allow it, every
+//!   page and frame gets `CLIPBOARD_SHIELD` before its first script, through this same
+//!   held-from-the-start attachment, so the guard's session on it is older than any agent
+//!   session (an older session's scripts run first and could disarm the shield, C12a). A
+//!   frame attached already running (a sandboxed srcdoc frame, C12c) gets it into the running
+//!   document too. A tab that was there before the guard attached (after a reconnect) has no
+//!   such guarantee: in a profile whose sessions deny the clipboard it is closed
+//!   (`clipboard_step`). The `clipboard-read`/`clipboard-write` denial that stops
+//!   `navigator.clipboard` is the download policy connection's job (`downloads`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
@@ -42,6 +52,45 @@ use crate::cdp::{CdpConn, CdpEvent};
 pub type PolicyOf = Arc<dyn Fn(&str) -> SessionPolicy + Send + Sync>;
 /// pegboard's own ports, read whenever a request is judged.
 pub type OwnPorts = Arc<dyn Fn() -> Vec<u16> + Send + Sync>;
+/// Whether the sessions of a browser context (an agent profile) allow the clipboard:
+/// `None` when no session holds the profile.
+pub type ClipboardOf = Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
+
+/// The capture listeners that stop copy, cut and paste in a document: `L_hard2` of spike 23
+/// (round 4, C12), which blocked every measured path together with the permission denial and
+/// the recursive held attachment. The references it calls are saved before any page script
+/// runs and called through `Reflect.apply`, so a page that replaces `Function.prototype.call`,
+/// `preventDefault` or `addEventListener` later cannot disarm it (C12a, i1-i3). It leaves no
+/// global behind.
+pub const CLIPBOARD_SHIELD: &str = r#"(()=>{const ap=Reflect.apply,pd=Event.prototype.preventDefault,sip=Event.prototype.stopImmediatePropagation,ael=EventTarget.prototype.addEventListener;const f=(e)=>{ap(pd,e,[]);ap(sip,e,[])};for(const t of [window,document])for(const n of ["copy","cut","paste","beforecopy","beforecut","beforepaste"])ap(ael,t,[n,f,true])})()"#;
+
+/// What the guard does about the clipboard with a target it attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardStep {
+    /// Nothing: the sessions allow the clipboard, or the target has no document.
+    Leave,
+    /// Adds `CLIPBOARD_SHIELD` for the target's next documents and, when it runs already,
+    /// into its current one.
+    Shield { run_immediately: bool },
+    /// Closes the tab: it was there before the guard attached, so an agent session on it may
+    /// be older than the guard's and its scripts would run before the shield (C12a).
+    Close,
+}
+
+/// The clipboard step for a target of `kind`, attached `waiting` for the debugger or not,
+/// in a profile whose sessions allow the clipboard (`Some(true)`), deny it (`Some(false)`) or
+/// that no session holds (`None`: shielded, as the default denies).
+pub fn clipboard_step(kind: &str, waiting: bool, allowed: Option<bool>) -> ClipboardStep {
+    if !matches!(kind, "page" | "iframe") || allowed == Some(true) {
+        return ClipboardStep::Leave;
+    }
+    if kind == "page" && !waiting && allowed == Some(false) {
+        return ClipboardStep::Close;
+    }
+    ClipboardStep::Shield {
+        run_immediately: !waiting,
+    }
+}
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_PAUSE: Duration = Duration::from_millis(500);
@@ -70,6 +119,9 @@ const FAILED_KEPT: Duration = Duration::from_secs(60);
 
 /// Kinds of target whose requests the guard intercepts on their own session.
 const INTERCEPTED: &[&str] = &["page", "iframe", "shared_worker", "service_worker"];
+/// How long the guard waits, after a (re)connect, for the targets that were already there to
+/// be set up before it lets commands through.
+const EARLY_SETUP_LIMIT: Duration = Duration::from_secs(10);
 
 /// Resolves host names for the guard. `PEGBOARD_TEST_HOST_RULES` (tests only) holds the
 /// `--host-resolver-rules` the browser was started with; its `MAP <name> <ip>` entries are
@@ -363,6 +415,7 @@ struct Inner {
     ws_url: String,
     human_context: String,
     policy_of: PolicyOf,
+    clipboard_of: ClipboardOf,
     own_ports: OwnPorts,
     resolver: Resolver,
     state: Mutex<State>,
@@ -408,6 +461,7 @@ impl Guard {
         ws_url: &str,
         human_context: &str,
         policy_of: PolicyOf,
+        clipboard_of: ClipboardOf,
         own_ports: OwnPorts,
         resolver: Resolver,
     ) -> Guard {
@@ -415,6 +469,7 @@ impl Guard {
             ws_url: ws_url.to_string(),
             human_context: human_context.to_string(),
             policy_of,
+            clipboard_of,
             own_ports,
             resolver,
             state: Mutex::new(State::default()),
@@ -584,32 +639,55 @@ impl Inner {
         if self.hold_until.lock().unwrap().is_some() {
             return;
         }
+        // The targets that were there already were attached while auto-attach was turned on
+        // (their events are queued): they are set up (a clipboard-denied tab among them
+        // closed) before commands are let through again.
+        let mut early = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.method == "Target.attachedToTarget" {
+                early.push(self.on_attached(&conn, event));
+            } else {
+                self.on_event(&conn, event);
+            }
+        }
+        let set_up = async {
+            for handle in early {
+                let _ = handle.await;
+            }
+        };
+        let _ = tokio::time::timeout(EARLY_SETUP_LIMIT, set_up).await;
         self.ready.send_replace(true);
         self.changed.send_modify(|n| *n += 1);
         while let Some(event) = events.recv().await {
-            match event.method.as_str() {
-                "Target.attachedToTarget" => self.on_attached(&conn, event),
-                "Target.detachedFromTarget" => self.on_detached(&event),
-                "Fetch.requestPaused" => {
-                    let Some(session) = event.session_id.clone() else {
-                        continue;
-                    };
-                    let context = {
-                        let state = self.state.lock().unwrap();
-                        state.sessions.get(&session).map(|a| a.context.clone())
-                    };
-                    let me = self.clone();
-                    let conn = conn.clone();
-                    tokio::spawn(async move {
-                        me.on_paused(&conn, &session, context, &event.params).await;
-                    });
-                }
-                _ => {}
-            }
+            self.on_event(&conn, event);
         }
     }
 
-    fn on_attached(self: &Arc<Self>, conn: &CdpConn, event: CdpEvent) {
+    fn on_event(self: &Arc<Self>, conn: &CdpConn, event: CdpEvent) {
+        match event.method.as_str() {
+            "Target.attachedToTarget" => drop(self.on_attached(conn, event)),
+            "Target.detachedFromTarget" => self.on_detached(&event),
+            "Fetch.requestPaused" => {
+                let Some(session) = event.session_id.clone() else {
+                    return;
+                };
+                let context = {
+                    let state = self.state.lock().unwrap();
+                    state.sessions.get(&session).map(|a| a.context.clone())
+                };
+                let me = self.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    me.on_paused(&conn, &session, context, &event.params).await;
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Sets up (or lets go) the attached target in a task of its own; the handle tells when
+    /// that is done.
+    fn on_attached(self: &Arc<Self>, conn: &CdpConn, event: CdpEvent) -> JoinHandle<()> {
         let p = &event.params;
         let s = |ptr: &str| p.pointer(ptr).and_then(Value::as_str).unwrap_or_default();
         let session = s("/sessionId").to_string();
@@ -647,13 +725,14 @@ impl Inner {
             let outcome = if foreign {
                 release(&conn, &session, parent.as_deref()).await
             } else {
-                me.set_up(&conn, &session, &target, &kind, waiting).await
+                me.set_up(&conn, &session, &target, &kind, &context, waiting)
+                    .await
             };
             me.log_attach(format!(
                 "{target} {kind} {whose} waiting={waiting} parent={} -> {outcome}",
                 parent.is_some()
             ));
-        });
+        })
     }
 
     fn log_attach(&self, line: String) {
@@ -664,19 +743,38 @@ impl Inner {
         state.attach_log.push_back(line);
     }
 
-    /// Turns interception on for an agent target and resumes it. A tab that cannot be
-    /// guarded is closed; a frame or worker is left waiting. Returns what happened (for the
-    /// diagnostics log).
+    /// Shields an agent target's documents from the clipboard events (`clipboard_step`),
+    /// turns interception on for it and resumes it. A tab that cannot be guarded is closed; a
+    /// frame or worker is left waiting. Returns what happened (for the diagnostics log).
     async fn set_up(
         &self,
         conn: &CdpConn,
         session: &str,
         target: &str,
         kind: &str,
+        context: &str,
         waiting: bool,
     ) -> String {
         let s = Some(session);
+        let step = clipboard_step(kind, waiting, (self.clipboard_of)(context));
+        if step == ClipboardStep::Close {
+            self.set_page(kind, target, Status::Failed(std::time::Instant::now()));
+            let closed = outcome(
+                conn.send("Target.closeTarget", json!({ "targetId": target }), None)
+                    .await,
+            );
+            return format!("closed: older than the guard, clipboard denied ({closed})");
+        }
         let result = async {
+            if let ClipboardStep::Shield { run_immediately } = step {
+                conn.send("Page.enable", json!({}), s).await?;
+                let mut params = json!({ "source": CLIPBOARD_SHIELD });
+                if run_immediately {
+                    params["runImmediately"] = json!(true);
+                }
+                conn.send("Page.addScriptToEvaluateOnNewDocument", params, s)
+                    .await?;
+            }
             if matches!(kind, "page" | "iframe") {
                 conn.send(
                     "Target.setAutoAttach",
@@ -1143,6 +1241,102 @@ mod tests {
         SessionPolicy {
             allow_domains: domains.iter().map(|d| d.to_string()).collect(),
             ..SessionPolicy::default()
+        }
+    }
+
+    #[test]
+    fn what_the_guard_does_for_the_clipboard() {
+        use ClipboardStep::*;
+        let table: &[(&str, bool, Option<bool>, ClipboardStep)] = &[
+            // New pages and frames, held from their start: the shield before the first script.
+            (
+                "page",
+                true,
+                Some(false),
+                Shield {
+                    run_immediately: false,
+                },
+            ),
+            (
+                "iframe",
+                true,
+                Some(false),
+                Shield {
+                    run_immediately: false,
+                },
+            ),
+            // A context no session holds: shielded too (closed unless allowed).
+            (
+                "page",
+                true,
+                None,
+                Shield {
+                    run_immediately: false,
+                },
+            ),
+            // A frame that runs already (a sandboxed srcdoc frame, spike C12c): into the
+            // running document as well.
+            (
+                "iframe",
+                false,
+                Some(false),
+                Shield {
+                    run_immediately: true,
+                },
+            ),
+            (
+                "iframe",
+                false,
+                None,
+                Shield {
+                    run_immediately: true,
+                },
+            ),
+            // A tab older than the guard in a profile whose sessions deny the clipboard: an
+            // agent session on it may be older than the guard's (spike C12a). Closed.
+            ("page", false, Some(false), Close),
+            // ... but a tab no session's policy is about is shielded where it stands.
+            (
+                "page",
+                false,
+                None,
+                Shield {
+                    run_immediately: true,
+                },
+            ),
+            // Sessions that allow the clipboard: nothing.
+            ("page", true, Some(true), Leave),
+            ("page", false, Some(true), Leave),
+            ("iframe", false, Some(true), Leave),
+            // Workers have no document.
+            ("service_worker", true, Some(false), Leave),
+            ("shared_worker", false, None, Leave),
+            ("worker", true, Some(false), Leave),
+        ];
+        for (kind, waiting, allowed, step) in table {
+            assert_eq!(
+                clipboard_step(kind, *waiting, *allowed),
+                *step,
+                "{kind} waiting={waiting} allowed={allowed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shield_is_the_measured_script() {
+        // L_hard2 of spike 23 (round 4, C12): saved references called through Reflect.apply,
+        // capture listeners on the window and the document for every clipboard event.
+        for part in [
+            "const ap=Reflect.apply",
+            "pd=Event.prototype.preventDefault",
+            "sip=Event.prototype.stopImmediatePropagation",
+            "ael=EventTarget.prototype.addEventListener",
+            "ap(pd,e,[]);ap(sip,e,[])",
+            "for(const t of [window,document])",
+            r#"["copy","cut","paste","beforecopy","beforecut","beforepaste"]"#,
+            "ap(ael,t,[n,f,true])",
+        ] {
+            assert!(CLIPBOARD_SHIELD.contains(part), "{part}");
         }
     }
 

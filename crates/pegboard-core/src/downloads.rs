@@ -466,6 +466,21 @@ struct Policy {
     generation: u64,
     /// A task is setting the policy again.
     reapplying: bool,
+    /// Whether the profile's sessions deny the clipboard (`apply_clipboard`). Then
+    /// `clipboard` is the connection that set `clipboard-read` and `clipboard-write` to
+    /// denied for the profile: Chrome lifts the denial when it closes (spike C2), and closing
+    /// it is how the denial is lifted on purpose.
+    clipboard_denied: bool,
+    clipboard: Option<CdpConn>,
+    /// Bumped with every clipboard connection, like `generation`.
+    clipboard_generation: u64,
+}
+
+impl Policy {
+    /// Whether the clipboard is as the profile's sessions want it.
+    fn clipboard_ready(&self) -> bool {
+        !self.clipboard_denied || self.clipboard.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,6 +571,9 @@ struct Inner {
 /// - When a policy connection ends, the profile is marked not ready (the daemon refuses its
 ///   sessions' commands), its running downloads are cancelled and the policy set again on a
 ///   new connection; after `REAPPLY_LIMIT` the `PolicyLost` callback closes its sessions.
+/// - The clipboard denial of a profile whose sessions deny the clipboard
+///   (`apply_clipboard`) lives the same way on a second connection of its own: one that only
+///   ever sets permissions, so closing it to lift the denial leaves the download policy be.
 pub struct Downloads {
     inner: Arc<Inner>,
     sweeper: JoinHandle<()>,
@@ -571,7 +589,8 @@ impl Drop for Downloads {
             .unwrap()
             .policies
             .values_mut()
-            .filter_map(|p| p.conn.take())
+            .flat_map(|p| [p.conn.take(), p.clipboard.take()])
+            .flatten()
             .collect();
         for conn in conns {
             conn.close();
@@ -633,17 +652,60 @@ impl Downloads {
             .context("could not set pegboard's download policy in the agent profile")
     }
 
+    /// Sets whether the profile (browser context `context`, under pegboard's download
+    /// policy already: `apply`) denies the clipboard, as its sessions' policies say. Denied:
+    /// `Browser.setPermission` sets `clipboard-read` and `clipboard-write` to denied for the
+    /// whole profile on a connection of its own, kept open (spikes C2, E2, E3); the profile
+    /// is made the default context for it if it is not (a tab of it activated: never call
+    /// this from a path a page can trigger). Allowed: that connection is closed, which lifts
+    /// the denial. An error leaves the profile not ready: the caller must not use it.
+    pub async fn apply_clipboard(&self, context: &str, denied: bool) -> Result<()> {
+        if context.is_empty() || context == self.inner.human_context {
+            bail!("refusing to set a clipboard policy on the human or an unknown context");
+        }
+        let _one = self.inner.applying.lock().await;
+        let lifted = {
+            let mut state = self.inner.state.lock().unwrap();
+            let Some(policy) = state.policies.get_mut(context) else {
+                bail!("the profile has no download policy");
+            };
+            policy.clipboard_denied = denied;
+            if denied {
+                None
+            } else {
+                // Its end is not a loss.
+                policy.clipboard_generation += 1;
+                policy.clipboard.take()
+            }
+        };
+        if let Some(conn) = lifted {
+            conn.close();
+        }
+        if self.inner.clipboard_ready(context) {
+            return Ok(());
+        }
+        self.inner
+            .deny_clipboard(context, FIRST_TRIES)
+            .await
+            .context("could not deny the clipboard in the agent profile")
+    }
+
     /// The context is gone (Chrome unloaded the profile): its policy went with it.
     pub fn forget_context(&self, context: &str) {
         let removed = self.inner.state.lock().unwrap().policies.remove(context);
-        if let Some(conn) = removed.and_then(|p| p.conn) {
-            conn.close();
+        for conn in removed.into_iter().flat_map(|p| [p.conn, p.clipboard]) {
+            conn.into_iter().for_each(|c| c.close());
         }
     }
 
     /// Whether the context's download policy is in place.
     pub fn is_ready(&self, context: &str) -> bool {
         self.inner.is_ready(context)
+    }
+
+    /// Whether the context's clipboard is as its sessions want it (denied unless allowed).
+    pub fn clipboard_ready(&self, context: &str) -> bool {
+        self.inner.clipboard_ready(context)
     }
 
     pub fn set_session_lookup(&self, lookup: SessionLookup) {
@@ -749,6 +811,27 @@ impl Downloads {
         self.inner.root.join(profile_dir)
     }
 
+    /// Test hook: closes the context's clipboard connection as a failure would and keeps a
+    /// new one from being made for `hold`. The caller gates it. False when there is none.
+    #[doc(hidden)]
+    pub fn drop_clipboard_for_test(&self, context: &str, hold: Duration) -> bool {
+        let conn = {
+            let state = self.inner.state.lock().unwrap();
+            state
+                .policies
+                .get(context)
+                .and_then(|p| p.clipboard.clone())
+        };
+        match conn {
+            Some(conn) => {
+                *self.inner.hold_until.lock().unwrap() = Some(tokio::time::Instant::now() + hold);
+                conn.close();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Test hook: closes the context's policy connection as a failure would and keeps a new
     /// one from being made for `hold`. The caller gates it.
     #[doc(hidden)]
@@ -794,6 +877,15 @@ impl Inner {
             .policies
             .get(context)
             .is_some_and(|p| p.ready)
+    }
+
+    fn clipboard_ready(&self, context: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .policies
+            .get(context)
+            .is_some_and(Policy::clipboard_ready)
     }
 
     fn lookup(&self, session: &SessionId) -> Option<SessionView> {
@@ -911,6 +1003,9 @@ impl Inner {
                     ready: false,
                     generation: 0,
                     reapplying: false,
+                    clipboard_denied: false,
+                    clipboard: None,
+                    clipboard_generation: 0,
                 });
             policy.generation += 1;
             policy.staging = staging;
@@ -937,6 +1032,95 @@ impl Inner {
                 inner.connection_ended(&context, generation);
             }
         });
+    }
+
+    /// Denies the clipboard of `context` on a new connection: the profile is made the
+    /// default context (as `establish` does), then `clipboard-read` and `clipboard-write` are
+    /// set to denied for it. The caller holds `applying`.
+    async fn deny_clipboard(self: &Arc<Self>, context: &str, tries: u32) -> Result<()> {
+        let (conn, events) = CdpConn::connect_queued(&self.ws_url).await?;
+        let mut last = anyhow!("the profile did not become the default context");
+        'attempt: for attempt in 0..tries {
+            if attempt > 0 {
+                tokio::time::sleep(RETRY_PAUSE).await;
+            }
+            // Not page-triggered (a session being created, a lost connection): see
+            // `establish`.
+            if !self.is_default(context).await {
+                if let Err(e) = self.activate(context).await {
+                    last = e;
+                    continue;
+                }
+                if !self.is_default(context).await {
+                    continue;
+                }
+            }
+            for name in ["clipboard-read", "clipboard-write"] {
+                let set = conn
+                    .send(
+                        "Browser.setPermission",
+                        json!({
+                            "permission": { "name": name },
+                            "setting": "denied",
+                            "browserContextId": context,
+                        }),
+                        None,
+                    )
+                    .await;
+                if let Err(e) = set {
+                    last = e;
+                    continue 'attempt;
+                }
+            }
+            let installed = {
+                let mut state = self.state.lock().unwrap();
+                match state.policies.get_mut(context) {
+                    // Still wanted (an `apply_clipboard` that allows waits for `applying`).
+                    Some(p) if p.clipboard_denied => {
+                        p.clipboard_generation += 1;
+                        let old = p.clipboard.replace(conn.clone());
+                        Some((p.clipboard_generation, old))
+                    }
+                    _ => None,
+                }
+            };
+            let Some((generation, old)) = installed else {
+                conn.close();
+                return Ok(());
+            };
+            if let Some(old) = old {
+                old.close();
+            }
+            let weak = Arc::downgrade(self);
+            let context = context.to_string();
+            let mut events = events;
+            tokio::spawn(async move {
+                while events.recv().await.is_some() {}
+                if let Some(inner) = weak.upgrade() {
+                    inner.clipboard_ended(&context, generation);
+                }
+            });
+            return Ok(());
+        }
+        conn.close();
+        Err(last)
+    }
+
+    fn clipboard_ended(self: &Arc<Self>, context: &str, generation: u64) {
+        let start = {
+            let mut state = self.state.lock().unwrap();
+            match state.policies.get_mut(context) {
+                Some(p) if p.clipboard_generation == generation => {
+                    p.clipboard = None;
+                    p.clipboard_denied && !std::mem::replace(&mut p.reapplying, true)
+                }
+                _ => false,
+            }
+        };
+        if start {
+            eprintln!("pegboard: a clipboard policy connection ended; setting it again");
+            tokio::spawn(reapply(Arc::downgrade(self), context.to_string()));
+        }
     }
 
     fn connection_ended(self: &Arc<Self>, context: &str, generation: u64) {
@@ -1467,7 +1651,8 @@ fn now() -> String {
         .unwrap_or_default()
 }
 
-/// Sets a context's policy again after its connection ended, until it is in place. When
+/// Sets a context's policy (its download policy, and its clipboard denial when its sessions
+/// deny the clipboard) again after its connection ended, until it is in place. When
 /// that takes longer than `REAPPLY_LIMIT` it tells `PolicyLost` (the daemon closes the
 /// profile's sessions) and stops: no window is brought forward again and again. The
 /// profile stays not ready; the next session opened in it sets the policy anew (`apply`).
@@ -1481,7 +1666,7 @@ async fn reapply(weak: Weak<Inner>, context: String) {
         let profile_dir = {
             let mut state = inner.state.lock().unwrap();
             match state.policies.get_mut(&context) {
-                Some(p) if !p.ready => p.profile_dir.clone(),
+                Some(p) if !(p.ready && p.clipboard_ready()) => p.profile_dir.clone(),
                 Some(p) => {
                     p.reapplying = false;
                     return;
@@ -1504,19 +1689,25 @@ async fn reapply(weak: Weak<Inner>, context: String) {
             Err(anyhow!("held by a test"))
         } else {
             let _one = inner.applying.lock().await;
-            if inner.is_ready(&context) {
-                Ok(())
-            } else {
-                inner.establish(&context, &profile_dir, AGAIN_TRIES).await
+            let mut result = Ok(());
+            if !inner.is_ready(&context) {
+                result = inner.establish(&context, &profile_dir, AGAIN_TRIES).await;
             }
+            if result.is_ok() && !inner.clipboard_ready(&context) {
+                result = inner
+                    .deny_clipboard(&context, AGAIN_TRIES)
+                    .await
+                    .context("denying the clipboard");
+            }
+            result
         };
         match result {
             Ok(()) => {
-                eprintln!("pegboard: the download policy is set again");
+                eprintln!("pegboard: the download policy (and clipboard denial) is set again");
                 return;
             }
             Err(e) if !held => {
-                eprintln!("pegboard: setting the download policy again failed: {e:#}")
+                eprintln!("pegboard: setting the download policy (or clipboard denial) again failed: {e:#}")
             }
             Err(_) => {}
         }
@@ -1524,7 +1715,7 @@ async fn reapply(weak: Weak<Inner>, context: String) {
             if let Some(p) = inner.state.lock().unwrap().policies.get_mut(&context) {
                 p.reapplying = false;
             }
-            eprintln!("pegboard: gave up setting the download policy again");
+            eprintln!("pegboard: gave up setting the download policy (or clipboard denial) again");
             let lost = inner.lost.lock().unwrap().clone();
             if let Some(lost) = lost {
                 lost(&context);

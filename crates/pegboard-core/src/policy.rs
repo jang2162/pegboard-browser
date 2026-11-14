@@ -290,6 +290,15 @@ impl PinTable {
     }
 }
 
+impl PinTable {
+    /// Whether the profile's sessions allow the clipboard, `None` when no session holds the
+    /// profile.
+    pub fn clipboard(&self, profile: &str) -> Option<bool> {
+        let table = self.pinned.lock().unwrap();
+        table.get(profile).map(|(pins, _)| pins.clipboard)
+    }
+}
+
 fn conflict(profile: &str, held: &ProfilePins, wanted: &ProfilePins) -> RpcError {
     let mut items = Vec::new();
     if held.clipboard != wanted.clipboard {
@@ -680,6 +689,20 @@ mod tests {
         assert!(table.acquire("p", b.clone()).is_err());
         records.remove(&2);
         assert!(table.acquire("p", b).is_ok());
+    }
+
+    #[test]
+    fn the_guard_reads_whether_a_profile_allows_the_clipboard() {
+        let table = PinTable::default();
+        assert_eq!(table.clipboard("p"), None);
+        let denied = table.acquire("p", pins(false, &[], false, false)).unwrap();
+        let allowed = table.acquire("q", pins(true, &[], false, false)).unwrap();
+        assert_eq!(table.clipboard("p"), Some(false));
+        assert_eq!(table.clipboard("q"), Some(true));
+        drop(denied);
+        drop(allowed);
+        assert_eq!(table.clipboard("p"), None);
+        assert_eq!(table.clipboard("q"), None);
     }
 
     #[test]
