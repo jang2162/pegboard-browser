@@ -85,7 +85,33 @@ pw.addEventListener('input', () => { if (pw.value.length >= 8) pw.form.submit();
 }
 
 /// `/dl/<name>` is served as an attachment named `<name>`, `/zip/<name>` as a plain zip.
+/// `/linkto/<rest>` is a page whose `#go` links to `/<rest>`. `/xsite/<rest>` frames
+/// `/inner/<rest>` from `localhost` (another site than the page's 127.0.0.1, so a separate
+/// frame target), whose `#go` links to `/<rest>`.
 fn download_route(path: &str) -> Option<(String, String)> {
+    let html = |body: String| Some(("content-type: text/html\r\n".to_string(), body));
+    if let Some(rest) = path.strip_prefix("/linkto/") {
+        return html(page(
+            "link",
+            &format!(r#"<a id="go" href="/{rest}">go</a>"#),
+        ));
+    }
+    if let Some(rest) = path.strip_prefix("/inner/") {
+        return html(page(
+            "inner",
+            &format!(r#"<a id="go" href="/{rest}">go</a>"#),
+        ));
+    }
+    if let Some(rest) = path.strip_prefix("/xsite/") {
+        return html(page(
+            "xsite",
+            &format!(
+                r#"<iframe id="fr"></iframe><script>
+document.getElementById('fr').src = 'http://localhost:' + location.port + '/inner/{rest}';
+</script>"#
+            ),
+        ));
+    }
     if let Some(name) = path.strip_prefix("/dl/") {
         return Some((
             format!(
@@ -264,6 +290,62 @@ fn oversized_route(path: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// What became of each `/slow/` stream, by name: `done` (all sent) or `cut` (the client
+/// closed the connection first).
+static STREAMS: std::sync::Mutex<Option<std::collections::HashMap<String, &'static str>>> =
+    std::sync::Mutex::new(None);
+
+pub fn stream_outcome(name: &str) -> Option<&'static str> {
+    STREAMS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(name).copied())
+}
+
+/// `/slow/<bytes>/<len|nolen>/<name>`: an attachment named `<name>` of `<bytes>` bytes sent
+/// 128 KiB every 100 ms (about 1.3 MB/s), with or without `Content-Length`.
+async fn serve_slow(sock: &mut tokio::net::TcpStream, rest: &str) {
+    let mut parts = rest.splitn(3, '/');
+    let (Some(bytes), Some(len), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        return;
+    };
+    let Ok(total) = bytes.parse::<usize>() else {
+        return;
+    };
+    let length = if len == "len" {
+        format!("content-length: {total}\r\n")
+    } else {
+        String::new()
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-disposition: attachment; filename=\"{name}\"\r\n{length}connection: close\r\n\r\n"
+    );
+    let mut outcome = "done";
+    if sock.write_all(head.as_bytes()).await.is_err() {
+        outcome = "cut";
+    }
+    let chunk = vec![b'x'; 128 << 10];
+    let mut sent = 0;
+    while outcome == "done" && sent < total {
+        let n = chunk.len().min(total - sent);
+        if sock.write_all(&chunk[..n]).await.is_err() {
+            outcome = "cut";
+            break;
+        }
+        sent += n;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if outcome == "done" {
+        let _ = sock.shutdown().await;
+    }
+    STREAMS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(name.to_string(), outcome);
+}
+
 async fn serve(mut sock: tokio::net::TcpStream) {
     let mut buf = vec![0u8; 8192];
     let Ok(n) = sock.read(&mut buf).await else {
@@ -276,6 +358,11 @@ async fn serve(mut sock: tokio::net::TcpStream) {
         .and_then(|l| l.split(' ').nth(1))
         .and_then(|p| p.split('?').next())
         .unwrap_or("/");
+    if let Some(rest) = path.strip_prefix("/slow/") {
+        let rest = rest.to_string();
+        serve_slow(&mut sock, &rest).await;
+        return;
+    }
     if let Some(bytes) = oversized_route(path) {
         let _ = sock.write_all(&bytes).await;
         let _ = sock.shutdown().await;
@@ -653,6 +740,9 @@ impl Shared {
             format!("MAP {PUBLIC_NAME} 127.0.0.1"),
         );
         std::env::set_var("PEGBOARD_TEST_HOOKS", "1");
+        // 4 MiB a download, 6 MiB a session (and a profile's running downloads), so the
+        // limits can be reached by the slow fixture streams.
+        std::env::set_var("PEGBOARD_TEST_DOWNLOAD_LIMITS", "4194304,6291456");
         let env = env();
         let public_fixture = fixture().await;
         let fixture = self::fixture().await;

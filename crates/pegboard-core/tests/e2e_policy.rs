@@ -723,3 +723,369 @@ fn download_policy_is_reapplied_after_its_connection_drops() {
         h.finish().await;
     });
 }
+
+// ---- downloads while they run (limits 4 MiB a file, 6 MiB a session: `common::Shared`) ----
+
+fn log_for(h: &Harness, info: &SessionInfo) -> ActionLog {
+    let manifest = Manifest::new(
+        &info.recording_id,
+        &info.id.0,
+        &info.name,
+        &info.profile,
+        &info.created_at,
+        "test",
+        "0.42.0",
+    );
+    ActionLog::open(&h.env.paths, manifest).unwrap()
+}
+
+/// Clicks `#go` in the tab from the test's own connection (no command, no activation),
+/// once the page has it (10 s at most).
+async fn click_go(h: &Harness, target: &str) {
+    let click = "(() => { const a = document.getElementById('go'); \
+                 if (!a) return false; a.click(); return true; })()";
+    for _ in 0..100 {
+        if h.eval(target, click).await == json!(true) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no #go in {target}");
+}
+
+/// Waits up to `secs` for the fixture's stream `name` to end; its outcome.
+async fn stream_end(name: &str, secs: u64) -> Option<&'static str> {
+    common::eventually(secs, || async { common::stream_outcome(name).is_some() }).await;
+    common::stream_outcome(name)
+}
+
+/// Runs `get url` until the outputs have told about `n` downloads (20 s at most).
+async fn told(
+    h: &Harness,
+    log: &mut ActionLog,
+    info: &SessionInfo,
+    n: usize,
+) -> Vec<serde_json::Value> {
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        if let Ok(r) = get_url(h, log, info).await {
+            seen.extend(
+                r.output["downloads"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        if seen.len() >= n {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    seen
+}
+
+/// The staging directory of the default agent profile is empty within 5 s.
+async fn staging_empties(h: &Harness) -> bool {
+    let staging = h.browser.downloads.staging_dir("PegboardAgent");
+    common::eventually(5, || async {
+        std::fs::read_dir(&staging)
+            .map(|d| d.count() == 0)
+            .unwrap_or(true)
+    })
+    .await
+}
+
+/// A download that grows past the file limit while it runs is cancelled then (the server
+/// sees the connection cut), with and without a declared length; it is reported once with
+/// the reason and leaves nothing behind.
+#[test]
+#[ignore]
+fn a_running_download_over_the_limit_is_cancelled() {
+    common::run(async {
+        let h = Harness::start();
+        for len in ["len", "nolen"] {
+            let probe = common::DownloadProbe::new();
+            let name = format!("{}-{len}", probe.token);
+            let (info, _) = h
+                .session(&format!("/linkto/slow/{}/{len}/{name}", 16 << 20))
+                .await;
+            let mut log = log_for(&h, &info);
+            let tab = h.manager.info(&info.id).unwrap().targets[0].clone();
+            click_go(&h, &tab).await;
+            assert_eq!(stream_end(&name, 20).await, Some("cut"), "{len}");
+            let seen = told(&h, &mut log, &info, 1).await;
+            assert_eq!(
+                seen,
+                [json!({ "name": name, "dropped": "file larger than 4 MiB" })],
+                "{len}"
+            );
+            assert!(staging_empties(&h).await, "{len}: staged file left");
+            assert!(!h.env.paths.session_files(&info.id).join(&name).exists());
+            assert!(probe.in_real_downloads().is_empty());
+            eprintln!("{len}: cancels {:?}", h.browser.downloads.cancel_counts());
+        }
+        h.finish().await;
+    });
+}
+
+/// Two downloads of one session that each fit but together pass the session limit while
+/// they run: one is cut while running, the other is saved.
+#[test]
+#[ignore]
+fn parallel_downloads_over_the_session_limit_are_cut_while_running() {
+    common::run(async {
+        let h = Harness::start();
+        let probe = common::DownloadProbe::new();
+        let size = 3584 << 10; // 3.5 MiB each: 7 MiB together, over 6 MiB
+        let names = [format!("{}-a", probe.token), format!("{}-b", probe.token)];
+        let (info, _) = h
+            .session(&format!("/linkto/slow/{size}/nolen/{}", names[0]))
+            .await;
+        let mut log = log_for(&h, &info);
+        let first = h.manager.info(&info.id).unwrap().targets[0].clone();
+        let second = h
+            .manager
+            .new_tab(
+                &info.id,
+                &format!("{}/linkto/slow/{size}/nolen/{}", h.fixture.origin, names[1]),
+            )
+            .await
+            .unwrap();
+        click_go(&h, &first).await;
+        click_go(&h, &second).await;
+        let outcomes = [
+            stream_end(&names[0], 20).await,
+            stream_end(&names[1], 20).await,
+        ];
+        eprintln!("outcomes {outcomes:?}");
+        assert_eq!(
+            outcomes.iter().filter(|o| **o == Some("cut")).count(),
+            1,
+            "{outcomes:?}"
+        );
+        let mut seen = told(&h, &mut log, &info, 2).await;
+        seen.sort_by_key(|d| d["name"].as_str().unwrap_or_default().to_string());
+        let dropped: Vec<_> = seen.iter().filter(|d| d.get("dropped").is_some()).collect();
+        let saved: Vec<_> = seen.iter().filter(|d| d["bytes"] == size).collect();
+        assert_eq!(dropped.len(), 1, "{seen:?}");
+        assert_eq!(saved.len(), 1, "{seen:?}");
+        assert_eq!(
+            dropped[0]["dropped"], "session download limit of 6 MiB reached",
+            "{seen:?}"
+        );
+        assert!(staging_empties(&h).await);
+        assert!(probe.in_real_downloads().is_empty());
+        h.finish().await;
+    });
+}
+
+/// Measurement and check: with the human's profile the browser's default context, a running
+/// download of the agent profile over the limit is still cut. Prints which way the cancel
+/// went (at once, or after making the agent profile the default).
+#[test]
+#[ignore]
+fn a_limit_cancel_works_when_the_agent_profile_is_not_the_default() {
+    common::run(async {
+        let h = Harness::start();
+        let probe = common::DownloadProbe::new();
+        let name = format!("{}-nd", probe.token);
+        let (info, _) = h
+            .session(&format!("/linkto/slow/{}/nolen/{name}", 16 << 20))
+            .await;
+        let mut log = log_for(&h, &info);
+        let tab = h.manager.info(&info.id).unwrap().targets[0].clone();
+        let conn = &h.browser.conn;
+        let human = human_page(&h.browser).await;
+        assert!(
+            common::establish_human_premise(&h.env, conn, &h.browser.human_context, &human).await,
+            "premise: the human's profile could not be made the default context"
+        );
+        let default = conn
+            .send("Target.getBrowserContexts", json!({}), None)
+            .await
+            .unwrap()["defaultBrowserContextId"]
+            .clone();
+        assert_eq!(default, json!(h.browser.human_context), "premise");
+        let before = h.browser.downloads.cancel_counts();
+        click_go(&h, &tab).await;
+        assert_eq!(stream_end(&name, 20).await, Some("cut"));
+        let after = h.browser.downloads.cancel_counts();
+        eprintln!("cancels [at once, after activation, failed]: before {before:?} after {after:?}");
+        let seen = told(&h, &mut log, &info, 1).await;
+        assert_eq!(
+            seen,
+            [json!({ "name": name, "dropped": "file larger than 4 MiB" })]
+        );
+        assert!(staging_empties(&h).await);
+        assert!(probe.in_real_downloads().is_empty());
+        h.finish().await;
+    });
+}
+
+/// A link clicked inside a cross-site frame (its own frame target): the download is found
+/// through that target's parent frame (spike F1b) and saved for the tab's session.
+#[test]
+#[ignore]
+fn a_download_from_a_cross_site_frame_belongs_to_its_tabs_session() {
+    common::run(async {
+        let h = Harness::start();
+        let probe = common::DownloadProbe::new();
+        let (info, _) = h.session(&format!("/xsite/dl/{}", probe.token)).await;
+        let mut log = log_for(&h, &info);
+        let conn = &h.browser.conn;
+        // Premise: the frame is a target of its own.
+        let mut frame = None;
+        for _ in 0..50 {
+            let r = conn
+                .send("Target.getTargets", json!({}), None)
+                .await
+                .unwrap();
+            frame = r["targetInfos"].as_array().unwrap().iter().find_map(|t| {
+                (t["type"] == "iframe" && t["url"].as_str().unwrap_or("").contains("/inner/"))
+                    .then(|| t["targetId"].as_str().unwrap().to_string())
+            });
+            if frame.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let frame = frame.expect("premise: the cross-site frame is its own target");
+        h.eval(&frame, "document.getElementById('go').click(); 1")
+            .await;
+        let saved = h.env.paths.session_files(&info.id).join(&probe.token);
+        assert!(
+            common::eventually(15, || async { saved.exists() }).await,
+            "not saved for the tab's session"
+        );
+        let seen = told(&h, &mut log, &info, 1).await;
+        assert_eq!(seen, [json!({ "name": probe.token, "bytes": 22 })]);
+        assert!(probe.in_real_downloads().is_empty());
+        h.finish().await;
+    });
+}
+
+/// A new tab whose first navigation is a download closes (spike F4); its download is still
+/// the session's: through the agent's `tab new <url>` (a client-made tab) and through the
+/// manager's own `new_tab`.
+#[test]
+#[ignore]
+fn a_new_tab_that_only_downloads_is_its_sessions() {
+    common::run(async {
+        let h = Harness::start();
+        let (info, _) = h.session("/counter").await;
+        let mut log = log_for(&h, &info);
+        let files = h.env.paths.session_files(&info.id);
+        let via_agent = common::DownloadProbe::new();
+        let r = run_command(
+            &h.manager,
+            &h.runner,
+            &h.env.paths,
+            &mut log,
+            &info.id,
+            &common::s(&[
+                "tab",
+                "new",
+                &format!("{}/dl/{}", h.fixture.origin, via_agent.token),
+            ]),
+            Some(30_000),
+        )
+        .await;
+        eprintln!("tab new: {r:?}");
+        assert!(
+            common::eventually(15, || async { files.join(&via_agent.token).exists() }).await,
+            "tab new: not saved for the session"
+        );
+        let via_manager = common::DownloadProbe::new();
+        let r = h
+            .manager
+            .new_tab(
+                &info.id,
+                &format!("{}/dl/{}", h.fixture.origin, via_manager.token),
+            )
+            .await;
+        eprintln!("new_tab: {r:?}");
+        assert!(
+            common::eventually(15, || async { files.join(&via_manager.token).exists() }).await,
+            "new_tab: not saved for the session"
+        );
+        assert!(via_agent.in_real_downloads().is_empty());
+        assert!(via_manager.in_real_downloads().is_empty());
+        h.finish().await;
+    });
+}
+
+/// Closing a session while its download runs cancels the download; nothing is saved for
+/// the closed session and the staging directory empties.
+#[test]
+#[ignore]
+fn closing_a_session_cancels_its_running_download() {
+    common::run(async {
+        let h = Harness::start();
+        let probe = common::DownloadProbe::new();
+        let name = format!("{}-close", probe.token);
+        let (info, _) = h
+            .session(&format!("/linkto/slow/{}/nolen/{name}", 3584 << 10))
+            .await;
+        let tab = h.manager.info(&info.id).unwrap().targets[0].clone();
+        let staging = h.browser.downloads.staging_dir("PegboardAgent");
+        click_go(&h, &tab).await;
+        // Running: its file is in staging.
+        let running = common::eventually(5, || async {
+            std::fs::read_dir(&staging)
+                .map(|d| d.count() > 0)
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(running, "premise: the download did not start");
+        h.sh.close_session(&info.id).await;
+        assert_eq!(stream_end(&name, 20).await, Some("cut"));
+        assert!(staging_empties(&h).await);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!h.env.paths.session_files(&info.id).join(&name).exists());
+        assert!(probe.in_real_downloads().is_empty());
+        h.finish().await;
+    });
+}
+
+/// When the policy connection drops while a download runs, that download is cancelled
+/// (it would finish unseen, spike L5) and reported as dropped for that reason.
+#[test]
+#[ignore]
+fn a_download_running_when_the_policy_drops_is_cancelled() {
+    common::run(async {
+        let h = Harness::start();
+        let probe = common::DownloadProbe::new();
+        let name = format!("{}-lost", probe.token);
+        let (info, _) = h
+            .session(&format!("/linkto/slow/{}/nolen/{name}", 3584 << 10))
+            .await;
+        let mut log = log_for(&h, &info);
+        let tab = h.manager.info(&info.id).unwrap().targets[0].clone();
+        let staging = h.browser.downloads.staging_dir("PegboardAgent");
+        click_go(&h, &tab).await;
+        let running = common::eventually(5, || async {
+            std::fs::read_dir(&staging)
+                .map(|d| d.count() > 0)
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(running, "premise: the download did not start");
+        assert!(h
+            .manager
+            .drop_download_policy_for_test(&info.id, Duration::from_millis(500)));
+        assert_eq!(stream_end(&name, 20).await, Some("cut"));
+        let back = common::eventually(20, || async {
+            h.manager.require_downloads(&info.id).is_ok()
+        })
+        .await;
+        assert!(back);
+        let seen = told(&h, &mut log, &info, 1).await;
+        assert_eq!(
+            seen,
+            [json!({ "name": name, "dropped": pegboard_core::downloads::POLICY_LOST })]
+        );
+        assert!(staging_empties(&h).await);
+        assert!(probe.in_real_downloads().is_empty());
+        h.finish().await;
+    });
+}

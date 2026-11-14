@@ -2003,3 +2003,59 @@ fn download_from_a_private_address_is_judged_at_the_request_stage() {
     assert!(probe.in_real_downloads().is_empty());
     close(&h);
 }
+
+/// When the download policy of a profile cannot be set again within 5 s, the daemon closes
+/// that profile's sessions (the test holds the policy down through the daemon's test hook,
+/// which exists only with `PEGBOARD_TEST_HOOKS`). A session opened in the profile afterwards
+/// sets the policy anew and works.
+#[test]
+#[ignore]
+fn a_profile_whose_download_policy_stays_lost_loses_its_sessions() {
+    let home = shared_home();
+    let prof = profile("pol-dl-giveup");
+    let handle = create(&["--profile", prof, "--url", "about:blank"]);
+    let other = create(&["--url", "about:blank"]);
+    let paths = pegboard_core::paths::paths_in(home.path());
+    let r: serde_json::Value = pegboard_core::api::Client::connect(&paths)
+        .unwrap()
+        .call(
+            "test.dropDownloadPolicy",
+            json!({ "sessionId": id_of(&handle), "token": token_of(&handle), "holdMs": 8000 }),
+        )
+        .unwrap();
+    assert_eq!(r["dropped"], true, "{r}");
+    // Refused at once, closed after the give-up.
+    let (code, _, err) = home.run(&["--session", &handle, "get", "url"]);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("download policy") || err.contains("session_not_found"),
+        "{err}"
+    );
+    let mut closed = false;
+    for _ in 0..150 {
+        let (_, _, err) = home.run(&["session", "info", &handle]);
+        if err.contains("session_not_found") {
+            closed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(closed, "the session was not closed");
+    let log = std::fs::read_to_string(home.path().join("daemon.log")).unwrap_or_default();
+    eprintln!(
+        "daemon.log: {:?}",
+        log.lines()
+            .filter(|l| l.contains("download policy"))
+            .collect::<Vec<_>>()
+    );
+    // Another profile's session is untouched.
+    let (code, _, err) = home.run(&["--session", &other, "get", "url"]);
+    assert_eq!(code, 0, "{err}");
+    // After the hold, a new session in the profile sets the policy again.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let again = create(&["--profile", prof, "--url", "about:blank"]);
+    let (code, _, err) = home.run(&["--session", &again, "get", "url"]);
+    assert_eq!(code, 0, "{err}");
+    close(&again);
+    close(&other);
+}
