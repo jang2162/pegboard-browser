@@ -63,6 +63,7 @@ const DEF = {
   O_naive: [`Document.prototype.execCommand=function(){return false}`],
   O_hard: [`(()=>{const o=function execCommand(){return false};Object.defineProperty(Document.prototype,'execCommand',{value:o,writable:false,configurable:false})})()`],
 };
+DEF.L_hard2 = [`(()=>{const ap=Reflect.apply,pd=Event.prototype.preventDefault,sip=Event.prototype.stopImmediatePropagation,ael=EventTarget.prototype.addEventListener;const f=(e)=>{ap(pd,e,[]);ap(sip,e,[])};for(const t of [window,document])for(const n of ${JSON.stringify(NAMES)})ap(ael,t,[n,f,true]);window.__defL=1})()`];
 DEF.L_hard_O_hard = [...DEF.L_hard, ...DEF.O_hard];
 let installed = []; // {sessionId, identifier}
 async function install(name, conn = P, sid = ps) {
@@ -204,28 +205,30 @@ try {
     out.A2 = a2;
   }
   // ================= A3 =================
-  if (want('a3')) {
+  for (const a3Name of (want('a3') ? ['L_hard', 'L_hard_O_hard'] : [])) {
     await uninstall();
     const a3 = {};
     const injected = [];
     const early = [];
-    const defSrc = [...DEF.L_hard, ...DEF.O_hard].join(';');
+    const defSrc = DEF[a3Name].join(';');
     const b = P; // browser-level session of pegboardd
     const onAttach = async (p, sid) => {
       injected.push({ type: p.targetInfo.type, url: p.targetInfo.url.replace(/:\d+/, ':PORT'), waiting: p.waitingForDebugger });
       try {
         await b.send('Page.enable', {}, sid).catch(() => {});
-        await b.send('Page.addScriptToEvaluateOnNewDocument', { source: defSrc }, sid).catch(() => {});
+        const added = await b.send('Page.addScriptToEvaluateOnNewDocument', { source: defSrc }, sid).catch(() => null);
+        if (added) installed.push({ conn: b, sid, id: added.identifier }); // round 4: recorded so uninstall() removes it
         if (p.targetInfo.type === 'page' || p.targetInfo.type === 'iframe') await b.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sid).catch(() => {});
         await b.send('Runtime.runIfWaitingForDebugger', {}, sid).catch(() => {});
       } catch {}
     };
-    b.on('Target.attachedToTarget', (p, from) => { if (!from) onAttach(p, p.sessionId); else onAttach(p, p.sessionId); });
+    const a3Listener = (p) => onAttach(p, p.sessionId);
+    b.on('Target.attachedToTarget', a3Listener);
     await b.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
     await b.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, ps); // the existing agent tab: OOPIFs attach below its page session
     installed.push({ conn: b, sid: ps, id: (await b.send('Page.addScriptToEvaluateOnNewDocument', { source: defSrc }, ps)).identifier });
     await sleep(500);
-    const trialA3 = async (name, fn, expect = SEL) => { sys.set(SYSVAL); const detail = await fn(); await settle(); a3[name] = { sys: classify(SYSVAL, sys.get(), expect), page: detail }; rec(`A3.${name}`, `${a3[name].sys} | ${String(detail).slice(0, 260)}`); };
+    const trialA3 = async (name, fn, expect = SEL) => { sys.set(SYSVAL); const detail = await fn(); await settle(); a3[name] = { sys: classify(SYSVAL, sys.get(), expect), page: detail }; rec(`A3[${a3Name}].${name}`, `${a3[name].sys} | ${String(detail).slice(0, 260)}`); };
     // existing agent tab: the page session of P has nothing; navigate so the document is created after attach
     await AG.navigate(ags, `${O}/clip`).catch(() => {});
     // we cannot rely on the old tab (already running): open a NEW tab from the agent tab -> auto-attach path
@@ -260,17 +263,134 @@ try {
     // nested key path inside the iframe: click its textarea to focus then Meta+C with commands
     await trialA3('cross_site_iframe_key_Meta+C_commands', async () => {
       await clickAt(ags, 300 + 100, 20); await sleep(200);
-      await ev(ags, `1`);
+      await keyEv(ags, 'a', 'KeyA', 65, { commands: ['selectAll'] });
       await keyEv(ags, 'c', 'KeyC', 67, { commands: ['copy'] });
-      return 'typed into iframe textarea at (400,20), selection by key: none -> only text selected by the click';
+      return 'clicked the iframe textarea, commands selectAll then copy (key path inside the cross-site iframe)';
     }, SEL);
     // the window before injection: how many targets were attached with waitingForDebugger
-    rec('A3.attached', JSON.stringify(injected.map((i) => `${i.type}${i.waiting ? '(paused)' : '(running)'}`)));
+    rec(`A3[${a3Name}].attached`, JSON.stringify(injected.map((i) => `${i.type}${i.waiting ? '(paused)' : '(running)'}`)));
     a3.attached = injected;
     await b.send('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
     await b.send('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }, ps).catch(() => {});
+    b.off('Target.attachedToTarget', a3Listener); // round 4: this listener used to stay active and kept injecting O_hard into later runs (A7)
     await uninstall();
-    out.A3 = a3;
+    (out.A3 = out.A3 || {})[a3Name] = a3;
+  }
+  // ================= A7 (round 3, item 5) =================
+  if (want('a7')) {
+    await uninstall();
+    const a7 = {};
+    const unsetAuto = async () => { await P.send('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {}); await P.send('Target.setAutoAttach', { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }, ps).catch(() => {}); };
+    // ---- (a) agent session OLDER than pegboard's injecting session ----
+    // ags was created before this younger pegboard session, so the agent's scripts run first (see b9d).
+    const pyoung = await P.attach(env.agent.targetId);
+    await P.send('Page.enable', {}, pyoung);
+    const attacks = {
+      'i1 neutralise Event.prototype.preventDefault + stopImmediatePropagation before L_hard captures them': `Event.prototype.preventDefault=function(){};Event.prototype.stopImmediatePropagation=function(){};`,
+      'i2 EventTarget.prototype.addEventListener replaced by a no-op before L_hard registers': `EventTarget.prototype.addEventListener=function(){};`,
+      'i3 Function.prototype.call replaced (L_hard calls the saved originals through it)': `Function.prototype.call=function(){};`,
+      'ii agent registers its own window capture copy/cut listener FIRST that only calls stopImmediatePropagation': `(()=>{const f=(e)=>{e.stopImmediatePropagation()};for(const n of ['copy','cut'])window.addEventListener(n,f,true)})()`,
+      'i4 agent saves pristine references on window, no tampering (control: capture only)': `window.__saved={pd:Event.prototype.preventDefault,sip:Event.prototype.stopImmediatePropagation,ael:EventTarget.prototype.addEventListener,call:Function.prototype.call}`,
+    };
+    for (const defName of ['L_hard', 'L_hard2']) for (const [order0, agentOlder] of [['agent session OLDER than pegboard injecting session', true], ['pegboard injecting session OLDER than agent session (control)', false]]) {
+      const order = `${defName}: ${order0}`;
+      for (const [name, src] of Object.entries(attacks)) {
+        await uninstall();
+        const ids = [];
+        // pegboard's L_hard always through P's sessions: older = ps (created first), younger = pyoung
+        const pegSid = agentOlder ? pyoung : ps;
+        const agSid = ags;
+        // agent's own script through the agent connection's session (ags is older than pyoung, younger than ps)
+        ids.push([P, pegSid, (await P.send('Page.addScriptToEvaluateOnNewDocument', { source: DEF[defName][0] }, pegSid)).identifier]);
+        ids.push([AG, agSid, (await AG.send('Page.addScriptToEvaluateOnNewDocument', { source: src }, agSid)).identifier]);
+        await load();
+        sys.set(SYSVAL);
+        await click(ags, 'ce'); await settle();
+        const clickRes = await ev(ags, 'window.__ce');
+        const clickSys = classify(SYSVAL, sys.get(), SEL);
+        sys.set(SYSVAL); await selectT(ags); await keyEv(ags, 'c', 'KeyC', 67, { commands: ['copy'] }); await settle();
+        const keySys = classify(SYSVAL, sys.get(), SEL);
+        sys.set(SYSVAL); await selectT(ags); const evalRes = await ev(ags, `String(document.execCommand('copy'))`, true); await settle();
+        a7[`${order} | ${name}`] = { clickExecCommandCopy: `${clickSys} (page ${clickRes})`, keyCommandsCopy: keySys, evalGestureExecCommandCopy: `${classify(SYSVAL, sys.get(), SEL)} (page ${evalRes})` };
+        rec(`A7a.${order} | ${name}`, JSON.stringify(a7[`${order} | ${name}`]));
+        for (const [c, sd, id] of ids) await c.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: id }, sd).catch(() => {});
+      }
+    }
+    await P.send('Target.detachFromTarget', { sessionId: pyoung }).catch(() => {});
+    // ---- (b) ONE configuration: L_hard + clipboard permission denied + recursive auto-attach; every write path + the extra keys ----
+    {
+      await uninstall();
+      const S = await env.connection();
+      for (const n of ['clipboard-read', 'clipboard-write']) await S.send('Browser.setPermission', { permission: { name: n }, setting: 'denied', browserContextId: agentCtx }).catch((e) => console.log('setPermission', e.message));
+      let useRI = true; // round 4: (c) is measured once with and once without runImmediately
+      const handler = async (p) => {
+        await P.send('Page.enable', {}, p.sessionId).catch(() => {});
+        // an attach that is NOT paused (observed for sandboxed srcdoc iframes) is also injected into the running document
+        await P.send('Page.addScriptToEvaluateOnNewDocument', { source: DEF.L_hard2[0], ...(p.waitingForDebugger || !useRI ? {} : { runImmediately: true }) }, p.sessionId).catch(() => {});
+        if (p.targetInfo.type === 'page' || p.targetInfo.type === 'iframe') await P.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, p.sessionId).catch(() => {});
+        await P.send('Runtime.runIfWaitingForDebugger', {}, p.sessionId).catch(() => {});
+      };
+      let on = true; P.on('Target.attachedToTarget', (p) => { if (on) handler(p); });
+      await P.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+      await P.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, ps);
+      installed.push({ conn: P, sid: ps, id: (await P.send('Page.addScriptToEvaluateOnNewDocument', { source: DEF.L_hard2[0] }, ps)).identifier });
+      await sleep(400);
+      const b = {};
+      for (const [k, fn] of Object.entries(ACT)) { await load(); sys.set(SYSVAL); const detail = await fn(); await settle(); b[k] = { sys: classify(SYSVAL, sys.get(), EXPECT[k] || SEL), page: detail }; }
+      b.g_key_paste_commands.read = seenPaste(b.g_key_paste_commands);
+      const keyTry = async (name, params, kind) => {
+        await load(); sys.set(SYSVAL);
+        if (kind === 'paste') await ev(ags, `document.getElementById('t').value='';document.getElementById('t').focus();1`); else await selectT(ags);
+        await keyEv(ags, ...params); await settle();
+        b[name] = kind === 'paste' ? (String(await ev(ags, `document.getElementById('t').value`)).includes(SYSVAL) ? 'PAGE READ SYSTEM CLIPBOARD' : 'no read') : classify(SYSVAL, sys.get(), SEL);
+      };
+      await keyTry('Control+Insert (no commands)', ['Insert', 'Insert', 45, { modifiers: 2 }], 'w');
+      await keyTry('Shift+Delete (no commands)', ['Delete', 'Delete', 46, { modifiers: 8 }], 'w');
+      await keyTry('Shift+Insert (no commands)', ['Insert', 'Insert', 45, { modifiers: 8 }], 'paste');
+      await keyTry('Control+C commands:[copy]', ['c', 'KeyC', 67, { modifiers: 2, commands: ['copy'] }], 'w');
+      await keyTry('Control+X commands:[cut]', ['x', 'KeyX', 88, { modifiers: 2, commands: ['cut'] }], 'w');
+      await keyTry('Control+V commands:[paste]', ['v', 'KeyV', 86, { modifiers: 2, commands: ['paste'] }], 'paste');
+      for (const [k, v] of Object.entries(b)) rec(`A7b.${k}`, typeof v === 'string' ? v : `${v.sys}${v.page !== undefined ? ` (${String(v.page).slice(0, 50)})` : ''}`);
+      a7.configuration_b = b;
+      // ---- (c) sandbox="allow-scripts" iframe under the same configuration ----
+      const seen = [];
+      P.on('Target.attachedToTarget', (p) => seen.push(`${p.targetInfo.type}:${p.targetInfo.url.replace(/:\d+/, ':PORT').slice(0, 40)}${p.waitingForDebugger ? '(paused)' : ''}`));
+      const c = {};
+      await load(); seen.length = 0; sys.set(SYSVAL);
+      await ev(ags, `(()=>{const f=document.createElement('iframe');f.id='sbx';f.setAttribute('sandbox','allow-scripts');f.style.cssText='position:absolute;left:300px;top:320px;width:300px;height:100px;border:0';f.srcdoc='<body style="margin:0"><textarea id=q style="width:100px;height:30px">${SEL}</textarea><button id=b style="position:absolute;left:0;top:50px;width:100px;height:40px" onclick="const q=document.getElementById(\\'q\\');q.focus();q.select();parent.postMessage({sbx:String(document.execCommand(\\'copy\\')),defL:!!window.__defL},\\'*\\')">c</button>';document.body.appendChild(f);return 1})()`);
+      await sleep(700);
+      c.targetsAttachedWhileCreatingSandboxedSrcdocIframe = seen.slice();
+      // control: the same attach events for a plain (unsandboxed) srcdoc iframe, and the page's own cross-site iframe alone
+      await load(); seen.length = 0;
+      await ev(ags, `(()=>{const f=document.createElement('iframe');f.srcdoc='<p>x</p>';document.body.appendChild(f);return 1})()`);
+      await sleep(700);
+      c.control_targetsAttachedForPlainSrcdocIframe = seen.slice();
+      await load(); seen.length = 0; await sleep(700);
+      c.control_targetsAttachedByLoadingThePageAlone = seen.slice();
+      await load(); seen.length = 0;
+      // round 4: the same sandboxed srcdoc iframe WITHOUT runImmediately for an unpaused attach (injection only through addScriptToEvaluateOnNewDocument)
+      useRI = false; await load(); seen.length = 0; sys.set(SYSVAL);
+      await ev(ags, `(()=>{const f=document.createElement('iframe');f.id='sbx';f.setAttribute('sandbox','allow-scripts');f.style.cssText='position:absolute;left:300px;top:320px;width:300px;height:100px;border:0';f.srcdoc='<body style="margin:0"><textarea id=q style="width:100px;height:30px">${SEL}</textarea><button id=b style="position:absolute;left:0;top:50px;width:100px;height:40px" onclick="const q=document.getElementById(\\'q\\');q.focus();q.select();parent.postMessage({sbx:String(document.execCommand(\\'copy\\')),defL:!!window.__defL},\\'*\\')">c</button>';document.body.appendChild(f);return 1})()`);
+      await sleep(700);
+      await clickAt(ags, 350, 320 + 70); await settle();
+      c.srcdocSandboxOpaque_gestureCopy_withoutRunImmediately = { messages: await ev(ags, 'JSON.stringify(window.__msgs)'), system: classify(SYSVAL, sys.get(), SEL), topDocumentO_hard: await ev(ags, `String(Document.prototype.execCommand).includes('return false')`) };
+      useRI = true; await load(); seen.length = 0; sys.set(SYSVAL); // fresh document for the with-runImmediately trial
+      await ev(ags, `(()=>{const f=document.createElement('iframe');f.id='sbx';f.setAttribute('sandbox','allow-scripts');f.style.cssText='position:absolute;left:300px;top:320px;width:300px;height:100px;border:0';f.srcdoc='<body style="margin:0"><textarea id=q style="width:100px;height:30px">${SEL}</textarea><button id=b style="position:absolute;left:0;top:50px;width:100px;height:40px" onclick="const q=document.getElementById(\\'q\\');q.focus();q.select();parent.postMessage({sbx:String(document.execCommand(\\'copy\\')),defL:!!window.__defL},\\'*\\')">c</button>';document.body.appendChild(f);return 1})()`);
+      await sleep(700);
+      await clickAt(ags, 350, 320 + 70); await settle();
+      c.srcdocSandboxOpaque_gestureCopy_withRunImmediately = { messages: await ev(ags, 'JSON.stringify(window.__msgs)'), system: classify(SYSVAL, sys.get(), SEL) };
+      // the same sandbox on a cross-site src (its own process)
+      await load(`${O}/clip`); seen.length = 0; sys.set(SYSVAL);
+      await ev(ags, `(()=>{const f=document.createElement('iframe');f.setAttribute('sandbox','allow-scripts');f.style.cssText='position:absolute;left:300px;top:0;width:400px;height:300px;border:0';f.src='http://c.test:${probe.port}/clip';document.body.appendChild(f);return 1})()`);
+      await sleep(1500);
+      c.targetsAttachedWhileCreatingSandboxedCrossSiteIframe = seen.slice();
+      await clickAt(ags, 300 + 60, 60 + 20); await settle();
+      c.crossSiteSandboxed_gestureCopy = { topDocumentO_hard: await ev(ags, `String(Document.prototype.execCommand).includes('return false')`), messages: await ev(ags, 'JSON.stringify(window.__msgs)'), system: classify(SYSVAL, sys.get(), SEL) };
+      for (const [k, v] of Object.entries(c)) rec(`A7c.${k}`, JSON.stringify(v));
+      a7.configuration_c = c;
+      on = false; await unsetAuto(); await uninstall(); await S.close?.();
+    }
+    out.A7 = a7;
   }
   // ================= A4 =================
   if (want('a4')) {

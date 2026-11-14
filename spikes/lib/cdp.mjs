@@ -43,6 +43,9 @@ export function connect(wsUrl, { headers } = {}) {
         if (!listeners.has(eventName)) listeners.set(eventName, []);
         listeners.get(eventName).push(cb);
       },
+      off(eventName, cb) {
+        listeners.set(eventName, (listeners.get(eventName) || []).filter((x) => x !== cb));
+      },
       async attach(targetId) {
         const { sessionId } = await api.send('Target.attachToTarget', { targetId, flatten: true });
         return sessionId;
