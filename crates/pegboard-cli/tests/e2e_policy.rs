@@ -1897,8 +1897,10 @@ fn oversized_download_is_dropped_and_reported() {
     let mut seen = Vec::new();
     for i in 1..=5 {
         let url = format!("{origin}/linkto/sized/900/{t}-{i}");
-        let (code, _, err) = home.run(&["--session", &handle, "open", &url]);
-        assert_eq!(code, 0, "{err}");
+        // Every result may carry the report of the previous download: all are read as JSON.
+        let opened = run_json(&home, &handle, &["open", &url]);
+        assert_eq!(opened["success"], true, "{opened}");
+        seen.extend(told(&opened));
         seen.extend(told(&run_json(&home, &handle, &["click", "#go"])));
         // One at a time, so the order of the totals is fixed.
         if i < 5 {
