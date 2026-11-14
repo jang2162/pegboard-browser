@@ -1394,8 +1394,9 @@ fn the_guard_renews_a_document_opened_past_the_shield() {
 }
 
 /// Review I1: `ready` comes back at most `EARLY_SETUP_LIMIT` (10 s) after a reconnect, but
-/// the commands of a clipboard-denied session wait until the tabs that were there are
-/// shielded and reloaded (here held 12 s by a test hook, as a busy renderer would).
+/// the commands of the profile's sessions wait until the tabs that were there are shielded
+/// and reloaded (here held 12 s by a test hook, as a busy renderer would). Final review m1:
+/// a session that allows the clipboard waits as well.
 #[test]
 #[ignore]
 fn commands_wait_for_the_old_tabs_after_a_reconnect() {
@@ -1404,6 +1405,10 @@ fn commands_wait_for_the_old_tabs_after_a_reconnect() {
         let _reset = Reset(&h);
         let a = agent(&h, false).await;
         let mut log = log_for(&h, &a.info);
+        let profile = "clip-early-open";
+        h.manager.create_profile(profile).await.unwrap();
+        let b = create(&h, true, Some(profile)).await.unwrap();
+        let mut b_log = log_for(&h, &b.info);
         assert!(h
             .manager
             .set_guard_early_delay_for_test(Duration::from_secs(12)));
@@ -1415,12 +1420,26 @@ fn commands_wait_for_the_old_tabs_after_a_reconnect() {
             Err(e) => e,
         };
         assert_eq!(e.code, codes::BROWSER_FAILED, "{e:?}");
-        assert!(e.message.contains("clipboard policy"), "{e:?}");
+        assert!(e.message.contains("still setting up"), "{e:?}");
+        let e = match command(&h, &mut b_log, &b.info, &["get", "url"]).await {
+            Ok(r) => {
+                panic!("a clipboard-allowing session ran before its old tabs were set up: {r:?}")
+            }
+            Err(e) => e,
+        };
+        assert_eq!(e.code, codes::BROWSER_FAILED, "{e:?}");
+        assert!(e.message.contains("still setting up"), "{e:?}");
         let done = common::eventually(20, || async {
-            h.manager.require_clipboard(&a.info.id).is_ok()
+            h.manager.require_tabs_set_up(&a.info.id).is_ok()
+                && h.manager.require_tabs_set_up(&b.info.id).is_ok()
         })
         .await;
         assert!(done, "the old tabs were never done");
+        command(&h, &mut b_log, &b.info, &["get", "url"])
+            .await
+            .unwrap();
+        h.close_session(&b.info.id).await;
+        let _ = h.manager.delete_profile(profile).await;
     });
 }
 

@@ -187,6 +187,11 @@ pub async fn run_command_with_hook(
     if let Err(e) = sessions.require_clipboard(id) {
         return refuse(log, entry, argv, e, started);
     }
+    // Tabs that were there when the guard reconnected may not be set up yet (shielded,
+    // judged): every session of the profile waits for them.
+    if let Err(e) = sessions.require_tabs_set_up(id) {
+        return refuse(log, entry, argv, e, started);
+    }
     let is_tab_new = matches!(checked, Checked::TabNew { .. });
     let mut run_argv = match checked {
         Checked::Run(words) => words,

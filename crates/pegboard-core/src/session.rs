@@ -77,6 +77,20 @@ fn browser_failed(e: anyhow::Error) -> RpcError {
     rpc_error(codes::BROWSER_FAILED, format!("{e:#}"))
 }
 
+/// The answer for a command while the profile's old tabs are still being set up after the
+/// guard (re)connected.
+fn early_setup_gate(pending: bool) -> Result<(), RpcError> {
+    if pending {
+        Err(rpc_error(
+            codes::BROWSER_FAILED,
+            "pegboard is still setting up the profile's tabs after its request guard \
+             reconnected; commands are refused until that is done",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn not_found(id: &SessionId) -> RpcError {
     rpc_error(codes::SESSION_NOT_FOUND, format!("no session {}", id.0))
 }
@@ -625,20 +639,9 @@ impl SessionManager {
     /// Refuses (`browser_failed`) while the clipboard of the session's profile is not denied
     /// as its sessions' policies want: Chrome lifts the denial when the connection that set
     /// it closes (spike C2), so commands wait until it is set again.
-    /// Also refuses a session that denies the clipboard while the guard is still shielding
-    /// the tabs that were there when it reconnected (`Guard::early_pending`).
     pub fn require_clipboard(&self, id: &SessionId) -> Result<(), RpcError> {
-        let (context, denied) = {
-            let table = self.inner.table.lock().unwrap();
-            let r = ready(&table, id)?;
-            (
-                r.context.clone(),
-                !r.info.policy.allow.contains(&ActionClass::Clipboard),
-            )
-        };
-        let in_place = self.inner.browser.downloads.clipboard_ready(&context)
-            && !(denied && self.inner.guard.early_pending(&context));
-        if in_place {
+        let context = self.context_of(id)?;
+        if self.inner.browser.downloads.clipboard_ready(&context) {
             Ok(())
         } else {
             Err(rpc_error(
@@ -647,6 +650,21 @@ impl SessionManager {
                  commands are refused until it is back",
             ))
         }
+    }
+
+    /// Refuses (`browser_failed`) while the guard is still setting up the tabs of the
+    /// session's profile that were there when it (re)connected (`Guard::early_pending`):
+    /// `require_guard` does not wait past `EARLY_SETUP_LIMIT`, and until then such a tab may
+    /// be neither shielded nor judged. Every session of the profile waits, whatever its
+    /// policy.
+    pub fn require_tabs_set_up(&self, id: &SessionId) -> Result<(), RpcError> {
+        let context = self.context_of(id)?;
+        early_setup_gate(self.inner.guard.early_pending(&context))
+    }
+
+    fn context_of(&self, id: &SessionId) -> Result<String, RpcError> {
+        let table = self.inner.table.lock().unwrap();
+        Ok(ready(&table, id)?.context.clone())
     }
 
     /// The session's download reports since the last call (see `downloads::Report`).
@@ -1558,6 +1576,14 @@ async fn close_tabs(
 mod tests {
     use super::*;
     use pegboard_protocol::SessionId;
+
+    #[test]
+    fn commands_wait_while_old_tabs_are_set_up() {
+        assert!(early_setup_gate(false).is_ok());
+        let e = early_setup_gate(true).unwrap_err();
+        assert_eq!(e.code, codes::BROWSER_FAILED);
+        assert!(e.message.contains("still setting up"), "{e:?}");
+    }
 
     #[test]
     fn group_title_handles_odd_names() {
