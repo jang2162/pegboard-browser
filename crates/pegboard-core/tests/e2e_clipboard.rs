@@ -181,7 +181,15 @@ fn restore(saved: &[u8], was_empty: bool) -> bool {
 
 impl Drop for Clipboard {
     fn drop(&mut self) {
-        if !restore(&self.saved, self.was_empty) {
+        // A copy the test started may still land (a slow page, a broken build under a
+        // mutation): restored after it, and checked again a moment later.
+        std::thread::sleep(Duration::from_millis(1000));
+        let mut restored = restore(&self.saved, self.was_empty);
+        std::thread::sleep(Duration::from_millis(500));
+        if restored && !holds(&self.saved, self.was_empty) {
+            restored = restore(&self.saved, self.was_empty);
+        }
+        if !restored {
             let what = format!(
                 "a restore did not take: the clipboard holds {:?} (types: {})",
                 String::from_utf8_lossy(&pasteboard("pbpaste", None)),
@@ -1256,8 +1264,23 @@ fn a_kept_tab_gets_the_shield_into_its_running_document_after_a_reconnect() {
             .unwrap();
         let conn = &h.browser.conn;
         let sid = conn.attach(&t).await.unwrap();
+        // The kept tab left its session, and with it the daemon's focus emulation; it is
+        // probably not the active tab of its window. Focused as a session tab would be, so a
+        // click copies (spike C1, C3).
+        for (method, params) in [
+            (
+                "Emulation.setFocusEmulationEnabled",
+                json!({ "enabled": true }),
+            ),
+            ("Page.setWebLifecycleState", json!({ "state": "active" })),
+        ] {
+            conn.send(method, params, Some(&sid)).await.unwrap();
+        }
         let tab = Tab { c: conn, sid };
-        assert!(h.manager.drop_guard_for_test(Duration::from_secs(3)));
+        assert!(h.manager.drop_guard_for_test(Duration::from_secs(4)));
+        // Chrome drops the guard's new-document scripts when it has read the closed
+        // connection.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         tab.load("/clip").await;
         assert!(
             click_copy_changes(&tab, "#cp", &clip).await,
