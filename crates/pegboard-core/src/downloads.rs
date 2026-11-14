@@ -474,6 +474,10 @@ struct Policy {
     clipboard: Option<CdpConn>,
     /// Bumped with every clipboard connection, like `generation`.
     clipboard_generation: u64,
+    /// The profile may carry a clipboard denial in Chrome: set since a denial was set and
+    /// until it was lifted by a reset. Closing (or losing) the connection does not lift it
+    /// (Task 7, measured), so a profile whose connection was lost is reset anew.
+    clipboard_maybe_denied: bool,
 }
 
 impl Policy {
@@ -664,17 +668,37 @@ impl Downloads {
             bail!("refusing to set a clipboard policy on the human or an unknown context");
         }
         let _one = self.inner.applying.lock().await;
-        let held = {
+        // What lifting needs: the connection that holds the denial, or (when that was lost
+        // and the denial may still be in Chrome) a new connection only for the reset.
+        enum Lift {
+            Nothing,
+            Held(CdpConn),
+            Lost,
+        }
+        let lift = {
             let mut state = self.inner.state.lock().unwrap();
             let Some(policy) = state.policies.get_mut(context) else {
                 bail!("the profile has no download policy");
             };
             if denied {
                 policy.clipboard_denied = true;
-                None
+                Lift::Nothing
+            } else if let Some(conn) = policy.clipboard.clone() {
+                Lift::Held(conn)
+            } else if policy.clipboard_maybe_denied {
+                Lift::Lost
             } else {
-                policy.clipboard.clone()
+                Lift::Nothing
             }
+        };
+        let held = match lift {
+            Lift::Nothing => None,
+            Lift::Held(conn) => Some(conn),
+            Lift::Lost => Some(
+                CdpConn::connect(&self.inner.ws_url)
+                    .await
+                    .context("could not lift the clipboard denial of the agent profile")?,
+            ),
         };
         if let Some(conn) = held {
             // Closing the connection alone did not lift the denial when measured (second
@@ -690,6 +714,7 @@ impl Downloads {
                 // Its end is not a loss.
                 policy.clipboard_generation += 1;
                 policy.clipboard.take();
+                policy.clipboard_maybe_denied = false;
             }
             drop(state);
             conn.close();
@@ -1026,6 +1051,7 @@ impl Inner {
                     clipboard_denied: false,
                     clipboard: None,
                     clipboard_generation: 0,
+                    clipboard_maybe_denied: false,
                 });
             policy.generation += 1;
             policy.staging = staging;
@@ -1075,6 +1101,10 @@ impl Inner {
                     continue;
                 }
             }
+            // From the first permission sent on, the profile may carry a denial.
+            if let Some(p) = self.state.lock().unwrap().policies.get_mut(context) {
+                p.clipboard_maybe_denied = true;
+            }
             for name in ["clipboard-read", "clipboard-write"] {
                 let set = conn
                     .send(
@@ -1097,6 +1127,7 @@ impl Inner {
                 match state.policies.get_mut(context) {
                     // Still wanted (an `apply_clipboard` that allows waits for `applying`).
                     Some(p) if p.clipboard_denied => {
+                        p.clipboard_maybe_denied = true;
                         p.clipboard_generation += 1;
                         let old = p.clipboard.replace(conn.clone());
                         Some((p.clipboard_generation, old))

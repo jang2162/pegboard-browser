@@ -902,6 +902,31 @@ impl ClientConn {
             let release = self.release_session(session_id, target_id);
             let _ = tokio::time::timeout(SHUTDOWN_STEP, release).await;
         }
+        // Detach the client's sessions explicitly and wait for the browser to confirm, so that
+        // when the connection is counted gone its sessions (and the new-document scripts
+        // registered on them) are gone too (`drop_clients`; the guard relies on it after a
+        // reconnect). Sessions of the entry that belong to another connection of the same
+        // session are not this upstream's: the browser refuses those, which is an answer too.
+        let sessions: Vec<String> = self
+            .entry
+            .scope
+            .lock()
+            .unwrap()
+            .cdp_sessions
+            .iter()
+            .cloned()
+            .collect();
+        let mut detaches = HashSet::new();
+        for session_id in sessions {
+            let detach = json!({ "method": "Target.detachFromTarget",
+                "params": { "sessionId": session_id } });
+            if let Ok(Ok(id)) =
+                tokio::time::timeout(SHUTDOWN_STEP, self.send_upstream(detach, Pending::Internal))
+                    .await
+            {
+                detaches.insert(id);
+            }
+        }
         let off = json!({ "method": "Target.setAutoAttach",
             "params": { "autoAttach": false, "waitForDebuggerOnStart": false, "flatten": true } });
         let off_id =
@@ -912,14 +937,18 @@ impl ClientConn {
         if let Some(off_id) = off_id {
             let deadline = Instant::now() + SHUTDOWN_DRAIN;
             let mut off_confirmed = false;
-            while !off_confirmed || self.release_in_flight() {
+            while !off_confirmed || self.release_in_flight() || !detaches.is_empty() {
                 let Ok(Some(text)) = tokio::time::timeout_at(deadline, self.up.recv()).await else {
                     break;
                 };
                 let Ok(msg) = serde_json::from_str::<Value>(&text) else {
                     continue;
                 };
-                off_confirmed |= msg.get("id").and_then(Value::as_u64) == Some(off_id);
+                let answered = msg.get("id").and_then(Value::as_u64);
+                off_confirmed |= answered == Some(off_id);
+                if let Some(id) = answered {
+                    detaches.remove(&id);
+                }
                 let _ =
                     tokio::time::timeout(SHUTDOWN_STEP, self.on_message_while_closing(msg)).await;
             }

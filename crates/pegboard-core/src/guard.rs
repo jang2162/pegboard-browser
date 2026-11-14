@@ -64,7 +64,18 @@ pub type ClipboardOf = Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
 /// runs and called through `Reflect.apply`, so a page that replaces `Function.prototype.call`,
 /// `preventDefault` or `addEventListener` later cannot disarm it (C12a, i1-i3). It leaves no
 /// global behind.
-pub const CLIPBOARD_SHIELD: &str = r#"(()=>{const ap=Reflect.apply,pd=Event.prototype.preventDefault,sip=Event.prototype.stopImmediatePropagation,ael=EventTarget.prototype.addEventListener;const f=(e)=>{ap(pd,e,[]);ap(sip,e,[])};for(const t of [window,document])for(const n of ["copy","cut","paste","beforecopy","beforecut","beforepaste"])ap(ael,t,[n,f,true])})()"#;
+///
+/// `document.open()` (also the one `document.write` does on a document that is no longer
+/// being parsed) removes every listener of the document and its window without making a new
+/// global, so no new-document script runs again (review C2). The shield therefore wraps
+/// `Document.prototype.open`, `write` and `writeln`: after the real `open` it adds its
+/// listeners again, and a `write`/`writeln` on a document that is not loading opens it
+/// first itself, so the listeners are back before anything written runs. The originals stay
+/// inside the shield; the wrappers cannot be redefined (`configurable: false`), and a page may
+/// still assign its own `document.write` on the instance (ad scripts do). Every value the
+/// wrappers use later (getters, loop bounds) was saved at the start, and they loop by index,
+/// so a page's later changes to `Array` or `Document` do not reach them.
+pub const CLIPBOARD_SHIELD: &str = r#"(()=>{const ap=Reflect.apply,gd=Object.getOwnPropertyDescriptor,dp=Object.defineProperty,pd=Event.prototype.preventDefault,sip=Event.prototype.stopImmediatePropagation,ael=EventTarget.prototype.addEventListener,D=Document.prototype,op=D.open,wr=D.write,wl=D.writeln,rs=gd(D,"readyState").get,dv=gd(D,"defaultView").get,N=["copy","cut","paste","beforecopy","beforecut","beforepaste"],L=N.length;const f=(e)=>{ap(pd,e,[]);ap(sip,e,[])};const on=(d)=>{const T=[ap(dv,d,[]),d];for(let i=0;i<2;i++){const t=T[i];if(t)for(let j=0;j<L;j++)ap(ael,t,[N[j],f,true])}};on(document);const lock=(k,v)=>dp(D,k,{value:v,writable:true,configurable:false,enumerable:true});const opened=(d)=>{if(ap(rs,d,[])!=="loading"){ap(op,d,[]);on(d)}};lock("open",function open(){const r=ap(op,this,arguments);on(this);return r});lock("write",function write(){opened(this);return ap(wr,this,arguments)});lock("writeln",function writeln(){opened(this);return ap(wl,this,arguments)})})()"#;
 
 /// What the guard does about the clipboard with a target it attached to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,9 +123,12 @@ pub fn clipboard_step(
 /// How long the shield's replies may take after the resume before a tab is closed.
 const SHIELD_LIMIT: Duration = Duration::from_secs(15);
 
-/// Most frames attached already running that one page session gets reloaded: a frame whose
-/// reload comes back as a new running target cannot make the guard reload forever.
-const FRAME_RELOADS: u32 = 8;
+/// How often one frame target attached already running is reloaded. A frame that keeps
+/// coming back running (a reload or navigation that attaches it again) beyond this has its
+/// tab closed (fail closed) rather than being reloaded forever or left unshielded.
+const FRAME_RELOADS: u32 = 3;
+/// Frame targets whose reloads are counted at once; the counts start again past it.
+const MAX_FRAME_RELOADS_KEPT: usize = 4096;
 
 /// Called once a reconnected guard has turned auto-attach on and before it sets up the
 /// targets that are there: drops the agents' connections of profiles whose sessions deny the
@@ -421,8 +435,6 @@ struct Attachment<'a> {
     target: &'a str,
     kind: &'a str,
     context: &'a str,
-    /// The guard's session the attachment came on (`None`: the browser level).
-    parent: Option<&'a str>,
     waiting: bool,
     /// Attached when the guard (re)connected (see `clipboard_step`).
     early: bool,
@@ -432,6 +444,9 @@ struct Attachment<'a> {
 struct Attached {
     target: String,
     context: String,
+    kind: String,
+    /// The guard's session it was attached through (`None`: the browser level).
+    parent: Option<String>,
 }
 
 #[derive(Default)]
@@ -451,8 +466,12 @@ struct State {
     attach_log: std::collections::VecDeque<String>,
     /// Refused requests per reason, since the daemon started (diagnostics, no URLs).
     denied: BTreeMap<&'static str, u64>,
-    /// Page session -> frames attached running that were reloaded under it (`FRAME_RELOADS`).
+    /// Frame target -> how often it was attached running and reloaded (`FRAME_RELOADS`).
     frame_reloads: HashMap<String, u32>,
+    /// Targets attached when the guard (re)connected whose set-up is not done, with their
+    /// context: commands of the context's clipboard-denied sessions wait for them
+    /// (`early_pending`).
+    early_pending: HashMap<String, String>,
     /// The current connection's event loop runs (`ready` is set only while it does).
     live: bool,
 }
@@ -488,6 +507,11 @@ struct Inner {
     /// Test hook (`PEGBOARD_TEST_NO_CLIPBOARD_SHIELD` with `PEGBOARD_TEST_HOOKS`): no shield
     /// and no clipboard reloads, to tell what they do from the rest of the guard.
     no_shield: bool,
+    /// Test hook: the set-up of targets there at a (re)connect waits this long first (a busy
+    /// renderer).
+    early_delay: Mutex<Duration>,
+    /// Test hook: the shield of frames counts as failed.
+    fail_shield: std::sync::atomic::AtomicBool,
 }
 
 pub struct Guard {
@@ -535,6 +559,8 @@ impl Guard {
             csp_header: std::sync::atomic::AtomicBool::new(true),
             no_shield: std::env::var_os("PEGBOARD_TEST_HOOKS").is_some()
                 && std::env::var_os("PEGBOARD_TEST_NO_CLIPBOARD_SHIELD").is_some(),
+            early_delay: Mutex::new(Duration::ZERO),
+            fail_shield: std::sync::atomic::AtomicBool::new(false),
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner)));
         Guard { inner, supervisor }
@@ -625,6 +651,34 @@ impl Guard {
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Whether targets of `context` that were there when the guard (re)connected are still
+    /// being set up (shielded, reloaded). `ready` does not wait past `EARLY_SETUP_LIMIT`; the
+    /// commands of the context's clipboard-denied sessions do (`SessionManager`).
+    pub fn early_pending(&self, context: &str) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .early_pending
+            .values()
+            .any(|c| c == context)
+    }
+
+    /// Test hook: the set-up of the targets there at the next (re)connect waits `delay`
+    /// first. The caller gates it.
+    #[doc(hidden)]
+    pub fn set_early_delay_for_test(&self, delay: Duration) {
+        *self.inner.early_delay.lock().unwrap() = delay;
+    }
+
+    /// Test hook: the shield of frames counts as failed. The caller gates it.
+    #[doc(hidden)]
+    pub fn set_fail_frame_shield_for_test(&self, on: bool) {
+        self.inner
+            .fail_shield
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Test hook: closes the guard's connection as a failure would, and keeps it from
     /// reconnecting for `hold`. The caller gates it (`SessionManager`).
     #[doc(hidden)]
@@ -664,6 +718,7 @@ async fn supervise(inner: Weak<Inner>) {
             state.pages.clear();
             state.documents.clear();
             state.frame_reloads.clear();
+            state.early_pending.clear();
         }
         guard.changed.send_modify(|n| *n += 1);
         drop(guard);
@@ -796,8 +851,17 @@ impl Inner {
                 Attached {
                     target: target.clone(),
                     context: context.clone(),
+                    kind: kind.clone(),
+                    parent: parent.clone(),
                 },
             );
+        }
+        if early && !foreign {
+            self.state
+                .lock()
+                .unwrap()
+                .early_pending
+                .insert(target.clone(), context.clone());
         }
         let me = self.clone();
         let conn = conn.clone();
@@ -817,12 +881,15 @@ impl Inner {
                     target: &target,
                     kind: &kind,
                     context: &context,
-                    parent: parent.as_deref(),
                     waiting,
                     early,
                 };
                 me.set_up(&conn, attached).await
             };
+            if early {
+                me.state.lock().unwrap().early_pending.remove(&target);
+                me.changed.send_modify(|n| *n += 1);
+            }
             me.log_attach(format!(
                 "{target} {kind} {whose} waiting={waiting} parent={} -> {outcome}",
                 parent.is_some()
@@ -842,6 +909,12 @@ impl Inner {
     /// turns interception on for it and resumes it. A tab that cannot be guarded is closed; a
     /// frame or worker is left waiting. Returns what happened (for the diagnostics log).
     async fn set_up(&self, conn: &CdpConn, a: Attachment<'_>) -> String {
+        if a.early {
+            let delay = *self.early_delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
         let Attachment {
             session,
             target,
@@ -921,19 +994,22 @@ impl Inner {
                     "not-waiting".to_string()
                 };
                 if let Some(shield) = shield {
-                    let shielded = tokio::time::timeout(SHIELD_LIMIT, shield)
-                        .await
-                        .map_err(|_| anyhow!("no answer in time"))
-                        .and_then(|r| r);
+                    let forced = self.fail_shield.load(std::sync::atomic::Ordering::SeqCst)
+                        && kind == "iframe";
+                    let shielded = if forced {
+                        Err(anyhow!("failed by a test"))
+                    } else {
+                        tokio::time::timeout(SHIELD_LIMIT, shield)
+                            .await
+                            .map_err(|_| anyhow!("no answer in time"))
+                            .and_then(|r| r)
+                    };
                     if let Err(e) = shielded {
-                        // Fail closed: a tab without the shield is closed; a frame cannot be.
+                        // Fail closed: it already runs (resumed above) without the shield, so
+                        // the tab (the frame's tab for a frame) is closed.
                         self.set_page(kind, target, Status::Failed(std::time::Instant::now()));
-                        if kind == "page" {
-                            let _ = conn
-                                .send("Target.closeTarget", json!({ "targetId": target }), None)
-                                .await;
-                        }
-                        return format!("resume={resumed} shield failed ({e:#})");
+                        let closed = self.close_tab_of(conn, session).await;
+                        return format!("resume={resumed} shield failed ({e:#}), {closed}");
                     }
                 }
                 self.set_page(kind, target, Status::Guarded { paused: waiting });
@@ -962,20 +1038,29 @@ impl Inner {
     ) -> String {
         let s = Some(a.session);
         match step {
-            ClipboardStep::ShieldAndReload => {
-                let r = conn.send("Page.reload", json!({}), s).await;
-                format!(" reload={}", outcome(r))
-            }
+            ClipboardStep::ShieldAndReload => match conn.send("Page.reload", json!({}), s).await {
+                Ok(_) => " reload=ok".to_string(),
+                // Its document may not have the shield first: fail closed.
+                Err(e) => format!(
+                    " reload failed ({e:#}), {}",
+                    self.close_tab_of(conn, a.session).await
+                ),
+            },
             ClipboardStep::ShieldAndReloadFrame => {
-                let parent = a.parent.unwrap_or_default().to_string();
                 let allowed = {
                     let mut state = self.state.lock().unwrap();
-                    let n = state.frame_reloads.entry(parent).or_insert(0);
+                    if state.frame_reloads.len() >= MAX_FRAME_RELOADS_KEPT {
+                        state.frame_reloads.clear();
+                    }
+                    let n = state.frame_reloads.entry(a.target.to_string()).or_insert(0);
                     *n += 1;
                     *n <= FRAME_RELOADS
                 };
                 if !allowed {
-                    return " frame-reload=limit".to_string();
+                    return format!(
+                        " frame-reload=limit, {}",
+                        self.close_tab_of(conn, a.session).await
+                    );
                 }
                 // `location` cannot be replaced by the page ([LegacyUnforgeable]).
                 let r = conn
@@ -985,10 +1070,46 @@ impl Inner {
                         s,
                     )
                     .await;
-                format!(" frame-reload={}", outcome(r))
+                match r {
+                    Ok(r) if r.get("exceptionDetails").is_none() => " frame-reload=ok".to_string(),
+                    other => format!(
+                        " frame-reload failed ({}), {}",
+                        outcome(other),
+                        self.close_tab_of(conn, a.session).await
+                    ),
+                }
             }
             _ => String::new(),
         }
+    }
+
+    /// Closes the tab that holds the guard's `session` (the tab itself, or the tab a frame
+    /// sits in, found through the sessions the guard attached them by). Returns what
+    /// happened, for the diagnostics log.
+    async fn close_tab_of(&self, conn: &CdpConn, session: &str) -> String {
+        let tab = {
+            let state = self.state.lock().unwrap();
+            let mut at = state.sessions.get(session);
+            let mut hops = 0;
+            loop {
+                match at {
+                    Some(a) if a.kind == "page" => break Some(a.target.clone()),
+                    Some(a) if hops < 32 => {
+                        at = a.parent.as_deref().and_then(|p| state.sessions.get(p));
+                        hops += 1;
+                    }
+                    _ => break None,
+                }
+            }
+        };
+        let Some(tab) = tab else {
+            return "its tab is unknown".to_string();
+        };
+        self.set_page("page", &tab, Status::Failed(std::time::Instant::now()));
+        let r = conn
+            .send("Target.closeTarget", json!({ "targetId": tab }), None)
+            .await;
+        format!("tab {tab} closed={}", outcome(r))
     }
 
     fn set_page(&self, kind: &str, target: &str, status: Status) {
@@ -1011,7 +1132,6 @@ impl Inner {
             return;
         };
         let mut state = self.state.lock().unwrap();
-        state.frame_reloads.remove(session);
         if let Some(gone) = state.sessions.remove(session) {
             // A tab's session ends with the tab; a failure stays visible to a waiter for a
             // while (`FAILED_KEPT`).
@@ -1468,12 +1588,22 @@ mod tests {
             "sip=Event.prototype.stopImmediatePropagation",
             "ael=EventTarget.prototype.addEventListener",
             "ap(pd,e,[]);ap(sip,e,[])",
-            "for(const t of [window,document])",
+            "const T=[ap(dv,d,[]),d]",
             r#"["copy","cut","paste","beforecopy","beforecut","beforepaste"]"#,
-            "ap(ael,t,[n,f,true])",
+            "ap(ael,t,[N[j],f,true])",
+            "on(document)",
+            // document.open clears listeners (review C2): put back after it, and before a
+            // write that opens.
+            r#"lock("open",function open(){const r=ap(op,this,arguments);on(this);return r})"#,
+            r#"if(ap(rs,d,[])!=="loading"){ap(op,d,[]);on(d)}"#,
+            r#"lock("write",function write(){opened(this);"#,
+            r#"lock("writeln",function writeln(){opened(this);"#,
+            "configurable:false",
         ] {
             assert!(CLIPBOARD_SHIELD.contains(part), "{part}");
         }
+        // Nothing the page can change later is iterated (no for...of in the wrappers).
+        assert_eq!(CLIPBOARD_SHIELD.matches(" of ").count(), 0);
     }
 
     fn words(csp: &str) -> Vec<&str> {

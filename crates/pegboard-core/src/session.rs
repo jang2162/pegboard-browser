@@ -38,9 +38,6 @@ const MAX_TITLE_CHARS: usize = 60;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the guard's reconnect waits for dropped client connections to end.
 const CLIENT_DROP_LIMIT: Duration = Duration::from_secs(5);
-/// And then for the browser to detach their CDP sessions (it reads the closed connections
-/// on its own schedule).
-const CLIENT_DETACH_PAUSE: Duration = Duration::from_millis(300);
 /// How long a new tab may wait for the request guard before it is closed.
 const GUARD_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -615,12 +612,20 @@ impl SessionManager {
     /// Refuses (`browser_failed`) while the clipboard of the session's profile is not denied
     /// as its sessions' policies want: Chrome lifts the denial when the connection that set
     /// it closes (spike C2), so commands wait until it is set again.
+    /// Also refuses a session that denies the clipboard while the guard is still shielding
+    /// the tabs that were there when it reconnected (`Guard::early_pending`).
     pub fn require_clipboard(&self, id: &SessionId) -> Result<(), RpcError> {
-        let context = {
+        let (context, denied) = {
             let table = self.inner.table.lock().unwrap();
-            ready(&table, id)?.context.clone()
+            let r = ready(&table, id)?;
+            (
+                r.context.clone(),
+                !r.info.policy.allow.contains(&ActionClass::Clipboard),
+            )
         };
-        if self.inner.browser.downloads.clipboard_ready(&context) {
+        let in_place = self.inner.browser.downloads.clipboard_ready(&context)
+            && !(denied && self.inner.guard.early_pending(&context));
+        if in_place {
             Ok(())
         } else {
             Err(rpc_error(
@@ -739,6 +744,29 @@ impl SessionManager {
             return false;
         }
         self.inner.guard.set_csp_header_for_test(on);
+        true
+    }
+
+    /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: the guard's set-up of the targets
+    /// there at its next reconnect waits `delay` first (a busy renderer). Returns whether it
+    /// did.
+    #[doc(hidden)]
+    pub fn set_guard_early_delay_for_test(&self, delay: Duration) -> bool {
+        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+            return false;
+        }
+        self.inner.guard.set_early_delay_for_test(delay);
+        true
+    }
+
+    /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: the guard's shield of frames counts
+    /// as failed. Returns whether it did.
+    #[doc(hidden)]
+    pub fn set_guard_fail_frame_shield_for_test(&self, on: bool) -> bool {
+        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+            return false;
+        }
+        self.inner.guard.set_fail_frame_shield_for_test(on);
         true
     }
 
@@ -1040,7 +1068,7 @@ impl Inner {
     /// The guard reconnected: drops the client connections of the sessions that deny the
     /// clipboard (their CDP sessions on the tabs may be older than the guard's new ones,
     /// spike C12a), so their clients connect again after the guard. Waits until they are
-    /// gone and a little more for the browser to detach their sessions.
+    /// gone: each detaches its sessions and waits for the browser's answer first.
     async fn drop_clipboard_denied_clients(&self) {
         let ids: Vec<SessionId> = {
             let table = self.table.lock().unwrap();
@@ -1060,7 +1088,6 @@ impl Inner {
              clipboard-denied session(s) (all gone: {gone})",
             ids.len()
         );
-        tokio::time::sleep(CLIENT_DETACH_PAUSE).await;
     }
 
     /// Attaches the daemon's own CDP session to the target with focus emulation on and

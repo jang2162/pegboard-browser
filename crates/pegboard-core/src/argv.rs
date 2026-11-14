@@ -768,11 +768,30 @@ pub fn class_of(argv: &[String]) -> Option<ActionClass> {
 /// acts on these without an editing command, spike C9); or a key named for the action.
 /// Case and the order of the parts do not matter, nor do other modifiers.
 fn is_clipboard_key(key: &str) -> bool {
-    const COMMAND: &[&str] = &["control", "ctrl", "meta", "cmd", "command", "controlormeta"];
+    // agent-browser 0.42.0 documents Control, Alt, Shift, Meta; other spellings a key
+    // parser may take (the left/right `code` names, Mod, Super, OS, Win) count as well.
+    const COMMAND: &[&str] = &[
+        "control",
+        "ctrl",
+        "controlleft",
+        "controlright",
+        "meta",
+        "metaleft",
+        "metaright",
+        "cmd",
+        "command",
+        "controlormeta",
+        "mod",
+        "super",
+        "os",
+        "osleft",
+        "osright",
+        "win",
+    ];
     let parts: Vec<String> = key.split('+').map(str::to_ascii_lowercase).collect();
     let has = |names: &[&str]| parts.iter().any(|p| names.contains(&p.as_str()));
     let command = has(COMMAND);
-    let shift = has(&["shift"]);
+    let shift = has(&["shift", "shiftleft", "shiftright"]);
     (command && has(&["c", "x", "v", "keyc", "keyx", "keyv", "insert"]))
         || (shift && has(&["insert", "delete", "del"]))
         || has(&["copy", "cut", "paste"])
@@ -1377,6 +1396,12 @@ mod tests {
             "Cmd+v",
             "Command+x",
             "ControlOrMeta+c",
+            "ControlLeft+c",
+            "MetaRight+v",
+            "Mod+x",
+            "Super+c",
+            "OS+v",
+            "ShiftLeft+Insert",
             "Control+Insert",
             "Meta+Insert",
             "Shift+Insert",

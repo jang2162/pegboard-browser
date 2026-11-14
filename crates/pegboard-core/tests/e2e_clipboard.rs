@@ -303,6 +303,27 @@ fn route(path: &str, port: u16) -> Option<String> {
                 inner()
             ),
         ),
+        // Ten of those: the guard's reloads are counted per frame, not per page (review C1).
+        "/sandbox-many" => page(
+            "sandbox-many",
+            &(0..10)
+                .map(|i| {
+                    format!(
+                        r#"<iframe id="f{i}" style="{frame}" sandbox="allow-scripts" srcdoc="{}"></iframe>"#,
+                        inner_listening_first()
+                    )
+                })
+                .collect::<String>(),
+        ),
+        // One of those whose document the page replaces every 300 ms (a frame that keeps
+        // coming back).
+        "/sandbox-loop" => page(
+            "sandbox-loop",
+            &format!(
+                r#"<iframe id="f" style="{frame}" sandbox="allow-scripts" srcdoc="{0}"></iframe><script>let n=0;setInterval(()=>{{const f=document.getElementById('f');f.srcdoc=f.srcdoc.replace(/<!--\d*-->|$/,'<!--'+(n++)+'-->')}},300)</script>"#,
+                inner_listening_first()
+            ),
+        ),
         // The same, whose document listens first.
         "/sandbox-first" => page(
             "sandbox-first",
@@ -929,12 +950,6 @@ fn clipboard_setting_of_one_session_does_not_leak_to_another() {
     });
 }
 
-/// Replaces K3's refusal of the agent's `Page.addScriptToEvaluateOnNewDocument` (agent-browser's
-/// `vitals` needs it): the agent's own new-document script cannot run before the shield, so it
-/// cannot disarm it (spike C12a: the older session's script runs first, and the guard holds
-/// every new target until its own session has set the shield). Tried on the agent's tab and on
-/// a popup the agent holds from its start itself (session-level auto-attach waiting for the
-/// debugger). The attack script marks that it ran.
 /// The agent's attack on the shield, as a new-document script (spike C12a: i1, i2, i3, ii).
 /// It marks that it ran.
 const ATTACK: &str = "(()=>{window.__agentRan=1;const noop=function(){};\
@@ -943,6 +958,11 @@ const ATTACK: &str = "(()=>{window.__agentRan=1;const noop=function(){};\
     Event.prototype.preventDefault=noop;Event.prototype.stopImmediatePropagation=noop;\
     Function.prototype.call=noop;EventTarget.prototype.addEventListener=noop})()";
 
+/// Replaces K3's refusal of the agent's `Page.addScriptToEvaluateOnNewDocument` (agent-browser's
+/// `vitals` needs it): the agent's own new-document script cannot run before the shield, so it
+/// cannot disarm it (spike C12a: the older session's script runs first, and the guard holds
+/// every new target until its own session has set the shield). Tried on the agent's tab and on
+/// a popup the agent is attached to from its start.
 #[test]
 #[ignore]
 fn agent_scripts_cannot_run_before_the_shield() {
@@ -1300,6 +1320,241 @@ fn a_kept_tab_gets_the_shield_into_its_running_document_after_a_reconnect() {
         let _ = conn
             .send("Target.closeTarget", json!({ "targetId": t }), None)
             .await;
+        let _ = h.manager.delete_profile(profile).await;
+    });
+}
+
+/// Review C1: the guard's reloads of frames attached running are counted per frame, so a page
+/// with many sandboxed srcdoc frames (each listening first) has every one covered, the last
+/// as well as the first; and a frame that keeps coming back running is reloaded a few times
+/// and then has its tab closed, never left running unshielded.
+#[test]
+#[ignore]
+fn many_and_returning_sandboxed_frames_stay_covered() {
+    common::run(async {
+        let clip = Clipboard::take();
+        let h = Harness::start();
+        for allow in [true, false] {
+            let a = agent(&h, allow).await;
+            let tab = a.tab(&a.first()).await;
+            tab.load("/sandbox-many").await;
+            settle().await;
+            let first = click_copy_changes(&tab, "#f0", &clip).await;
+            let last = click_copy_changes(&tab, "#f9", &clip).await;
+            eprintln!("many frames, allow={allow}: first {first}, last {last}");
+            assert_eq!((first, last), (allow, allow), "allow={allow}");
+            h.close_session(&a.info.id).await;
+        }
+        let a = agent(&h, false).await;
+        let first = a.first();
+        let tab = a.tab(&first).await;
+        tab.load("/sandbox-loop").await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let open = page_targets(&h.browser.conn)
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.target_id == first);
+        // Closed is covered too (nothing to click); open, the frame's copy must not land.
+        let changed = open && click_copy_changes(&tab, "#f", &clip).await;
+        let log = h.manager.guard_attach_log();
+        eprintln!(
+            "returning frame: tab open={open}, copy changed={changed}, running frames: {:#?}",
+            log.iter()
+                .filter(|l| l.contains("iframe agent waiting=false"))
+                .collect::<Vec<_>>()
+        );
+        assert!(!changed, "the returning frame's copy went through");
+    });
+}
+
+/// The HTML of `/clip`'s copy area, to write into a document.
+fn copy_area(listen_first: bool) -> String {
+    let first = if listen_first {
+        "<script>window.addEventListener('copy',function(e){e.stopImmediatePropagation()},true)</script>"
+    } else {
+        ""
+    };
+    format!(r#"{first}<textarea id="t">x</textarea><button id="cp" onclick="{COPY}">copy</button>"#)
+}
+
+/// Review C2: `document.open()` removes every listener of the document and its window and
+/// makes no new global, so no new-document script runs again. The shield wraps `open`,
+/// `write` and `writeln` so its listeners are back before anything written runs. Each way is
+/// tried in a denied session (the copy must not land) and an allowed one (it must).
+#[test]
+#[ignore]
+fn document_open_and_write_do_not_remove_the_shield() {
+    common::run(async {
+        let clip = Clipboard::take();
+        let h = Harness::start();
+        let js = |s: &str| serde_json::to_string(s).unwrap();
+        let ways: Vec<(&str, String)> = vec![
+            (
+                "open, write, close",
+                format!(
+                    "document.open();document.write({});document.close();1",
+                    js(&copy_area(false))
+                ),
+            ),
+            (
+                "write on the loaded document (opens it)",
+                format!("document.write({});document.close();1", js(&copy_area(false))),
+            ),
+            (
+                "writeln on the loaded document",
+                format!("document.writeln({});document.close();1", js(&copy_area(false))),
+            ),
+            (
+                "written content listens first",
+                format!(
+                    "document.open();document.write({});document.close();1",
+                    js(&copy_area(true))
+                ),
+            ),
+            (
+                "open from another realm",
+                format!(
+                    "(()=>{{const f=document.createElement('iframe');document.body.appendChild(f);\
+                     const D=f.contentWindow.Document.prototype;D.open.call(document);\
+                     D.write.call(document,{});document.close();return 1}})()",
+                    js(&copy_area(false))
+                ),
+            ),
+            (
+                "a document made elsewhere, adopted",
+                format!(
+                    "(()=>{{const d=document.implementation.createHTMLDocument('');\
+                     d.body.innerHTML={};\
+                     document.replaceChild(document.adoptNode(d.documentElement),document.documentElement);return 1}})()",
+                    js(&copy_area(false))
+                ),
+            ),
+        ];
+        for allow in [true, false] {
+            let a = agent(&h, allow).await;
+            let tab = a.tab(&a.first()).await;
+            for (way, expr) in &ways {
+                tab.load("/clip").await;
+                let said = tab.eval(expr, false).await;
+                settle().await;
+                let changed = click_copy_changes(&tab, "#cp", &clip).await;
+                eprintln!("{way}, allow={allow}: eval {said}, copy changed {changed}");
+                assert_eq!(changed, allow, "{way}: allow={allow} (eval said {said})");
+            }
+            h.close_session(&a.info.id).await;
+        }
+    });
+}
+
+/// Resets a guard test hook when dropped, also when the test fails.
+struct Reset<'a>(&'a Harness);
+
+impl Drop for Reset<'_> {
+    fn drop(&mut self) {
+        self.0
+            .manager
+            .set_guard_early_delay_for_test(Duration::ZERO);
+        self.0.manager.set_guard_fail_frame_shield_for_test(false);
+    }
+}
+
+/// Review I1: `ready` comes back at most `EARLY_SETUP_LIMIT` (10 s) after a reconnect, but
+/// the commands of a clipboard-denied session wait until the tabs that were there are
+/// shielded and reloaded (here held 12 s by a test hook, as a busy renderer would).
+#[test]
+#[ignore]
+fn commands_wait_for_the_old_tabs_after_a_reconnect() {
+    common::run(async {
+        let h = Harness::start();
+        let _reset = Reset(&h);
+        let a = agent(&h, false).await;
+        let mut log = log_for(&h, &a.info);
+        assert!(h
+            .manager
+            .set_guard_early_delay_for_test(Duration::from_secs(12)));
+        assert!(h.manager.drop_guard_for_test(Duration::from_secs(1)));
+        let back = common::eventually(15, || async { h.manager.require_guard().is_ok() }).await;
+        assert!(back, "the guard did not come back");
+        let e = match command(&h, &mut log, &a.info, &["get", "url"]).await {
+            Ok(r) => panic!("a command ran before the old tabs were shielded: {r:?}"),
+            Err(e) => e,
+        };
+        assert_eq!(e.code, codes::BROWSER_FAILED, "{e:?}");
+        assert!(e.message.contains("clipboard policy"), "{e:?}");
+        let done = common::eventually(20, || async {
+            h.manager.require_clipboard(&a.info.id).is_ok()
+        })
+        .await;
+        assert!(done, "the old tabs were never done");
+    });
+}
+
+/// Review I2: a frame whose shield fails already runs (it was resumed first), so the tab that
+/// holds it is closed (forced by a test hook).
+#[test]
+#[ignore]
+fn a_frame_whose_shield_fails_closes_its_tab() {
+    common::run(async {
+        let h = Harness::start();
+        let _reset = Reset(&h);
+        let a = agent(&h, false).await;
+        let first = a.first();
+        let tab = a.tab(&first).await;
+        tab.load("/clip").await;
+        assert!(h.manager.set_guard_fail_frame_shield_for_test(true));
+        let _ = h
+            .browser
+            .conn
+            .send(
+                "Runtime.evaluate",
+                json!({ "expression": format!("location.href = {:?}; 1", url("/xsite")) }),
+                Some(&h.browser.conn.attach(&first).await.unwrap()),
+            )
+            .await;
+        let closed = common::eventually(15, || async {
+            !page_targets(&h.browser.conn)
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.target_id == first)
+        })
+        .await;
+        let log = h.manager.guard_attach_log().join("\n");
+        assert!(
+            closed,
+            "the tab of a frame without the shield is open:\n{log}"
+        );
+        assert!(log.contains("shield failed"), "{log}");
+    });
+}
+
+/// Review I3: a denial whose connection was lost and given up on may still be in Chrome
+/// (closing the connection does not lift it). A session allowing the clipboard in that
+/// profile afterwards gets it lifted with a reset on a new connection.
+#[test]
+#[ignore]
+fn a_lost_denial_is_lifted_for_a_session_that_allows_the_clipboard() {
+    common::run(async {
+        let clip = Clipboard::take();
+        let h = Harness::start();
+        let profile = "clip-lost";
+        h.manager.create_profile(profile).await.unwrap();
+        let denied = create(&h, false, Some(profile)).await.unwrap();
+        assert_eq!(writes_in(&denied, &clip).await, (false, false));
+        // Held down past the give-up (5 s).
+        assert!(h
+            .manager
+            .drop_clipboard_policy_for_test(&denied.info.id, Duration::from_secs(7)));
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        h.close_session(&denied.info.id).await;
+        let allowed = create(&h, true, Some(profile)).await.unwrap();
+        assert_eq!(
+            writes_in(&allowed, &clip).await,
+            (true, true),
+            "the lost denial was not lifted (writeText, execCommand)"
+        );
+        h.close_session(&allowed.info.id).await;
         let _ = h.manager.delete_profile(profile).await;
     });
 }
