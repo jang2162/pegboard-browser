@@ -73,6 +73,8 @@ struct Flag {
 }
 
 struct Arg {
+    /// Its name as an argument of the MCP tool (camelCase).
+    name: &'static str,
     kind: Kind,
     required: bool,
     /// The value is a secret (a cookie's or storage entry's value, a dialog's answer): the
@@ -104,6 +106,10 @@ struct Form {
     /// Further words of this kind after `args` (joined into text, or a list of values).
     rest: Option<Kind>,
     rest_required: bool,
+    /// The rest's name as an argument of the MCP tool.
+    rest_name: &'static str,
+    /// The rest is a list of values (each its own word), not text.
+    rest_many: bool,
     flags: &'static [Flag],
     /// `--` may come right before the rest (literal text, may start with '-').
     literal_rest: bool,
@@ -113,16 +119,18 @@ struct Form {
     text: TextUse,
 }
 
-const fn req(kind: Kind) -> Arg {
+const fn req(name: &'static str, kind: Kind) -> Arg {
     Arg {
+        name,
         kind,
         required: true,
         secret: false,
     }
 }
 
-const fn opt(kind: Kind) -> Arg {
+const fn opt(name: &'static str, kind: Kind) -> Arg {
     Arg {
+        name,
         kind,
         required: false,
         secret: false,
@@ -157,6 +165,8 @@ const fn form(words: &'static [&'static str], class: ActionClass, args: &'static
         args,
         rest: None,
         rest_required: false,
+        rest_name: "",
+        rest_many: false,
         flags: &[],
         literal_rest: false,
         default_file: None,
@@ -172,17 +182,26 @@ const fn with_flags(f: Form, flags: &'static [Flag]) -> Form {
     Form { flags, ..f }
 }
 
-const fn with_rest(f: Form, kind: Kind, required: bool) -> Form {
+const fn with_rest(f: Form, name: &'static str, kind: Kind, required: bool) -> Form {
     Form {
         rest: Some(kind),
         rest_required: required,
+        rest_name: name,
+        ..f
+    }
+}
+
+/// The rest is a list of values.
+const fn many(f: Form) -> Form {
+    Form {
+        rest_many: true,
         ..f
     }
 }
 
 use Kind::*;
 
-const SEL: &[Arg] = &[req(Selector)];
+const SEL: &[Arg] = &[req("selector", Selector)];
 const IMAGE: &[&str] = &["png", "jpg", "jpeg"];
 const FIND_ACTIONS: Kind = Choice(&["click", "fill", "check", "hover", "text"]);
 const FIND_FLAGS: &[Flag] = &[value(&["--name"], Text), switch(&["--exact"])];
@@ -227,7 +246,7 @@ const WAIT_FLAGS: &[Flag] = &[
 /// `webmcp`, `clipboard`, `react`, `pushstate` reach outside the session (local files, the
 /// CLI's own network access, an unauthenticated DevTools proxy).
 const GRAMMAR: &[Form] = &[
-    form(&["open"], ActionClass::Navigate, &[req(Url)]),
+    form(&["open"], ActionClass::Navigate, &[req("url", Url)]),
     form(&["back"], ActionClass::Navigate, &[]),
     form(&["forward"], ActionClass::Navigate, &[]),
     form(&["reload"], ActionClass::Navigate, &[]),
@@ -243,7 +262,7 @@ const GRAMMAR: &[Form] = &[
     form(
         &["get", "attr"],
         ActionClass::Get,
-        &[req(Selector), req(Text)],
+        &[req("selector", Selector), req("attribute", Text)],
     ),
     form(&["get", "count"], ActionClass::Get, SEL),
     form(&["get", "box"], ActionClass::Get, SEL),
@@ -265,7 +284,7 @@ const GRAMMAR: &[Form] = &[
     Form {
         literal_rest: true,
         ..with_text(
-            with_rest(form(&["fill"], ActionClass::Fill, SEL), Text, true),
+            with_rest(form(&["fill"], ActionClass::Fill, SEL), "text", Text, true),
             TextUse::Typed,
         )
     },
@@ -273,17 +292,18 @@ const GRAMMAR: &[Form] = &[
         literal_rest: true,
         flags: &[switch(&["--clear"]), value(&["--delay"], Number)],
         ..with_text(
-            with_rest(form(&["type"], ActionClass::Fill, SEL), Text, true),
+            with_rest(form(&["type"], ActionClass::Fill, SEL), "text", Text, true),
             TextUse::Typed,
         )
     },
     with_text(
-        form(&["press"], ActionClass::Fill, &[req(Key)]),
+        form(&["press"], ActionClass::Fill, &[req("key", Key)]),
         TextUse::Key,
     ),
     with_text(
         with_rest(
             form(&["keyboard", "type"], ActionClass::Fill, &[]),
+            "text",
             Text,
             true,
         ),
@@ -292,20 +312,29 @@ const GRAMMAR: &[Form] = &[
     with_text(
         with_rest(
             form(&["keyboard", "inserttext"], ActionClass::Fill, &[]),
+            "text",
             Text,
             true,
         ),
         TextUse::Typed,
     ),
     with_text(
-        with_rest(form(&["select"], ActionClass::Click, SEL), Text, true),
+        many(with_rest(
+            form(&["select"], ActionClass::Click, SEL),
+            "values",
+            Text,
+            true,
+        )),
         TextUse::Typed,
     ),
     with_flags(
         form(
             &["scroll"],
             ActionClass::Scroll,
-            &[opt(Choice(&["up", "down", "left", "right"])), opt(Number)],
+            &[
+                opt("direction", Choice(&["up", "down", "left", "right"])),
+                opt("amount", Number),
+            ],
         ),
         &[value(&["-s", "--selector"], Selector)],
     ),
@@ -313,7 +342,7 @@ const GRAMMAR: &[Form] = &[
         form(
             &["drag"],
             ActionClass::Click,
-            &[req(Selector), req(Selector)],
+            &[req("source", Selector), req("target", Selector)],
         ),
         &[switch(&["--human"])],
     ),
@@ -321,7 +350,7 @@ const GRAMMAR: &[Form] = &[
         form(
             &["mouse", "move"],
             ActionClass::Click,
-            &[req(Number), req(Number)],
+            &[req("x", Number), req("y", Number)],
         ),
         &[
             value(&["--duration"], Number),
@@ -330,32 +359,76 @@ const GRAMMAR: &[Form] = &[
             value(&["--seed"], Number),
         ],
     ),
-    form(&["mouse", "down"], ActionClass::Click, &[opt(MOUSE_BUTTON)]),
-    form(&["mouse", "up"], ActionClass::Click, &[opt(MOUSE_BUTTON)]),
+    form(
+        &["mouse", "down"],
+        ActionClass::Click,
+        &[opt("button", MOUSE_BUTTON)],
+    ),
+    form(
+        &["mouse", "up"],
+        ActionClass::Click,
+        &[opt("button", MOUSE_BUTTON)],
+    ),
     form(
         &["mouse", "wheel"],
         ActionClass::Scroll,
-        &[req(Number), opt(Number)],
+        &[req("deltaY", Number), opt("deltaX", Number)],
     ),
-    find(&["find", "role"], &[req(Text), opt(FIND_ACTIONS)]),
-    find(&["find", "text"], &[req(Text), opt(FIND_ACTIONS)]),
-    find(&["find", "label"], &[req(Text), opt(FIND_ACTIONS)]),
-    find(&["find", "placeholder"], &[req(Text), opt(FIND_ACTIONS)]),
-    find(&["find", "alt"], &[req(Text), opt(FIND_ACTIONS)]),
-    find(&["find", "title"], &[req(Text), opt(FIND_ACTIONS)]),
-    find(&["find", "testid"], &[req(Text), opt(FIND_ACTIONS)]),
-    find(&["find", "first"], &[req(Selector), opt(FIND_ACTIONS)]),
-    find(&["find", "last"], &[req(Selector), opt(FIND_ACTIONS)]),
+    find(
+        &["find", "role"],
+        &[req("query", Text), opt("action", FIND_ACTIONS)],
+    ),
+    find(
+        &["find", "text"],
+        &[req("query", Text), opt("action", FIND_ACTIONS)],
+    ),
+    find(
+        &["find", "label"],
+        &[req("query", Text), opt("action", FIND_ACTIONS)],
+    ),
+    find(
+        &["find", "placeholder"],
+        &[req("query", Text), opt("action", FIND_ACTIONS)],
+    ),
+    find(
+        &["find", "alt"],
+        &[req("query", Text), opt("action", FIND_ACTIONS)],
+    ),
+    find(
+        &["find", "title"],
+        &[req("query", Text), opt("action", FIND_ACTIONS)],
+    ),
+    find(
+        &["find", "testid"],
+        &[req("query", Text), opt("action", FIND_ACTIONS)],
+    ),
+    find(
+        &["find", "first"],
+        &[req("selector", Selector), opt("action", FIND_ACTIONS)],
+    ),
+    find(
+        &["find", "last"],
+        &[req("selector", Selector), opt("action", FIND_ACTIONS)],
+    ),
     find(
         &["find", "nth"],
-        &[req(Number), req(Selector), opt(FIND_ACTIONS)],
+        &[
+            req("index", Number),
+            req("selector", Selector),
+            opt("action", FIND_ACTIONS),
+        ],
     ),
     // A number waits that long; anything else is a selector.
     with_flags(
-        form(&["wait"], ActionClass::Wait, &[opt(Selector)]),
+        form(&["wait"], ActionClass::Wait, &[opt("target", Selector)]),
         WAIT_FLAGS,
     ),
-    with_rest(form(&["eval"], ActionClass::Eval, &[]), Text, true),
+    with_rest(
+        form(&["eval"], ActionClass::Eval, &[]),
+        "expression",
+        Text,
+        true,
+    ),
     Form {
         flags: &[
             switch(&["--full", "-f"]),
@@ -368,25 +441,34 @@ const GRAMMAR: &[Form] = &[
         ..form(
             &["screenshot"],
             ActionClass::Snapshot,
-            &[opt(ShotSelector), opt(File(IMAGE))],
+            &[opt("selector", ShotSelector), opt("file", File(IMAGE))],
         )
     },
-    form(&["pdf"], ActionClass::Snapshot, &[req(File(&["pdf"]))]),
+    form(
+        &["pdf"],
+        ActionClass::Snapshot,
+        &[req("file", File(&["pdf"]))],
+    ),
     // The files are looked up by name in the person's upload directory (see `UploadFile`).
-    with_rest(
+    many(with_rest(
         form(&["upload"], ActionClass::Upload, SEL),
+        "files",
         UploadFile,
         true,
-    ),
-    form(&["tab"], ActionClass::Navigate, &[opt(TabRef)]),
+    )),
+    form(&["tab"], ActionClass::Navigate, &[opt("tab", TabRef)]),
     form(&["tab", "list"], ActionClass::Read, &[]),
-    form(&["tab", "new"], ActionClass::Navigate, &[opt(Url)]),
-    form(&["tab", "close"], ActionClass::Navigate, &[opt(TabRef)]),
+    form(&["tab", "new"], ActionClass::Navigate, &[opt("url", Url)]),
+    form(
+        &["tab", "close"],
+        ActionClass::Navigate,
+        &[opt("tab", TabRef)],
+    ),
     form(&["frame"], ActionClass::Navigate, SEL),
     form(
         &["dialog", "accept"],
         ActionClass::Interact,
-        &[secret(opt(Text))],
+        &[secret(opt("text", Text))],
     ),
     form(&["dialog", "dismiss"], ActionClass::Interact, &[]),
     form(&["dialog", "status"], ActionClass::Read, &[]),
@@ -396,32 +478,40 @@ const GRAMMAR: &[Form] = &[
         form(
             &["cookies", "set"],
             ActionClass::State,
-            &[req(Text), secret(req(Text))],
+            &[req("name", Text), secret(req("value", Text))],
         ),
         COOKIE_FLAGS,
     ),
-    form(&["storage", "local"], ActionClass::Read, &[opt(Text)]),
+    form(
+        &["storage", "local"],
+        ActionClass::Read,
+        &[opt("key", Text)],
+    ),
     form(
         &["storage", "local", "get"],
         ActionClass::Read,
-        &[opt(Text)],
+        &[opt("key", Text)],
     ),
     form(
         &["storage", "local", "set"],
         ActionClass::State,
-        &[req(Text), secret(req(Text))],
+        &[req("key", Text), secret(req("value", Text))],
     ),
     form(&["storage", "local", "clear"], ActionClass::State, &[]),
-    form(&["storage", "session"], ActionClass::Read, &[opt(Text)]),
+    form(
+        &["storage", "session"],
+        ActionClass::Read,
+        &[opt("key", Text)],
+    ),
     form(
         &["storage", "session", "get"],
         ActionClass::Read,
-        &[opt(Text)],
+        &[opt("key", Text)],
     ),
     form(
         &["storage", "session", "set"],
         ActionClass::State,
-        &[req(Text), secret(req(Text))],
+        &[req("key", Text), secret(req("value", Text))],
     ),
     form(&["storage", "session", "clear"], ActionClass::State, &[]),
     with_flags(
@@ -443,17 +533,21 @@ const GRAMMAR: &[Form] = &[
         ],
     ),
     with_flags(
-        form(&["a11y"], ActionClass::Snapshot, &[opt(Url)]),
+        form(&["a11y"], ActionClass::Snapshot, &[opt("url", Url)]),
         &[
             value(&["--tags"], Text),
             value(&["-s", "--selector"], Selector),
         ],
     ),
-    form(&["vitals"], ActionClass::Read, &[opt(Url)]),
+    form(&["vitals"], ActionClass::Read, &[opt("url", Url)]),
     form(
         &["set", "viewport"],
         ActionClass::Interact,
-        &[req(Number), req(Number), opt(Number)],
+        &[
+            req("width", Number),
+            req("height", Number),
+            opt("scale", Number),
+        ],
     ),
 ];
 
@@ -461,10 +555,133 @@ const fn find(words: &'static [&'static str], args: &'static [Arg]) -> Form {
     Form {
         flags: FIND_FLAGS,
         ..with_text(
-            with_rest(form(words, ActionClass::Click, args), Text, false),
+            with_rest(form(words, ActionClass::Click, args), "text", Text, false),
             TextUse::Typed,
         )
     }
+}
+
+/// What a positional argument or flag value may be, as `forms` describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgKind {
+    /// A CSS or XPath selector, or a `@ref` from a snapshot.
+    Selector,
+    /// Free text (one word of the command line).
+    Text,
+    /// A JavaScript expression.
+    Expr,
+    /// An http(s) URL with a host, a data: URL or about:blank.
+    Url,
+    /// A key or combination such as `Enter` or `Control+a`.
+    Key,
+    /// A finite decimal, possibly negative (a flag value is never negative).
+    Number,
+    /// `t<N>`, a label, or a 32-hex target id.
+    TabRef,
+    /// A bare file name (no path) with one of these extensions; any extension when empty.
+    File(&'static [&'static str]),
+    /// One of these words.
+    Choice(&'static [&'static str]),
+}
+
+/// One accepted form of a command, as the grammar declares it: the public description from
+/// which the MCP tools are made. Describing a line is not checking it: `check` still judges
+/// every line, however it was built.
+#[derive(Debug, Clone)]
+pub struct FormSpec {
+    /// Command and subcommand words.
+    pub words: &'static [&'static str],
+    /// The form's action class (`class_of` refines it for `wait --fn`, `find ... <action>`,
+    /// `a11y <url>` and `vitals <url>`).
+    pub class: ActionClass,
+    /// Positional arguments, in order.
+    pub args: Vec<ArgSpec>,
+    /// Further words after the arguments.
+    pub rest: Option<RestSpec>,
+    pub flags: Vec<FlagSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArgSpec {
+    pub name: &'static str,
+    pub kind: ArgKind,
+    pub required: bool,
+    /// The action log never keeps the value.
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestSpec {
+    pub name: &'static str,
+    pub kind: ArgKind,
+    pub required: bool,
+    /// A list of values, each its own word (otherwise text, which may be one word).
+    pub many: bool,
+    /// `--` may come right before the rest, which may then start with '-'.
+    pub literal: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlagSpec {
+    /// The flag's spellings (at least one long `--` name).
+    pub names: &'static [&'static str],
+    /// The kind of its value; `None` for a switch. (`--annotate`, which may take `true` or
+    /// `false`, is described as a switch.)
+    pub value: Option<ArgKind>,
+}
+
+fn public_kind(kind: Kind) -> ArgKind {
+    match kind {
+        Selector | ShotSelector => ArgKind::Selector,
+        Text => ArgKind::Text,
+        Expr => ArgKind::Expr,
+        Url => ArgKind::Url,
+        Key => ArgKind::Key,
+        Number => ArgKind::Number,
+        TabRef => ArgKind::TabRef,
+        File(exts) => ArgKind::File(exts),
+        UploadFile => ArgKind::File(&[]),
+        Choice(options) => ArgKind::Choice(options),
+    }
+}
+
+/// Every form of the grammar, in its order.
+pub fn forms() -> Vec<FormSpec> {
+    GRAMMAR
+        .iter()
+        .map(|f| FormSpec {
+            words: f.words,
+            class: f.class,
+            args: f
+                .args
+                .iter()
+                .map(|a| ArgSpec {
+                    name: a.name,
+                    kind: public_kind(a.kind),
+                    required: a.required,
+                    secret: a.secret,
+                })
+                .collect(),
+            rest: f.rest.map(|kind| RestSpec {
+                name: f.rest_name,
+                kind: public_kind(kind),
+                required: f.rest_required,
+                many: f.rest_many,
+                literal: f.literal_rest,
+            }),
+            flags: f
+                .flags
+                .iter()
+                .map(|fl| FlagSpec {
+                    names: fl.names,
+                    value: match fl.arity {
+                        Arity::Value(kind) => Some(public_kind(kind)),
+                        Arity::Switch | Arity::OptionalBool => None,
+                    },
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 pub(crate) fn rejected(message: impl Into<String>) -> RpcError {
@@ -1478,6 +1695,103 @@ mod tests {
             Some(TextDestination::Unknown)
         );
         assert_eq!(at(&["click", "#a"]), None);
+    }
+
+    #[test]
+    fn forms_describe_the_grammar_one_to_one() {
+        let forms = forms();
+        assert_eq!(forms.len(), GRAMMAR.len());
+        for (spec, f) in forms.iter().zip(GRAMMAR) {
+            let name = f.words.join(" ");
+            assert_eq!(spec.words, f.words);
+            assert_eq!(spec.class, f.class, "{name}");
+            assert_eq!(spec.args.len(), f.args.len(), "{name}");
+            assert_eq!(spec.flags.len(), f.flags.len(), "{name}");
+            assert_eq!(spec.rest.is_some(), f.rest.is_some(), "{name}");
+            for (a, arg) in spec.args.iter().zip(f.args) {
+                assert_eq!(a.required, arg.required, "{name}");
+                assert_eq!(a.secret, arg.secret, "{name}");
+            }
+            if let Some(rest) = &spec.rest {
+                assert_eq!(rest.required, f.rest_required, "{name}");
+                assert_eq!(rest.literal, f.literal_rest, "{name}");
+            }
+            // Every argument has a name, distinct within the form, in camelCase.
+            let mut names: Vec<&str> = spec.args.iter().map(|a| a.name).collect();
+            names.extend(spec.rest.as_ref().map(|r| r.name));
+            for n in &names {
+                assert!(
+                    !n.is_empty()
+                        && n.bytes().next().unwrap().is_ascii_lowercase()
+                        && n.bytes().all(|b| b.is_ascii_alphanumeric()),
+                    "{name}: {n:?}"
+                );
+            }
+            let mut unique = names.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), names.len(), "{name}: {names:?}");
+            for flag in &spec.flags {
+                assert!(flag.names.iter().any(|n| n.starts_with("--")), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn forms_tell_kinds_as_the_checker_judges_them() {
+        let find = |words: &[&str]| {
+            forms()
+                .into_iter()
+                .find(|f| f.words == words)
+                .unwrap_or_else(|| panic!("{words:?}"))
+        };
+        let shot = find(&["screenshot"]);
+        assert!(matches!(shot.args[0].kind, ArgKind::Selector));
+        assert!(matches!(shot.args[1].kind, ArgKind::File(e) if e == IMAGE));
+        assert_eq!(
+            shot.flags
+                .iter()
+                .map(|f| (f.names, f.value.is_some()))
+                .collect::<Vec<_>>(),
+            vec![(&["--full", "-f"][..], false), (&["--annotate"][..], false)]
+        );
+        let upload = find(&["upload"]);
+        let rest = upload.rest.unwrap();
+        assert!(matches!(rest.kind, ArgKind::File(e) if e.is_empty()));
+        assert!(rest.many && rest.required && !rest.literal);
+        let fill = find(&["fill"]);
+        let rest = fill.rest.unwrap();
+        assert!(matches!(rest.kind, ArgKind::Text) && !rest.many && rest.literal);
+        assert!(find(&["select"]).rest.unwrap().many);
+        assert!(find(&["cookies", "set"]).args[1].secret);
+        let snap = find(&["snapshot"]);
+        assert!(matches!(
+            snap.flags
+                .iter()
+                .find(|f| f.names.contains(&"--depth"))
+                .unwrap()
+                .value,
+            Some(ArgKind::Number)
+        ));
+        assert!(matches!(
+            find(&["wait"])
+                .flags
+                .iter()
+                .find(|f| f.names == ["--fn"])
+                .unwrap()
+                .value,
+            Some(ArgKind::Expr)
+        ));
+        assert!(matches!(find(&["open"]).args[0].kind, ArgKind::Url));
+        assert!(matches!(
+            find(&["tab", "close"]).args[0].kind,
+            ArgKind::TabRef
+        ));
+        assert!(matches!(find(&["press"]).args[0].kind, ArgKind::Key));
+        assert!(matches!(
+            find(&["mouse", "down"]).args[0].kind,
+            ArgKind::Choice(o) if o == ["left", "right", "middle"]
+        ));
     }
 
     /// A new form that takes free text must be classified: either its text is hidden, or it
