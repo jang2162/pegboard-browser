@@ -28,10 +28,12 @@
 //!   held-from-the-start attachment, so the guard's session on it is older than any agent
 //!   session (an older session's scripts run first and could disarm the shield, C12a). A
 //!   frame attached already running (a sandboxed srcdoc frame, C12c) gets it into the running
-//!   document too. A tab that was there before the guard attached (after a reconnect) has no
-//!   such guarantee: in a profile whose sessions deny the clipboard it is closed
-//!   (`clipboard_step`). The `clipboard-read`/`clipboard-write` denial that stops
-//!   `navigator.clipboard` is the download policy connection's job (`downloads`).
+//!   document too and is made to reload itself, so its next document has it first. After a
+//!   reconnect the agents' connections of clipboard-denied sessions are dropped first
+//!   (`BeforeReady`: no agent session stays older than the guard's), and the tabs that were
+//!   there are shielded and reloaded (`clipboard_step`). The `clipboard-read`/
+//!   `clipboard-write` denial that stops `navigator.clipboard` is the download policy
+//!   connection's job (`downloads`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
@@ -72,25 +74,49 @@ pub enum ClipboardStep {
     /// Adds `CLIPBOARD_SHIELD` for the target's next documents and, when it runs already,
     /// into its current one.
     Shield { run_immediately: bool },
-    /// Closes the tab: it was there before the guard attached, so an agent session on it may
-    /// be older than the guard's and its scripts would run before the shield (C12a).
-    Close,
+    /// A tab that was there before the guard (re)connected: shielded, then reloaded (once
+    /// interception is on), so that the shield is the first script of its next document.
+    /// The agents' connections of its profile were dropped before (`BeforeReady`), so no
+    /// agent session on it is older than the guard's (C12a).
+    ShieldAndReload,
+    /// A frame attached already running (a sandboxed srcdoc frame, spike C12c): its own first
+    /// script ran before the shield, so the frame reloads itself (`location.reload()` in it)
+    /// and its next document has the shield first.
+    ShieldAndReloadFrame,
 }
 
 /// The clipboard step for a target of `kind`, attached `waiting` for the debugger or not,
 /// in a profile whose sessions allow the clipboard (`Some(true)`), deny it (`Some(false)`) or
-/// that no session holds (`None`: shielded, as the default denies).
-pub fn clipboard_step(kind: &str, waiting: bool, allowed: Option<bool>) -> ClipboardStep {
+/// that no session holds (`None`: shielded, as the default denies). `early`: attached when
+/// the guard (re)connected, set up before it counts as ready.
+pub fn clipboard_step(
+    kind: &str,
+    waiting: bool,
+    allowed: Option<bool>,
+    early: bool,
+) -> ClipboardStep {
     if !matches!(kind, "page" | "iframe") || allowed == Some(true) {
         return ClipboardStep::Leave;
     }
-    if kind == "page" && !waiting && allowed == Some(false) {
-        return ClipboardStep::Close;
+    if kind == "iframe" && !waiting {
+        return ClipboardStep::ShieldAndReloadFrame;
+    }
+    if kind == "page" && !waiting && early && allowed == Some(false) {
+        return ClipboardStep::ShieldAndReload;
     }
     ClipboardStep::Shield {
         run_immediately: !waiting,
     }
 }
+
+/// Most frames attached already running that one page session gets reloaded: a frame whose
+/// reload comes back as a new running target cannot make the guard reload forever.
+const FRAME_RELOADS: u32 = 8;
+
+/// Called once a reconnected guard has turned auto-attach on and before it sets up the
+/// targets that are there: drops the agents' connections of profiles whose sessions deny the
+/// clipboard (`ProxyServer::drop_clients`), so no agent session is older than the guard's.
+pub type BeforeReady = Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_PAUSE: Duration = Duration::from_millis(500);
@@ -386,6 +412,19 @@ enum Status {
     Failed(std::time::Instant),
 }
 
+/// A target the guard was attached to, as `set_up` needs it.
+struct Attachment<'a> {
+    session: &'a str,
+    target: &'a str,
+    kind: &'a str,
+    context: &'a str,
+    /// The guard's session the attachment came on (`None`: the browser level).
+    parent: Option<&'a str>,
+    waiting: bool,
+    /// Attached when the guard (re)connected (see `clipboard_step`).
+    early: bool,
+}
+
 #[derive(Debug, Clone)]
 struct Attached {
     target: String,
@@ -409,6 +448,8 @@ struct State {
     attach_log: std::collections::VecDeque<String>,
     /// Refused requests per reason, since the daemon started (diagnostics, no URLs).
     denied: BTreeMap<&'static str, u64>,
+    /// Page session -> frames attached running that were reloaded under it (`FRAME_RELOADS`).
+    frame_reloads: HashMap<String, u32>,
 }
 
 struct Inner {
@@ -416,6 +457,7 @@ struct Inner {
     human_context: String,
     policy_of: PolicyOf,
     clipboard_of: ClipboardOf,
+    before_ready: BeforeReady,
     own_ports: OwnPorts,
     resolver: Resolver,
     state: Mutex<State>,
@@ -462,6 +504,7 @@ impl Guard {
         human_context: &str,
         policy_of: PolicyOf,
         clipboard_of: ClipboardOf,
+        before_ready: BeforeReady,
         own_ports: OwnPorts,
         resolver: Resolver,
     ) -> Guard {
@@ -470,6 +513,7 @@ impl Guard {
             human_context: human_context.to_string(),
             policy_of,
             clipboard_of,
+            before_ready,
             own_ports,
             resolver,
             state: Mutex::new(State::default()),
@@ -609,6 +653,7 @@ async fn supervise(inner: Weak<Inner>) {
             state.sessions.clear();
             state.pages.clear();
             state.documents.clear();
+            state.frame_reloads.clear();
         }
         guard.changed.send_modify(|n| *n += 1);
         drop(guard);
@@ -639,13 +684,18 @@ impl Inner {
         if self.hold_until.lock().unwrap().is_some() {
             return;
         }
+        // After a reconnect: the agents' connections that may hold sessions older than the
+        // guard's are dropped first (they connect again, younger).
+        if self.state.lock().unwrap().connections > 1 {
+            (self.before_ready)().await;
+        }
         // The targets that were there already were attached while auto-attach was turned on
         // (their events are queued): they are set up (a clipboard-denied tab among them
-        // closed) before commands are let through again.
+        // reloaded) before commands are let through again.
         let mut early = Vec::new();
         while let Ok(event) = events.try_recv() {
             if event.method == "Target.attachedToTarget" {
-                early.push(self.on_attached(&conn, event));
+                early.push(self.on_attached(&conn, event, true));
             } else {
                 self.on_event(&conn, event);
             }
@@ -665,7 +715,7 @@ impl Inner {
 
     fn on_event(self: &Arc<Self>, conn: &CdpConn, event: CdpEvent) {
         match event.method.as_str() {
-            "Target.attachedToTarget" => drop(self.on_attached(conn, event)),
+            "Target.attachedToTarget" => drop(self.on_attached(conn, event, false)),
             "Target.detachedFromTarget" => self.on_detached(&event),
             "Fetch.requestPaused" => {
                 let Some(session) = event.session_id.clone() else {
@@ -687,7 +737,12 @@ impl Inner {
 
     /// Sets up (or lets go) the attached target in a task of its own; the handle tells when
     /// that is done.
-    fn on_attached(self: &Arc<Self>, conn: &CdpConn, event: CdpEvent) -> JoinHandle<()> {
+    fn on_attached(
+        self: &Arc<Self>,
+        conn: &CdpConn,
+        event: CdpEvent,
+        early: bool,
+    ) -> JoinHandle<()> {
         let p = &event.params;
         let s = |ptr: &str| p.pointer(ptr).and_then(Value::as_str).unwrap_or_default();
         let session = s("/sessionId").to_string();
@@ -725,8 +780,16 @@ impl Inner {
             let outcome = if foreign {
                 release(&conn, &session, parent.as_deref()).await
             } else {
-                me.set_up(&conn, &session, &target, &kind, &context, waiting)
-                    .await
+                let attached = Attachment {
+                    session: &session,
+                    target: &target,
+                    kind: &kind,
+                    context: &context,
+                    parent: parent.as_deref(),
+                    waiting,
+                    early,
+                };
+                me.set_up(&conn, attached).await
             };
             me.log_attach(format!(
                 "{target} {kind} {whose} waiting={waiting} parent={} -> {outcome}",
@@ -746,27 +809,24 @@ impl Inner {
     /// Shields an agent target's documents from the clipboard events (`clipboard_step`),
     /// turns interception on for it and resumes it. A tab that cannot be guarded is closed; a
     /// frame or worker is left waiting. Returns what happened (for the diagnostics log).
-    async fn set_up(
-        &self,
-        conn: &CdpConn,
-        session: &str,
-        target: &str,
-        kind: &str,
-        context: &str,
-        waiting: bool,
-    ) -> String {
+    async fn set_up(&self, conn: &CdpConn, a: Attachment<'_>) -> String {
+        let Attachment {
+            session,
+            target,
+            kind,
+            context,
+            waiting,
+            ..
+        } = a;
         let s = Some(session);
-        let step = clipboard_step(kind, waiting, (self.clipboard_of)(context));
-        if step == ClipboardStep::Close {
-            self.set_page(kind, target, Status::Failed(std::time::Instant::now()));
-            let closed = outcome(
-                conn.send("Target.closeTarget", json!({ "targetId": target }), None)
-                    .await,
-            );
-            return format!("closed: older than the guard, clipboard denied ({closed})");
-        }
+        let step = clipboard_step(kind, waiting, (self.clipboard_of)(context), a.early);
         let result = async {
-            if let ClipboardStep::Shield { run_immediately } = step {
+            let run_immediately = match step {
+                ClipboardStep::Leave => None,
+                ClipboardStep::Shield { run_immediately } => Some(run_immediately),
+                ClipboardStep::ShieldAndReload | ClipboardStep::ShieldAndReloadFrame => Some(true),
+            };
+            if let Some(run_immediately) = run_immediately {
                 conn.send("Page.enable", json!({}), s).await?;
                 let mut params = json!({ "source": CLIPBOARD_SHIELD });
                 if run_immediately {
@@ -814,7 +874,8 @@ impl Inner {
                     "not-waiting".to_string()
                 };
                 self.set_page(kind, target, Status::Guarded { paused: waiting });
-                format!("guarded resume={resumed}")
+                let reloaded = self.reload_for_clipboard(conn, step, &a).await;
+                format!("guarded resume={resumed}{reloaded}")
             }
             Err(e) => {
                 self.set_page(kind, target, Status::Failed(std::time::Instant::now()));
@@ -825,6 +886,45 @@ impl Inner {
                 }
                 format!("failed ({e:#})")
             }
+        }
+    }
+
+    /// The reload a clipboard step asks for, once the target is guarded (its requests are
+    /// judged). Returns what happened, for the diagnostics log.
+    async fn reload_for_clipboard(
+        &self,
+        conn: &CdpConn,
+        step: ClipboardStep,
+        a: &Attachment<'_>,
+    ) -> String {
+        let s = Some(a.session);
+        match step {
+            ClipboardStep::ShieldAndReload => {
+                let r = conn.send("Page.reload", json!({}), s).await;
+                format!(" reload={}", outcome(r))
+            }
+            ClipboardStep::ShieldAndReloadFrame => {
+                let parent = a.parent.unwrap_or_default().to_string();
+                let allowed = {
+                    let mut state = self.state.lock().unwrap();
+                    let n = state.frame_reloads.entry(parent).or_insert(0);
+                    *n += 1;
+                    *n <= FRAME_RELOADS
+                };
+                if !allowed {
+                    return " frame-reload=limit".to_string();
+                }
+                // `location` cannot be replaced by the page ([LegacyUnforgeable]).
+                let r = conn
+                    .send(
+                        "Runtime.evaluate",
+                        json!({ "expression": "location.reload()" }),
+                        s,
+                    )
+                    .await;
+                format!(" frame-reload={}", outcome(r))
+            }
+            _ => String::new(),
         }
     }
 
@@ -848,6 +948,7 @@ impl Inner {
             return;
         };
         let mut state = self.state.lock().unwrap();
+        state.frame_reloads.remove(session);
         if let Some(gone) = state.sessions.remove(session) {
             // A tab's session ends with the tab; a failure stays visible to a waiter for a
             // while (`FAILED_KEPT`).
@@ -1247,77 +1348,49 @@ mod tests {
     #[test]
     fn what_the_guard_does_for_the_clipboard() {
         use ClipboardStep::*;
-        let table: &[(&str, bool, Option<bool>, ClipboardStep)] = &[
+        let new_doc = Shield {
+            run_immediately: false,
+        };
+        let running = Shield {
+            run_immediately: true,
+        };
+        // (kind, waiting, allowed, set up before the guard counts as ready, step)
+        let table: &[(&str, bool, Option<bool>, bool, ClipboardStep)] = &[
             // New pages and frames, held from their start: the shield before the first script.
-            (
-                "page",
-                true,
-                Some(false),
-                Shield {
-                    run_immediately: false,
-                },
-            ),
-            (
-                "iframe",
-                true,
-                Some(false),
-                Shield {
-                    run_immediately: false,
-                },
-            ),
+            ("page", true, Some(false), false, new_doc),
+            ("iframe", true, Some(false), false, new_doc),
             // A context no session holds: shielded too (closed unless allowed).
-            (
-                "page",
-                true,
-                None,
-                Shield {
-                    run_immediately: false,
-                },
-            ),
-            // A frame that runs already (a sandboxed srcdoc frame, spike C12c): into the
-            // running document as well.
-            (
-                "iframe",
-                false,
-                Some(false),
-                Shield {
-                    run_immediately: true,
-                },
-            ),
-            (
-                "iframe",
-                false,
-                None,
-                Shield {
-                    run_immediately: true,
-                },
-            ),
-            // A tab older than the guard in a profile whose sessions deny the clipboard: an
-            // agent session on it may be older than the guard's (spike C12a). Closed.
-            ("page", false, Some(false), Close),
+            ("page", true, None, false, new_doc),
+            // A page attached a second time, not waiting (a popup is attached through the
+            // browser level and through its opener's session): into the running document.
+            // Never closed or reloaded: its first attachment held it.
+            ("page", false, Some(false), false, running),
+            ("page", false, None, false, running),
+            // A tab that was there before the guard (re)connected, in a profile whose
+            // sessions deny the clipboard: shielded and reloaded once the agents' older
+            // connections are gone, so the shield is the first script of its next document.
+            ("page", false, Some(false), true, ShieldAndReload),
             // ... but a tab no session's policy is about is shielded where it stands.
-            (
-                "page",
-                false,
-                None,
-                Shield {
-                    run_immediately: true,
-                },
-            ),
+            ("page", false, None, true, running),
+            // A frame that runs already (a sandboxed srcdoc frame, spike C12c): its own
+            // first script ran before the shield, so it is reloaded (shield first).
+            ("iframe", false, Some(false), false, ShieldAndReloadFrame),
+            ("iframe", false, None, false, ShieldAndReloadFrame),
+            ("iframe", false, Some(false), true, ShieldAndReloadFrame),
             // Sessions that allow the clipboard: nothing.
-            ("page", true, Some(true), Leave),
-            ("page", false, Some(true), Leave),
-            ("iframe", false, Some(true), Leave),
+            ("page", true, Some(true), false, Leave),
+            ("page", false, Some(true), true, Leave),
+            ("iframe", false, Some(true), false, Leave),
             // Workers have no document.
-            ("service_worker", true, Some(false), Leave),
-            ("shared_worker", false, None, Leave),
-            ("worker", true, Some(false), Leave),
+            ("service_worker", true, Some(false), false, Leave),
+            ("shared_worker", false, None, true, Leave),
+            ("worker", true, Some(false), false, Leave),
         ];
-        for (kind, waiting, allowed, step) in table {
+        for (kind, waiting, allowed, early, step) in table {
             assert_eq!(
-                clipboard_step(kind, *waiting, *allowed),
+                clipboard_step(kind, *waiting, *allowed, *early),
                 *step,
-                "{kind} waiting={waiting} allowed={allowed:?}"
+                "{kind} waiting={waiting} allowed={allowed:?} early={early}"
             );
         }
     }

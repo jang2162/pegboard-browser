@@ -131,6 +131,10 @@ struct SessionEntry {
     scope: Mutex<Scope>,
     /// Set to true when the session is unregistered; client connections then close.
     closed: watch::Sender<bool>,
+    /// Bumped to drop the client connections open now; the client may connect again.
+    kick: watch::Sender<u64>,
+    /// Client connections of this session whose upstream is open.
+    clients: Arc<AtomicUsize>,
 }
 
 impl SessionEntry {
@@ -155,6 +159,8 @@ impl SessionEntry {
                 upload_dirs: Vec::new(),
             }),
             closed: watch::channel(false).0,
+            kick: watch::channel(0).0,
+            clients: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -283,6 +289,35 @@ impl ProxyServer {
         let entry = self.shared.sessions.lock().unwrap().remove(&id.0);
         if let Some(entry) = entry {
             entry.closed.send_replace(true);
+        }
+    }
+
+    /// Drops the client connections the sessions have open now (each ends as a client
+    /// disconnect does, so the browser detaches their CDP sessions) and waits up to `limit`
+    /// until they are gone. The sessions stay registered: their clients can connect again.
+    /// Returns whether every one was gone in time.
+    pub async fn drop_clients(&self, ids: &[SessionId], limit: Duration) -> bool {
+        let entries: Vec<Arc<SessionEntry>> = {
+            let sessions = self.shared.sessions.lock().unwrap();
+            ids.iter()
+                .filter_map(|id| sessions.get(&id.0).cloned())
+                .collect()
+        };
+        for entry in &entries {
+            entry.kick.send_modify(|n| *n += 1);
+        }
+        let deadline = Instant::now() + limit;
+        loop {
+            if entries
+                .iter()
+                .all(|e| e.clients.load(Ordering::SeqCst) == 0)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -575,6 +610,9 @@ async fn handle_socket(shared: Arc<Shared>, mut sock: TcpStream) -> Result<()> {
         }
     };
     let open = OpenConnection::new(shared.connections.clone());
+    let session_open = OpenConnection::new(entry.clients.clone());
+    let mut kick = entry.kick.subscribe();
+    kick.borrow_and_update();
     let key = head.single("sec-websocket-key").unwrap_or_default();
     let accept = derive_accept_key(key.as_bytes());
     let resp = format!(
@@ -606,8 +644,9 @@ async fn handle_socket(shared: Arc<Shared>, mut sock: TcpStream) -> Result<()> {
         tab_rx,
         stray_tx,
         stray_rx,
+        _session_open: session_open,
     };
-    conn.run(closed, writer).await;
+    conn.run(closed, kick, writer).await;
     Ok(())
 }
 
@@ -798,6 +837,9 @@ struct ClientConn {
     tab_rx: mpsc::UnboundedReceiver<TabCreated>,
     stray_tx: mpsc::UnboundedSender<StrayClosed>,
     stray_rx: mpsc::UnboundedReceiver<StrayClosed>,
+    /// Counts this connection in its session's `clients` until it is dropped (after the
+    /// upstream is closed).
+    _session_open: OpenConnection,
 }
 
 fn reply(client: &ClientRef, body: Result<Value, (i64, String)>) -> Value {
@@ -814,11 +856,17 @@ fn reply(client: &ClientRef, body: Result<Value, (i64, String)>) -> Value {
 }
 
 impl ClientConn {
-    async fn run(mut self, mut closed: watch::Receiver<bool>, writer: JoinHandle<()>) {
+    async fn run(
+        mut self,
+        mut closed: watch::Receiver<bool>,
+        mut kick: watch::Receiver<u64>,
+        writer: JoinHandle<()>,
+    ) {
         loop {
             let stash_expiry = self.stash.front().map(|(at, _)| *at + STASH_MAX_AGE);
             let step = tokio::select! {
                 _ = async { let _ = closed.wait_for(|c| *c).await; } => break,
+                _ = kick.changed() => break,
                 m = self.client_rx.next() => match m {
                     Some(Ok(Message::Text(t))) => self.on_client(t.as_str()).await,
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
@@ -881,10 +929,12 @@ impl ClientConn {
             open,
             client_tx,
             client_rx,
+            _session_open: session_open,
             ..
         } = self;
         drop(up);
         drop(open);
+        drop(session_open);
         drop(client_tx);
         let abort = writer.abort_handle();
         if tokio::time::timeout(CLIENT_CLOSE_TIMEOUT, writer)

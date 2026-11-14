@@ -36,6 +36,11 @@ const GROUP_COLORS: &[&str] = &[
 ];
 const MAX_TITLE_CHARS: usize = 60;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the guard's reconnect waits for dropped client connections to end.
+const CLIENT_DROP_LIMIT: Duration = Duration::from_secs(5);
+/// And then for the browser to detach their CDP sessions (it reads the closed connections
+/// on its own schedule).
+const CLIENT_DETACH_PAUSE: Duration = Duration::from_millis(300);
 /// How long a new tab may wait for the request guard before it is closed.
 const GUARD_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -186,6 +191,8 @@ impl SessionManager {
         let pins = PinTable::default();
         let contexts: Arc<Mutex<HashMap<String, String>>> = Arc::default();
         let resolver = Resolver::from_env();
+        // The manager, for the guard's reconnect hook (it starts before the manager exists).
+        let late: Arc<std::sync::OnceLock<Weak<Inner>>> = Arc::default();
         let guard = {
             let (clip_pins, clip_contexts) = (pins.clone(), contexts.clone());
             let clipboard_of = Arc::new(move |context: &str| {
@@ -201,11 +208,21 @@ impl SessionManager {
                     None => SessionPolicy::default(),
                 }
             });
+            let late = late.clone();
+            let before_ready: crate::guard::BeforeReady = Arc::new(move || {
+                let inner = late.get().and_then(Weak::upgrade);
+                Box::pin(async move {
+                    if let Some(inner) = inner {
+                        inner.drop_clipboard_denied_clients().await;
+                    }
+                })
+            });
             Guard::start(
                 &browser.ws_url,
                 &browser.human_context,
                 policy_of,
                 clipboard_of,
+                before_ready,
                 own_ports_fn(&browser, &proxy),
                 resolver.clone(),
             )
@@ -225,6 +242,7 @@ impl SessionManager {
             resolver,
             contexts,
         });
+        let _ = late.set(Arc::downgrade(&inner));
         let weak = Arc::downgrade(&inner);
         inner
             .browser
@@ -1017,6 +1035,32 @@ impl Inner {
         });
         runtimes.insert(name.to_string(), rt.clone());
         Ok(rt)
+    }
+
+    /// The guard reconnected: drops the client connections of the sessions that deny the
+    /// clipboard (their CDP sessions on the tabs may be older than the guard's new ones,
+    /// spike C12a), so their clients connect again after the guard. Waits until they are
+    /// gone and a little more for the browser to detach their sessions.
+    async fn drop_clipboard_denied_clients(&self) {
+        let ids: Vec<SessionId> = {
+            let table = self.table.lock().unwrap();
+            table
+                .records
+                .iter()
+                .filter(|(_, r)| !r.info.policy.allow.contains(&ActionClass::Clipboard))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let gone = self.proxy.drop_clients(&ids, CLIENT_DROP_LIMIT).await;
+        eprintln!(
+            "pegboard: the request guard reconnected; dropped the agent connections of {} \
+             clipboard-denied session(s) (all gone: {gone})",
+            ids.len()
+        );
+        tokio::time::sleep(CLIENT_DETACH_PAUSE).await;
     }
 
     /// Attaches the daemon's own CDP session to the target with focus emulation on and

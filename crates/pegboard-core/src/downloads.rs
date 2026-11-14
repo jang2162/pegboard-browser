@@ -664,22 +664,40 @@ impl Downloads {
             bail!("refusing to set a clipboard policy on the human or an unknown context");
         }
         let _one = self.inner.applying.lock().await;
-        let lifted = {
+        let held = {
             let mut state = self.inner.state.lock().unwrap();
             let Some(policy) = state.policies.get_mut(context) else {
                 bail!("the profile has no download policy");
             };
-            policy.clipboard_denied = denied;
             if denied {
+                policy.clipboard_denied = true;
                 None
             } else {
-                // Its end is not a loss.
-                policy.clipboard_generation += 1;
-                policy.clipboard.take()
+                policy.clipboard.clone()
             }
         };
-        if let Some(conn) = lifted {
+        if let Some(conn) = held {
+            // Closing the connection alone did not lift the denial when measured (second
+            // machine, Task 7: a session allowing the clipboard after denied ones could not
+            // write); the permissions are reset explicitly first, which Chrome takes only
+            // while the profile is the default context (E).
+            self.inner
+                .lift_clipboard(context, &conn, FIRST_TRIES)
+                .await
+                .context("could not lift the clipboard denial of the agent profile")?;
+            let mut state = self.inner.state.lock().unwrap();
+            if let Some(policy) = state.policies.get_mut(context) {
+                // Its end is not a loss.
+                policy.clipboard_generation += 1;
+                policy.clipboard.take();
+            }
+            drop(state);
             conn.close();
+        }
+        if !denied {
+            if let Some(policy) = self.inner.state.lock().unwrap().policies.get_mut(context) {
+                policy.clipboard_denied = false;
+            }
         }
         if self.inner.clipboard_ready(context) {
             return Ok(());
@@ -815,12 +833,14 @@ impl Downloads {
     /// new one from being made for `hold`. The caller gates it. False when there is none.
     #[doc(hidden)]
     pub fn drop_clipboard_for_test(&self, context: &str, hold: Duration) -> bool {
+        // Taken at once (a real loss is noticed when the connection's events end, a moment
+        // later): a command right after this must see it gone.
         let conn = {
-            let state = self.inner.state.lock().unwrap();
+            let mut state = self.inner.state.lock().unwrap();
             state
                 .policies
-                .get(context)
-                .and_then(|p| p.clipboard.clone())
+                .get_mut(context)
+                .and_then(|p| p.clipboard.take())
         };
         match conn {
             Some(conn) => {
@@ -1103,6 +1123,39 @@ impl Inner {
             return Ok(());
         }
         conn.close();
+        Err(last)
+    }
+
+    /// Resets the permissions of `context` on its clipboard connection, the profile made the
+    /// default context first (as `establish` does). The caller holds `applying`.
+    async fn lift_clipboard(&self, context: &str, conn: &CdpConn, tries: u32) -> Result<()> {
+        let mut last = anyhow!("the profile did not become the default context");
+        for attempt in 0..tries {
+            if attempt > 0 {
+                tokio::time::sleep(RETRY_PAUSE).await;
+            }
+            // Not page-triggered (a session being created): see `establish`.
+            if !self.is_default(context).await {
+                if let Err(e) = self.activate(context).await {
+                    last = e;
+                    continue;
+                }
+                if !self.is_default(context).await {
+                    continue;
+                }
+            }
+            match conn
+                .send(
+                    "Browser.resetPermissions",
+                    json!({ "browserContextId": context }),
+                    None,
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => last = e,
+            }
+        }
         Err(last)
     }
 

@@ -34,6 +34,9 @@ static CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The system clipboard for the length of a test: the text it held is put back on drop.
 struct Clipboard {
     saved: Vec<u8>,
+    /// It held nothing at all (not even empty text): it is emptied again, not given an empty
+    /// text item.
+    was_empty: bool,
     _one: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -99,6 +102,7 @@ impl Clipboard {
         }
         Clipboard {
             saved: pasteboard("pbpaste", None),
+            was_empty: info.is_empty(),
             _one: one,
         }
     }
@@ -125,6 +129,20 @@ impl Clipboard {
 
 impl Drop for Clipboard {
     fn drop(&mut self) {
+        if self.was_empty {
+            let cleared = Command::new("osascript")
+                .args([
+                    "-l",
+                    "JavaScript",
+                    "-e",
+                    "ObjC.import('AppKit'); $.NSPasteboard.generalPasteboard.clearContents; 1",
+                ])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if cleared {
+                return;
+            }
+        }
         pasteboard("pbcopy", Some(&self.saved));
     }
 }
@@ -815,14 +833,17 @@ fn clipboard_setting_of_one_session_does_not_leak_to_another() {
 /// every new target until its own session has set the shield). Tried on the agent's tab and on
 /// a popup the agent holds from its start itself (session-level auto-attach waiting for the
 /// debugger). The attack script marks that it ran.
+/// The agent's attack on the shield, as a new-document script (spike C12a: i1, i2, i3, ii).
+/// It marks that it ran.
+const ATTACK: &str = "(()=>{window.__agentRan=1;const noop=function(){};\
+    window.addEventListener('copy',function(e){e.stopImmediatePropagation()},true);\
+    window.addEventListener('cut',function(e){e.stopImmediatePropagation()},true);\
+    Event.prototype.preventDefault=noop;Event.prototype.stopImmediatePropagation=noop;\
+    Function.prototype.call=noop;EventTarget.prototype.addEventListener=noop})()";
+
 #[test]
 #[ignore]
 fn agent_scripts_cannot_run_before_the_shield() {
-    const ATTACK: &str = "(()=>{window.__agentRan=1;const noop=function(){};\
-        window.addEventListener('copy',function(e){e.stopImmediatePropagation()},true);\
-        window.addEventListener('cut',function(e){e.stopImmediatePropagation()},true);\
-        Event.prototype.preventDefault=noop;Event.prototype.stopImmediatePropagation=noop;\
-        Function.prototype.call=noop;EventTarget.prototype.addEventListener=noop})()";
     common::run(async {
         let clip = Clipboard::take();
         let h = Harness::start();
@@ -903,7 +924,15 @@ fn agent_scripts_cannot_run_before_the_shield() {
         })
         .await;
         assert!(loaded, "the popup did not load");
-        settle().await;
+        // Measured on the second machine: the popup's first document ran without the agent's
+        // script (its attachment did not hold the popup), so the script only applies from the
+        // next document on. That one is what is tried here; whether the agent's session on
+        // the popup is older than the guard's decides it either way.
+        eprintln!(
+            "agent script on the popup's first document: {}",
+            popup.eval("String(window.__agentRan)", false).await
+        );
+        popup.load("/clip").await;
         assert_eq!(popup.eval("String(window.__agentRan)", false).await, "1");
         assert!(
             !click_copy_changes(&popup, "#cp", &clip).await,
@@ -912,11 +941,12 @@ fn agent_scripts_cannot_run_before_the_shield() {
     });
 }
 
-/// Measures a gap the measurements left open: a sandboxed srcdoc frame is attached already
-/// running (spike C12c), so its own first script runs before the shield that goes into the
-/// running document. A capture listener of its own that stops the event (C12a, ii) would then
-/// come first. Expected to show the gap (README "알려진 한계"): when it fails, the gap is
-/// real; when it passes, the gap is closed by something not understood yet.
+/// A sandboxed srcdoc frame is attached already running (spike C12c), so its own first
+/// script runs before the shield that goes into the running document, and a capture listener
+/// of its own that stops the event (C12a, ii) comes first (measured on the second machine:
+/// the copy went through). The guard makes such a frame reload itself once the shield is
+/// registered: its next document has the shield first. Prints what the guard did with
+/// frames attached running.
 #[test]
 #[ignore]
 fn sandboxed_srcdoc_frame_listening_first() {
@@ -936,6 +966,13 @@ fn sandboxed_srcdoc_frame_listening_first() {
             }
             h.close_session(&a.info.id).await;
         }
+        let log = h.manager.guard_attach_log();
+        eprintln!(
+            "frames attached running: {:#?}",
+            log.iter()
+                .filter(|l| l.contains("iframe agent waiting=false"))
+                .collect::<Vec<_>>()
+        );
     });
 }
 
@@ -954,9 +991,10 @@ fn clipboard_denial_is_set_again_after_its_connection_drops() {
         assert!(h
             .manager
             .drop_clipboard_policy_for_test(&a.info.id, Duration::from_secs(3)));
-        let e = command(&h, &mut log, &a.info, &["get", "url"])
-            .await
-            .unwrap_err();
+        let e = match command(&h, &mut log, &a.info, &["get", "url"]).await {
+            Ok(r) => panic!("a command ran while the denial was down: {r:?}"),
+            Err(e) => e,
+        };
         assert_eq!(e.code, codes::BROWSER_FAILED, "{e:?}");
         assert!(e.message.contains("clipboard policy"), "{e:?}");
         let back = common::eventually(20, || async {
@@ -977,46 +1015,126 @@ fn clipboard_denial_is_set_again_after_its_connection_drops() {
     });
 }
 
-/// K2: a tab that was there before the guard attached (after a guard reconnect) has no
-/// guarantee that the guard's session is older than the agent's: in a profile whose sessions
-/// deny the clipboard it is closed, before commands are let through again. A tab of a profile
-/// whose sessions allow the clipboard stays.
+/// K2 and the reconnect gap: after a guard reconnect the agents' connections of sessions that
+/// deny the clipboard are dropped before the guard sets anything up (their CDP sessions on the
+/// tabs, and their auto-attach, would be older than the guard's: C12a). The tabs that were
+/// there are shielded and reloaded, so the shield is the first script of their next document:
+/// an attack script the agent registered before the reconnect is gone with its session. A
+/// session allowing the clipboard keeps its connection, and nothing is closed.
 #[test]
 #[ignore]
-fn tabs_older_than_the_guard_are_closed_in_clipboard_denied_profiles() {
+fn after_a_guard_reconnect_agent_connections_are_dropped_and_tabs_reloaded() {
     common::run(async {
+        let clip = Clipboard::take();
         let h = Harness::start();
         let profile = "clip-reconnect";
         h.manager.create_profile(profile).await.unwrap();
         let denied = agent(&h, false).await;
         let allowed = create(&h, true, Some(profile)).await.unwrap();
         let (d, k) = (denied.first(), allowed.first());
+        let tab = denied.tab(&d).await;
+        tab.load("/clip").await;
+        denied
+            .c
+            .send(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": ATTACK }),
+                Some(&tab.sid),
+            )
+            .await
+            .unwrap();
+        tab.eval("window.__beforeReconnect = 1; 1", false).await;
+        let kept = allowed.tab(&k).await;
+        kept.load("/clip").await;
+
         assert!(h.manager.drop_guard_for_test(Duration::from_secs(2)));
         let back = common::eventually(15, || async { h.manager.require_guard().is_ok() }).await;
         assert!(back, "the guard did not come back");
-        // Closed before the guard counts as ready again: no wait needed, but allow the close
-        // to show in the target list.
-        let conn = &h.browser.conn;
-        let gone = common::eventually(5, || async {
-            !page_targets(conn)
+        let log = h.manager.guard_attach_log().join("\n");
+
+        // The denied session's old connection is gone; the allowed one's is not.
+        let dropped = common::eventually(5, || async {
+            denied
+                .c
+                .send("Target.getTargets", json!({}), None)
                 .await
-                .unwrap()
-                .iter()
-                .any(|t| t.target_id == d)
+                .is_err()
         })
         .await;
-        let log = h.manager.guard_attach_log().join("\n");
-        assert!(gone, "the denied session's old tab is still open:\n{log}");
-        assert!(log.contains("closed: older than the guard"), "{log}");
+        assert!(dropped, "the denied session's connection was not dropped");
         assert!(
-            page_targets(conn)
+            allowed
+                .c
+                .send("Target.getTargets", json!({}), None)
                 .await
-                .unwrap()
-                .iter()
-                .any(|t| t.target_id == k),
-            "the allowed session's tab was closed"
+                .is_ok(),
+            "the allowed session's connection was dropped"
+        );
+        // Nothing was closed.
+        let pages = page_targets(&h.browser.conn).await.unwrap();
+        for t in [&d, &k] {
+            assert!(
+                pages.iter().any(|p| &p.target_id == t),
+                "{t} closed:\n{log}"
+            );
+        }
+        assert!(log.contains("reload=ok"), "no tab was reloaded:\n{log}");
+
+        // A new connection, as agent-browser makes: the tab has a new document without the
+        // agent's old script, and the shield holds.
+        let ep = h.manager.endpoint(&denied.info.id).unwrap();
+        let c = common::client(&ep).await;
+        let sid = c.attach(&d).await.unwrap();
+        let fresh = Tab { c: &c, sid };
+        let reloaded = common::eventually(10, || async {
+            fresh.eval("String(window.__beforeReconnect)", false).await == "undefined"
+                && fresh.eval("document.readyState", false).await == "complete"
+        })
+        .await;
+        assert!(reloaded, "the old tab was not reloaded:\n{log}");
+        assert_eq!(
+            fresh.eval("String(window.__agentRan)", false).await,
+            "undefined",
+            "the agent's script from before the reconnect ran"
+        );
+        assert!(
+            !click_copy_changes(&fresh, "#cp", &clip).await,
+            "the old tab's copy went through after the reconnect"
         );
         h.close_session(&allowed.info.id).await;
         let _ = h.manager.delete_profile(profile).await;
+    });
+}
+
+/// The controller's question: agent-browser recovers when the guard's reconnect drops its
+/// connection (its next command works, perhaps after one failure, which is printed).
+#[test]
+#[ignore]
+fn agent_browser_recovers_after_its_connection_is_dropped() {
+    common::run(async {
+        let h = Harness::start();
+        let (info, ep) = h.session("/counter").await;
+        let r = h.exec(&info, &ep, &["get", "url"]).await;
+        assert!(common::ok(&r), "{r:?}");
+        assert!(h.manager.drop_guard_for_test(Duration::from_secs(2)));
+        let back = common::eventually(15, || async { h.manager.require_guard().is_ok() }).await;
+        assert!(back, "the guard did not come back");
+        let mut outcomes = Vec::new();
+        for _ in 0..3 {
+            let r = h
+                .runner
+                .exec(&info.id, &ep, &common::s(&["get", "url"]), 30_000)
+                .await;
+            let ok = matches!(&r, Ok(r) if common::ok(r));
+            outcomes.push(format!("{r:?}"));
+            if ok {
+                break;
+            }
+        }
+        eprintln!("commands after the drop: {outcomes:#?}");
+        assert!(
+            outcomes.len() == 1,
+            "agent-browser's first command after its connection was dropped did not work: {outcomes:#?}"
+        );
     });
 }
