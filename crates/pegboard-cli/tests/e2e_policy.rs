@@ -1852,11 +1852,16 @@ fn deny_download_writes_no_file_anywhere() {
         );
         assert!(d.get("bytes").is_none(), "{d}");
     }
-    // Not in the session's files, the staging directory, anywhere under the home, nor in
-    // ~/Downloads.
+    // Not in the session's files, anywhere under the home under its name, nor in
+    // ~/Downloads; and the staging directory (files named by Chrome's guid) is empty.
     assert!(files_list(home, &handle).is_empty());
     let anywhere = probe.find_under(home.path());
     assert!(anywhere.is_empty(), "{anywhere:?}");
+    let staging = home.path().join("downloads").join("PegboardAgent");
+    let left: Vec<_> = std::fs::read_dir(&staging)
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "staged files left: {left:?}");
     assert!(probe.in_real_downloads().is_empty());
     close(&handle);
 }
