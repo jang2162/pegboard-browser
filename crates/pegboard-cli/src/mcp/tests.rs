@@ -1,6 +1,7 @@
 //! Protocol and tool tests against a stubbed core API.
 
 use super::*;
+use pegboard_core::argv::Checked;
 use pegboard_protocol::ActionClass;
 
 const FOREIGN: &str = "s_foreignn";
@@ -18,6 +19,10 @@ struct StubState {
     calls: Vec<(String, Value)>,
     /// When set, session.info fails with this code (the daemon in trouble).
     info_error: Option<&'static str>,
+    /// When set, the output of command.exec, or its error (else the line it ran, as text).
+    exec_reply: Option<Result<Value, RpcError>>,
+    /// Bytes of the image a screenshot saves.
+    shot_bytes: usize,
 }
 
 /// A core API that answers like the daemon, and puts tokens everywhere it can: a `token`
@@ -31,6 +36,8 @@ struct Stub {
     leak_in_text: bool,
     /// Answer session.create with a session but a reply that does not decode.
     bad_create: bool,
+    /// Where the sessions' files directories are.
+    files: Arc<tempfile::TempDir>,
 }
 
 fn token_of(id: &str) -> String {
@@ -52,6 +59,7 @@ impl Stub {
             start: Ok(()),
             leak_in_text: true,
             bad_create: false,
+            files: Arc::new(tempfile::tempdir().unwrap()),
         };
         stub.state.lock().unwrap().sessions.push((
             FOREIGN.into(),
@@ -103,6 +111,10 @@ impl Stub {
 impl Core for Stub {
     fn ensure_running(&mut self) -> Result<(), String> {
         self.start.clone()
+    }
+
+    fn files_dir(&self, id: &SessionId) -> std::path::PathBuf {
+        self.files.path().join(&id.0)
     }
 
     fn call(&mut self, method: &str, p: Value) -> Result<Value, RpcError> {
@@ -226,6 +238,40 @@ impl Core for Stub {
                     }],
                     "token": token,
                 }))
+            }
+            "command.exec" => {
+                let Some(i) = with_token(&st) else {
+                    return Err(not_found(&id));
+                };
+                // An output as agent-browser gives it, in the daemon's result.
+                let result = |output: Value| {
+                    let failed = output["success"] == false;
+                    json!({ "exitCode": i32::from(failed), "output": output, "stderr": "" })
+                };
+                if let Some(reply) = st.exec_reply.clone() {
+                    return reply.map(result);
+                }
+                let id = SessionId(st.sessions[i].0.clone());
+                let argv: Vec<String> = serde_json::from_value(p["argv"].clone()).unwrap();
+                let dir = self.files_dir(&id);
+                // Checked like the daemon checks it.
+                let checked = pegboard_core::argv::check(&argv, &dir)?;
+                if argv[0] == "screenshot" {
+                    let Checked::Run(words) = checked else {
+                        panic!()
+                    };
+                    let path = words.iter().find(|w| w.ends_with(".png")).unwrap();
+                    let path = std::path::PathBuf::from(path);
+                    assert!(path.starts_with(&dir), "{path:?}");
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+                    png.resize(st.shot_bytes.max(png.len()), 0);
+                    std::fs::write(&path, png).unwrap();
+                    return Ok(result(json!({ "success": true, "data": { "path": path } })));
+                }
+                Ok(result(
+                    json!({ "success": true, "data": { "ran": argv.join(" ") } }),
+                ))
             }
             "browser.status" => Ok(json!({
                 "running": true, "pid": 42, "chromeVersion": "157", "sessions": st.sessions.len(),
@@ -372,7 +418,21 @@ fn initialize_and_tools_list() {
         .raw(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
         .is_none());
     assert_eq!(h.request("ping", json!({}))["result"], json!({}));
-    assert_eq!(h.tool_names(), DEFAULT_TOOLS);
+    // The management tools, then the action tools of the default bundles (core, tabs).
+    let names = h.tool_names();
+    assert_eq!(names[..DEFAULT_TOOLS.len()], DEFAULT_TOOLS);
+    let actions = &names[DEFAULT_TOOLS.len()..];
+    for t in [
+        "pegboard_open",
+        "pegboard_click",
+        "pegboard_snapshot",
+        "pegboard_tab",
+    ] {
+        assert!(actions.contains(&t.to_string()), "{actions:?}");
+    }
+    for t in ["pegboard_cookies", "pegboard_storage", "pegboard_network"] {
+        assert!(!actions.contains(&t.to_string()), "{actions:?}");
+    }
     let list = h.request("tools/list", json!({}));
     for t in list["result"]["tools"].as_array().unwrap() {
         assert!(
@@ -385,7 +445,9 @@ fn initialize_and_tools_list() {
     let mut op = Harness::new(true);
     let mut expected: Vec<&str> = DEFAULT_TOOLS.to_vec();
     expected.extend(OPERATOR_ONLY);
-    assert_eq!(op.tool_names(), expected);
+    let op_names = op.tool_names();
+    assert_eq!(op_names[..expected.len()], expected);
+    assert_eq!(&op_names[expected.len()..], actions);
     // Listing tools does not start or call anything.
     assert!(h.stub.methods().is_empty());
 }
@@ -1038,4 +1100,296 @@ fn an_adopted_handle_stays_hidden_until_the_daemon_confirms_it() {
     assert!(list.contains(adopted), "{list}");
     let (err, text) = h.call("pegboard_files_list", json!({ "sessionId": adopted }));
     assert!(!err, "{text}");
+}
+
+// ---- browser action tools ----
+
+/// The `command.exec` calls the stub received.
+fn execs(h: &Harness) -> Vec<Value> {
+    h.stub.calls_of("command.exec")
+}
+
+#[test]
+fn action_tools_send_the_command_line_with_the_sessions_token() {
+    for operator in [false, true] {
+        let mut h = Harness::new(operator);
+        let a = h.create(json!({}));
+        let (err, text) = h.call("pegboard_click", json!({ "selector": "#btn" }));
+        assert!(!err, "{text}");
+        assert_eq!(text, "click #btn");
+        let (err, text) = h.call(
+            "pegboard_fill",
+            json!({ "sessionId": a, "selector": "#name", "text": "a b" }),
+        );
+        assert!(!err, "{text}");
+        let calls = execs(&h);
+        assert_eq!(
+            calls[0],
+            json!({ "sessionId": a, "argv": ["click", "#btn"], "timeoutMs": null, "token": token_of(&a) })
+        );
+        assert_eq!(calls[1]["argv"], json!(["fill", "#name", "a b"]));
+        // An operator drives only what it holds, like the default mode.
+        let (err, text) = h.call(
+            "pegboard_click",
+            json!({ "sessionId": FOREIGN, "selector": "#btn" }),
+        );
+        assert!(
+            err && text == format!("session_not_found: no session {FOREIGN}"),
+            "{text}"
+        );
+        assert_eq!(execs(&h).len(), 2);
+        assert!(!h.stub.methods().iter().any(|m| m.ends_with("_any")));
+    }
+}
+
+#[test]
+fn a_call_without_session_id_needs_exactly_one_session() {
+    let mut h = Harness::new(false);
+    let (err, text) = h.call("pegboard_click", json!({ "selector": "#btn" }));
+    assert!(err && text.starts_with("invalid_params: "), "{text}");
+    assert!(text.contains("pegboard_session_create"), "{text}");
+    let a = h.create(json!({}));
+    let b = h.create(json!({}));
+    let (err, text) = h.call("pegboard_click", json!({ "selector": "#btn" }));
+    assert!(err && text.starts_with("invalid_params: "), "{text}");
+    assert!(text.contains(&a) && text.contains(&b), "{text}");
+    assert!(execs(&h).is_empty());
+    h.call("pegboard_session_close", json!({ "sessionId": a }));
+    let (err, text) = h.call("pegboard_click", json!({ "selector": "#btn" }));
+    assert!(!err, "{text}");
+    assert_eq!(execs(&h)[0]["sessionId"], json!(b));
+    // An adopted handle the daemon has not confirmed does not count as held.
+    let mut owned = Owned::default();
+    owned
+        .adopt(&format!("s_adoptedd.{}", token_of("s_adoptedd")))
+        .unwrap();
+    let mut h = Harness::with(opts(false, SessionPolicy::default()), Stub::new(), owned);
+    let (err, text) = h.call("pegboard_click", json!({ "selector": "#btn" }));
+    assert!(err && text.starts_with("invalid_params: "), "{text}");
+}
+
+#[test]
+fn bad_arguments_never_reach_the_daemon() {
+    let mut h = Harness::new(false);
+    let a = h.create(json!({}));
+    for (tool, args) in [
+        ("pegboard_click", json!({ "selector": "--cdp" })),
+        ("pegboard_click", json!({ "selector": "#a", "cdp": 9222 })),
+        (
+            "pegboard_fill",
+            json!({ "selector": "#a", "text": ["a", "b"] }),
+        ),
+        (
+            "pegboard_mouse",
+            json!({ "command": "move", "x": "1; rm", "y": 1 }),
+        ),
+        ("pegboard_get", json!({ "command": "url --cdp 9222" })),
+        (
+            "pegboard_get",
+            json!({ "command": "url", "selector": "#a" }),
+        ),
+        (
+            "pegboard_upload",
+            json!({ "selector": "#f", "files": [["a.txt"]] }),
+        ),
+        (
+            "pegboard_upload",
+            json!({ "selector": "#f", "files": ["../a.txt", "/etc/passwd"] }),
+        ),
+        (
+            "pegboard_click",
+            json!({ "sessionId": format!("{a}.{}", token_of(&a)), "selector": "#a" }),
+        ),
+        (
+            "pegboard_click",
+            json!({ "sessionId": 7, "selector": "#a" }),
+        ),
+        (
+            "pegboard_click",
+            json!({ "sessionId": MISSING, "selector": "#a" }),
+        ),
+        (
+            "pegboard_click",
+            json!({ "sessionId": FOREIGN, "selector": "#a" }),
+        ),
+    ] {
+        let (err, text) = h.call(tool, args.clone());
+        assert!(err, "{tool} {args}: {text}");
+        let code = text.split(':').next().unwrap();
+        assert!(
+            ["invalid_params", "session_not_found", "argv_rejected"].contains(&code),
+            "{tool} {args}: {text}"
+        );
+        // Whatever passed `to_argv` was refused by the daemon's own check (the stub's).
+        for call in execs(&h) {
+            let argv: Vec<String> = serde_json::from_value(call["argv"].clone()).unwrap();
+            assert!(
+                pegboard_core::argv::check(&argv, std::path::Path::new("/f")).is_err(),
+                "{argv:?} ran"
+            );
+        }
+    }
+    // A tool that is not offered is not a tool (the bundles leave cookies out).
+    let r = h.request(
+        "tools/call",
+        json!({ "name": "pegboard_cookies", "arguments": {} }),
+    );
+    assert_eq!(r["error"]["code"], INVALID_PARAMS, "{r}");
+    for name in ["pegboard_connect", "pegboard_close", "pegboard_session"] {
+        let r = h.request("tools/call", json!({ "name": name, "arguments": {} }));
+        assert_eq!(r["error"]["code"], INVALID_PARAMS, "{r}");
+    }
+}
+
+#[test]
+fn the_daemons_refusals_and_failures_keep_their_codes() {
+    let mut h = Harness::new(false);
+    h.create(json!({}));
+    // Refused by the daemon's grammar check: its code and message as they are.
+    let (err, text) = h.call("pegboard_open", json!({ "url": "file:///etc/hosts" }));
+    assert!(err && text.starts_with("argv_rejected: "), "{text}");
+    h.stub.state.lock().unwrap().exec_reply = Some(Err(RpcError {
+        code: codes::POLICY_DENIED.into(),
+        message: "eval is not allowed in this session".into(),
+        data: None,
+    }));
+    let (err, text) = h.call("pegboard_eval", json!({ "expression": "1" }));
+    assert!(err, "{text}");
+    assert_eq!(text, "policy_denied: eval is not allowed in this session");
+    // Ran and failed: as the CLI says it.
+    h.stub.state.lock().unwrap().exec_reply =
+        Some(Ok(json!({ "success": false, "error": "no element #x" })));
+    let (err, text) = h.call("pegboard_click", json!({ "selector": "#x" }));
+    assert!(err, "{text}");
+    assert_eq!(text, "command_failed: no element #x");
+    // The session went away meanwhile: it is no longer held.
+    h.stub.state.lock().unwrap().exec_reply = Some(Err(not_found("s_x")));
+    let (err, _) = h.call("pegboard_click", json!({ "selector": "#x" }));
+    assert!(err);
+    let (err, text) = h.call("pegboard_click", json!({ "selector": "#x" }));
+    assert!(err && text.contains("holds no session"), "{text}");
+}
+
+#[test]
+fn results_tell_downloads_once_each() {
+    let mut h = Harness::new(false);
+    h.create(json!({}));
+    h.stub.state.lock().unwrap().exec_reply = Some(Ok(json!({
+        "success": true, "data": { "url": "https://a.test/" },
+        "downloads": [{ "name": "a.zip", "bytes": 3 }, { "name": "b.bin", "dropped": "too large" }],
+    })));
+    let (err, text) = h.call("pegboard_get", json!({ "command": "url" }));
+    assert!(!err, "{text}");
+    assert_eq!(
+        text,
+        "https://a.test/\ndownloaded a.zip (3 bytes)\ndownload b.bin was deleted: too large"
+    );
+    // Also with a failed command.
+    h.stub.state.lock().unwrap().exec_reply = Some(Ok(json!({
+        "success": false, "error": "boom", "downloads": [{ "name": "c.zip", "bytes": 1 }],
+    })));
+    let (err, text) = h.call("pegboard_click", json!({ "selector": "#x" }));
+    assert!(err);
+    assert_eq!(text, "command_failed: boom\ndownloaded c.zip (1 bytes)");
+}
+
+#[test]
+fn screenshot_returns_the_image_up_to_5_mib() {
+    let mut h = Harness::new(false);
+    let a = h.create(json!({}));
+    let content = |h: &mut Harness, args: Value| {
+        let r = h.request(
+            "tools/call",
+            json!({ "name": "pegboard_screenshot", "arguments": args }),
+        );
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        r["result"]["content"].as_array().unwrap().clone()
+    };
+    let c = content(&mut h, json!({}));
+    assert_eq!(c.len(), 2, "{c:?}");
+    assert_eq!(c[1]["type"], "image");
+    assert_eq!(c[1]["mimeType"], "image/png");
+    let png = data_encoding::BASE64
+        .decode(c[1]["data"].as_str().unwrap().as_bytes())
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG"));
+    let c = content(&mut h, json!({ "file": "page.png", "full": true }));
+    assert_eq!(c.get(1).map(|i| &i["type"]), Some(&json!("image")), "{c:?}");
+    assert_eq!(
+        execs(&h)[1]["argv"],
+        json!(["screenshot", "page.png", "--full"])
+    );
+    // Too large: the name only.
+    h.stub.state.lock().unwrap().shot_bytes = tools::MAX_IMAGE_BYTES as usize + 1;
+    let c = content(&mut h, json!({ "file": "big.png" }));
+    assert_eq!(c.len(), 1, "{:?}", c[0]);
+    let text = c[0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("larger than 5 MiB") && text.contains("big.png"),
+        "{text}"
+    );
+    // An image outside the session's files is never read.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside = elsewhere.path().join("x.png");
+    std::fs::write(&outside, b"\x89PNG\r\n\x1a\nsecret").unwrap();
+    let inside = h.stub.files_dir(&SessionId(a.clone()));
+    std::os::unix::fs::symlink(&outside, inside.join("link.png")).unwrap();
+    for path in [
+        outside.clone(),
+        inside.join("link.png"),
+        inside.join("../../x.png"),
+    ] {
+        h.stub.state.lock().unwrap().exec_reply =
+            Some(Ok(json!({ "success": true, "data": { "path": path } })));
+        let c = content(&mut h, json!({}));
+        assert_eq!(c.len(), 1, "{path:?}: {c:?}");
+    }
+}
+
+#[test]
+fn bundles_choose_the_action_tools() {
+    let names = |tools: Vec<Bundle>| {
+        let mut h = Harness::with(
+            Options {
+                operator: false,
+                tools,
+                policy: SessionPolicy::default(),
+            },
+            Stub::new(),
+            Owned::default(),
+        );
+        h.tool_names()[DEFAULT_TOOLS.len()..].to_vec()
+    };
+    assert_eq!(
+        names(vec![Bundle::State]),
+        ["pegboard_cookies", "pegboard_storage"]
+    );
+    assert_eq!(names(vec![Bundle::Tabs]), ["pegboard_tab"]);
+    let all = names(vec![Bundle::All]);
+    let mut words: Vec<String> = pegboard_core::argv::forms()
+        .iter()
+        .map(|f| format!("pegboard_{}", f.words[0]))
+        .collect();
+    words.dedup();
+    assert_eq!(all, words);
+    let mut h = Harness::with(
+        Options {
+            operator: false,
+            tools: vec![Bundle::State],
+            policy: SessionPolicy::default(),
+        },
+        Stub::new(),
+        Owned::default(),
+    );
+    h.create(json!({}));
+    let (err, text) = h.call(
+        "pegboard_cookies",
+        json!({ "command": "set", "name": "n", "value": "v" }),
+    );
+    assert!(!err, "{text}");
+    let r = h.request(
+        "tools/call",
+        json!({ "name": "pegboard_click", "arguments": { "selector": "#a" } }),
+    );
+    assert_eq!(r["error"]["code"], INVALID_PARAMS, "{r}");
 }

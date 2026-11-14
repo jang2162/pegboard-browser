@@ -87,7 +87,9 @@ enum Cmd {
         /// the browser; drive only the sessions this server created or was given.
         #[arg(long)]
         operator: bool,
-        /// Tool bundles to offer.
+        /// Browser action tool bundles to offer: core (page actions), tabs, state
+        /// (cookies, storage), network (network, console, errors, vitals, a11y), all. State
+        /// and network are off by default. The session and recording tools are always on.
         #[arg(
             long,
             value_enum,
@@ -373,17 +375,26 @@ fn files_list(paths: &Paths, session: String, json: bool) -> Result<(), RpcError
 
 /// One line per download the result tells about (on stderr, so stdout keeps the output).
 fn tell_downloads(output: &Value) {
-    let Some(list) = output.get("downloads").and_then(Value::as_array) else {
-        return;
-    };
-    for d in list {
-        let name = d["name"].as_str().unwrap_or("?");
-        match (d["bytes"].as_u64(), d["dropped"].as_str()) {
-            (Some(bytes), _) => eprintln!("pegboard: downloaded {name} ({bytes} bytes)"),
-            (_, Some(why)) => eprintln!("pegboard: download {name} was deleted: {why}"),
-            _ => {}
-        }
+    for line in download_lines(output) {
+        eprintln!("pegboard: {line}");
     }
+}
+
+/// What a command's result tells about downloads that ended (each told once).
+pub(crate) fn download_lines(output: &Value) -> Vec<String> {
+    let Some(list) = output.get("downloads").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|d| {
+            let name = d["name"].as_str().unwrap_or("?");
+            match (d["bytes"].as_u64(), d["dropped"].as_str()) {
+                (Some(bytes), _) => Some(format!("downloaded {name} ({bytes} bytes)")),
+                (_, Some(why)) => Some(format!("download {name} was deleted: {why}")),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn profile(paths: &Paths, command: ProfileCmd, json: bool) -> Result<(), RpcError> {
@@ -609,7 +620,7 @@ fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), Rpc
 }
 
 /// The text of an agent-browser result: its data when that is one text, else JSON.
-fn render_output(output: &Value) -> String {
+pub(crate) fn render_output(output: &Value) -> String {
     let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
     match output.get("data") {
         Some(Value::String(s)) => s.clone(),
@@ -662,15 +673,18 @@ fn agent_command(
     if succeeded(&r) {
         return Ok(());
     }
-    let why = r
-        .output
+    eprintln!("pegboard: command failed: {}", failure_reason(&r));
+    std::process::exit(EXIT_FAILURE)
+}
+
+/// What a command that ran but failed said: its `error`, else its stderr.
+pub(crate) fn failure_reason(r: &CommandExecResult) -> String {
+    r.output
         .get("error")
         .and_then(Value::as_str)
         .map(String::from)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| r.stderr.trim().to_string());
-    eprintln!("pegboard: command failed: {why}");
-    std::process::exit(EXIT_FAILURE)
+        .unwrap_or_else(|| r.stderr.trim().to_string())
 }
 
 fn socket_answers(paths: &Paths) -> bool {
