@@ -1174,13 +1174,21 @@ fn downloads_are_told_in_mcp_results() {
     let id = mcp.create(json!({ "url": format!("{origin}/dlpage/{t}") }));
     let (err, text) = mcp.call("pegboard_click", json!({ "selector": "#att" }));
     assert!(!err, "{text}");
-    let mut told = text.matches(&format!("downloaded \"{t}\" ")).count();
+    // pegboard's words, then the page-chosen name in a block of its own.
+    let told_of = |text: &str| {
+        if text.contains(&format!("\n{t}\n--- END_AGENT_BROWSER_PAGE_CONTENT nonce=")) {
+            text.matches("downloaded a file (").count()
+        } else {
+            0
+        }
+    };
+    let mut told = told_of(&text);
     let deadline = Instant::now() + Duration::from_secs(20);
     while told == 0 {
         assert!(Instant::now() < deadline, "the download was not told");
         std::thread::sleep(Duration::from_millis(300));
         let (_, text) = mcp.call("pegboard_get", json!({ "command": "url" }));
-        told += text.matches(&format!("downloaded \"{t}\" ")).count();
+        told += told_of(&text);
     }
     assert_eq!(told, 1);
     // Told once only.

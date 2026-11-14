@@ -1233,20 +1233,30 @@ impl Registry {
             ),
             "seq  time  command  result  duration".to_string(),
         ];
+        // A failure's text may be agent-browser's, quoting the page: all of them go
+        // together between page-content markers after the table.
+        let mut failures = Vec::new();
         for a in &actions {
             let words = std::iter::once(a.command.as_str())
                 .chain(a.args.iter().map(String::as_str))
                 .collect::<Vec<_>>()
                 .join(" ");
             let result = match (a.ok, &a.error) {
-                (true, _) => "ok".to_string(),
-                (false, Some(e)) => format!("failed: {e}"),
-                (false, None) => "failed".to_string(),
+                (true, _) => "ok",
+                (false, Some(e)) => {
+                    failures.push(format!("seq {}: {e}", a.seq));
+                    "failed (why: below)"
+                }
+                (false, None) => "failed",
             };
             out.push(format!(
                 "{}  {}  {}  {}  {}ms",
                 a.seq, a.ts, words, result, a.duration_ms
             ));
+        }
+        if !failures.is_empty() {
+            out.push("why the failed actions failed:".to_string());
+            out.push(wrap_page_content(&failures.join("\n"), None));
         }
         Ok(out.join("\n"))
     }
@@ -1373,20 +1383,22 @@ fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Resul
     })
 }
 
-/// The downloads a result tells of. A name comes from the page, so it is quoted (on one
-/// line: it cannot start a marker line); pegboard_files_list has the files.
+/// The downloads a result tells of. A name comes from the page, so it goes between
+/// page-content markers after pegboard's own words; pegboard_files_list has the files.
 fn download_notes(output: &Value) -> Vec<String> {
     let Some(list) = output.get("downloads").and_then(Value::as_array) else {
         return Vec::new();
     };
     list.iter()
         .filter_map(|d| {
-            let name = d["name"].as_str().unwrap_or("?");
+            let name = wrap_page_content(d["name"].as_str().unwrap_or("?"), None);
             match (d["bytes"].as_u64(), d["dropped"].as_str()) {
                 (Some(bytes), _) => Some(format!(
-                    "downloaded {name:?} ({bytes} bytes; see pegboard_files_list)"
+                    "downloaded a file ({bytes} bytes; see pegboard_files_list), named:\n{name}"
                 )),
-                (_, Some(why)) => Some(format!("download {name:?} was deleted: {why}")),
+                (_, Some(why)) => Some(format!(
+                    "a download was deleted: {why}; it was named:\n{name}"
+                )),
                 _ => None,
             }
         })
@@ -1514,11 +1526,16 @@ fn files_list(ctx: &mut Ctx, id: &SessionId) -> Result<String, RpcError> {
     if files.is_empty() {
         return Ok("no files".to_string());
     }
-    Ok(files
+    // The names come from pages (downloads): the listing goes between page-content markers.
+    let listing = files
         .iter()
         .map(|f| format!("{}  {}  {}", f.bytes, f.modified_at, f.name))
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n");
+    Ok(format!(
+        "bytes  modified  name\n{}",
+        wrap_page_content(&listing, None)
+    ))
 }
 
 #[cfg(test)]

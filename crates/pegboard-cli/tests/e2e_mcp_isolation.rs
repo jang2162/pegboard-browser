@@ -1227,13 +1227,13 @@ fn mcp_download_lands_only_in_the_session_dir() {
         );
         // The agent is told, and its files list has them.
         for _ in 0..20 {
-            if told.matches("downloaded \"").count() >= 2 {
+            if told.matches("downloaded a file (").count() >= 2 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(300));
             told.push_str(&agent.call("pegboard_get", json!({ "command": "url" })).1);
         }
-        assert_eq!(told.matches("downloaded \"").count(), 2, "{told}");
+        assert_eq!(told.matches("downloaded a file (").count(), 2, "{told}");
         let listed = agent.ok("pegboard_files_list", json!({}));
         assert!(listed.contains(&probe.token), "{listed}");
     }
