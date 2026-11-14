@@ -1089,3 +1089,45 @@ fn a_download_running_when_the_policy_drops_is_cancelled() {
         h.finish().await;
     });
 }
+
+/// A running download from an agent tab no session owns is cancelled at once (not only
+/// deleted at its end): the server sees the connection cut and staging empties.
+#[test]
+#[ignore]
+fn an_unattributed_running_download_is_cancelled() {
+    common::run(async {
+        let h = Harness::start();
+        let probe = common::DownloadProbe::new();
+        let name = format!("{}-stray", probe.token);
+        let (info, _) = h.create("/counter").await;
+        let conn = &h.browser.conn;
+        let tab = h.manager.info(&info.id).unwrap().targets[0].clone();
+        let agent = common::context_of(conn, &tab).await;
+        // The agent profile last active, a context-less tab lands in it, owned by no session.
+        common::activate_any_target_in(conn, &agent).await;
+        let r = conn
+            .send("Target.createTarget", json!({ "url": "about:blank" }), None)
+            .await
+            .unwrap();
+        let stray = r["targetId"].as_str().unwrap().to_string();
+        assert_eq!(common::context_of(conn, &stray).await, agent, "premise");
+        let s = conn.attach(&stray).await.unwrap();
+        conn.navigate(
+            &s,
+            &format!("{}/linkto/slow/{}/nolen/{name}", h.fixture.origin, 16 << 20),
+        )
+        .await
+        .unwrap();
+        let _ = conn
+            .send("Target.detachFromTarget", json!({ "sessionId": s }), None)
+            .await;
+        click_go(&h, &stray).await;
+        assert_eq!(stream_end(&name, 20).await, Some("cut"));
+        assert!(staging_empties(&h).await);
+        assert!(probe.in_real_downloads().is_empty());
+        let _ = conn
+            .send("Target.closeTarget", json!({ "targetId": stray }), None)
+            .await;
+        h.finish().await;
+    });
+}
