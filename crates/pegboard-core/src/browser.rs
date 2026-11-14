@@ -92,6 +92,7 @@ impl Browser {
             .arg(format!("--load-extension={}", cfg.extension_dir.display()))
             .arg("--disable-features=DisableLoadExtensionCommandLineSwitch")
             .args(test_host_rules())
+            .args(test_address_spaces())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -360,6 +361,16 @@ fn test_host_rules() -> Vec<String> {
         Vec::new()
     } else {
         vec![format!("--host-resolver-rules={}", rules.join(", "))]
+    }
+}
+
+/// Test-only: `PEGBOARD_TEST_IP_SPACE_OVERRIDES` is passed as `--ip-address-space-overrides`
+/// (e.g. `127.0.0.1:<port>=public`), so a local test server can play a server on a public
+/// address for Chrome's local-network checks (spike round 2, N2).
+fn test_address_spaces() -> Vec<String> {
+    match std::env::var("PEGBOARD_TEST_IP_SPACE_OVERRIDES") {
+        Ok(v) if !v.is_empty() => vec![format!("--ip-address-space-overrides={v}")],
+        _ => Vec::new(),
     }
 }
 

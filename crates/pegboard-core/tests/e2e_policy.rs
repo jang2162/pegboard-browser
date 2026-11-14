@@ -135,6 +135,16 @@ use pegboard_protocol::SessionInfo;
 use serde_json::json;
 use std::time::Duration;
 
+/// Port of the fixture server Chrome counts as a public address (serves `PUBLIC_NAME`).
+fn public_port(h: &Harness) -> String {
+    h.public_fixture
+        .origin
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
 fn fixture_port(h: &Harness) -> String {
     h.fixture.origin.rsplit(':').next().unwrap().to_string()
 }
@@ -142,7 +152,7 @@ fn fixture_port(h: &Harness) -> String {
 /// A session of the test's own whose first page is `path` on `common::PUBLIC_NAME` (served
 /// again with the CSP), and a client attached to its first tab.
 async fn public_session(h: &Harness, path: &str) -> (SessionInfo, Endpoint, CdpConn, String) {
-    let url = format!("http://{}:{}{path}", common::PUBLIC_NAME, fixture_port(h));
+    let url = format!("http://{}:{}{path}", common::PUBLIC_NAME, public_port(h));
     let info = h
         .manager
         .create(SessionCreateParams {
@@ -182,7 +192,7 @@ fn oversized_documents_fail_and_the_guard_stays_up() {
         let connections = h.manager.guard_connections();
         let failed = not_served(&h);
         for path in ["/big", "/bomb"] {
-            let url = format!("http://{}:{}{path}", common::PUBLIC_NAME, fixture_port(&h));
+            let url = format!("http://{}:{}{path}", common::PUBLIC_NAME, public_port(&h));
             let r = c
                 .send("Page.navigate", json!({ "url": url }), Some(&session))
                 .await
@@ -201,11 +211,7 @@ fn oversized_documents_fail_and_the_guard_stays_up() {
         // The same address still serves normal pages, with the CSP.
         c.navigate(
             &session,
-            &format!(
-                "http://{}:{}/counter",
-                common::PUBLIC_NAME,
-                fixture_port(&h)
-            ),
+            &format!("http://{}:{}/counter", common::PUBLIC_NAME, public_port(&h)),
         )
         .await
         .unwrap();
@@ -549,52 +555,75 @@ async fn child_frames(conn: &CdpConn, session: &str) -> Vec<String> {
         .collect()
 }
 
-/// Measurement for the review (an image or text document framed by a public page): what the
-/// frame is in three setups — a local page (not served again), a public page served again
-/// with the CSP, and a public page served again without the CSP header (test hook) — and
-/// what the attacker's step from the parent gives. The guard traces its decisions to stderr
-/// (run with --nocapture). Asserted: from the public page with the CSP, the attacker's
-/// WebSocket does not open, and the framed document is shown (not an error page).
+/// An image or text document framed by a page from a public address (same origin): it loads
+/// (one child frame, not an error page), the guard serves it again with the CSP, and the
+/// attacker's step from the parent (`new frames[i].WebSocket(...)` in the frame's realm) is
+/// refused by `connect-src`. Two controls: on a local page the frame loads without being
+/// served again and no violation is reported; served again without the CSP header (test
+/// hook) the frame loads and no violation is reported. The guard traces to stderr
+/// (--nocapture).
 #[test]
 #[ignore]
-fn framed_documents_of_a_public_page_measurement() {
+fn framed_documents_of_a_public_page_get_the_csp() {
     common::run(async {
         let h = Harness::start();
-        let port = fixture_port(&h);
         let (info, _, _client, _) = public_session(&h, "/counter").await;
-        let target = info.targets[0].clone();
         let conn = &h.browser.conn;
-        let s = conn.attach(&target).await.unwrap();
+        let s = conn.attach(&info.targets[0]).await.unwrap();
         conn.send("Page.enable", json!({}), Some(&s)).await.unwrap();
         let ws = "ws://10.255.255.1:81/ws";
-        let mut public_with_csp = Vec::new();
-        for (label, origin, csp) in [
-            ("local page", format!("http://127.0.0.1:{port}"), true),
-            (
-                "public page, CSP",
-                format!("http://{}:{port}", common::PUBLIC_NAME),
-                true,
-            ),
-            (
-                "public page, served again WITHOUT the CSP header",
-                format!("http://{}:{port}", common::PUBLIC_NAME),
-                false,
-            ),
-        ] {
-            assert!(h.manager.set_guard_csp_header_for_test(csp));
+        let local = format!("http://127.0.0.1:{}", fixture_port(&h));
+        let public = format!("http://{}:{}", common::PUBLIC_NAME, public_port(&h));
+        // (label, page origin, CSP header on, served again, CSP expected)
+        let setups = [
+            ("local page", local, true, false, false),
+            ("public page", public.clone(), true, true, true),
+            ("public page, no CSP header", public, false, true, false),
+        ];
+        let mut failures = Vec::new();
+        for (label, origin, header, served_again, csp) in setups {
+            assert!(h.manager.set_guard_csp_header_for_test(header));
             conn.navigate(&s, &format!("{origin}/counter"))
                 .await
                 .unwrap();
+            assert_eq!(
+                conn.evaluate(&s, "document.title").await.unwrap(),
+                "counter",
+                "{label}: the page did not load"
+            );
             for src in ["/pixel.gif", "/plain.txt"] {
-                eprintln!("--- {label}, framed {src}");
+                let served_before = h.manager.guard_served();
                 let got = conn.evaluate(&s, &frame_probe_js(src, ws)).await.unwrap();
                 let got = got.as_str().unwrap_or_default().to_string();
                 let frames = child_frames(conn, &s).await;
-                eprintln!("{label}, framed {src}: {got}; frames: {frames:?}");
-                if label == "public page, CSP" {
-                    public_with_csp.push((src, got, frames));
-                }
-                // One frame at a time.
+                let served = h.manager.guard_served() - served_before;
+                eprintln!(
+                    "{label}, framed {src}: {got}; served again: {served}; frames: {frames:?}"
+                );
+                let loaded = frames.len() == 1
+                    && frames[0].contains(&format!("{src}\""))
+                    && frames[0].contains("unreachable=null");
+                let readable = got.contains(&format!("frame={origin}{src} complete"));
+                let violated = got.contains("violations=connect-src");
+                let mut check = |ok: bool, what: &str| {
+                    if !ok {
+                        failures.push(format!("{label}, {src}: {what}: {got}; frames {frames:?}"));
+                    }
+                };
+                check(loaded, "the framed document did not load");
+                check(
+                    readable,
+                    "the framed document is not readable from its page",
+                );
+                check(
+                    (served > 0) == served_again,
+                    "served again or not, unlike expected",
+                );
+                check(
+                    violated == csp,
+                    "connect-src violation present or absent, unlike expected",
+                );
+                check(!got.starts_with("ws=OPEN"), "the WebSocket opened");
                 let _ = conn
                     .evaluate(
                         &s,
@@ -607,14 +636,6 @@ fn framed_documents_of_a_public_page_measurement() {
         let _ = conn
             .send("Target.detachFromTarget", json!({ "sessionId": s }), None)
             .await;
-        for (src, got, frames) in public_with_csp {
-            assert!(!got.starts_with("ws=OPEN"), "{src}: {got}");
-            // The frame shows its document, not an error page: serving it again must not
-            // break framed images and text.
-            assert!(
-                frames.iter().all(|f| f.contains("unreachable=null")),
-                "{src}: the framed document did not load: {frames:?}"
-            );
-        }
+        assert!(failures.is_empty(), "{failures:#?}");
     });
 }

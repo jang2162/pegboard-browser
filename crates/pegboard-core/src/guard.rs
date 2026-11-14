@@ -345,6 +345,8 @@ struct State {
     documents: HashMap<String, Resolved>,
     /// Connections made so far (diagnostics: a reconnect shows as a jump).
     connections: u64,
+    /// Documents served again with the CSP so far (diagnostics).
+    served: u64,
     /// The last `ATTACH_LOG` attachments and what the guard did with them (diagnostics).
     attach_log: std::collections::VecDeque<String>,
     /// Refused requests per reason, since the daemon started (diagnostics, no URLs).
@@ -482,6 +484,12 @@ impl Guard {
             .iter()
             .cloned()
             .collect()
+    }
+
+    /// Documents served again with the CSP since the guard started (diagnostics).
+    #[doc(hidden)]
+    pub fn served(&self) -> u64 {
+        self.inner.state.lock().unwrap().served
     }
 
     /// Connections the guard has made since it started (diagnostics).
@@ -953,7 +961,10 @@ impl Inner {
         };
         let served = served.await;
         match &served {
-            Ok(_) => traced("served again with the CSP"),
+            Ok(_) => {
+                self.state.lock().unwrap().served += 1;
+                traced("served again with the CSP")
+            }
             Err(e) => traced(&format!("failed: {e:#}")),
         }
         if served.is_err() {

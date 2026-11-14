@@ -332,12 +332,18 @@ pub fn shared_home() -> &'static Home {
         let home = Home::new();
         let rules = host_rules();
         let browser_rules = browser_only_host_rules();
+        let spaces = format!(
+            "127.0.0.1:{}=public",
+            public_listener().local_addr().unwrap().port()
+        );
         let (code, _, err) = home.run_env(
             &[
                 ("PEGBOARD_TEST_HOST_RULES", rules.as_str()),
                 ("PEGBOARD_TEST_BROWSER_HOST_RULES", browser_rules.as_str()),
                 // The guard traces what it does with documents into daemon.log.
                 ("PEGBOARD_TEST_HOOKS", "1"),
+                // Chrome counts the public listener's port as a public address.
+                ("PEGBOARD_TEST_IP_SPACE_OVERRIDES", spaces.as_str()),
             ],
             &["browser", "start"],
         );
@@ -391,6 +397,15 @@ pub fn host_rules() -> String {
 /// connects to 127.0.0.1 under it (`browser_only_host_rules`, which Chrome applies first):
 /// pages "from a public address" served by a local test server.
 pub const PUBLIC_NAME: &str = "public.test";
+
+/// A loopback listener, bound once per test binary before the shared browser starts, whose
+/// port the browser counts as a public address (`--ip-address-space-overrides`). Tests serve
+/// `PUBLIC_NAME` pages from it (through `try_clone`), so those pages and their same-origin
+/// loads look to Chrome's own local-network check like a real public site.
+pub fn public_listener() -> &'static TcpListener {
+    static LISTENER: std::sync::OnceLock<TcpListener> = std::sync::OnceLock::new();
+    LISTENER.get_or_init(|| TcpListener::bind("127.0.0.1:0").unwrap())
+}
 
 /// Host resolver rules given to the browser only (`PEGBOARD_TEST_BROWSER_HOST_RULES`).
 pub fn browser_only_host_rules() -> String {

@@ -616,6 +616,9 @@ where
 pub struct Shared {
     pub env: Env,
     pub fixture: Fixture,
+    /// The same pages on a port Chrome counts as a public address
+    /// (`PEGBOARD_TEST_IP_SPACE_OVERRIDES`): serve `PUBLIC_NAME` pages from it.
+    pub public_fixture: Fixture,
     pub browser: Arc<Browser>,
     pub proxy: Arc<ProxyServer>,
     pub manager: SessionManager,
@@ -651,7 +654,18 @@ impl Shared {
         );
         std::env::set_var("PEGBOARD_TEST_HOOKS", "1");
         let env = env();
-        let fixture = fixture().await;
+        let public_fixture = fixture().await;
+        let fixture = self::fixture().await;
+        let public_port = public_fixture
+            .origin
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_string();
+        std::env::set_var(
+            "PEGBOARD_TEST_IP_SPACE_OVERRIDES",
+            format!("127.0.0.1:{public_port}=public"),
+        );
         let browser = Arc::new(Browser::launch(&env.paths, &env.cfg).await.unwrap());
         let upstream = Arc::new(WsUpstream {
             browser_ws_url: browser.ws_url.clone(),
@@ -671,6 +685,7 @@ impl Shared {
         Shared {
             env,
             fixture,
+            public_fixture,
             browser,
             proxy,
             manager,

@@ -536,6 +536,12 @@ impl SessionManager {
         self.inner.guard.denied()
     }
 
+    /// Documents the guard has served again with the CSP (diagnostics).
+    #[doc(hidden)]
+    pub fn guard_served(&self) -> u64 {
+        self.inner.guard.served()
+    }
+
     /// What the guard did with its last attachments (diagnostics).
     #[doc(hidden)]
     pub fn guard_attach_log(&self) -> Vec<String> {

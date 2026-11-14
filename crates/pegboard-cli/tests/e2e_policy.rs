@@ -456,6 +456,10 @@ use std::sync::{Arc, Mutex};
 struct AddressServer {
     a: u16,
     b: u16,
+    /// A loopback port Chrome counts as a public address (`common::public_listener`): pages of
+    /// `PUBLIC_NAME` are served from it, so their same-origin loads pass Chrome's own
+    /// local-network check as on a real public site.
+    p: u16,
     lan: Option<u16>,
     hits: Arc<Mutex<Vec<String>>>,
 }
@@ -500,25 +504,40 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
 
 impl AddressServer {
-    fn start() -> AddressServer {
-        let hits = Arc::new(Mutex::new(Vec::new()));
-        let listen = |ip: &str| {
-            let l = std::net::TcpListener::bind((ip, 0)).unwrap();
-            let port = l.local_addr().unwrap().port();
-            let hits = hits.clone();
-            std::thread::spawn(move || {
-                for stream in l.incoming() {
-                    let Ok(stream) = stream else { continue };
-                    let hits = hits.clone();
-                    std::thread::spawn(move || serve_one(stream, hits));
-                }
-            });
-            port
-        };
-        let a = listen("127.0.0.1");
-        let b = listen("127.0.0.1");
-        let lan = lan_ip().map(|ip| listen(&ip.to_string()));
-        AddressServer { a, b, lan, hits }
+    /// The binary's one server (started on first use; the public port is the listener the
+    /// shared browser was told about).
+    fn start() -> &'static AddressServer {
+        static SERVER: std::sync::OnceLock<AddressServer> = std::sync::OnceLock::new();
+        SERVER.get_or_init(|| {
+            let hits = Arc::new(Mutex::new(Vec::new()));
+            let serve = |l: std::net::TcpListener| {
+                let port = l.local_addr().unwrap().port();
+                let hits = hits.clone();
+                std::thread::spawn(move || {
+                    for stream in l.incoming() {
+                        let Ok(stream) = stream else { continue };
+                        let hits = hits.clone();
+                        std::thread::spawn(move || serve_one(stream, hits));
+                    }
+                });
+                port
+            };
+            let bind = |ip: &str| std::net::TcpListener::bind((ip, 0)).unwrap();
+            let a = serve(bind("127.0.0.1"));
+            let b = serve(bind("127.0.0.1"));
+            let p = serve(public_listener().try_clone().unwrap());
+            let lan = lan_ip().map(|ip| serve(bind(&ip.to_string())));
+            AddressServer { a, b, p, lan, hits }
+        })
+    }
+
+    /// The port that serves `host`'s pages: the public one for `PUBLIC_NAME`.
+    fn port_of(&self, host: &str) -> u16 {
+        if host == PUBLIC_NAME {
+            self.p
+        } else {
+            self.a
+        }
     }
 
     /// The LAN port; the test cannot run without a private address on this machine.
@@ -850,8 +869,9 @@ fn private_network_is_closed_unless_allowed() {
     );
     // WebSockets are covered on pages from public addresses only (the CSP): a page on a local
     // origin is passed unchanged (owner's ruling).
-    let (code, _, err) = open(&h, &format!("http://{PUBLIC_NAME}:{}/page", srv.a));
+    let (code, _, err) = open(&h, &format!("http://{PUBLIC_NAME}:{}/page", srv.p));
     assert_eq!(code, 0, "{err}");
+    assert_title(&h, "policy");
     let ws = settle(
         &h,
         &ws_csp_js(&format!("ws://{PRIVATE_NAME}:{lan}/ws?m={wm}")),
@@ -996,9 +1016,10 @@ fn allow_domain_closes_everything_else_including_localhost() {
     assert_ne!(settle(&h, &img_js(&unlisted("/img", &im))), "LOADED");
     // WebSockets, from a page of the listed public name (served again with the CSP; a page
     // on a local origin is passed unchanged by the owner's ruling).
-    let page = |host: &str| format!("http://{host}:{}/page", srv.a);
+    let page = |host: &str| format!("http://{host}:{}/page", srv.port_of(host));
     let (code, _, err) = open(&h, &page(PUBLIC_NAME));
     assert_eq!(code, 0, "{err}");
+    assert_title(&h, "policy");
     let lm = marker("lw");
     for url in [
         format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b),
@@ -1245,8 +1266,9 @@ fn pages_from_a_public_address_get_the_csp() {
         "--profile",
         profile("pol-csp-default"),
         "--url",
-        &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
+        &format!("http://{PUBLIC_NAME}:{}/page", srv.p),
     ]);
+    assert_title(&h, "policy");
     let wm = marker("w");
     let refused = settle(
         &h,
@@ -1312,7 +1334,7 @@ fn oopif_subrequests_are_judged() {
         "--profile",
         profile("pol-priv-closed"),
         "--url",
-        &embed_url(&srv, &private(&m)),
+        &embed_url(srv, &private(&m)),
     ]);
     assert!(!wait(&m), "the cross-site frame reached the private server");
     close(&h);
@@ -1323,7 +1345,7 @@ fn oopif_subrequests_are_judged() {
         profile("pol-priv-open"),
         "--allow-private-network",
         "--url",
-        &embed_url(&srv, &private(&m)),
+        &embed_url(srv, &private(&m)),
     ]);
     assert!(wait(&m), "the frame did not run (control)");
     close(&h);
@@ -1357,8 +1379,9 @@ fn frames_of_a_public_page_inherit_the_csp() {
         "--profile",
         profile("pol-csp-default"),
         "--url",
-        &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
+        &format!("http://{PUBLIC_NAME}:{}/page", srv.p),
     ]);
+    assert_title(&h, "policy");
     let wm = marker("fw");
     let got = settle(
         &h,
@@ -1411,8 +1434,9 @@ fn sniffed_and_duplicated_content_types_get_the_csp() {
         "--profile",
         profile("pol-csp-default"),
         "--url",
-        &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
+        &format!("http://{PUBLIC_NAME}:{}/page", srv.p),
     ]);
+    assert_title(&h, "policy");
     // The second case: a download type first and HTML last. Chrome takes the last valid
     // type and renders HTML; a check that read only the first would pass it as a download
     // without the CSP.
@@ -1420,7 +1444,7 @@ fn sniffed_and_duplicated_content_types_get_the_csp() {
         "ct=unknown%2Funknown",
         "ct=application%2Foctet-stream&ct2=text%2Fhtml",
     ] {
-        let url = format!("http://{PUBLIC_NAME}:{}/typed?{query}", srv.a);
+        let url = format!("http://{PUBLIC_NAME}:{}/typed?{query}", srv.p);
         let (code, _, err) = open(&h, &url);
         assert_eq!(code, 0, "{query}: {err}");
         let (code, out, err) = shared_home().run(&["--session", &h, "eval", "document.title"]);
@@ -1469,6 +1493,14 @@ fn framed_ws_js(src: &str, url: &str) -> String {
     )
 }
 
+/// Asserts that the session's tab shows the document titled `want` (the document loaded:
+/// what follows is not run against an error page or the page before).
+fn assert_title(handle: &str, want: &str) {
+    let (code, out, err) = shared_home().run(&["--session", handle, "eval", "document.title"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(json(&out)["result"], want, "the page did not load: {out}");
+}
+
 /// The guard's trace lines in daemon.log about documents whose path is `path`.
 fn guard_trace(path: &str) -> Vec<String> {
     let log = std::fs::read_to_string(shared_home().path().join("daemon.log")).unwrap_or_default();
@@ -1489,26 +1521,28 @@ fn inert_documents_get_the_csp_too() {
         "--profile",
         profile("pol-csp-default"),
         "--url",
-        &format!("http://{PUBLIC_NAME}:{}/page", srv.a),
+        &format!("http://{PUBLIC_NAME}:{}/page", srv.p),
     ]);
-    // The same documents opened at the top level, for the record.
-    for src in ["/img", "/txt"] {
-        let _ = open(&h, &format!("http://{PUBLIC_NAME}:{}{src}", srv.a));
-        let (_, out, _) = shared_home().run(&[
-            "--session",
-            &h,
-            "eval",
-            "[document.URL, document.readyState, document.contentType].join(' ')",
-        ]);
+    assert_title(&h, "policy");
+    let types = [("/img", "image/gif"), ("/txt", "text/plain")];
+    // The same documents opened at the top level: they load as what they are.
+    for (src, ctype) in types {
+        let (code, _, err) = open(&h, &format!("http://{PUBLIC_NAME}:{}{src}", srv.p));
+        assert_eq!(code, 0, "{src}: {err}");
+        let (code, out, err) =
+            shared_home().run(&["--session", &h, "eval", "document.contentType"]);
+        assert_eq!(code, 0, "{err}");
         eprintln!(
             "top level {src}: {}; guard: {:?}",
             out.trim(),
             guard_trace(src)
         );
+        assert_eq!(json(&out)["result"], ctype, "{src} did not load: {out}");
     }
-    let (code, _, err) = open(&h, &format!("http://{PUBLIC_NAME}:{}/page", srv.a));
+    let (code, _, err) = open(&h, &format!("http://{PUBLIC_NAME}:{}/page", srv.p));
     assert_eq!(code, 0, "{err}");
-    for src in ["/img", "/txt"] {
+    assert_title(&h, "policy");
+    for (src, ctype) in types {
         let wm = marker("iw");
         let url = format!("ws://{UNLISTED_NAME}:{}/ws?m={wm}", srv.b);
         let got = settle(&h, &framed_ws_js(src, &url));
@@ -1516,15 +1550,16 @@ fn inert_documents_get_the_csp_too() {
             "public page, framed {src}: {got}; guard: {:?}",
             guard_trace(src)
         );
-        // The attacker's WebSocket does not open and never reaches the server. Either the
-        // frame's CSP refused it (a connect-src violation), or the parent cannot reach the
-        // frame's realm at all (the step throws).
+        // The frame loaded its document (same origin, readable from the page) ...
+        let frame = format!("frame=http://{PUBLIC_NAME}:{}{src} complete {ctype}", srv.p);
+        assert!(
+            got.contains(&frame),
+            "{src} did not load in the frame: {got}"
+        );
+        // ... and the attacker's WebSocket, made in its realm from the page, is refused by the
+        // frame's CSP and never reaches the server.
         assert!(!got.starts_with("ws=OPEN"), "{src}: {got}");
-        assert!(!got.starts_with("TIMEOUT"), "{src}: {got}");
-        let refused_by_csp = got.contains("violations=connect-src");
-        let realm_unreachable =
-            got.starts_with("ws=THROW:SecurityError") && got.contains("frame=unreadable");
-        assert!(refused_by_csp || realm_unreachable, "{src}: {got}");
+        assert!(got.contains("violations=connect-src"), "{src}: {got}");
         assert!(!srv.reached(&wm));
     }
     close(&h);
@@ -1562,7 +1597,7 @@ fn served_again_bodies_keep_their_bytes() {
             "--profile",
             profile("pol-csp-default"),
             "--url",
-            &format!("http://{host}:{}/sjis", srv.a),
+            &format!("http://{host}:{}/sjis", srv.port_of(host)),
         ]);
         let (code, out, err) = shared_home().run(&[
             "--session",
@@ -1575,7 +1610,7 @@ fn served_again_bodies_keep_their_bytes() {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let (code, _, err) = open(&h, &format!("http://{host}:{}/utf8big", srv.a));
+        let (code, _, err) = open(&h, &format!("http://{host}:{}/utf8big", srv.port_of(host)));
         assert_eq!(code, 0, "{err}");
         let (code, out, err) = shared_home().run(&["--session", &h, "eval", probe]);
         assert_eq!(code, 0, "{err}");
