@@ -1279,6 +1279,7 @@ fn session_for_action(
 fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Result<Reply, RpcError> {
     let argv = to_argv(&format!("pegboard_{word}"), args)?;
     let (id, token) = session_for_action(ctx, args)?;
+    let page_content = is_page_content(&argv);
     let params = CommandExecParams {
         session_id: id.clone(),
         argv,
@@ -1303,6 +1304,9 @@ fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Resul
     if text.is_empty() {
         text = "ok".to_string();
     }
+    if ok && (page_content || boundary_of(&r.output).is_some()) {
+        text = wrap_page_content(&text, boundary_of(&r.output));
+    }
     let mut image = None;
     if ok && word == "screenshot" {
         match screenshot_image(&ctx.core.files_dir(&id), &r.output) {
@@ -1324,6 +1328,59 @@ fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Resul
         is_error: !ok,
         image,
     })
+}
+
+/// Whether what a command line answers comes from the page: what it reads (`get`, `is`,
+/// `find ... text`, the console, cookies, storage, tabs, dialogs), evaluates, or the page's
+/// tree and audits (`snapshot`, `a11y`, `vitals`).
+fn is_page_content(argv: &[String]) -> bool {
+    use pegboard_protocol::ActionClass::*;
+    matches!(argv::class_of(argv), Some(Get | Read | Eval))
+        || matches!(
+            argv.first().map(String::as_str),
+            Some("snapshot" | "a11y" | "vitals")
+        )
+}
+
+/// agent-browser's content boundary of an output (`_boundary`, at the top or in `data`):
+/// its nonce, and the page's origin when it says.
+fn boundary_of(output: &Value) -> Option<(String, Option<String>)> {
+    let b = [&output["_boundary"], &output["data"]["_boundary"]]
+        .into_iter()
+        .find(|b| !b.is_null())?;
+    let (nonce, origin) = match b {
+        Value::String(nonce) => (nonce.as_str(), None),
+        Value::Object(_) => (b["nonce"].as_str()?, b["origin"].as_str()),
+        _ => return None,
+    };
+    let usable = !nonce.is_empty()
+        && nonce.len() <= 128
+        && nonce
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+    usable.then(|| (nonce.to_string(), origin.map(str::to_string)))
+}
+
+/// Page text between agent-browser's page-content markers, so the agent can tell it from
+/// pegboard's own words and the page cannot fake the end (it does not know the nonce). The
+/// nonce is agent-browser's when the output carries one, else a fresh random one.
+/// (agent-browser's `--json` output keeps the text bare and tells the nonce in `_boundary`.)
+fn wrap_page_content(text: &str, boundary: Option<(String, Option<String>)>) -> String {
+    // Always, even when the text holds markers already: the page could have written them.
+    let (nonce, origin) = boundary.unwrap_or_else(|| {
+        use rand::RngCore;
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        (data_encoding::HEXLOWER.encode(&bytes), None)
+    });
+    let origin = origin
+        .filter(|o| !o.chars().any(|c| c.is_whitespace() || c.is_control()))
+        .map(|o| format!(" origin={o}"))
+        .unwrap_or_default();
+    format!(
+        "--- AGENT_BROWSER_PAGE_CONTENT nonce={nonce}{origin} ---\n{text}\n\
+         --- END_AGENT_BROWSER_PAGE_CONTENT nonce={nonce} ---"
+    )
 }
 
 enum Shot {
