@@ -1477,28 +1477,34 @@ fn document_open_and_write_do_not_remove_the_shield() {
             let wrapped = tab
                 .eval(
                     "(()=>{const f=document.createElement('iframe');document.body.appendChild(f);\
-                     return String(f.contentWindow.Document.prototype.open).includes('on(this)')})()",
+                     return String(f.contentWindow.Document.prototype.open).includes('own(this)')})()",
                     false,
                 )
                 .await;
             eprintln!("allow={allow}: a fresh frame's realm has the wrapped open: {wrapped}");
             for (way, expr) in &ways {
                 tab.load("/clip").await;
+                let before = h.manager.guard_attach_log();
                 let said = tab.eval(expr, false).await;
                 settle().await;
                 let changed = click_copy_changes(&tab, "#cp", &clip).await;
                 eprintln!("{way}, allow={allow}: eval {said}, copy changed {changed}");
-                for line in h
+                let opened: Vec<String> = h
                     .manager
                     .guard_attach_log()
-                    .iter()
-                    .rev()
-                    .take(3)
-                    .filter(|l| l.contains("document opened"))
-                {
+                    .into_iter()
+                    .filter(|l| l.contains("document opened") && !before.contains(l))
+                    .collect();
+                for line in &opened {
                     eprintln!("  guard: {line}");
                 }
                 assert_eq!(changed, allow, "{way}: allow={allow} (eval said {said})");
+                // Through the shield's wrappers (every realm a page reaches here has them),
+                // the shield is first again at once: the guard leaves the document alone.
+                assert!(
+                    opened.iter().all(|l| l.contains("shield first")),
+                    "{way}: the guard renewed a document the shield held: {opened:#?}"
+                );
             }
             h.close_session(&a.info.id).await;
         }
@@ -1514,7 +1520,61 @@ impl Drop for Reset<'_> {
             .manager
             .set_guard_early_delay_for_test(Duration::ZERO);
         self.0.manager.set_guard_fail_frame_shield_for_test(false);
+        self.0.manager.set_guard_shield_wrappers_for_test(true);
     }
+}
+
+/// The guard's own check after `document.open()` (the backstop for an `open` that does not go
+/// through the shield's wrappers; here the wrappers are left out by a test hook, so every
+/// `open` gets past them). With content that listens first, the guard sees the page first and
+/// renews the document; the copy does not land.
+#[test]
+#[ignore]
+fn the_guard_renews_a_document_opened_past_the_shield() {
+    common::run(async {
+        let clip = Clipboard::take();
+        let h = Harness::start();
+        let _reset = Reset(&h);
+        assert!(h.manager.set_guard_shield_wrappers_for_test(false));
+        let a = agent(&h, false).await;
+        let tab = a.tab(&a.first()).await;
+        tab.load("/clip").await;
+        let before = h.manager.guard_attach_log();
+        let js = serde_json::to_string(&copy_area(true)).unwrap();
+        tab.eval(
+            &format!("document.open();document.write({js});document.close();1"),
+            false,
+        )
+        .await;
+        let renewed = common::eventually(10, || async {
+            h.manager
+                .guard_attach_log()
+                .iter()
+                .any(|l| !before.contains(l) && l.contains("page first") && l.contains("renewed"))
+        })
+        .await;
+        let log: Vec<String> = h
+            .manager
+            .guard_attach_log()
+            .into_iter()
+            .filter(|l| l.contains("document opened") && !before.contains(l))
+            .collect();
+        eprintln!("{log:#?}");
+        assert!(renewed, "the guard did not renew the document: {log:#?}");
+        let loaded = common::eventually(10, || async {
+            tab.eval("document.readyState", false).await == "complete"
+                && tab
+                    .eval("String(!!document.getElementById('cp'))", false)
+                    .await
+                    == "true"
+        })
+        .await;
+        assert!(loaded, "the renewed page did not load");
+        assert!(
+            !click_copy_changes(&tab, "#cp", &clip).await,
+            "the copy went through after the guard's renewal"
+        );
+    });
 }
 
 /// Review I1: `ready` comes back at most `EARLY_SETUP_LIMIT` (10 s) after a reconnect, but

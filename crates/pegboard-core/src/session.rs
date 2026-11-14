@@ -759,6 +759,17 @@ impl SessionManager {
         true
     }
 
+    /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: the guard's shield goes in without
+    /// its `open`/`write` wrappers (`on: false`). Returns whether it did.
+    #[doc(hidden)]
+    pub fn set_guard_shield_wrappers_for_test(&self, on: bool) -> bool {
+        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+            return false;
+        }
+        self.inner.guard.set_shield_wrappers_for_test(on);
+        true
+    }
+
     /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: the guard's shield of frames counts
     /// as failed. Returns whether it did.
     #[doc(hidden)]
