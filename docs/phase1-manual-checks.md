@@ -169,7 +169,7 @@ cat /tmp/pegboard-m-loop.log
 | 기대 결과 | 파일이 `$PEGBOARD_HOME/sessions/<세션 id>/files` 아래에 생기거나, 최소한 사람이 쓰는 다운로드 폴더에 섞이지 않는다. 사람 쪽 폴더에 생기면 알려진 한계로 적는다 |
 | 실제 결과 | **2026-11-13, 에이전트 수행. 기대와 다름: 사람의 다운로드 폴더에 생겼다(알려진 한계로 기록).** 근거: 세션 `s_hyjictij`에서 `pegboard open http://127.0.0.1:8765/` → `snapshot -i`에서 `link "sample.zip" [ref=e3]` → `pegboard click @e3`(종료 코드 0). 4초 뒤 `$PEGBOARD_HOME/sessions/s_hyjictij/files`는 비어 있었고, 파일은 `~/Downloads/sample.zip`(22바이트, 내용 `pegboard manual check`, 07:42 생성)에 생겼다. `find`로 `$PEGBOARD_HOME`, `~/Downloads`, `/tmp`를 찾아도 이것 하나뿐이었다. 두 프로필(`Default`, `PegboardAgent`)의 `Preferences`에 `download` 키가 없다. 즉 에이전트 프로필의 다운로드 위치가 지정되지 않아 Chrome 기본값인 macOS 사용자의 `~/Downloads`로 간다. 다운로드 확인 창 없이 곧바로 저장됐다. M4보다 먼저 했으므로 "M4에서 바꾼 다운로드 폴더"는 아직 없었다 |
 
-수정(2026-11-13): 에이전트 프로필의 다운로드를 막아 고쳤다. 자동 시험 `agent_download_writes_no_file`, `download_policy_survives_reconnects`, `human_downloads_still_work`(e2e_isolation), `agent_cannot_reenable_downloads`(e2e_proxy)가 덮는다. 손으로 다시 확인하는 것은 선택이다.
+수정(2026-11-13): 에이전트 프로필의 다운로드를 막아 고쳤다. 2a(2026-11-14)부터는 막지 않고 다운로드를 시작한 탭의 세션 파일 디렉터리로 받는다(README "세션 정책"). 자동 시험 `agent_download_writes_no_file`, `download_policy_survives_reconnects`, `human_downloads_still_work`(e2e_isolation), `agent_cannot_reenable_downloads`(e2e_proxy)가 덮는다. 손으로 다시 확인하는 것은 선택이다.
 
 ### M6. 사람이 탭을 탭그룹 사이로 끌기
 
@@ -231,4 +231,5 @@ cut -d' ' -f2- /tmp/pegboard-front.log | sort | uniq -c
 
 - [spike-findings.md](./spike-findings.md)의 "미실시" 표에서 화면 잠금, 다른 데스크톱 공간, 환경설정 누출, 다운로드 경로 행: 수행한 날짜와 결과를 적는다.
 - 새는 것이 나오면 [architecture.md](./architecture.md) 11절 "남는 위험"과 README의 "알려진 한계"에 한 줄씩 더한다.
+- 2a의 수동 확인(N1~N4)은 [phase2a-manual-checks.md](./phase2a-manual-checks.md).
 - M1~M7, M8, M8b가 모두 끝나면 [roadmap.md](./roadmap.md)의 1단계 상태를 "완료"로 고친다.

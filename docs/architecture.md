@@ -139,7 +139,7 @@ flowchart LR
 | 경로 | 프로토콜 | 비고 |
 |---|---|---|
 | CLI/MCP → 로컬 `pegboardd` | 코어 API. 유닉스 소켓(Windows는 명명된 파이프) 위의 JSON-RPC 2.0, 한 줄에 메시지 하나 | 소유자만 접근 가능한 권한 |
-| `pegboardd` → agent-browser | 자식 프로세스 실행. 공개 CLI 인터페이스(`--json`, `mcp call`)만 사용 | 데몬 소켓 프로토콜에는 의존하지 않는다 |
+| `pegboardd` → agent-browser | 자식 프로세스 실행. 공개 CLI 인터페이스(`--json`)만 사용(MCP 도구도 CLI 명령줄로 바꿔 실행한다. 7절) | 데몬 소켓 프로토콜에는 의존하지 않는다 |
 | agent-browser → 세션 CDP 프록시 | CDP. 루프백 WebSocket, 세션별 무작위 토큰을 `--cdp-headers`로 전달 | 세션이 가진 탭만 보인다 |
 | 프록시 → 브라우저 | CDP 전체 + `Pegboard` 도메인. 3단계부터 파이프(1~2단계는 루프백 디버깅 포트) | 3단계부터 TCP 포트를 열지 않는다 |
 | 릴레이 → 호스팅 서버 | 바깥 방향 WSS 상시 연결 | NAT 뒤에서도 동작 |
@@ -537,54 +537,39 @@ pegboard relay run | status
 
 # 그 밖
 pegboard config get|set|sync
-pegboard mcp [--tools core,...]
+pegboard mcp [--operator] [--tools core,...] [정책 옵션]
 pegboard doctor
 ```
 
 **동작 명령 통과 규칙**: `pegboard`는 agent-browser의 동작 명령을 그대로 넘기되, 접속 대상과 실행 환경을 바꾸는 전역 플래그는 거부한다. 거부 대상: `--cdp`, `--auto-connect`, `--provider`, `--profile`, `--executable-path`, `--args`, `--extension`, `--state`, `--config`, `--engine`. 에이전트가 이 플래그로 세션 밖 브라우저에 붙는 것을 막기 위해서다. `session`, `close`, `record`, `install`, `upgrade`, `connect`처럼 Pegboard가 맡는 명령은 가로채서 Pegboard 쪽 동작으로 바꾼다.
 
-### MCP 도구 초안
+### MCP 도구 (2a)
 
-Pegboard 고유 도구:
+2a에서 MCP 도구의 구성을 바꿨다. 이 절의 처음 초안은 "브라우저 동작 도구는 agent-browser의 MCP 도구 목록을 그대로 중계한다"였다. 2a는 **허용 명령 문법(`argv.rs`의 `GRAMMAR`)에서 도구를 생성한다**([2a 설계](./plans/2026-11-13-phase2a-mcp-and-policy-design.md) 4절, 사용자 결정 D6).
 
-| 도구 | 인자 | 결과 |
-|---|---|---|
-| `pegboard_browser_list` | 없음 | 브라우저 목록과 상태 |
-| `pegboard_profile_list` | `browser?` | 에이전트 프로필 목록 |
-| `pegboard_profile_create` | `name`, `from?`, `browser?` | 프로필 정보 |
-| `pegboard_session_create` | `name?`, `browser?`, `url?`, `record?`, `profile?`, `tempProfile?`, `tempProfileFrom?` | `sessionId`, 탭그룹 정보 |
-| `pegboard_session_list` | `browser?` | 세션 목록 |
-| `pegboard_session_info` | `sessionId` | 세션 상태, 탭 목록, 사람 개입 여부 |
-| `pegboard_session_close` | `sessionId`, `keepTabs?` | 녹화 ID |
-| `pegboard_recording_list` | `sessionId?` | 녹화 목록 |
-| `pegboard_recording_get` | `recordingId` | 요약과 동작 로그 |
+- 이유: 중계하면 요청이 JSON으로 agent-browser에 들어가 1단계의 argv 검사(`argv::check`)와 비밀 가림을 거치지 않는다. 같은 검사를 JSON용으로 한 벌 더 만들어 두 벌을 맞춰야 하고, 1단계에서 가장 공을 들인 검사를 우회하는 두 번째 입구가 생긴다. 문법에서 생성하면 검사와 가림이 한 벌이고 "CLI와 MCP가 같은 길을 간다"가 구조로 보장된다. 대가: 도구 설명을 우리가 쓰고, agent-browser의 새 명령은 문법에 넣어야 따라온다.
+- 문법의 첫 단어 하나가 도구 하나다(`pegboard_open`, `pegboard_snapshot`, `pegboard_get`, `pegboard_tab` 등). 하위 명령은 `command`, 위치 인자와 플래그는 이름 붙은 인자(플래그는 긴 이름의 camelCase)로 받는다. 스키마는 `additionalProperties: false`이고, 모르는 인자는 무시하지 않고 거부한다. 문법에 없는 것은 MCP로 받을 수 없다.
+- 호출은 인자를 argv로 바꿔(`mcp::tools::to_argv`, 값 하나가 단어 하나, `-`로 시작하는 값은 `fill`/`type`의 글 말고는 거부) 코어 API `command.exec`에 CLI와 같은 꼴로 보낸다. 그 뒤는 CLI와 같다: `argv::check` → 정책 판정 → 주소 판정 → `runner.exec` → 동작 기록. 시험 `cli_and_mcp_run_the_same_command_the_same_way`, `the_same_inputs_are_rejected_by_both`(e2e_mcp).
+- 결과: agent-browser 출력의 글. 페이지에서 왔을 수 있는 글(성공한 결과 전부와 실패 이유)은 pegboard가 결과마다 새로 고른 난수로 `--- AGENT_BROWSER_PAGE_CONTENT nonce=… ---`와 `--- END_AGENT_BROWSER_PAGE_CONTENT nonce=… ---` 사이에 넣는다. agent-browser의 `--json` 출력에는 표식이 없고(측정) 페이지가 고를 수 있는 값을 난수로 쓰면 블록을 일찍 끝낼 수 있어서다. `screenshot`은 그림 콘텐츠도 돌려준다(5 MiB까지). 끝난 다운로드는 다음 결과에 한 번 알린다.
+- 도구 묶음 `--tools`: `core`(페이지 동작), `tabs`(`tab`), `state`(`cookies`, `storage`), `network`(`network`, `console`, `errors`, `vitals`, `a11y`), `all`. 기본 `core,tabs`. 목록은 서버 하나에 한 벌이고, 정책이 막는 명령도 목록에 남아 `policy_denied`로 답한다(한 도구 안에 읽기와 쓰기 형식이 섞여 있어 목록으로 가릴 수 없다).
 
-브라우저 동작 도구는 agent-browser의 MCP 도구 목록을 그대로 중계한다. agent-browser가 타입이 붙은 도구 목록과 프로필을 이미 갖고 있고, `mcp call`로 도구 하나를 상태 없이 실행할 수 있기 때문이다 [확인]. `pegboard mcp`는 도구 호출을 받아 `sessionId`를 확인한 뒤 브라우저가 있는 머신의 `pegboardd`에 넘기고, 거기서 `agent-browser mcp call`을 실행한다. 접속을 바꾸는 공용 인자(`extraArgs` 등)는 걸러 낸다.
+관리 도구:
 
-도구 스키마 예:
+| 도구 | 인자 | 기본 모드 | `--operator` |
+|---|---|---|---|
+| `pegboard_session_create` | `name?`, `url?`, `profile?` | 정책은 서버의 옵션으로 고정 | `policy?`도 받는다 |
+| `pegboard_session_list` | 없음 | 자기 세션만 | 전부 |
+| `pegboard_session_info` | `sessionId` | 자기 세션만 | 전부(`session.info_any`) |
+| `pegboard_session_close` | `sessionId`, `keepTabs?` | 자기 세션만 | 전부(`session.close_any`) |
+| `pegboard_recording_list`, `pegboard_recording_get` | 없음 / `recordingId` | 자기 세션의 기록만 | 전부 |
+| `pegboard_files_list` | `sessionId` | 자기 세션만 | 자기 세션만(토큰이 필요하다) |
+| `pegboard_browser_status` | 없음 | 있음 | 있음(세션 수 포함) |
+| `pegboard_profile_list`, `_create`, `_delete`, `pegboard_browser_stop` | CLI와 같음 | 없음 | 있음 |
 
-```json
-{
-  "name": "pegboard_session_create",
-  "description": "브라우저에 에이전트 세션을 만든다. 세션은 탭그룹 하나에 대응한다.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "name":     { "type": "string", "description": "탭그룹 제목으로 쓰일 세션 이름" },
-      "browser":  { "type": "string", "description": "local 또는 릴레이 이름. 기본 local" },
-      "url":      { "type": "string", "description": "첫 탭에서 열 주소" },
-      "record":   { "type": "boolean", "default": true },
-      "profile":  { "type": "string", "description": "에이전트 프로필 이름. 기본 default" },
-      "tempProfile": { "type": "boolean", "default": false,
-                    "description": "세션이 닫히면 지워지는 임시 프로필에서 실행. profile과 함께 쓸 수 없다" },
-      "tempProfileFrom": { "type": "string",
-                    "description": "임시 프로필의 복사 원본. 생략하면 빈 프로필" }
-    }
-  }
-}
-```
-
-도구 이름을 `agent_browser_*` 그대로 둘지 `pegboard_*`로 바꿀지는 작은 결정이다. 제안: 그대로 둔다. 에이전트가 agent-browser의 스킬 문서를 그대로 활용할 수 있다.
+- "자기 세션"은 그 서버가 만들었거나 `PEGBOARD_SESSION`으로 넘겨받은(데몬이 확인한) 세션이다. 서버는 그 핸들을 메모리에만 쥐고 도구 인자와 결과에는 세션 ID만 쓴다. 남의 세션은 없는 세션과 글자 하나 다르지 않게 답한다.
+- 조종은 두 모드 모두 자기 세션만 한다. 운영자 모드가 남의 세션을 조종하려면 코어 API가 핸들을 내줘야 하는데, 설계의 제안대로 그 메서드 없이 더 좁은 쪽을 골랐다.
+- 서버가 끝나면(stdin 닫힘, SIGTERM, SIGINT, SIGHUP) 자기가 만든 세션을 닫는다. 넘겨받은 세션은 닫지 않는다. 한 서버가 열어 둘 수 있는 세션은 16개다.
+- 시험: e2e_mcp(서버 수명, 모드, 동등성, 표식), e2e_mcp_isolation(격리 시험 묶음의 MCP 판).
 
 ### 코어 API 메시지 초안
 
@@ -611,7 +596,8 @@ JSON-RPC 2.0, 한 줄에 메시지 하나.
 | `profile.list`, `profile.create`, `profile.info`, `profile.open`, `profile.delete` | 에이전트 프로필 |
 | `session.create`, `session.list`, `session.info`, `session.close`, `session.pause`, `session.resume` | 세션 |
 | `command.exec` | agent-browser 명령 실행 |
-| `mcp.listTools`, `mcp.callTool` | 동작 도구 중계 |
+| `session.info_any`, `session.close_any` | 운영자용, 토큰 없이 세션 보기와 닫기(2a) |
+| `files.list` | 세션 파일 디렉터리의 파일(2a) |
 | `recording.list`, `recording.get`, `recording.read`, `recording.delete` | 녹화 |
 | `confirm.respond` | 확인이 필요한 동작에 대한 승인·거부 |
 | 알림: `session.changed`, `confirm.required` | 서버에서 클라이언트로 |
@@ -924,7 +910,7 @@ WSS  /v1/tunnel/client?relay={id}   클라이언트 스트림
 
 | 위협 | 대응 |
 |---|---|
-| 페이지 내용이 에이전트를 조종한다(프롬프트 주입) | 페이지 출력에 경계 표식을 기본으로 붙인다 [확인: agent-browser `--content-boundaries`]. 세션 범위 밖으로는 나갈 수 없게 한다(결정 2) |
+| 페이지 내용이 에이전트를 조종한다(프롬프트 주입) | MCP 결과에서 페이지에서 왔을 수 있는 글을 pegboard가 결과마다 새로 고른 난수의 경계 표식 사이에 넣는다(2a, 7절). 페이지는 그 난수를 모르므로 블록을 일찍 끝낼 수 없다(시험 `mcp_page_content_markers_wrap_page_text_and_a_page_cannot_end_the_block`). 세션 범위와 정책 밖으로는 나갈 수 없게 한다(결정 2) |
 | 조종당한 에이전트가 사람의 탭이나 로그인 상태를 쓴다 | 프로필 격리(결정 6)와 CDP 프록시. 사람 프로필의 타깃은 어떤 정책으로도 열리지 않는다. 탭 생성은 프록시가 가로채 에이전트 프로필에 만들고, 프로필을 지정하지 않는 브라우저 수준 메서드는 거부한다(결정 2) |
 | 조종당한 에이전트가 에이전트 프로필에 로그인된 계정으로 파괴적 동작을 한다 | 동작 정책과 확인 절차. 완전히 막을 수는 없다(아래 "남는 위험") |
 | 조종당한 에이전트가 다른 세션의 탭을 읽는다 | 세션별 CDP 프록시. 탭그룹 밖 타깃은 보이지 않는다. 쿠키는 같은 프로필이면 공유된다 |
@@ -942,22 +928,32 @@ WSS  /v1/tunnel/client?relay={id}   클라이언트 스트림
 
 1. **범위(항상 강제)**: 자기 탭그룹의 타깃만. 프록시가 강제하며 정책으로 풀 수 없다.
 2. **도메인**: 허용목록 또는 차단목록. 탐색과 하위 요청에 적용.
-3. **동작**: agent-browser의 동작 분류를 그대로 쓴다 [확인]: `navigate`, `click`, `fill`, `eval`, `download`, `upload`, `snapshot`, `scroll`, `wait`, `read`, `get`, `interact`, `network`, `state`. 분류마다 허용, 확인 필요, 거부 중 하나.
+3. **동작**: 명령마다 붙인 분류(`argv.rs`의 문법이 형식마다 정한다): `navigate`, `click`, `fill`, `snapshot`, `scroll`, `wait`, `read`, `get`, `interact`, `eval`, `download`, `upload`, `state`, `clipboard`. 분류마다 허용이나 거부.
 
-기본 정책 (사용자 결정, 2026-11-10: 대부분 허용, 일부만 확인):
+세션의 정책은 만들 때 정해지고 바뀌지 않는다. CLI는 `session create`의 옵션, MCP 기본 모드는 `pegboard mcp`를 띄울 때의 옵션(그 서버의 모든 세션), `--operator`는 `pegboard_session_create`의 `policy` 인자로 준다. 기본 모드의 도구 인자로는 줄 수도 바꿀 수도 없다(시험 `mcp_agent_cannot_widen_its_policy`).
 
-| 분류 | 기본 |
-|---|---|
-| `navigate`, `click`, `fill`, `snapshot`, `scroll`, `wait`, `read`, `get`, `interact` | 허용 |
-| `eval` | 허용 (많은 작업에 필요하다. 엄격 모드에서는 확인) |
-| `download` | 허용, 세션 디렉터리로만 |
-| `upload` | 확인 필요 |
-| `network`(요청 가로채기), `state`(쿠키·저장소 쓰기) | 확인 필요 |
-| 프로필 전체 쿠키 읽기 | 거부 (정책으로도 풀 수 없음) |
+기본 정책 (2a, 사용자 결정 2026-11-13. 2026-11-10의 "대부분 허용, 일부만 확인"에서 확인할 것을 거부로 바꿨다):
 
-확인이 필요한 동작은 브라우저에 승인 창을 띄우고, 코어 API의 `confirm.required` 알림으로도 내보낸다. agent-browser는 대기 중인 확인을 60초 뒤 자동 거부한다 [확인].
+| 항목 | 기본 | 여는 법, 닫는 법 |
+|---|---|---|
+| `navigate`, `click`, `fill`, `snapshot`, `scroll`, `wait`, `read`, `get`, `interact` | 허용 | `--deny <분류>` |
+| `eval` | 허용 (많은 작업에 필요하다) | `--deny eval` |
+| `download` | 허용, 세션 파일 디렉터리로만(파일 200 MiB, 세션 1 GiB) | `--deny download` |
+| `upload` | 거부 | `--allow upload`와 `--upload-dir <폴더>`가 둘 다 있어야 열린다 |
+| `state`(쿠키·저장소 쓰기) | **거부** (1단계에서는 허용이었다) | `--allow state` |
+| `clipboard`(읽기, 쓰기, 복사 키) | 거부. 프로필 단위 | `--allow clipboard` |
+| 사설망(RFC 1918, 링크 로컬, CGNAT, IPv6 ULA) | 거부. 프로필 단위 | `--allow-private-network` |
+| localhost와 루프백 | 허용. 프로필 단위 | `--no-localhost` |
+| 도메인 허용목록 | 없음(어디로든). 프로필 단위 | `--allow-domain <도메인,...>`: 목록만 열린다. 루프백은 목록에 있어야 열린다 |
+| pegboard 자신의 포트(디버깅 포트, 세션 프록시) | 거부 | 정책으로 열 수 없다 |
+| 프로필 전체 쿠키 읽기, 다른 세션과 사람 프로필의 타깃 | 거부 | 정책으로 열 수 없다 |
+| 쉬는 세션 | 마지막 명령 뒤 1시간에 닫힘 | `--no-expire` |
 
-**정책 판정은 `pegboardd`가 한다.** 명령을 agent-browser에 넘기기 전에 분류하고 허용, 확인, 거부를 정한다. agent-browser의 `--action-policy`와 `--confirm-actions`에는 기대지 않는다. 0.42.0은 문서의 분류명(`eval`)이 아니라 내부 동작명(`evaluate`, `url`)으로 매칭해서, 문서의 예시 `{"deny":["eval"]}`이 `eval`을 막지 못했다 [확인: 0단계 A8]. 위 표의 분류는 우리가 명령 이름에서 직접 매핑한다.
+"프로필 단위" 항목(클립보드, 주소 정책 전체)은 Chrome이 브라우저 컨텍스트 단위로만 걸게 해 주거나(권한), 그 프로필의 서비스 워커와 공유 워커 요청을 한 세션에 귀속할 수 없어서다. 그 프로필에 열린 세션이 있는 동안 첫 세션의 값으로 고정되고, 다른 값을 원하는 세션은 `profile_policy_conflict`로 거부된다(사용자 결정 D8). 거부된 명령은 `policy_denied`와 여는 옵션을 알려 주고, 동작 기록에는 이름만 남는다.
+
+확인이 필요한 동작(승인 창, `confirm.required` 알림)은 2a에서 만들지 않았다(실시간 승인은 뒤로 미뤘다). agent-browser는 대기 중인 확인을 60초 뒤 자동 거부한다 [확인]. 만들 때 참고한다.
+
+**정책 판정은 `pegboardd`가 한다.** 명령을 agent-browser에 넘기기 전에 분류하고 허용과 거부를 정한다. agent-browser의 `--action-policy`와 `--confirm-actions`에는 기대지 않는다. 0.42.0은 문서의 분류명(`eval`)이 아니라 내부 동작명(`evaluate`, `url`)으로 매칭해서, 문서의 예시 `{"deny":["eval"]}`이 `eval`을 막지 못했다 [확인: 0단계 A8]. 위 표의 분류는 우리가 명령 이름에서 직접 매핑한다.
 
 ### 릴레이와 서버 간 인증과 암호화
 
@@ -992,6 +988,9 @@ WSS  /v1/tunnel/client?relay={id}   클라이언트 스트림
 - 사람 프로필의 새 타깃도 브라우저 수준 자동 연결로 시작 때 데몬의 응답 한 번만큼 멈춘다. 공유 워커와 서비스 워커 안의 중첩 워커는 자동 연결되지 않는다. `--no-localhost`는 허용목록이 있을 때도 적용된다.
 - 에이전트 쪽 연결이 새 팝업에 붙어 가드가 `Fetch.enable`을 하기 전에 `Page.navigate`를 보낼 수 있는지(경주)는 재지 않았다.
 - 가드의 브라우저 연결이 끊기면 Chrome이 가로채기를 푼다 [확인: 2a G5]. 다시 붙을 때까지 데몬은 모든 세션의 명령을 거부하지만, 이미 열린 페이지의 스크립트는 그동안 판정 없이 요청을 낼 수 있다.
+- 프로필마다 건 정책(다운로드 동작, 클립보드 권한 거부)은 Chrome이 그 순간 기본 컨텍스트인 프로필에만 받아 준다 [확인: 2a E]. 그래서 정책을 다시 걸 때(연결이 끊겼을 때, 열린 프로필의 클립보드 설정이 바뀔 때) 그 프로필이 기본이 아니면 그 프로필의 탭 하나를 활성화한다. 이때 에이전트 창이 앞으로 나와 사람이 다른 곳에서 치던 키를 가져갈 수 있다(페이지가 일으킬 수 없는 경우로 한정했다. 다운로드 취소처럼 페이지가 일으킬 수 있는 일에는 활성화하지 않는다). 수동 확인 N3.
+- 업로드(2a 작업 6): 파일은 맨 이름으로만 고르고 데몬과 프록시가 각각 실제 경로가 업로드 폴더나 세션 파일 디렉터리 바로 안의 일반 파일인지 본다. 프록시는 맨 이름 규칙을 다시 적용하지 않아, 세션 엔드포인트에 직접 붙은 클라이언트는 그 폴더 안의 점 파일도 올릴 수 있다. 업로드 폴더가 pegboard 데이터 디렉터리와 겹치는지는 세션을 만들 때 한 번 본다(그 뒤 사람이 심볼릭 링크를 바꾸면 넓어진다). 검사와 Chrome이 파일을 읽는 사이의 경주는 사람의 폴더라 남긴다.
+- MCP(2a 작업 9, 10): 권한 구분은 MCP 서버 프로세스가 한다. 데몬의 코어 API에는 호출자 구분이 없어, 소켓에 닿는 로컬 프로세스는 운영자용 `session.info_any`/`session.close_any`, `session.list`(모든 세션의 정책 포함), 기록 조회, `browser.stop`을 토큰 없이 부를 수 있다(1단계의 `browser stop`과 같은 수준). 셸 없는 에이전트는 MCP 도구 말고는 닿을 길이 없다는 것이 전제다. 서버는 자기가 쥔 토큰과 핸들 꼴의 글을 결과에서 지운다(페이지의 글이라도 핸들 꼴이면 지워진다). 강제로 죽은 서버의 세션은 쉬는 세션 닫기(1시간)로만 닫힌다. 에이전트가 `eval`에 직접 쓴 글은 가림 규칙(`/`나 템플릿 치환이 없으면 그대로)대로 기록되므로, 에이전트가 어디선가 본 핸들을 `eval`에 넣으면 기록에 남는다.
 
 ---
 

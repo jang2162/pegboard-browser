@@ -18,7 +18,7 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 |---|---|---|
 | 0 | 검증 스파이크 | 제품 없음. 미확인 가정 13개의 답 |
 | 1 | 로컬 MVP | 순정 Chromium에서 세션 생성, 탭그룹 격리, CLI로 제어, 동작 로그 |
-| 2 | MCP와 녹화 | MCP 서버, 화면 녹화와 재생, 정책과 확인 |
+| 2 | MCP와 녹화 | 2a: MCP 서버와 세션 정책(완료). 2b: 화면 녹화와 재생 |
 | 3 | Chromium 포크 v1 | 설치 가능한 Pegboard 브라우저 (macOS), 자동 업데이트 |
 | 3-2 | 북마크 프로필 | 북마크바 왼쪽 선택기로 북마크 묶음 전환 |
 | 4 | 릴레이와 호스팅 서버 | 원격 머신의 브라우저에 세션을 만들고 제어 |
@@ -94,36 +94,66 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 
 **목적**: 에이전트가 실제로 붙어 쓸 수 있는 인터페이스와, 작업을 되돌아볼 수 있는 기록을 갖춘다.
 
-**할 일**
-1. `pegboard mcp`: Pegboard 고유 도구와 agent-browser 도구 중계. 도구 프로필 선택.
-2. CLI와 MCP 동등성 시험: 같은 코어 API를 거치는지, 결과가 같은지.
-3. 화면 녹화: 탭별 화면 캡처, 변화 프레임 저장, 색인.
-4. 탐색 기록, 사람 개입 감지.
-5. 재생 화면: 동작 목록과 화면의 시간축 연결. `recording open`, `recording export`.
-6. 보존 정책과 자동 삭제. 도메인 단위 화면 기록 끄기.
-7. 정책: 동작 분류별 허용·확인·거부, 도메인 허용목록(프록시 구현), 확인 요청 알림.
-8. 페이지 출력 경계 표식을 기본으로 켠다.
-9. 선택 기록: 네트워크 메타데이터, 콘솔.
-10. 프로필 복사: `profile create --from`, `session create --temp-profile [--from]`, 임시 프로필 자동 삭제와 비정상 종료 뒤 정리.
+2단계는 커서 둘로 나눴다(사용자 결정, 2026-11-13): **2a**는 MCP와 세션 정책, **2b**는 화면 녹화와 재생. 프로필 복사(아래 10번)는 로그인 정보를 복제하는 일이라 따로 설계하기로 하고 2b 뒤로 미뤘다.
 
-**동작하는 것**
-- MCP 클라이언트 설정에 `pegboard mcp`를 넣으면 에이전트가 세션을 만들고 브라우저를 제어한다.
-- 세션이 끝나면 `pegboard recording open`으로 무슨 일이 있었는지 화면과 함께 볼 수 있다.
-- 세션에 도메인 허용목록을 걸면 그 밖의 도메인으로 나가지 못한다.
-- 업로드 같은 동작은 승인을 기다린다.
-- `session create --temp-profile --from default`로 기본 프로필의 로그인을 가진 채 시작하고, 세션을 닫으면 그 프로필이 사라진다.
+**할 일** (괄호는 맡은 단계)
+1. `pegboard mcp`: Pegboard 고유 도구와 브라우저 동작 도구. 도구 묶음 선택. (2a. 동작 도구는 agent-browser의 것을 중계하지 않고 허용 명령 문법에서 생성한다: architecture.md 7절)
+2. CLI와 MCP 동등성 시험: 같은 코어 API를 거치는지, 결과가 같은지. (2a)
+3. 화면 녹화: 탭별 화면 캡처, 변화 프레임 저장, 색인. (2b)
+4. 탐색 기록, 사람 개입 감지. (2b)
+5. 재생 화면: 동작 목록과 화면의 시간축 연결. `recording open`, `recording export`. (2b)
+6. 보존 정책과 자동 삭제. 도메인 단위 화면 기록 끄기. (2b)
+7. 정책: 동작 분류별 허용·거부, 도메인 허용목록(프록시 구현). (2a. 확인 요청과 실시간 승인은 하지 않았다: 아래 "2a가 남긴 것")
+8. 페이지 출력 경계 표식을 기본으로 켠다. (2a)
+9. 선택 기록: 네트워크 메타데이터, 콘솔. (2b)
+10. 프로필 복사: `profile create --from`, `session create --temp-profile [--from]`, 임시 프로필 자동 삭제와 비정상 종료 뒤 정리. (2b 뒤)
 
-**아직 안 되는 것**: 설치형 브라우저, 원격.
+### 2a. MCP와 세션 정책
 
-**2단계에서 정할 것 (1단계 최종 검토에서 넘어온 것)**
-- 탭을 그룹 사이로 끌었을 때 소속: 1단계는 "소속은 탭을 따라가지 그룹을 따라가지 않는다"(세션 범위가 타깃 ID로 정해진다). 그룹을 따라 소속이 바뀌게 할지 정한다. 바꾸면 범위 계산과 세션 닫기 규칙을 함께 바꾼다.
-- 토큰 없는 API(`session list`, 기록 조회, `profile delete`, `browser stop`)에 권한 모델을 둘지.
-- 브라우저 수준 자동 연결을 넘기지 않고 프록시가 흉내 내는 방식.
-- 열린 파일 기술자 정리, 기록 보존 기간.
+**자동 시험 완료 (2026-11-14)**. 설계는 [plans/2026-11-13-phase2a-mcp-and-policy-design.md](./plans/2026-11-13-phase2a-mcp-and-policy-design.md), 실행 계획은 [plans/2026-11-13-phase2a-mcp-and-policy.md](./plans/2026-11-13-phase2a-mcp-and-policy.md). 손으로 하는 확인 N1~N4([phase2a-manual-checks.md](./phase2a-manual-checks.md))는 아직 하지 않았다.
+
+**동작하는 것** (각 줄 끝: 자동 시험)
+- MCP 클라이언트 설정에 `pegboard mcp`를 넣으면 셸 없는 에이전트가 세션을 만들고 브라우저를 조종하고 자기 세션의 기록을 읽는다. 서버가 끝나면 자기가 만든 세션을 닫는다. → e2e_mcp의 `mcp_starts_the_daemon_and_creates_a_session`, `sessions_are_closed_when_stdin_closes`, `sessions_are_closed_on_sigterm`, `sessions_are_closed_on_sigint_and_sighup`, `a_client_that_stops_reading_still_ends_on_sigterm`, `stdin_end_during_a_running_call_ends_the_server`, `requests_written_before_stdin_closes_are_all_answered` 외.
+- MCP 명령은 CLI와 같은 길(`daemon::run_command`)을 가고 같은 입력이 거부된다. → e2e_mcp의 `cli_and_mcp_run_the_same_command_the_same_way`, `the_same_inputs_are_rejected_by_both`, `the_session_policy_applies_to_mcp_actions`, `secrets_typed_over_mcp_are_redacted_like_the_cli`, `page_text_carries_boundary_markers`, `screenshot_returns_an_image`, `downloads_are_told_in_mcp_results`.
+- 세션마다 정책이 붙고 에이전트는 넓히지 못한다(`state`, `upload`, `clipboard`는 기본 거부). → pegboard-cli e2e_policy의 `state_commands_need_allow_state`, `deny_eval_blocks_eval_and_wait_fn`, `second_session_cannot_widen_a_pinned_profile`, `upload_needs_allow_and_a_directory`, `upload_cannot_reach_outside_the_directory` 외. e2e_mcp의 `server_policy_is_attached_to_every_session`, `adopted_session_keeps_its_own_wider_policy`.
+- 주소 규칙: 자기 포트는 늘 닫히고, 사설망은 열어야 열리고, 허용목록을 걸면 그 밖으로 나가지 못한다. → pegboard-cli e2e_policy의 `own_ports_are_never_reachable`, `private_network_is_closed_unless_allowed`, `public_name_resolving_to_a_private_address_is_blocked`, `redirect_to_private_address_is_blocked`, `allow_domain_closes_everything_else_including_localhost`, `pages_from_a_public_address_get_the_csp`, `workers_follow_the_rules_task_2_established` 외. pegboard-core e2e_policy의 `agent_cannot_turn_the_guard_off`, `the_human_profile_is_untouched`, `commands_are_refused_while_the_guard_is_down`, `created_tabs_wait_for_the_guard` 외.
+- 다운로드는 시작한 탭의 세션 파일 디렉터리로만 가고 한도를 넘거나 세션을 알 수 없으면 지워진다. → pegboard-cli e2e_policy의 `download_lands_in_the_session_files_dir_only`, `deny_download_writes_no_file_anywhere`, `oversized_download_is_dropped_and_reported`, pegboard-core e2e_policy의 `a_running_download_over_the_limit_is_cancelled`, `download_policy_is_reapplied_after_its_connection_drops` 외, e2e_isolation의 `agent_download_writes_no_file`, `unattributed_download_is_deleted`.
+- 클립보드는 허용하지 않은 세션에서 읽기도 쓰기도 막힌다. → pegboard-core e2e_clipboard의 `agent_cannot_write_the_clipboard_by_default`, `agent_cannot_read_the_clipboard_by_default`, `allow_clipboard_opens_it`, `new_tabs_popups_and_frames_are_covered`, `agent_scripts_cannot_run_before_the_shield`, `document_open_and_write_do_not_remove_the_shield` 외.
+- 쉬는 세션(마지막 명령 뒤 1시간)은 닫힌다. → e2e_cli의 `idle_session_is_closed_after_the_expiry`.
+- 격리 시험 묶음의 MCP 판: MCP 도구만 가진 에이전트가 사람 프로필, 다른 서버나 사람의 세션, 세션 밖의 브라우저, 더 넓은 정책, 토큰에 닿지 못한다. 시험마다 새 브라우저를 띄우며 이후 모든 단계에서 유지한다. → e2e_mcp_isolation의 `mcp_agent_cannot_list_or_switch_to_human_tabs`, `mcp_agent_cannot_read_human_cookies_or_storage`, `mcp_new_tabs_open_in_the_agent_profile_with_the_human_window_last_active`, `mcp_agent_cannot_reach_another_servers_session`, `mcp_agent_cannot_widen_its_policy`, `mcp_results_and_errors_never_carry_tokens_or_ports`, `mcp_agent_cannot_reach_pegboards_own_ports_or_the_private_network`, `mcp_agent_cannot_write_the_clipboard`, `mcp_download_lands_only_in_the_session_dir`, `killed_mcp_server_leaves_sessions_that_expire`, `mcp_upload_cannot_read_outside_its_upload_dir`, `mcp_page_content_markers_wrap_page_text_and_a_page_cannot_end_the_block`, `mcp_clipboard_denied_session_can_still_run_vitals`, `mcp_server_cannot_drive_a_cli_session_it_did_not_adopt`, `mcp_operator_mode_cannot_drive_other_sessions`.
+- 시험 브라우저: 격리 시험 묶음 말고는 시험 파일 하나가 브라우저 하나를 같이 쓴다(전체 실행의 브라우저 실행이 107번에서 37번으로 줄었다. 2a 작업 1).
+
+**2a가 남긴 것**
+- 확인 요청과 실시간 승인: 2a는 "사람이 세션을 만들 때 열지 않은 것은 거부"다(사용자 결정 D5). 브라우저 승인 창은 3단계(포크)의 일이다.
+- `network route`(에이전트의 요청 가로채기): 데몬의 요청 가드와 함께 쓸 규칙을 설계해야 한다.
+- 브라우저 수준 자동 연결을 넘기지 않고 프록시가 흉내 내는 방식(1단계에서 넘어온 것).
+- 데몬이 띄우는 자식 프로세스(agent-browser, Chrome)에 열린 파일 기술자가 새지 않게 정리하기(1단계에서 넘어온 것).
+- `sandbox`의 `srcdoc` 프레임을 다시 읽게 하는 비용(그 프레임의 상태가 사라지고, 3번을 넘으면 탭을 닫는다).
+- 정책을 다시 걸 때 에이전트 프로필의 탭을 활성화해 사람의 키보드 초점을 가져갈 수 있는 것(수동 확인 N3로 잰다).
+- 서비스 워커의 주 스크립트 요청이 가로채기에 잡히지 않는 것.
+- 정책이 허용한 루프백이나 사설망 주소의 문서가 연 웹소켓이 주소 규칙 밖인 것.
+- Chrome이 호스트 이름을 데몬과 다르게 푸는 경우(DNS-over-HTTPS, rebinding)의 사설 주소 접근과 그 부작용.
+- 허용목록이 없는 세션에서 공개 사이트의 평문 `ws://`가 막히는 것(CSP로 "사설망만 빼고"를 말할 수 없다).
+- 재지 않은 클립보드 경로: 오른쪽 클릭 메뉴, 사람의 직접 입력(수동 확인 N1, N2).
+- 탭을 그룹 사이로 끌었을 때 소속: 2a도 "소속은 탭을 따라간다"(사용자 결정 D4)이고, 세션을 닫으면 자기 탭만 닫는다. 그룹을 따라 소속이 바뀌게 할지는 정하지 않았다.
+- 토큰 없는 코어 API(`session list`, 기록 조회, `profile delete`, `browser stop`, 운영자용 `session.info_any`/`close_any`)의 권한 모델: 2a는 데몬에 호출자 구분을 넣지 않고 MCP 서버 프로세스가 구분한다.
+- 기록 보존 기간(2b).
+
+### 2b. 녹화와 재생
+
+할 일 3, 4, 5, 6, 9. 설계 전이다.
+
+**동작하는 것** (2단계 전체를 마친 뒤)
+- MCP 클라이언트 설정에 `pegboard mcp`를 넣으면 에이전트가 세션을 만들고 브라우저를 제어한다. (2a)
+- 세션에 도메인 허용목록을 걸면 그 밖의 도메인으로 나가지 못한다. (2a)
+- 세션이 끝나면 `pegboard recording open`으로 무슨 일이 있었는지 화면과 함께 볼 수 있다. (2b)
+- `session create --temp-profile --from default`로 기본 프로필의 로그인을 가진 채 시작하고, 세션을 닫으면 그 프로필이 사라진다. (2b 뒤)
+
+**아직 안 되는 것**: 설치형 브라우저, 원격, 실시간 승인.
 
 **수동 확인에서 넘어온 것 (2026-11-13)**
-- 다운로드 경로(M5): 에이전트가 받은 파일이 `~/Downloads`에 확인 창 없이 저장되던 것을, 1단계에서 에이전트 프로필의 다운로드를 막는 것(데몬이 프로필마다 CDP `Browser.setDownloadBehavior` deny를 건다)으로 고쳤다. 남은 것: architecture.md 6절과 11절의 "다운로드는 세션별 디렉터리로"는 구현되어 있지 않다. 세션별 폴더로 받게 할지, 어떤 정책으로 허용할지는 2단계에서 정한다. 참고: Chrome은 `browserContextId`를 그 시점에 기본 컨텍스트(마지막으로 활성이던 프로필)인 프로필에서만 찾는다. 정책은 건 연결이 닫히면 사라지고, 한 연결은 컨텍스트 하나의 정책만 쥔다. 그래서 프로필마다 데몬 수명 동안 열려 있는 연결을 따로 둔다.
-- (2a에서 고침) `pegboard tab new 'data:...'`이 `about:blank`로 열리던 것. 추정 원인(코드를 읽고 한 판단, 두 번째 기기의 시험으로 확인한다): 브리지가 `chrome.tabs.update`로 주소를 열었는데 Chrome은 그 방식의 이동이 data 주소로 가는 것을 막는다(호출은 성공하고 탭은 빈 채). 이제 브리지가 빈 탭을 만든 뒤 CDP로 이동한다.
+- (2a에서 고침) 다운로드 경로(M5): 에이전트가 받은 파일이 `~/Downloads`에 확인 창 없이 저장되던 것. 1단계에서 에이전트 프로필의 다운로드를 막았고, 2a에서 다운로드를 시작한 탭의 세션 파일 디렉터리로 받게 했다(README "세션 정책"). 참고: Chrome은 `browserContextId`를 그 시점에 기본 컨텍스트(마지막으로 활성이던 프로필)인 프로필에서만 찾는다. 정책은 건 연결이 닫히면 사라지고, 한 연결은 컨텍스트 하나의 정책만 쥔다. 그래서 프로필마다 데몬 수명 동안 열려 있는 연결을 따로 둔다.
+- (2a에서 고침) `pegboard tab new 'data:...'`이 `about:blank`로 열리던 것. 브리지가 빈 탭을 만든 뒤 CDP로 이동한다(시험 `tab_new_opens_a_data_url`).
 - 그룹에 탭이 하나뿐이면 사람이 그 탭을 끌 때 그룹 전체가 움직인다(Chrome의 동작). 그룹을 따라 소속을 바꿀지 정할 때 참고한다.
 
 ---
