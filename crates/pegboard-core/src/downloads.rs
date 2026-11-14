@@ -279,6 +279,8 @@ const STALE: Duration = Duration::from_secs(6 * 3600);
 /// first navigation is the download): finding it is tried this often, this far apart.
 const RESOLVE_TRIES: u32 = 4;
 const RESOLVE_PAUSE: Duration = Duration::from_millis(500);
+/// Settled guids remembered (`State::settled`).
+const MAX_SETTLED: usize = 1024;
 /// Longest time spent looking through tabs' frame trees for one download.
 const FRAME_SEARCH_LIMIT: Duration = Duration::from_secs(5);
 /// Most frames walked up from a download's frame to its tab.
@@ -403,6 +405,10 @@ struct State {
     used: HashMap<SessionId, u64>,
     /// Sessions that ended (ids are never reused): nothing is saved or reported for them.
     gone: HashSet<SessionId>,
+    /// Guids settled lately: every policy connection reports every download (L1), so a
+    /// late copy of an event must not start a settled download again.
+    settled: HashSet<String>,
+    settled_order: std::collections::VecDeque<String>,
     reports: HashMap<SessionId, Vec<Report>>,
 }
 
@@ -853,7 +859,7 @@ impl Inner {
             "Browser.downloadWillBegin" => {
                 let fresh = {
                     let mut state = self.state.lock().unwrap();
-                    if state.downloads.contains_key(&guid) {
+                    if state.downloads.contains_key(&guid) || state.settled.contains(&guid) {
                         false
                     } else {
                         state.downloads.insert(
@@ -1095,6 +1101,13 @@ impl Inner {
         let Some(d) = state.downloads.remove(guid) else {
             return;
         };
+        if state.settled_order.len() >= MAX_SETTLED {
+            if let Some(old) = state.settled_order.pop_front() {
+                state.settled.remove(&old);
+            }
+        }
+        state.settled.insert(guid.to_string());
+        state.settled_order.push_back(guid.to_string());
         let staged = Self::staged(&state, guid);
         let open = session
             .as_ref()
