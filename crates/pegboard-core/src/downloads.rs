@@ -1704,7 +1704,9 @@ async fn reapply(weak: Weak<Inner>, context: String) {
         match result {
             Ok(()) => {
                 eprintln!("pegboard: the download policy (and clipboard denial) is set again");
-                return;
+                // The top of the loop clears `reapplying` (so that a later loss starts a new
+                // attempt) if nothing was lost meanwhile, and tries again if something was.
+                continue;
             }
             Err(e) if !held => {
                 eprintln!("pegboard: setting the download policy (or clipboard denial) again failed: {e:#}")
