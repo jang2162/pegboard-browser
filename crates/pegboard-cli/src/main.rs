@@ -17,8 +17,8 @@ use pegboard_core::paths::{ensure_home, paths, socket_path_fits, Paths};
 use pegboard_core::policy;
 use pegboard_core::runner::succeeded;
 use pegboard_protocol::{
-    codes, ActionClass, BrowserStatus, CommandExecParams, CommandExecResult, ProfileInfo, RpcError,
-    SessionCreateParams, SessionId, SessionInfo, SessionPolicy,
+    codes, ActionClass, BrowserStatus, CommandExecParams, CommandExecResult, FileInfo, ProfileInfo,
+    RpcError, SessionCreateParams, SessionId, SessionInfo, SessionPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -73,6 +73,11 @@ enum Cmd {
     Recording {
         #[command(subcommand)]
         command: RecordingCmd,
+    },
+    /// The session's files (its downloads, screenshots and PDFs).
+    Files {
+        #[command(subcommand)]
+        command: FilesCmd,
     },
     #[command(hide = true)]
     Daemon,
@@ -137,6 +142,12 @@ enum SessionCmd {
         #[arg(long)]
         keep_tabs: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum FilesCmd {
+    /// List the files of the session (--session or $PEGBOARD_SESSION).
+    List,
 }
 
 #[derive(Subcommand)]
@@ -245,19 +256,56 @@ fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
         Cmd::Profile { command } => profile(paths, command, json),
         Cmd::Session { command } => session(paths, command, json),
         Cmd::Recording { command } => recording(paths, command, json),
-        Cmd::Agent(argv) => {
-            let id = cli
-                .session
-                .or_else(|| std::env::var("PEGBOARD_SESSION").ok())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| usage("no session: pass --session or set PEGBOARD_SESSION"));
-            if !id
-                .split_once('.')
-                .is_some_and(|(_, token)| !token.is_empty())
-            {
-                usage("session handle must be <id>.<token> (the first line printed by `pegboard session create`)");
-            }
-            agent_command(paths, id, argv, json)
+        Cmd::Files {
+            command: FilesCmd::List,
+        } => files_list(paths, session_of(cli.session), json),
+        Cmd::Agent(argv) => agent_command(paths, session_of(cli.session), argv, json),
+    }
+}
+
+/// The session handle of `--session`, else `$PEGBOARD_SESSION`: `<id>.<token>`.
+fn session_of(flag: Option<String>) -> String {
+    let id = flag
+        .or_else(|| std::env::var("PEGBOARD_SESSION").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| usage("no session: pass --session or set PEGBOARD_SESSION"));
+    if !id
+        .split_once('.')
+        .is_some_and(|(_, token)| !token.is_empty())
+    {
+        usage("session handle must be <id>.<token> (the first line printed by `pegboard session create`)");
+    }
+    id
+}
+
+fn files_list(paths: &Paths, session: String, json: bool) -> Result<(), RpcError> {
+    let (id, token) = parse_handle(&session);
+    let files: Vec<FileInfo> = call(
+        paths,
+        "files.list",
+        json!({ "sessionId": id, "token": token }),
+    )?;
+    if json {
+        print_json(&files);
+    } else {
+        for f in &files {
+            println!("{}  {}  {}", f.bytes, f.modified_at, f.name);
+        }
+    }
+    Ok(())
+}
+
+/// One line per download the result tells about (on stderr, so stdout keeps the output).
+fn tell_downloads(output: &Value) {
+    let Some(list) = output.get("downloads").and_then(Value::as_array) else {
+        return;
+    };
+    for d in list {
+        let name = d["name"].as_str().unwrap_or("?");
+        match (d["bytes"].as_u64(), d["dropped"].as_str()) {
+            (Some(bytes), _) => eprintln!("pegboard: downloaded {name} ({bytes} bytes)"),
+            (_, Some(why)) => eprintln!("pegboard: download {name} was deleted: {why}"),
+            _ => {}
         }
     }
 }
@@ -543,11 +591,14 @@ fn agent_command(
     )?;
     if json {
         print_json(&r.output);
-    } else if succeeded(&r) {
-        let text = render_output(&r.output);
-        if !text.is_empty() {
-            println!("{text}");
+    } else {
+        if succeeded(&r) {
+            let text = render_output(&r.output);
+            if !text.is_empty() {
+                println!("{text}");
+            }
         }
+        tell_downloads(&r.output);
     }
     if succeeded(&r) {
         return Ok(());

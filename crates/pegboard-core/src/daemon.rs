@@ -12,6 +12,7 @@ use crate::actionlog::{
     ActionEntry, ActionLog, MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
 };
 use crate::argv::{self, rejected, Checked, TextDestination};
+use crate::downloads::Report;
 use crate::paths::Paths;
 use crate::policy;
 use crate::proxy::server::Endpoint;
@@ -177,6 +178,10 @@ pub async fn run_command_with_hook(
     if let Err(e) = sessions.require_guard() {
         return refuse(log, entry, argv, e, started);
     }
+    // Without its download policy the profile's downloads land in the user's ~/Downloads.
+    if let Err(e) = sessions.require_downloads(id) {
+        return refuse(log, entry, argv, e, started);
+    }
     let is_tab_new = matches!(checked, Checked::TabNew { .. });
     let mut run_argv = match checked {
         Checked::Run(words) => words,
@@ -258,9 +263,40 @@ pub async fn run_command_with_hook(
     entry.ok = succeeded;
     // An expression's error can quote page values (a JSON parse error shows the text).
     entry.error = error_text(entry.redacted, is_expression_command(argv), &outcome);
+    report_downloads(sessions, log, id, &mut outcome)?;
     append(log, entry)?;
     sessions.touch(id);
     outcome
+}
+
+/// Downloads of the session that ended since its last result: one log entry each, and
+/// `"downloads": [...]` in this result's output (each told once). Kept for the next result
+/// when this one has no output to carry them.
+fn report_downloads(
+    sessions: &SessionManager,
+    log: &mut ActionLog,
+    id: &SessionId,
+    outcome: &mut Result<CommandExecResult, RpcError>,
+) -> Result<(), RpcError> {
+    let Ok(CommandExecResult {
+        output: Value::Object(output),
+        ..
+    }) = outcome
+    else {
+        return Ok(());
+    };
+    let reports = sessions.take_download_reports(id);
+    if reports.is_empty() {
+        return Ok(());
+    }
+    output.insert(
+        "downloads".to_string(),
+        Value::Array(reports.iter().map(Report::to_json).collect()),
+    );
+    for r in &reports {
+        append(log, r.log_entry(id))?;
+    }
+    Ok(())
 }
 
 /// The URLs a navigating command line opens (`open`, `tab new`, `a11y <url>`, `vitals <url>`),

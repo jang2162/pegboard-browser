@@ -232,6 +232,16 @@ pub struct CommandExecResult {
     pub stderr: String,
 }
 
+/// A file in a session's files directory (`files.list`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileInfo {
+    pub name: String,
+    pub bytes: u64,
+    /// RFC 3339, UTC.
+    pub modified_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProfileInfo {
     pub name: String,

@@ -22,6 +22,7 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 use crate::actionlog::{self, valid_recording_id, ActionLog, Manifest};
 use crate::browser::{find_chrome, Browser, BrowserConfig};
 use crate::daemon::run_command;
+use crate::downloads::list_files;
 use crate::paths::{ensure, Paths};
 use crate::profiles::{rpc_error, Profiles};
 use crate::proxy::server::{ProxyServer, WsUpstream};
@@ -342,6 +343,15 @@ impl Daemon {
             stop,
             me: me.clone(),
         });
+        // A profile whose download policy could not be set again in time loses its sessions.
+        let weak = Arc::downgrade(&daemon);
+        daemon
+            .sessions
+            .on_download_policy_lost(Arc::new(move |context: &str| {
+                let Some(d) = weak.upgrade() else { return };
+                let context = context.to_string();
+                tokio::spawn(async move { d.close_sessions_in(&context).await });
+            }));
         // The daemon ends with its browser.
         let weak = Arc::downgrade(&daemon);
         tokio::spawn(async move {
@@ -409,6 +419,27 @@ impl Daemon {
         }
     }
 
+    /// Closes every session of a browser context (its download policy is gone).
+    async fn close_sessions_in(&self, context: &str) {
+        for id in self.sessions.sessions_in_context(context) {
+            let slot = self.slots.lock().unwrap().get(&id).cloned();
+            let Some(slot) = slot else { continue };
+            if slot.closing.swap(true, Ordering::SeqCst) {
+                continue;
+            }
+            eprintln!(
+                "pegboard: closing session {}: its profile's download policy could not be set again",
+                id.0
+            );
+            if let Err(e) = self.close_slot(id.clone(), slot, false).await {
+                eprintln!(
+                    "pegboard: closing session {}: {}: {}",
+                    id.0, e.code, e.message
+                );
+            }
+        }
+    }
+
     /// Asks whoever runs the daemon to end it (`wait_stopped` then returns).
     pub fn request_stop(&self) {
         self.stop.send_replace(true);
@@ -470,6 +501,12 @@ impl Daemon {
                 to_value(self.close_session(p).await?)
             }
             "command.exec" => to_value(self.exec(params(p)?).await?),
+            "files.list" => {
+                let p: SessionIdParams = params(p)?;
+                let id = checked_session(&p.session_id)?;
+                self.authorize(&id, p.token.as_deref())?;
+                to_value(list_files(&self.paths.session_files(&id)))
+            }
             "recording.list" => {
                 to_value(actionlog::list(&self.paths).map_err(|e| internal(e.to_string()))?)
             }
@@ -671,13 +708,21 @@ impl Daemon {
         if let Err(e) = self.runner.detach(&id).await {
             eprintln!("pegboard: {}: {}", e.code, e.message);
         }
+        // Downloads no command result told about yet go to the log before it ends.
+        let reports = self.sessions.take_download_reports(&id);
         let result = if close_tabs {
             self.sessions.close(p).await
         } else {
             self.sessions.info(&id)
         };
         // Taken after `detach` stopped the running command, which releases the lock.
-        let _ = log.lock().await.finish(&now());
+        {
+            let mut log = log.lock().await;
+            for r in &reports {
+                let _ = log.append(r.log_entry(&id));
+            }
+            let _ = log.finish(&now());
+        }
         self.remove_files(&id);
         result
     }

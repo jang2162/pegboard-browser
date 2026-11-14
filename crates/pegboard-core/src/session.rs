@@ -23,6 +23,7 @@ use crate::address::Verdict;
 use crate::bridge::{Bridge, GroupId};
 use crate::browser::{Browser, BrowserConfig};
 use crate::cdp::{page_targets, CdpConn, CdpEvent};
+use crate::downloads::{PolicyLost, Report, SessionView};
 use crate::guard::{judge_request, Guard, Resolver};
 use crate::paths::Paths;
 use crate::policy::{self, PinGuard, PinTable};
@@ -219,8 +220,23 @@ impl SessionManager {
             contexts,
         });
         let weak = Arc::downgrade(&inner);
-        inner.proxy.on_target_added(move |_, target_id| {
+        inner
+            .browser
+            .downloads
+            .set_session_lookup(Arc::new(move |id: &SessionId| {
+                let inner = weak.upgrade()?;
+                let table = inner.table.lock().unwrap();
+                let r = table.records.get(id)?;
+                Some(SessionView {
+                    allows_downloads: policy::judge_action(&r.info.policy, ActionClass::Download)
+                        .is_ok(),
+                    context: r.context.clone(),
+                })
+            }));
+        let weak = Arc::downgrade(&inner);
+        inner.proxy.on_target_added(move |id, target_id| {
             if let Some(inner) = weak.upgrade() {
+                inner.browser.downloads.own(target_id, id);
                 let target_id = target_id.to_string();
                 tokio::spawn(async move {
                     let _ = inner.ensure_focus(&target_id).await;
@@ -294,6 +310,7 @@ impl SessionManager {
         }
 
         // From here on a failure must take back everything made so far.
+        inner.browser.downloads.own(&first, &id);
         let endpoint = inner.proxy.register(
             &id,
             &runtime.context,
@@ -407,6 +424,8 @@ impl SessionManager {
             ready(&table, id)?;
             table.records.remove(id).ok_or_else(|| not_found(id))?
         };
+        // Downloads still running for it are deleted when they end.
+        inner.browser.downloads.forget_session(id);
         let mut targets: BTreeSet<String> = inner.proxy.targets(id).into_iter().collect();
         // Clients go first, so an agent cannot make new tabs while the old ones close.
         inner.proxy.unregister(id);
@@ -489,6 +508,9 @@ impl SessionManager {
             inner.record_group(id, &group);
             inner.proxy.set_group(id, group);
         }
+        // Known as the session's at once: its first navigation may be a download, which
+        // closes the tab (spike F4) before it would join the scope.
+        inner.browser.downloads.own(&target, id);
         let added = async {
             require_context(&inner.browser.conn, &target, &context).await?;
             inner
@@ -503,6 +525,7 @@ impl SessionManager {
             Ok(())
         };
         if let Err(e) = added.await {
+            inner.browser.downloads.disown(&target);
             inner.release_focus(&target).await;
             // Through the bridge, which refuses a tab outside its profile.
             let tabs = BTreeSet::from([target]);
@@ -521,6 +544,68 @@ impl SessionManager {
         } else {
             Err(guard_down())
         }
+    }
+
+    /// Refuses (`browser_failed`) while the download policy of the session's profile is not
+    /// in place: without it Chrome saves the profile's downloads into the user's
+    /// `~/Downloads` (spike L5), so commands wait until it is set again.
+    pub fn require_downloads(&self, id: &SessionId) -> Result<(), RpcError> {
+        let context = {
+            let table = self.inner.table.lock().unwrap();
+            ready(&table, id)?.context.clone()
+        };
+        if self.inner.browser.downloads.is_ready(&context) {
+            Ok(())
+        } else {
+            Err(rpc_error(
+                codes::BROWSER_FAILED,
+                "pegboard's download policy for the session's profile is not in place; \
+                 commands are refused until it is back",
+            ))
+        }
+    }
+
+    /// The session's download reports since the last call (see `downloads::Report`).
+    pub fn take_download_reports(&self, id: &SessionId) -> Vec<Report> {
+        self.inner.browser.downloads.take_reports(id)
+    }
+
+    /// The open sessions in a browser context.
+    pub fn sessions_in_context(&self, context: &str) -> Vec<SessionId> {
+        let table = self.inner.table.lock().unwrap();
+        table
+            .records
+            .iter()
+            .filter(|(_, r)| r.context == context)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Called with a browser context whose download policy could not be set again in time:
+    /// its sessions must be closed (`Daemon` does).
+    pub fn on_download_policy_lost(&self, lost: PolicyLost) {
+        self.inner.browser.downloads.on_policy_lost(lost);
+    }
+
+    /// Test hook, only when `PEGBOARD_TEST_HOOKS` is set: drops the download policy
+    /// connection of the session's profile as a failure would and keeps it down for `hold`.
+    /// Returns whether it did.
+    #[doc(hidden)]
+    pub fn drop_download_policy_for_test(&self, id: &SessionId, hold: Duration) -> bool {
+        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+            return false;
+        }
+        let context = {
+            let table = self.inner.table.lock().unwrap();
+            match ready(&table, id) {
+                Ok(r) => r.context.clone(),
+                Err(_) => return false,
+            }
+        };
+        self.inner
+            .browser
+            .downloads
+            .drop_connection_for_test(&context, hold)
     }
 
     /// Judges a URL the session wants to open by its address policy, before anything runs
@@ -944,6 +1029,7 @@ impl Inner {
         targets.insert(first.to_string());
         self.proxy.unregister(id);
         self.table.lock().unwrap().records.remove(id);
+        self.browser.downloads.forget_session(id);
         if let Ok(members) = bridge.members(group).await {
             targets.extend(members);
         }
@@ -990,6 +1076,7 @@ impl Inner {
                 ) else {
                     return;
                 };
+                self.browser.downloads.opened(target, opener);
                 self.adopt(target, opener, context);
             }
             "Target.detachedFromTarget" => {
