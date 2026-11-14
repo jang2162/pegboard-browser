@@ -867,6 +867,46 @@ fn ending_closes_created_sessions_only() {
     assert_eq!(h.owned.lock().unwrap().ids(), [SessionId(adopted.into())]);
 }
 
+/// A tab kept open leaves the session's allow-list once no session pins the profile, so
+/// only the human (operator mode, the CLI) may keep tabs.
+#[test]
+fn keeping_tabs_is_refused_in_default_mode() {
+    let mut h = Harness::new(false);
+    let mine = h.create(json!({}));
+    let (err, text) = h.call(
+        "pegboard_session_close",
+        json!({ "sessionId": mine, "keepTabs": true }),
+    );
+    assert_eq!(
+        (err, text.as_str()),
+        (
+            true,
+            "invalid_params: keeping tabs is only for operator mode or the CLI"
+        )
+    );
+    assert!(h.stub.calls_of("session.close").is_empty());
+    assert_eq!(h.owned.lock().unwrap().ids(), [SessionId(mine.clone())]);
+    // keepTabs false is the default mode's close.
+    let (err, text) = h.call(
+        "pegboard_session_close",
+        json!({ "sessionId": mine, "keepTabs": false }),
+    );
+    assert!(!err, "{text}");
+    assert_eq!(h.stub.calls_of("session.close")[0]["keepTabs"], false);
+
+    let mut h = Harness::new(true);
+    let mine = h.create(json!({}));
+    for id in [mine.as_str(), FOREIGN] {
+        let (err, text) = h.call(
+            "pegboard_session_close",
+            json!({ "sessionId": id, "keepTabs": true }),
+        );
+        assert!(!err, "{text}");
+    }
+    assert_eq!(h.stub.calls_of("session.close")[0]["keepTabs"], true);
+    assert_eq!(h.stub.calls_of("session.close_any")[0]["keepTabs"], true);
+}
+
 #[test]
 fn handles_are_adopted_only_when_well_formed() {
     let mut owned = Owned::default();

@@ -149,6 +149,12 @@ fn management_tools(operator: bool) -> Vec<Tool> {
         "url": { "type": "string", "description": "The page to open (http, https, data or about:blank)." },
         "profile": { "type": "string", "description": "An existing browser profile (default: the default agent profile)." },
     });
+    let keep = if operator {
+        " keepTabs leaves the tabs open outside any group (they then follow the profile's \
+         default address policy once no session pins it)."
+    } else {
+        " keepTabs (operator mode only) is refused here."
+    };
     let create_text = if operator {
         create_props["policy"] = policy_schema();
         "Create a browser session (its own tab group) and return its id. `policy` sets what \
@@ -190,10 +196,7 @@ fn management_tools(operator: bool) -> Vec<Tool> {
         (
             Kind::SessionClose,
             "pegboard_session_close",
-            format!(
-                "Close a session ({scope}) and its tabs; keepTabs leaves the tabs open \
-                 outside any group. Its recording stays."
-            ),
+            format!("Close a session ({scope}) and its tabs.{keep} Its recording stays."),
             schema(
                 json!({ "sessionId": session_id_schema(), "keepTabs": { "type": "boolean" } }),
                 &["sessionId"],
@@ -958,6 +961,11 @@ impl Registry {
             Kind::SessionClose => {
                 let a = plain(&["sessionId", "keepTabs"])?;
                 let (id, keep_tabs) = (a.session_id()?, a.flag("keepTabs")?);
+                // A kept tab falls back to the profile's default address policy once no
+                // session pins the profile: only the human may choose that.
+                if keep_tabs && !self.operator {
+                    return Err(invalid("keeping tabs is only for operator mode or the CLI"));
+                }
                 self.session_close(ctx, &id, keep_tabs)
             }
             Kind::RecordingList => {
