@@ -79,9 +79,32 @@ fn non_text(info: &str) -> Option<String> {
 }
 
 impl Clipboard {
-    /// Saves the system clipboard, or panics without touching it when it holds non-text data.
+    /// The clipboard for one test. The first test of the process saves what the clipboard
+    /// holds (or panics without touching it when that is not plain text); every test puts
+    /// THAT back when it ends, so a late write of one test cannot become the "original" of
+    /// the next. A test that finds something else there (a write that landed after the
+    /// previous restore) puts the original back first and records it.
     fn take() -> Clipboard {
         let one = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((saved, was_empty)) = ORIGINAL.get() {
+            if !holds(saved, *was_empty) {
+                let what = format!(
+                    "found the clipboard changed after the previous test's restore: {:?}",
+                    String::from_utf8_lossy(&pasteboard("pbpaste", None))
+                );
+                eprintln!("{what}");
+                RESTORE_FAILURES
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(what);
+                restore(saved, *was_empty);
+            }
+            return Clipboard {
+                saved: saved.clone(),
+                was_empty: *was_empty,
+                _one: one,
+            };
+        }
         let info = Command::new("osascript")
             .args(["-e", "clipboard info"])
             .output()
@@ -210,19 +233,24 @@ impl Drop for Clipboard {
 #[ignore]
 fn zz_the_clipboard_is_as_it_was_before_the_run() {
     let _one = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
-    let failures = RESTORE_FAILURES
+    // Late writes of the last test land first.
+    std::thread::sleep(Duration::from_secs(2));
+    let mut problems = RESTORE_FAILURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    assert!(failures.is_empty(), "{failures:#?}");
     if let Some((saved, was_empty)) = ORIGINAL.get() {
-        assert!(
-            holds(saved, *was_empty),
-            "the clipboard is not as before the run: {:?} (types: {})",
-            String::from_utf8_lossy(&pasteboard("pbpaste", None)),
-            clipboard_types()
-        );
+        if !holds(saved, *was_empty) {
+            problems.push(format!(
+                "the clipboard is not as before the run: {:?} (types: {})",
+                String::from_utf8_lossy(&pasteboard("pbpaste", None)),
+                clipboard_types()
+            ));
+            // Put back in any case, then report.
+            restore(saved, *was_empty);
+        }
     }
+    assert!(problems.is_empty(), "{problems:#?}");
 }
 
 #[test]
@@ -1422,6 +1450,15 @@ fn document_open_and_write_do_not_remove_the_shield() {
                 ),
             ),
             (
+                "open from another realm, written content listening first",
+                format!(
+                    "(()=>{{const f=document.createElement('iframe');document.body.appendChild(f);\
+                     const D=f.contentWindow.Document.prototype;D.open.call(document);\
+                     D.write.call(document,{});document.close();return 1}})()",
+                    js(&copy_area(true))
+                ),
+            ),
+            (
                 "a document made elsewhere, adopted",
                 format!(
                     "(()=>{{const d=document.implementation.createHTMLDocument('');\
@@ -1434,12 +1471,33 @@ fn document_open_and_write_do_not_remove_the_shield() {
         for allow in [true, false] {
             let a = agent(&h, allow).await;
             let tab = a.tab(&a.first()).await;
+            // Measurement: does a fresh same-origin frame's realm have the shield's wrappers
+            // when a script reaches it right after creating it?
+            tab.load("/clip").await;
+            let wrapped = tab
+                .eval(
+                    "(()=>{const f=document.createElement('iframe');document.body.appendChild(f);\
+                     return String(f.contentWindow.Document.prototype.open).includes('on(this)')})()",
+                    false,
+                )
+                .await;
+            eprintln!("allow={allow}: a fresh frame's realm has the wrapped open: {wrapped}");
             for (way, expr) in &ways {
                 tab.load("/clip").await;
                 let said = tab.eval(expr, false).await;
                 settle().await;
                 let changed = click_copy_changes(&tab, "#cp", &clip).await;
                 eprintln!("{way}, allow={allow}: eval {said}, copy changed {changed}");
+                for line in h
+                    .manager
+                    .guard_attach_log()
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .filter(|l| l.contains("document opened"))
+                {
+                    eprintln!("  guard: {line}");
+                }
                 assert_eq!(changed, allow, "{way}: allow={allow} (eval said {said})");
             }
             h.close_session(&a.info.id).await;

@@ -75,7 +75,17 @@ pub type ClipboardOf = Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
 /// still assign its own `document.write` on the instance (ad scripts do). Every value the
 /// wrappers use later (getters, loop bounds) was saved at the start, and they loop by index,
 /// so a page's later changes to `Array` or `Document` do not reach them.
-pub const CLIPBOARD_SHIELD: &str = r#"(()=>{const ap=Reflect.apply,gd=Object.getOwnPropertyDescriptor,dp=Object.defineProperty,pd=Event.prototype.preventDefault,sip=Event.prototype.stopImmediatePropagation,ael=EventTarget.prototype.addEventListener,D=Document.prototype,op=D.open,wr=D.write,wl=D.writeln,rs=gd(D,"readyState").get,dv=gd(D,"defaultView").get,N=["copy","cut","paste","beforecopy","beforecut","beforepaste"],L=N.length;const f=(e)=>{ap(pd,e,[]);ap(sip,e,[])};const on=(d)=>{const T=[ap(dv,d,[]),d];for(let i=0;i<2;i++){const t=T[i];if(t)for(let j=0;j<L;j++)ap(ael,t,[N[j],f,true])}};on(document);const lock=(k,v)=>dp(D,k,{value:v,writable:true,configurable:false,enumerable:true});const opened=(d)=>{if(ap(rs,d,[])!=="loading"){ap(op,d,[]);on(d)}};lock("open",function open(){const r=ap(op,this,arguments);on(this);return r});lock("write",function write(){opened(this);return ap(wr,this,arguments)});lock("writeln",function writeln(){opened(this);return ap(wl,this,arguments)})})()"#;
+///
+/// The listener's source carries the guard's random nonce (`shield_source`): only the guard
+/// sees a listener's source (`DOMDebugger.getEventListeners`; pages have no such API, and no
+/// wrapper's own source contains it), so it can tell its listener from a page's copy of it
+/// (`check_opened`).
+pub const CLIPBOARD_SHIELD: &str = r#"(()=>{const ap=Reflect.apply,gd=Object.getOwnPropertyDescriptor,dp=Object.defineProperty,pd=Event.prototype.preventDefault,sip=Event.prototype.stopImmediatePropagation,ael=EventTarget.prototype.addEventListener,D=Document.prototype,op=D.open,wr=D.write,wl=D.writeln,rs=gd(D,"readyState").get,dv=gd(D,"defaultView").get,N=["copy","cut","paste","beforecopy","beforecut","beforepaste"],L=N.length;const f=(e)=>{ap(pd,e,[]);ap(sip,e,[]);"__PEGBOARD_NONCE__"};const on=(d)=>{const T=[ap(dv,d,[]),d];for(let i=0;i<2;i++){const t=T[i];if(t)for(let j=0;j<L;j++)ap(ael,t,[N[j],f,true])}};on(document);const lock=(k,v)=>dp(D,k,{value:v,writable:true,configurable:false,enumerable:true});const opened=(d)=>{if(ap(rs,d,[])!=="loading"){ap(op,d,[]);on(d)}};lock("open",function open(){const r=ap(op,this,arguments);on(this);return r});lock("write",function write(){opened(this);return ap(wr,this,arguments)});lock("writeln",function writeln(){opened(this);return ap(wl,this,arguments)})})()"#;
+
+/// The shield with the guard's `nonce` in its listener.
+pub fn shield_source(nonce: &str) -> String {
+    CLIPBOARD_SHIELD.replace("__PEGBOARD_NONCE__", nonce)
+}
 
 /// What the guard does about the clipboard with a target it attached to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +128,26 @@ pub fn clipboard_step(
     ClipboardStep::Shield {
         run_immediately: !waiting,
     }
+}
+
+/// Whether, in `listeners` (as `DOMDebugger.getEventListeners` lists them, in the order they
+/// run), the first capture listener of every clipboard event has `nonce` in its source.
+pub fn first_capture_listeners_hold(listeners: &[Value], nonce: &str) -> bool {
+    const EVENTS: [&str; 6] = [
+        "copy",
+        "cut",
+        "paste",
+        "beforecopy",
+        "beforecut",
+        "beforepaste",
+    ];
+    EVENTS.iter().all(|event| {
+        listeners
+            .iter()
+            .find(|l| l["type"] == *event && l["useCapture"] == true)
+            .and_then(|l| l["handler"]["description"].as_str())
+            .is_some_and(|source| source.contains(nonce))
+    })
 }
 
 /// How long the shield's replies may take after the resume before a tab is closed.
@@ -512,6 +542,9 @@ struct Inner {
     early_delay: Mutex<Duration>,
     /// Test hook: the shield of frames counts as failed.
     fail_shield: std::sync::atomic::AtomicBool,
+    /// Random, in the shield's listener: tells the guard's listener from a page's (see
+    /// `CLIPBOARD_SHIELD`).
+    nonce: String,
 }
 
 pub struct Guard {
@@ -561,6 +594,12 @@ impl Guard {
                 && std::env::var_os("PEGBOARD_TEST_NO_CLIPBOARD_SHIELD").is_some(),
             early_delay: Mutex::new(Duration::ZERO),
             fail_shield: std::sync::atomic::AtomicBool::new(false),
+            nonce: {
+                use rand::RngCore;
+                let mut bytes = [0u8; 16];
+                rand::thread_rng().fill_bytes(&mut bytes);
+                bytes.iter().map(|b| format!("{b:02x}")).collect()
+            },
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner)));
         Guard { inner, supervisor }
@@ -804,6 +843,7 @@ impl Inner {
         match event.method.as_str() {
             "Target.attachedToTarget" => drop(self.on_attached(conn, event, false)),
             "Target.detachedFromTarget" => self.on_detached(&event),
+            "Page.documentOpened" => self.on_document_opened(conn, &event),
             "Fetch.requestPaused" => {
                 let Some(session) = event.session_id.clone() else {
                     return;
@@ -820,6 +860,191 @@ impl Inner {
             }
             _ => {}
         }
+    }
+
+    /// `document.open()` ran in a frame of a shielded target: it removed every listener of
+    /// that document and its window and made no new global (review C2). The shield's own
+    /// wrappers put its listeners back at once, but an `open` taken from a realm the shield
+    /// never reached does not go through them (measured: another realm's `open` cleared the
+    /// shield). So the guard checks, and the commands of the context's clipboard-denied
+    /// sessions wait meanwhile.
+    fn on_document_opened(self: &Arc<Self>, conn: &CdpConn, event: &CdpEvent) {
+        let Some(session) = event.session_id.clone() else {
+            return;
+        };
+        let attached = self.state.lock().unwrap().sessions.get(&session).cloned();
+        let Some(attached) = attached else {
+            return;
+        };
+        if self.no_shield || (self.clipboard_of)(&attached.context) == Some(true) {
+            return;
+        }
+        let frame = event.params["frame"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if frame.is_empty() {
+            return;
+        }
+        let key = format!("opened:{frame}");
+        self.state
+            .lock()
+            .unwrap()
+            .early_pending
+            .insert(key.clone(), attached.context.clone());
+        let me = self.clone();
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let outcome = me.check_opened(&conn, &session, &attached, &frame).await;
+            me.state.lock().unwrap().early_pending.remove(&key);
+            me.changed.send_modify(|n| *n += 1);
+            me.log_attach(format!(
+                "{} {} document opened in frame {frame} -> {outcome}",
+                attached.target, attached.kind
+            ));
+        });
+    }
+
+    /// Puts the shield into every frame of the session's page again, then looks at the
+    /// opened frame's window: for every clipboard event the first capture listener must be
+    /// the guard's (its nonce). If something of the page comes first (content written after
+    /// the `open` ran its scripts before the shield was back), the frame gets a new document
+    /// (a tab reloads, a frame inside it goes to `about:blank`, a frame target reloads itself),
+    /// counted per frame like the other reloads; past that, or when anything fails, its tab
+    /// is closed.
+    async fn check_opened(
+        &self,
+        conn: &CdpConn,
+        session: &str,
+        attached: &Attached,
+        frame: &str,
+    ) -> String {
+        let s = Some(session);
+        let shield = json!({ "source": shield_source(&self.nonce), "runImmediately": true });
+        let again = conn
+            .send("Page.addScriptToEvaluateOnNewDocument", shield, s)
+            .await;
+        if let Ok(r) = &again {
+            // The one registered at set-up stays; this one only ran into the documents.
+            if let Some(id) = r["identifier"].as_str() {
+                let _ = conn
+                    .send(
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        json!({ "identifier": id }),
+                        s,
+                    )
+                    .await;
+            }
+        }
+        match self.first_listeners_are_ours(conn, session, frame).await {
+            Ok(true) if again.is_ok() => return "shield first".to_string(),
+            Ok(_) => {}
+            Err(e) => {
+                return format!(
+                    "could not check ({e:#}), {}",
+                    self.close_tab_of(conn, session).await
+                )
+            }
+        }
+        let allowed = {
+            let mut state = self.state.lock().unwrap();
+            if state.frame_reloads.len() >= MAX_FRAME_RELOADS_KEPT {
+                state.frame_reloads.clear();
+            }
+            let n = state
+                .frame_reloads
+                .entry(format!("opened:{frame}"))
+                .or_insert(0);
+            *n += 1;
+            *n <= FRAME_RELOADS
+        };
+        if !allowed {
+            return format!(
+                "page first, limit, {}",
+                self.close_tab_of(conn, session).await
+            );
+        }
+        let renewed = if frame == attached.target && attached.kind == "page" {
+            conn.send("Page.reload", json!({}), s).await
+        } else if frame == attached.target {
+            conn.send(
+                "Runtime.evaluate",
+                json!({ "expression": "location.reload()" }),
+                s,
+            )
+            .await
+        } else {
+            conn.send(
+                "Page.navigate",
+                json!({ "url": "about:blank", "frameId": frame }),
+                s,
+            )
+            .await
+        };
+        match renewed {
+            Ok(r) if r.get("exceptionDetails").is_none() && r.get("errorText").is_none() => {
+                "page first, renewed".to_string()
+            }
+            other => format!(
+                "page first, renewing failed ({}), {}",
+                outcome(other),
+                self.close_tab_of(conn, session).await
+            ),
+        }
+    }
+
+    /// Whether, on the window of `frame`, the first capture listener of every clipboard event
+    /// is the guard's. Looked at from an isolated world of the frame (the page cannot reach
+    /// it); a listener is the guard's when its source holds the nonce.
+    async fn first_listeners_are_ours(
+        &self,
+        conn: &CdpConn,
+        session: &str,
+        frame: &str,
+    ) -> Result<bool> {
+        let s = Some(session);
+        let world = conn
+            .send(
+                "Page.createIsolatedWorld",
+                json!({ "frameId": frame, "worldName": "pegboard-check" }),
+                s,
+            )
+            .await?;
+        let context = world["executionContextId"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("no isolated world"))?;
+        let group = "pegboard-check";
+        let window = conn
+            .send(
+                "Runtime.evaluate",
+                json!({ "expression": "window", "contextId": context, "objectGroup": group }),
+                s,
+            )
+            .await?;
+        let object = window["result"]["objectId"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no window"))?
+            .to_string();
+        let listeners = conn
+            .send(
+                "DOMDebugger.getEventListeners",
+                json!({ "objectId": object }),
+                s,
+            )
+            .await;
+        let _ = conn
+            .send(
+                "Runtime.releaseObjectGroup",
+                json!({ "objectGroup": group }),
+                s,
+            )
+            .await;
+        let listeners = listeners?;
+        let list = listeners["listeners"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        Ok(first_capture_listeners_hold(&list, &self.nonce))
     }
 
     /// Sets up (or lets go) the attached target in a task of its own; the handle tells when
@@ -943,7 +1168,7 @@ impl Inner {
         // comes, before its first document runs.
         let shield = run_immediately.map(|run_immediately| {
             let enable = conn.send_now("Page.enable", json!({}), s);
-            let mut params = json!({ "source": CLIPBOARD_SHIELD });
+            let mut params = json!({ "source": shield_source(&self.nonce) });
             if run_immediately {
                 params["runImmediately"] = json!(true);
             }
@@ -1600,10 +1825,46 @@ mod tests {
             r#"lock("writeln",function writeln(){opened(this);"#,
             "configurable:false",
         ] {
-            assert!(CLIPBOARD_SHIELD.contains(part), "{part}");
+            assert!(shield_source("n0nce").contains(part), "{part}");
         }
         // Nothing the page can change later is iterated (no for...of in the wrappers).
         assert_eq!(CLIPBOARD_SHIELD.matches(" of ").count(), 0);
+        // The nonce is in the listener only.
+        let source = shield_source("n0nce");
+        assert_eq!(source.matches("n0nce").count(), 1);
+        assert!(source.contains(r#"ap(sip,e,[]);"n0nce"}"#));
+    }
+
+    #[test]
+    fn the_first_capture_listener_of_every_clipboard_event_must_be_the_guards() {
+        let l = |t: &str, capture: bool, source: &str| json!({ "type": t, "useCapture": capture, "handler": { "description": source } });
+        let ours = |t: &str| l(t, true, "(e)=>{ap(pd,e,[]);ap(sip,e,[]);\"N1\"}");
+        let names = [
+            "copy",
+            "cut",
+            "paste",
+            "beforecopy",
+            "beforecut",
+            "beforepaste",
+        ];
+        let all: Vec<Value> = names.iter().map(|n| ours(n)).collect();
+        assert!(first_capture_listeners_hold(&all, "N1"));
+        // A bubbling listener of the page before ours does not matter.
+        let mut bubbling = vec![l("copy", false, "function(){}")];
+        bubbling.extend(all.clone());
+        assert!(first_capture_listeners_hold(&bubbling, "N1"));
+        // A capture listener of the page first does.
+        let mut first = vec![l("copy", true, "e=>e.stopImmediatePropagation()")];
+        first.extend(all.clone());
+        assert!(!first_capture_listeners_hold(&first, "N1"));
+        // A page's copy of the shield's text without the nonce is not ours.
+        let mut copied = vec![l("cut", true, "(e)=>{ap(pd,e,[]);ap(sip,e,[])}")];
+        copied.extend(all.clone());
+        assert!(!first_capture_listeners_hold(&copied, "N1"));
+        // Missing for one event (cleared and not back).
+        assert!(!first_capture_listeners_hold(&all[1..], "N1"));
+        // Another nonce.
+        assert!(!first_capture_listeners_hold(&all, "N2"));
     }
 
     fn words(csp: &str) -> Vec<&str> {
