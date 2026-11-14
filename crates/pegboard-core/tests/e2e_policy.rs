@@ -505,6 +505,9 @@ fn created_tabs_wait_for_the_guard() {
         assert!(e.contains("could not check"), "{e}");
         assert_eq!(h.manager.info(&info.id).unwrap().targets, before);
         guard_back(&h).await;
+        // The reconnect dropped the client's connection (a default session denies the
+        // clipboard: its agents connect again after the guard, Task 7); a new one is made.
+        let c = common::client(&ep).await;
         let r = c
             .send("Target.createTarget", json!({ "url": "about:blank" }), None)
             .await

@@ -109,6 +109,9 @@ pub fn clipboard_step(
     }
 }
 
+/// How long the shield's replies may take after the resume before a tab is closed.
+const SHIELD_LIMIT: Duration = Duration::from_secs(15);
+
 /// Most frames attached already running that one page session gets reloaded: a frame whose
 /// reload comes back as a new running target cannot make the guard reload forever.
 const FRAME_RELOADS: u32 = 8;
@@ -450,6 +453,8 @@ struct State {
     denied: BTreeMap<&'static str, u64>,
     /// Page session -> frames attached running that were reloaded under it (`FRAME_RELOADS`).
     frame_reloads: HashMap<String, u32>,
+    /// The current connection's event loop runs (`ready` is set only while it does).
+    live: bool,
 }
 
 struct Inner {
@@ -480,6 +485,9 @@ struct Inner {
     /// Test hook: false serves documents again without adding the CSP header, to tell what
     /// the header does from what serving again does.
     csp_header: std::sync::atomic::AtomicBool,
+    /// Test hook (`PEGBOARD_TEST_NO_CLIPBOARD_SHIELD` with `PEGBOARD_TEST_HOOKS`): no shield
+    /// and no clipboard reloads, to tell what they do from the rest of the guard.
+    no_shield: bool,
 }
 
 pub struct Guard {
@@ -525,6 +533,8 @@ impl Guard {
             profile_budgets: Mutex::new(HashMap::new()),
             trace: std::env::var_os("PEGBOARD_TEST_HOOKS").is_some(),
             csp_header: std::sync::atomic::AtomicBool::new(true),
+            no_shield: std::env::var_os("PEGBOARD_TEST_HOOKS").is_some()
+                && std::env::var_os("PEGBOARD_TEST_NO_CLIPBOARD_SHIELD").is_some(),
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner)));
         Guard { inner, supervisor }
@@ -684,33 +694,55 @@ impl Inner {
         if self.hold_until.lock().unwrap().is_some() {
             return;
         }
-        // After a reconnect: the agents' connections that may hold sessions older than the
-        // guard's are dropped first (they connect again, younger).
-        if self.state.lock().unwrap().connections > 1 {
-            (self.before_ready)().await;
-        }
         // The targets that were there already were attached while auto-attach was turned on
-        // (their events are queued): they are set up (a clipboard-denied tab among them
-        // reloaded) before commands are let through again.
+        // (their events are queued). They are set up in a task of their own, after a
+        // reconnect only once the agents' connections that may hold sessions older than the
+        // guard's are dropped (they connect again, younger), and `ready` waits for it. New
+        // targets meanwhile (held from their start: the human's, the bridge's worker) are
+        // handled at once by the loop below, never held up by this.
+        let reconnect = {
+            let mut state = self.state.lock().unwrap();
+            state.live = true;
+            state.connections > 1
+        };
         let mut early = Vec::new();
         while let Ok(event) = events.try_recv() {
             if event.method == "Target.attachedToTarget" {
-                early.push(self.on_attached(&conn, event, true));
+                early.push(event);
             } else {
                 self.on_event(&conn, event);
             }
         }
-        let set_up = async {
-            for handle in early {
-                let _ = handle.await;
-            }
+        let readiness = {
+            let me = self.clone();
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                if reconnect {
+                    (me.before_ready)().await;
+                }
+                let handles: Vec<_> = early
+                    .into_iter()
+                    .map(|event| me.on_attached(&conn, event, true))
+                    .collect();
+                let set_up = async {
+                    for handle in handles {
+                        let _ = handle.await;
+                    }
+                };
+                let _ = tokio::time::timeout(EARLY_SETUP_LIMIT, set_up).await;
+                // Not for a connection that has ended meanwhile.
+                let state = me.state.lock().unwrap();
+                if state.live {
+                    me.ready.send_replace(true);
+                    me.changed.send_modify(|n| *n += 1);
+                }
+            })
         };
-        let _ = tokio::time::timeout(EARLY_SETUP_LIMIT, set_up).await;
-        self.ready.send_replace(true);
-        self.changed.send_modify(|n| *n += 1);
         while let Some(event) = events.recv().await {
             self.on_event(&conn, event);
         }
+        self.state.lock().unwrap().live = false;
+        readiness.abort();
     }
 
     fn on_event(self: &Arc<Self>, conn: &CdpConn, event: CdpEvent) {
@@ -819,22 +851,37 @@ impl Inner {
             ..
         } = a;
         let s = Some(session);
-        let step = clipboard_step(kind, waiting, (self.clipboard_of)(context), a.early);
-        let result = async {
-            let run_immediately = match step {
-                ClipboardStep::Leave => None,
-                ClipboardStep::Shield { run_immediately } => Some(run_immediately),
-                ClipboardStep::ShieldAndReload | ClipboardStep::ShieldAndReloadFrame => Some(true),
-            };
-            if let Some(run_immediately) = run_immediately {
-                conn.send("Page.enable", json!({}), s).await?;
-                let mut params = json!({ "source": CLIPBOARD_SHIELD });
-                if run_immediately {
-                    params["runImmediately"] = json!(true);
-                }
-                conn.send("Page.addScriptToEvaluateOnNewDocument", params, s)
-                    .await?;
+        let step = if self.no_shield {
+            ClipboardStep::Leave
+        } else {
+            clipboard_step(kind, waiting, (self.clipboard_of)(context), a.early)
+        };
+        let run_immediately = match step {
+            ClipboardStep::Leave => None,
+            ClipboardStep::Shield { run_immediately } => Some(run_immediately),
+            ClipboardStep::ShieldAndReload | ClipboardStep::ShieldAndReloadFrame => Some(true),
+        };
+        // The shield is written now, before anything else on this session, and its replies
+        // are awaited only after the resume. Both are renderer-side commands: a held target
+        // with no live renderer yet (a popup without opener, one that navigates to another
+        // site or to a download) answers them only once its navigation goes on, which the
+        // resume allows, so awaiting them first held such a popup forever (second machine,
+        // Task 7). The session keeps them in order and hands them to the renderer when it
+        // comes, before its first document runs.
+        let shield = run_immediately.map(|run_immediately| {
+            let enable = conn.send_now("Page.enable", json!({}), s);
+            let mut params = json!({ "source": CLIPBOARD_SHIELD });
+            if run_immediately {
+                params["runImmediately"] = json!(true);
             }
+            let add = conn.send_now("Page.addScriptToEvaluateOnNewDocument", params, s);
+            async move {
+                enable.await?;
+                add.await?;
+                anyhow::Ok(())
+            }
+        });
+        let result = async {
             if matches!(kind, "page" | "iframe") {
                 conn.send(
                     "Target.setAutoAttach",
@@ -873,6 +920,22 @@ impl Inner {
                 } else {
                     "not-waiting".to_string()
                 };
+                if let Some(shield) = shield {
+                    let shielded = tokio::time::timeout(SHIELD_LIMIT, shield)
+                        .await
+                        .map_err(|_| anyhow!("no answer in time"))
+                        .and_then(|r| r);
+                    if let Err(e) = shielded {
+                        // Fail closed: a tab without the shield is closed; a frame cannot be.
+                        self.set_page(kind, target, Status::Failed(std::time::Instant::now()));
+                        if kind == "page" {
+                            let _ = conn
+                                .send("Target.closeTarget", json!({ "targetId": target }), None)
+                                .await;
+                        }
+                        return format!("resume={resumed} shield failed ({e:#})");
+                    }
+                }
                 self.set_page(kind, target, Status::Guarded { paused: waiting });
                 let reloaded = self.reload_for_clipboard(conn, step, &a).await;
                 format!("guarded resume={resumed}{reloaded}")

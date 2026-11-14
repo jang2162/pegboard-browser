@@ -166,29 +166,53 @@ impl CdpConn {
         params: Value,
         session_id: Option<&str>,
     ) -> Result<Value> {
+        self.send_now(method, params, session_id).await
+    }
+
+    /// Writes the request at once (before this returns, so requests sent one after the other
+    /// reach the browser in that order) and returns a future of its reply, which may be
+    /// awaited later or not at all.
+    pub fn send_now(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<Value>> + Send + 'static {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let mut msg = json!({ "id": id, "method": method, "params": params });
         if let Some(s) = session_id {
             msg["sessionId"] = json!(s);
         }
         let (tx, rx) = oneshot::channel();
-        {
+        let sent = {
             let mut pending = self.inner.pending.lock().unwrap();
             if pending.closed {
+                false
+            } else {
+                pending.waiters.insert(id, tx);
+                true
+            }
+        };
+        let sent = sent && {
+            let ok = self.inner.out.send(Message::text(msg.to_string())).is_ok();
+            if !ok {
+                self.inner.pending.lock().unwrap().waiters.remove(&id);
+            }
+            ok
+        };
+        let inner = self.inner.clone();
+        let method = method.to_string();
+        async move {
+            if !sent {
                 bail!("CDP connection closed");
             }
-            pending.waiters.insert(id, tx);
-        }
-        if self.inner.out.send(Message::text(msg.to_string())).is_err() {
-            self.inner.pending.lock().unwrap().waiters.remove(&id);
-            bail!("CDP connection closed");
-        }
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(result)) => result.with_context(|| format!("{method} failed")),
-            Ok(Err(_)) => bail!("CDP connection closed during {method}"),
-            Err(_) => {
-                self.inner.pending.lock().unwrap().waiters.remove(&id);
-                bail!("{method} timed out after {}s", REQUEST_TIMEOUT.as_secs())
+            match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+                Ok(Ok(result)) => result.with_context(|| format!("{method} failed")),
+                Ok(Err(_)) => bail!("CDP connection closed during {method}"),
+                Err(_) => {
+                    inner.pending.lock().unwrap().waiters.remove(&id);
+                    bail!("{method} timed out after {}s", REQUEST_TIMEOUT.as_secs())
+                }
             }
         }
     }

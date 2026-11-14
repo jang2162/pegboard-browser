@@ -100,9 +100,12 @@ impl Clipboard {
                  restore would lose; copy some plain text and run again. Nothing was changed."
             );
         }
+        let saved = pasteboard("pbpaste", None);
+        let was_empty = info.is_empty();
+        let _ = ORIGINAL.set((saved.clone(), was_empty));
         Clipboard {
-            saved: pasteboard("pbpaste", None),
-            was_empty: info.is_empty(),
+            saved,
+            was_empty,
             _one: one,
         }
     }
@@ -127,23 +130,90 @@ impl Clipboard {
     }
 }
 
-impl Drop for Clipboard {
-    fn drop(&mut self) {
-        if self.was_empty {
-            let cleared = Command::new("osascript")
+/// What the clipboard held when the first test of this run took it.
+static ORIGINAL: OnceLock<(Vec<u8>, bool)> = OnceLock::new();
+/// Restores that did not give back what was saved (checked by the last test).
+static RESTORE_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn clipboard_types() -> String {
+    Command::new("osascript")
+        .args(["-e", "clipboard info"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|e| format!("unreadable: {e}"))
+}
+
+/// Whether the clipboard holds `saved` (nothing at all when `was_empty`).
+fn holds(saved: &[u8], was_empty: bool) -> bool {
+    if was_empty {
+        clipboard_types().is_empty()
+    } else {
+        pasteboard("pbpaste", None) == saved
+    }
+}
+
+/// Puts `saved` back (empties the clipboard when it was empty), checks it, and tries once
+/// more when it did not take.
+fn restore(saved: &[u8], was_empty: bool) -> bool {
+    for _ in 0..2 {
+        if was_empty {
+            let _ = Command::new("osascript")
                 .args([
                     "-l",
                     "JavaScript",
                     "-e",
-                    "ObjC.import('AppKit'); $.NSPasteboard.generalPasteboard.clearContents; 1",
+                    "ObjC.import('AppKit'); $.NSPasteboard.generalPasteboard.clearContents(); 1",
                 ])
-                .output()
-                .is_ok_and(|o| o.status.success());
-            if cleared {
-                return;
-            }
+                .output();
+        } else {
+            pasteboard("pbcopy", Some(saved));
         }
-        pasteboard("pbcopy", Some(&self.saved));
+        if holds(saved, was_empty) {
+            return true;
+        }
+    }
+    if was_empty {
+        // At least no marker is left behind.
+        pasteboard("pbcopy", Some(b""));
+    }
+    false
+}
+
+impl Drop for Clipboard {
+    fn drop(&mut self) {
+        if !restore(&self.saved, self.was_empty) {
+            let what = format!(
+                "a restore did not take: the clipboard holds {:?} (types: {})",
+                String::from_utf8_lossy(&pasteboard("pbpaste", None)),
+                clipboard_types()
+            );
+            eprintln!("{what}");
+            RESTORE_FAILURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(what);
+        }
+    }
+}
+
+/// Runs last (tests run in name order): every test gave the clipboard back, and it holds what
+/// it held before the first test of this run.
+#[test]
+#[ignore]
+fn zz_the_clipboard_is_as_it_was_before_the_run() {
+    let _one = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
+    let failures = RESTORE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert!(failures.is_empty(), "{failures:#?}");
+    if let Some((saved, was_empty)) = ORIGINAL.get() {
+        assert!(
+            holds(saved, *was_empty),
+            "the clipboard is not as before the run: {:?} (types: {})",
+            String::from_utf8_lossy(&pasteboard("pbpaste", None)),
+            clipboard_types()
+        );
     }
 }
 
@@ -196,7 +266,8 @@ fn route(path: &str, port: u16) -> Option<String> {
 <button id="cp" onclick="{COPY}">copy</button>
 <button id="ct" onclick="{CUT}">cut</button>
 <button id="wt" onclick="{WRITE}">write</button>
-<button id="op" onclick="window.open('/clip')">open</button>"#
+<button id="op" onclick="window.open('/clip')">open</button>
+<a id="np" target="_blank" rel="noopener" href="http://localhost:{port}/clip">another site, no opener</a>"#
     );
     let frame = "width:320px;height:200px;border:0";
     Some(match path {
@@ -331,8 +402,9 @@ impl Agent {
         r["targetId"].as_str().unwrap().to_string()
     }
 
-    /// The popup `opener` opened (adopted into the session's scope by the listing).
-    async fn popup_of(&self, opener: &str) -> String {
+    /// A popup `opener` opened that is not in `known` (adopted into the session's scope by
+    /// the listing).
+    async fn popup_of(&self, opener: &str, known: &[String]) -> String {
         for _ in 0..50 {
             let r = self
                 .c
@@ -342,7 +414,11 @@ impl Agent {
             let found = r["targetInfos"].as_array().and_then(|infos| {
                 infos
                     .iter()
-                    .find(|t| t["type"] == "page" && t["openerId"] == opener)
+                    .find(|t| {
+                        t["type"] == "page"
+                            && t["openerId"] == opener
+                            && !known.iter().any(|k| t["targetId"] == k.as_str())
+                    })
                     .and_then(|t| t["targetId"].as_str().map(String::from))
             });
             if let Some(id) = found {
@@ -746,10 +822,28 @@ fn new_tabs_popups_and_frames_are_covered() {
             let first = a.tab(&a.first()).await;
             first.load("/clip").await;
             first.click("#op").await;
-            let popup_id = a.popup_of(&a.first()).await;
+            let popup_id = a.popup_of(&a.first(), &[]).await;
             let popup = a.tab(&popup_id).await;
             settle().await;
             got.push(("popup", click_copy_changes(&popup, "#cp", &clip).await));
+
+            // A link to another site without opener: a popup with no live renderer while the
+            // guard holds it (the shield is answered only after the resume).
+            first.load("/clip").await;
+            first.click("#np").await;
+            let other = a
+                .popup_of(&a.first(), std::slice::from_ref(&popup_id))
+                .await;
+            let other = a.tab(&other).await;
+            let loaded = common::eventually(10, || async {
+                other.eval("document.readyState", false).await == "complete"
+            })
+            .await;
+            assert!(loaded, "the popup without opener did not load");
+            got.push((
+                "popup to another site without opener",
+                click_copy_changes(&other, "#cp", &clip).await,
+            ));
 
             first.load("/xsite").await;
             got.push((
@@ -1136,5 +1230,53 @@ fn agent_browser_recovers_after_its_connection_is_dropped() {
             outcomes.len() == 1,
             "agent-browser's first command after its connection was dropped did not work: {outcomes:#?}"
         );
+    });
+}
+
+/// Why the shield also goes into running documents (`runImmediately`): a tab no session holds
+/// any more (kept by a closed session) is not reloaded after a guard reconnect, so a document
+/// it loaded while the guard was down (with no shield: it went with the old connection) gets
+/// the shield where it stands. The control shows the copy goes through while the guard is down.
+#[test]
+#[ignore]
+fn a_kept_tab_gets_the_shield_into_its_running_document_after_a_reconnect() {
+    common::run(async {
+        let clip = Clipboard::take();
+        let h = Harness::start();
+        let profile = "clip-kept";
+        h.manager.create_profile(profile).await.unwrap();
+        let a = create(&h, false, Some(profile)).await.unwrap();
+        let t = a.first();
+        h.manager
+            .close(pegboard_protocol::SessionCloseParams {
+                session_id: a.info.id.clone(),
+                keep_tabs: true,
+            })
+            .await
+            .unwrap();
+        let conn = &h.browser.conn;
+        let sid = conn.attach(&t).await.unwrap();
+        let tab = Tab { c: conn, sid };
+        assert!(h.manager.drop_guard_for_test(Duration::from_secs(3)));
+        tab.load("/clip").await;
+        assert!(
+            click_copy_changes(&tab, "#cp", &clip).await,
+            "control: the document loaded while the guard was down did not copy"
+        );
+        let back = common::eventually(15, || async { h.manager.require_guard().is_ok() }).await;
+        assert!(back, "the guard did not come back");
+        assert_eq!(
+            tab.eval("document.readyState", false).await,
+            "complete",
+            "the kept tab was reloaded or closed"
+        );
+        assert!(
+            !click_copy_changes(&tab, "#cp", &clip).await,
+            "the running document of the kept tab did not get the shield"
+        );
+        let _ = conn
+            .send("Target.closeTarget", json!({ "targetId": t }), None)
+            .await;
+        let _ = h.manager.delete_profile(profile).await;
     });
 }
