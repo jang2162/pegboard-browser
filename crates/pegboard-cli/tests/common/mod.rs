@@ -1,6 +1,8 @@
 //! Helpers shared by the end-to-end test binaries of the `pegboard` CLI.
 #![allow(dead_code)]
 
+pub mod mcp;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
