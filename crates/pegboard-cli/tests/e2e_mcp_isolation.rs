@@ -1584,9 +1584,18 @@ fn mcp_clipboard_denied_session_can_still_run_vitals() {
     let info = a.ok("pegboard_session_info", json!({}));
     assert!(info.contains("allow -"), "{info}");
     a.denied("pegboard_press", json!({ "key": "Control+c" }), "clipboard");
-    let (err, text) = a.call("pegboard_vitals", json!({}));
-    assert!(!err, "vitals failed in a clipboard-denied session: {text}");
-    assert!(!text.trim().is_empty());
+    // Both forms: on the current page, and after opening a URL (the form that has to set up
+    // its measuring script before the page's first script runs). The outputs are printed as
+    // evidence of what vitals measured (`--nocapture`).
+    for args in [json!({}), json!({ "url": format!("{origin}/counter") })] {
+        let (err, text) = a.call("pegboard_vitals", args.clone());
+        eprintln!("vitals {args}: error {err}: {text}");
+        assert!(
+            !err,
+            "vitals {args} failed in a clipboard-denied session: {text}"
+        );
+        assert!(!text.trim().is_empty());
+    }
 }
 
 #[test]
