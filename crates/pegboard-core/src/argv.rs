@@ -745,6 +745,14 @@ pub fn class_of(argv: &[String]) -> Option<ActionClass> {
         ["wait"] if words.iter().any(|w| w == "--fn") => ActionClass::Eval,
         // With a URL they go there first.
         ["a11y"] | ["vitals"] if !positionals(form, words).is_empty() => ActionClass::Navigate,
+        // Copy, cut and paste by key reach the system clipboard.
+        ["press"]
+            if positionals(form, words)
+                .first()
+                .is_some_and(|k| is_clipboard_key(k)) =>
+        {
+            ActionClass::Clipboard
+        }
         ["find", ..] => match find_action(form, words) {
             Some("fill") => ActionClass::Fill,
             Some("hover") => ActionClass::Interact,
@@ -753,6 +761,21 @@ pub fn class_of(argv: &[String]) -> Option<ActionClass> {
         },
         _ => form.class,
     })
+}
+
+/// Whether a `press` key copies, cuts or pastes: `Meta` or `Control` (or a name for them)
+/// with `c`, `x`, `v` (or `KeyC`...) or `Insert`; `Shift` with `Insert` or `Delete` (Chrome
+/// acts on these without an editing command, spike C9); or a key named for the action.
+/// Case and the order of the parts do not matter, nor do other modifiers.
+fn is_clipboard_key(key: &str) -> bool {
+    const COMMAND: &[&str] = &["control", "ctrl", "meta", "cmd", "command", "controlormeta"];
+    let parts: Vec<String> = key.split('+').map(str::to_ascii_lowercase).collect();
+    let has = |names: &[&str]| parts.iter().any(|p| names.contains(&p.as_str()));
+    let command = has(COMMAND);
+    let shift = has(&["shift"]);
+    (command && has(&["c", "x", "v", "keyc", "keyx", "keyv", "insert"]))
+        || (shift && has(&["insert", "delete", "del"]))
+        || has(&["copy", "cut", "paste"])
 }
 
 /// The positional words (not flags, not flag values) of a line the grammar accepted.
@@ -1328,6 +1351,77 @@ mod tests {
         ] {
             assert_eq!(class_of(&s(bad)), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn clipboard_key_combinations_are_class_clipboard() {
+        // Copy, cut and paste by key: Meta or Control with c, x or v (any case, any order,
+        // with more modifiers), the Insert/Delete combinations Chrome acts on without an
+        // editing command (spike C9), and the keys named for the actions.
+        for key in [
+            "Meta+c",
+            "meta+C",
+            "Meta+x",
+            "Meta+v",
+            "Control+c",
+            "Control+x",
+            "Control+v",
+            "CONTROL+V",
+            "Control+Shift+v",
+            "Shift+Control+v",
+            "c+Meta",
+            "Alt+Meta+c",
+            "Meta+KeyC",
+            "Control+keyv",
+            "Ctrl+c",
+            "Cmd+v",
+            "Command+x",
+            "ControlOrMeta+c",
+            "Control+Insert",
+            "Meta+Insert",
+            "Shift+Insert",
+            "shift+insert",
+            "Insert+Shift",
+            "Shift+Delete",
+            "Shift+Del",
+            "Copy",
+            "Cut",
+            "paste",
+        ] {
+            assert_eq!(
+                class_of(&s(&["press", key])),
+                Some(ActionClass::Clipboard),
+                "{key}"
+            );
+        }
+        for key in [
+            "c",
+            "C",
+            "v",
+            "Meta+a",
+            "Control+a",
+            "Enter",
+            "Insert",
+            "Delete",
+            "Shift+c",
+            "Shift+v",
+            "Alt+c",
+            "Control+Delete",
+            "Shift+Tab",
+            "KeyC",
+            "Control+cc",
+        ] {
+            assert_eq!(
+                class_of(&s(&["press", key])),
+                Some(ActionClass::Fill),
+                "{key}"
+            );
+        }
+        // Typed text is not a key combination.
+        assert_eq!(
+            class_of(&s(&["keyboard", "type", "Meta+c"])),
+            Some(ActionClass::Fill)
+        );
     }
 
     #[test]
