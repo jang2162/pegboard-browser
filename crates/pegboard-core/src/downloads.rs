@@ -503,9 +503,10 @@ struct State {
     /// this is the second check).
     gone: HashSet<SessionId>,
     gone_order: std::collections::VecDeque<SessionId>,
-    /// Cancels that worked at once, worked after a background tab made the profile default,
-    /// and failed (diagnostics: `cancel_counts`).
-    cancels: [u64; 3],
+    /// Cancels that worked and that were refused (diagnostics: `cancel_counts`).
+    cancels: [u64; 2],
+    /// Tabs activated to make a profile the default (diagnostics: `activations`).
+    activations: u64,
     /// Guids settled lately: every policy connection reports every download (L1), so a
     /// late copy of an event must not start a settled download again.
     settled: HashSet<String>,
@@ -718,11 +719,17 @@ impl Downloads {
         *entry = reports;
     }
 
-    /// Cancels that worked at once, after a background tab made the profile default, and
-    /// that failed (diagnostics and tests).
+    /// Cancels that worked and that were refused (diagnostics and tests).
     #[doc(hidden)]
-    pub fn cancel_counts(&self) -> [u64; 3] {
+    pub fn cancel_counts(&self) -> [u64; 2] {
         self.inner.state.lock().unwrap().cancels
+    }
+
+    /// Tabs this module has activated (each can bring an agent window forward) since the
+    /// browser started (diagnostics and tests).
+    #[doc(hidden)]
+    pub fn activations(&self) -> u64 {
+        self.inner.state.lock().unwrap().activations
     }
 
     /// The session's reports since the last call, oldest first.
@@ -814,19 +821,17 @@ impl Inner {
             if attempt > 0 {
                 tokio::time::sleep(RETRY_PAUSE).await;
             }
-            // Not page-triggered (a lost connection, a new window): the quiet way first, then
-            // activating a tab, which may bring the agent window forward.
-            let mut quiet = None;
+            // Not page-triggered (a lost connection, a new window): activating a tab of the
+            // profile is the only measured way to make it the default; it brings the agent
+            // window forward and can take the keyboard from the human. (A background tab
+            // created in the profile is refused while it is not the default: measured.)
             if !self.is_default(context).await {
-                quiet = self.make_default_quietly(context).await;
-                if quiet.is_none() {
-                    if let Err(e) = self.activate(context).await {
-                        last = e;
-                        continue;
-                    }
-                    if !self.is_default(context).await {
-                        continue;
-                    }
+                if let Err(e) = self.activate(context).await {
+                    last = e;
+                    continue;
+                }
+                if !self.is_default(context).await {
+                    continue;
                 }
             }
             self.cancel_running(context, &staging).await;
@@ -842,9 +847,6 @@ impl Inner {
                     None,
                 )
                 .await;
-            if let Some(tab) = quiet {
-                self.close_quiet_tab(&tab).await;
-            }
             match set {
                 Ok(_) => {
                     self.install(context, profile_dir, staging, conn, events);
@@ -855,51 +857,6 @@ impl Inner {
         }
         conn.close();
         Err(last)
-    }
-
-    /// Makes the agent profile `context` the default context without bringing anything
-    /// forward: a blank background tab is created in it (creating a tab in a profile makes
-    /// it the default, spike E3). Returns that tab (the caller closes it with
-    /// `close_quiet_tab`) when the profile is the default afterwards.
-    async fn make_default_quietly(&self, context: &str) -> Option<String> {
-        if context.is_empty() || context == self.human_context {
-            return None;
-        }
-        let r = self
-            .conn
-            .send(
-                "Target.createTarget",
-                json!({ "url": "about:blank", "browserContextId": context, "background": true }),
-                None,
-            )
-            .await;
-        let tab = match r {
-            Ok(r) => r["targetId"].as_str()?.to_string(),
-            Err(e) => {
-                eprintln!(
-                    "pegboard: a background tab could not be made in the agent profile: {e:#}"
-                );
-                return None;
-            }
-        };
-        if self.agent_context_of(&tab).await.as_deref() != Some(context) {
-            // Never left in another profile.
-            self.close_quiet_tab(&tab).await;
-            return None;
-        }
-        if self.is_default(context).await {
-            Some(tab)
-        } else {
-            self.close_quiet_tab(&tab).await;
-            None
-        }
-    }
-
-    async fn close_quiet_tab(&self, tab: &str) {
-        let _ = self
-            .conn
-            .send("Target.closeTarget", json!({ "targetId": tab }), None)
-            .await;
     }
 
     /// Whether `context` is the browser's default context now.
@@ -922,6 +879,7 @@ impl Inner {
             .iter()
             .find(|t| t.browser_context_id.as_deref() == Some(context))
             .ok_or_else(|| anyhow!("the agent profile has no open tab"))?;
+        self.state.lock().unwrap().activations += 1;
         self.conn
             .send(
                 "Target.activateTarget",
@@ -1033,10 +991,13 @@ impl Inner {
     }
 
     /// Cancels a download of the agent profile `context`. Chrome takes a context id only for
-    /// the profile that is the default context (measured for cancelling too, Task 5 run at
-    /// cb39d0c): when the cancel is refused, the profile is made the default with a
-    /// background tab (`make_default_quietly`), never by activating a tab, and the cancel is
-    /// tried once more. Each outcome is counted (`cancel_counts`) and logged.
+    /// the profile that is the default context (measured for cancelling too, Task 5 runs at
+    /// cb39d0c and a2ced1c). A page can start this path at will, so when the cancel is
+    /// refused nothing more is tried: the only measured way to make the profile the default
+    /// is activating one of its tabs, which brings a window forward and can take the keys
+    /// the human is typing (a background tab is refused too). The download then runs on
+    /// into staging, within the profile's running cap, and is deleted when it ends (or by
+    /// the sweeper). Each outcome is counted (`cancel_counts`) and logged.
     async fn cancel(&self, guid: &str, context: &str) {
         if context.is_empty() || context == self.human_context {
             return;
@@ -1055,45 +1016,11 @@ impl Inner {
             }
             Err(e) => e,
         };
-        // Ended meanwhile: nothing to cancel, and no reason to bring a window forward.
-        let ended = self
-            .state
-            .lock()
-            .unwrap()
-            .downloads
-            .get(guid)
-            .is_none_or(|d| d.end.is_some());
-        if ended {
-            return;
-        }
-        // A page can start this path at will, so it never brings a window forward (a person
-        // typing in their own window must not have keys land in an agent tab): only the
-        // quiet way is tried.
-        let again = match self.make_default_quietly(context).await {
-            Some(tab) => {
-                let r = send().await.map(drop);
-                self.close_quiet_tab(&tab).await;
-                r
-            }
-            None => Err(anyhow!(
-                "the profile could not be made the default context quietly"
-            )),
-        };
-        match again {
-            Ok(()) => {
-                self.state.lock().unwrap().cancels[1] += 1;
-                eprintln!(
-                    "pegboard: a download was cancelled after its profile was made the default \
-                     context with a background tab (the first cancel was refused: {first:#})"
-                );
-            }
-            Err(e) => {
-                self.state.lock().unwrap().cancels[2] += 1;
-                // It runs on into staging (within the profile's running cap) and is deleted
-                // when it ends, or by the sweeper.
-                eprintln!("pegboard: could not cancel a download: {first:#}; then: {e:#}");
-            }
-        }
+        self.state.lock().unwrap().cancels[1] += 1;
+        eprintln!(
+            "pegboard: could not cancel a download (it runs on into staging and is deleted \
+             when it ends): {first:#}"
+        );
     }
 
     fn on_event(self: &Arc<Self>, event: CdpEvent) {

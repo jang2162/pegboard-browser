@@ -890,12 +890,12 @@ fn frontmost() -> String {
         .map(|o| {
             let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if out.is_empty() {
-                format!("? {}", String::from_utf8_lossy(&o.stderr).trim())
+                format!("unknown ({})", String::from_utf8_lossy(&o.stderr).trim())
             } else {
                 out
             }
         })
-        .unwrap_or_else(|e| format!("? {e}"))
+        .unwrap_or_else(|e| format!("unknown ({e})"))
 }
 
 async fn default_context(conn: &CdpConn) -> String {
@@ -906,9 +906,9 @@ async fn default_context(conn: &CdpConn) -> String {
 }
 
 /// With the human's profile the default context, a running download of the agent profile
-/// over the limit is dropped, cancelled without bringing anything forward (the front
-/// application does not change), and leaves nothing behind. Prints the cancel counts
-/// `[at once, after a background tab, failed]`.
+/// over the limit is dropped without any tab being activated (nothing is brought forward):
+/// the cancel is refused there (measured), so it runs to its end and is deleted, leaving
+/// nothing behind. Prints the cancel counts `[worked, refused]`.
 #[test]
 #[ignore]
 fn a_limit_cancel_works_when_the_agent_profile_is_not_the_default() {
@@ -934,15 +934,22 @@ fn a_limit_cancel_works_when_the_agent_profile_is_not_the_default() {
         );
         let front = frontmost();
         let before = h.browser.downloads.cancel_counts();
+        let activations = h.browser.downloads.activations();
         click_go(&h, &tab).await;
         let outcome = stream_end(&name, 25).await;
         let after = h.browser.downloads.cancel_counts();
+        // Information only: a failed AppleScript call reads as "unknown (...)".
         let front_after = frontmost();
         eprintln!(
-            "MEASURE stream {outcome:?}; cancels [at once, background tab, failed] before \
-             {before:?} after {after:?}; front {front:?} -> {front_after:?}"
+            "MEASURE stream {outcome:?}; cancels [worked, refused] before {before:?} after \
+             {after:?}; front {front:?} -> {front_after:?}"
         );
-        assert_eq!(front_after, front, "a window came forward");
+        // A page-triggered cancel never activates a tab (which brings a window forward).
+        assert_eq!(
+            h.browser.downloads.activations(),
+            activations,
+            "a tab was activated for a page-triggered cancel"
+        );
         let seen = told(&h, &mut log, &info, 1).await;
         assert_eq!(
             seen,
@@ -1037,7 +1044,11 @@ fn measure_making_the_agent_profile_default_without_focus() {
                 "MEASURE {method}: after: default {} (agent {agent:?}) front {front1:?} \
                  (changed: {}); cancel: {again:?}; stream {:?}",
                 default_context(conn).await,
-                front1 != front0,
+                if front0.starts_with("unknown") || front1.starts_with("unknown") {
+                    "unknown".to_string()
+                } else {
+                    (front1 != front0).to_string()
+                },
                 stream_end(&name, 10).await
             );
             if let Some(t) = made {
