@@ -195,10 +195,76 @@ impl Drop for DownloadProbe {
     }
 }
 
+/// A name the browser (and the daemon) resolve to 127.0.0.1 and that the homes of
+/// `shared_home`, `limited_home` and `screen_home` list in `screen_off_domains`.
+pub const SCREEN_OFF_NAME: &str = "screen-off.test";
+
+/// What the screen recording tests show, from the fixture on `port`: (status line and
+/// headers, body).
+fn screen_route(path: &str, port: u16) -> Option<(String, String)> {
+    let html = |body: String| {
+        (
+            "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n".to_string(),
+            body,
+        )
+    };
+    // Noise over the whole page every 100 ms: frames that compress badly, so a recording
+    // reaches a limit of a few MB within seconds.
+    let noise = r#"<canvas id="c" style="position:fixed;inset:0;width:100vw;height:100vh"></canvas><script>
+const c = document.getElementById('c');
+window.changes = 0;
+function paint() {
+  c.width = innerWidth; c.height = innerHeight;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(c.width, c.height);
+  for (let i = 0; i < img.data.length; i += 65536) crypto.getRandomValues(img.data.subarray(i, i + 65536));
+  for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+  ctx.putImageData(img, 0, 0); window.changes++;
+}
+paint(); setInterval(paint, 100);
+</script>"#;
+    Some(match path {
+        "/animated" => html(page("animated", noise)),
+        "/off" => html(page("off", &format!("<h1>screen off</h1>{noise}"))),
+        "/to-off" => (
+            format!("HTTP/1.1 302 Found\r\nlocation: http://{SCREEN_OFF_NAME}:{port}/off\r\n"),
+            String::new(),
+        ),
+        "/popup-off" => html(page(
+            "popup-off",
+            &format!(
+                r#"<button id="pop" onclick="window.open('http://{SCREEN_OFF_NAME}:{port}/off')">Open</button>"#
+            ),
+        )),
+        "/popup" => html(page(
+            "popup",
+            r#"<button id="pop" onclick="window.open('/animated')">Open</button>"#,
+        )),
+        // Five changes within 300 ms once `start()` is called, then still; `settledAt` is
+        // the time of the last change.
+        "/settle" => html(page(
+            "settle",
+            r#"<h1 id="n">0</h1><script>
+window.settledAt = null;
+window.start = () => {
+  let n = 0;
+  const t = setInterval(() => {
+    n++; document.getElementById('n').textContent = String(n);
+    document.body.style.background = 'hsl(' + (n * 67) + ',70%,60%)';
+    if (n === 5) { clearInterval(t); window.settledAt = Date.now(); }
+  }, 60);
+  return 'started';
+};
+</script>"#,
+        )),
+        _ => return None,
+    })
+}
+
 /// Serves the fixture pages on a loopback port for as long as the test process lives.
 pub fn fixture() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -212,6 +278,14 @@ pub fn fixture() -> String {
                     .and_then(|l| l.split(' ').nth(1))
                     .and_then(|p| p.split('?').next())
                     .unwrap_or("/");
+                if let Some((head, body)) = screen_route(path, port) {
+                    let resp = format!(
+                        "{head}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    return;
+                }
                 let resp = match (download_route(path), route(path)) {
                     (Some((headers, body)), _) => format!(
                         "HTTP/1.1 200 OK\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -361,25 +435,7 @@ static SHARED_HOME: std::sync::OnceLock<Home> = std::sync::OnceLock::new();
 /// signals or stale files make their own `Home`.
 pub fn shared_home() -> &'static Home {
     SHARED_HOME.get_or_init(|| {
-        let home = Home::new();
-        let rules = host_rules();
-        let browser_rules = browser_only_host_rules();
-        let spaces = format!(
-            "127.0.0.1:{}=public",
-            public_listener().local_addr().unwrap().port()
-        );
-        let (code, _, err) = home.run_env(
-            &[
-                ("PEGBOARD_TEST_HOST_RULES", rules.as_str()),
-                ("PEGBOARD_TEST_BROWSER_HOST_RULES", browser_rules.as_str()),
-                // The guard traces what it does with documents into daemon.log.
-                ("PEGBOARD_TEST_HOOKS", "1"),
-                // Chrome counts the public listener's port as a public address.
-                ("PEGBOARD_TEST_IP_SPACE_OVERRIDES", spaces.as_str()),
-            ],
-            &["browser", "start"],
-        );
-        assert_eq!(code, 0, "{err}");
+        let home = screen_home(SCREEN_OFF_CONFIG);
         guard_shared_home(home.path());
         // SAFETY: registers a plain `extern "C"` function without arguments.
         unsafe {
@@ -387,6 +443,60 @@ pub fn shared_home() -> &'static Home {
         }
         home
     })
+}
+
+/// The `config.toml` of the test homes: the screen of `SCREEN_OFF_NAME` is not recorded.
+pub const SCREEN_OFF_CONFIG: &str = "[recording]\nscreen_off_domains = [\"screen-off.test\"]\n";
+
+static LIMITED_HOME: std::sync::OnceLock<Home> = std::sync::OnceLock::new();
+
+/// A second shared home like `shared_home`, whose recordings have small limits: 4 MB in
+/// all, 2 MB a recording.
+pub fn limited_home() -> &'static Home {
+    LIMITED_HOME.get_or_init(|| {
+        let home = screen_home(&format!(
+            "{SCREEN_OFF_CONFIG}max_total_gb = 0.004\nmax_per_recording_gb = 0.002\n"
+        ));
+        guard_shared_home(home.path());
+        // SAFETY: registers a plain `extern "C"` function without arguments.
+        unsafe {
+            libc::atexit(stop_limited_home);
+        }
+        home
+    })
+}
+
+extern "C" fn stop_limited_home() {
+    if let Some(home) = LIMITED_HOME.get() {
+        home.stop_everything();
+        let _ = std::fs::remove_dir_all(home.path());
+    }
+}
+
+/// A new home with this `config.toml` and a started daemon and browser, set up like
+/// `shared_home`'s (host rules, test hooks). Dropping it stops them.
+pub fn screen_home(config: &str) -> Home {
+    let home = Home::new();
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
+    let rules = host_rules();
+    let browser_rules = browser_only_host_rules();
+    let spaces = format!(
+        "127.0.0.1:{}=public",
+        public_listener().local_addr().unwrap().port()
+    );
+    let (code, _, err) = home.run_env(
+        &[
+            ("PEGBOARD_TEST_HOST_RULES", rules.as_str()),
+            ("PEGBOARD_TEST_BROWSER_HOST_RULES", browser_rules.as_str()),
+            // The guard traces what it does with documents into daemon.log.
+            ("PEGBOARD_TEST_HOOKS", "1"),
+            // Chrome counts the public listener's port as a public address.
+            ("PEGBOARD_TEST_IP_SPACE_OVERRIDES", spaces.as_str()),
+        ],
+        &["browser", "start"],
+    );
+    assert_eq!(code, 0, "{err}");
+    home
 }
 
 /// A name the shared browser (and its daemon) resolve to this machine's private LAN address
@@ -421,7 +531,7 @@ pub fn host_rules() -> String {
     format!(
         "MAP {PRIVATE_NAME} {private}, MAP {PUBLIC_LOOKING_NAME} {private}, \
          MAP {LISTED_NAME} 127.0.0.1, MAP {UNLISTED_NAME} 127.0.0.1, \
-         MAP {PUBLIC_NAME} 93.184.216.34"
+         MAP {SCREEN_OFF_NAME} 127.0.0.1, MAP {PUBLIC_NAME} 93.184.216.34"
     )
 }
 

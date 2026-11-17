@@ -1233,3 +1233,85 @@ fn set_file_input_files_only_takes_files_from_the_sessions_directories() {
         }
     });
 }
+
+/// The screen stream is the recorder's: an agent can neither start, stop nor acknowledge one
+/// on its own session (refused by the proxy), and the recording's stream goes on.
+#[test]
+#[ignore]
+fn agent_cannot_start_or_stop_the_screencast() {
+    common::run(async {
+        let sh = common::shared();
+        let (info, ep) = sh.session("/counter").await;
+        let first = sh.manager.info(&info.id).unwrap().targets[0].clone();
+        let manifest = pegboard_core::actionlog::Manifest::new(
+            &info.recording_id,
+            &info.id.0,
+            "",
+            &info.profile,
+            &info.created_at,
+            "chrome",
+            "agent-browser",
+        );
+        let log = pegboard_core::actionlog::ActionLog::open(&sh.env.paths, manifest).unwrap();
+        let handle = log.manifest_handle();
+        let context = sh.manager.context_of(&info.id).unwrap();
+        sh.recorder
+            .begin_session(
+                &info.id,
+                &context,
+                std::sync::Arc::new(tokio::sync::Mutex::new(log)),
+                handle.clone(),
+                Vec::new(),
+            )
+            .await;
+        let screen = handle.dir().join("screen").join(&first);
+        let frames = || {
+            std::fs::read_dir(&screen)
+                .map(|d| {
+                    d.filter(|e| {
+                        e.as_ref()
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(".jpg")
+                    })
+                    .count()
+                })
+                .unwrap_or(0)
+        };
+        assert!(
+            common::eventually(10, || async { frames() > 0 }).await,
+            "the recording wrote no frame"
+        );
+
+        let c = common::client(&ep).await;
+        let session = c.attach(&first).await.unwrap();
+        for (method, params) in [
+            (
+                "Page.startScreencast",
+                json!({ "format": "jpeg", "maxWidth": 320 }),
+            ),
+            ("Page.stopScreencast", json!({})),
+            ("Page.screencastFrameAck", json!({ "sessionId": 1 })),
+        ] {
+            let r = c.send(method, params, Some(&session)).await;
+            let err = format!("{:#}", r.expect_err(method));
+            assert!(
+                err.contains("pegboard records the session's screen itself"),
+                "{method}: {err}"
+            );
+        }
+        // The recorder's stream goes on (the page changes every 100 ms).
+        let before = frames();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let after = frames();
+        assert!(after >= before + 3, "{before} -> {after} frames");
+        sh.recorder.end_session(&info.id).await;
+        assert_eq!(
+            handle.get().screen,
+            pegboard_core::actionlog::ScreenStatus::Recorded
+        );
+        c.close();
+        sh.close_session(&info.id).await;
+    });
+}
