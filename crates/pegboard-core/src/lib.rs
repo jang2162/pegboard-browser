@@ -13,6 +13,7 @@ pub mod paths;
 pub mod policy;
 pub mod profiles;
 pub mod proxy;
+pub mod recording;
 pub mod runner;
 pub mod service;
 pub mod session;
