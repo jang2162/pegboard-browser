@@ -633,7 +633,7 @@ impl Recorder {
                 tab.off_marked = false;
                 let shot = Shot {
                     ts: now_ts(),
-                    url: tab.gate.url().map(url_for_log),
+                    url: tab.gate.current_url().map(url_for_log),
                     data: p["data"].as_str().unwrap_or_default().to_string(),
                 };
                 if let Some(shot) = tab.throttle.offer(now, shot) {

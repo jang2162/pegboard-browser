@@ -240,6 +240,11 @@ impl ScreenGate {
     pub fn url(&self) -> Option<&str> {
         self.pending.as_deref().or(self.current.as_deref())
     }
+
+    /// The URL of the document the main frame shows (committed), for a frame.
+    pub fn current_url(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
 }
 
 /// The screen bytes one recording may still write (max_per_recording_bytes).
@@ -584,6 +589,8 @@ mod tests {
         let mut g = ScreenGate::new(Some("http://a.test/"));
         g.navigation_started("http://a.test/to-off");
         assert!(g.open(&cfg));
+        assert_eq!(g.current_url(), Some("http://a.test/"));
+        assert_eq!(g.url(), Some("http://a.test/to-off"));
         g.committed("http://screen-off.test/off");
         assert!(!g.open(&cfg));
         // An empty list: every known URL is open.
