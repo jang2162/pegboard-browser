@@ -129,14 +129,18 @@ pub fn may_record(target_context: &str, session_context: &str, human_context: &s
         && target_context != human_context
 }
 
-/// Why stream frames stay out after leaving a screen-off page (spike F5): the old page's
-/// frames still come after the new main-frame `frameNavigated`, until the new document's
-/// first contentful paint; a back/forward-cache restore has no lifecycle events.
+/// Why stream frames stay out although the main frame's URL is not screen-off (spike F5):
+/// after leaving a screen-off page the old page's frames still come after the new main-frame
+/// `frameNavigated`, until the new document's first contentful paint; a back/forward-cache
+/// restore has no lifecycle events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Hold {
     /// Until `firstContentfulPaint` of this loader. Never comes: the tab stays unrecorded.
     Paint(String),
     Until(Instant),
+    /// The recorder is (re)attaching and does not know yet what the tab showed meanwhile
+    /// (`attaching` .. `attached`).
+    Unknown,
 }
 
 /// Whether frames of a target may be written now: the main frame's URL is known and not
@@ -144,11 +148,21 @@ enum Hold {
 ///
 /// `open` is the URL rule, which a direct capture follows (one sent after the current
 /// navigation committed, see `capture_ticket`); stream frames follow `stream_open`, which
-/// also holds them out after leaving a screen-off page until the new document painted.
+/// also holds them out after leaving a screen-off page until the new document painted, and
+/// while an attach has not found out what the tab shows.
+///
+/// A gate lives as long as the recording of its target, across reattaches: what it knew
+/// before (the document, a hold) decides what a reattach may assume.
 pub struct ScreenGate {
     current: Option<String>,
     pending: Option<String>,
     hold: Option<Hold>,
+    /// The hold before `attaching`, given back when the tab still shows the same document.
+    resume: Option<Option<Hold>>,
+    /// The loader of the committed main-frame document, when known.
+    loader: Option<String>,
+    /// The last loader whose first contentful paint was seen.
+    painted: Option<String>,
     /// Main-frame documents committed so far.
     navigations: u64,
 }
@@ -159,6 +173,9 @@ impl ScreenGate {
             current: url.map(String::from),
             pending: None,
             hold: None,
+            resume: None,
+            loader: None,
+            painted: None,
             navigations: 0,
         }
     }
@@ -166,6 +183,13 @@ impl ScreenGate {
     /// The main frame started to navigate to `url` (it may still be redirected).
     pub fn navigation_started(&mut self, url: &str) {
         self.pending = Some(url.to_string());
+    }
+
+    /// The main frame stopped loading. A navigation that had not committed by then was
+    /// cancelled (or became a download): it no longer counts. One that committed was
+    /// already taken by `committed`/`navigated`.
+    pub fn navigation_stopped(&mut self) {
+        self.pending = None;
     }
 
     /// The main frame committed a document at `url`.
@@ -183,7 +207,8 @@ impl ScreenGate {
     /// The main frame's `Page.frameNavigated`: `committed`, and when the screen was closed
     /// (a screen-off or unknown page, or still held), stream frames stay out until the new
     /// document (`loader_id`) paints, or for `RESTORE_HOLD` after a back/forward-cache
-    /// restore (`restored`).
+    /// restore (`restored`). The same document again (an event the attach already read
+    /// from the frame tree) changes nothing.
     pub fn navigated(
         &mut self,
         cfg: &RecordingConfig,
@@ -192,21 +217,87 @@ impl ScreenGate {
         restored: bool,
         now: Instant,
     ) {
+        if !loader_id.is_empty() && self.loader.as_deref() == Some(loader_id) {
+            return;
+        }
         let was_closed =
             !self.current.as_deref().is_some_and(|u| !cfg.screen_off(u)) || self.held(now);
         self.committed(url);
+        self.loader = Some(loader_id.to_string()).filter(|l| !l.is_empty());
+        self.resume = None;
         self.hold = if cfg.screen_off(url) || !was_closed {
             None
         } else if restored {
             Some(Hold::Until(now + RESTORE_HOLD))
         } else {
-            Some(Hold::Paint(loader_id.to_string()))
+            self.paint_hold(loader_id)
         };
+    }
+
+    fn paint_hold(&self, loader_id: &str) -> Option<Hold> {
+        if !loader_id.is_empty() && self.painted.as_deref() == Some(loader_id) {
+            None
+        } else {
+            Some(Hold::Paint(loader_id.to_string()))
+        }
+    }
+
+    /// The recorder is attaching (again) to the tab: stream frames stay out until
+    /// `attached` tells what the tab shows. `url` is the browser's answer before the attach,
+    /// used when nothing better is known.
+    pub fn attaching(&mut self, url: Option<&str>) {
+        if self.hold != Some(Hold::Unknown) {
+            self.resume = Some(self.hold.take());
+        }
+        self.hold = Some(Hold::Unknown);
+        if self.current.is_none() {
+            self.current = url.map(String::from);
+        }
+    }
+
+    /// The attach read the main frame (`url`, `loader_id`) from the frame tree, after
+    /// lifecycle events were turned on, and found whether that document has painted
+    /// (`painted`: its first contentful paint was already there; false when unknown).
+    ///
+    /// - A commit event came meanwhile: that event's judgement stands (nothing to do).
+    /// - The document it knew before (same loader): its previous state comes back.
+    /// - Any other document (first attach, or a commit while the recorder was away): the
+    ///   tab may have come from a screen-off page whose screen is still shown until this
+    ///   document paints, so frames stay out until it has painted (fail closed).
+    pub fn attached(&mut self, cfg: &RecordingConfig, url: &str, loader_id: &str, painted: bool) {
+        if !self.resolving() {
+            return;
+        }
+        if painted && !loader_id.is_empty() {
+            self.painted = Some(loader_id.to_string());
+        }
+        if !loader_id.is_empty() && self.loader.as_deref() == Some(loader_id) {
+            self.hold = self.resume.take().flatten();
+            return;
+        }
+        self.resume = None;
+        self.committed(url);
+        self.loader = Some(loader_id.to_string()).filter(|l| !l.is_empty());
+        self.hold = if cfg.screen_off(url) || cfg.screen_off_domains.is_empty() {
+            None
+        } else {
+            self.paint_hold(loader_id)
+        };
+    }
+
+    /// Between `attaching` and `attached` (or the first commit event): nothing is known of
+    /// what the tab shows yet.
+    pub fn resolving(&self) -> bool {
+        self.hold == Some(Hold::Unknown)
     }
 
     /// A `Page.lifecycleEvent` of the main frame.
     pub fn lifecycle(&mut self, loader_id: &str, name: &str) {
-        if name == "firstContentfulPaint" && self.hold == Some(Hold::Paint(loader_id.to_string())) {
+        if name != "firstContentfulPaint" {
+            return;
+        }
+        self.painted = Some(loader_id.to_string());
+        if self.hold == Some(Hold::Paint(loader_id.to_string())) {
             self.hold = None;
         }
     }
@@ -214,7 +305,7 @@ impl ScreenGate {
     fn held(&self, now: Instant) -> bool {
         match &self.hold {
             None => false,
-            Some(Hold::Paint(_)) => true,
+            Some(Hold::Paint(_) | Hold::Unknown) => true,
             Some(Hold::Until(t)) => now < *t,
         }
     }
@@ -227,7 +318,7 @@ impl ScreenGate {
     /// Before a direct capture is sent: `None` when it may not be taken now; otherwise the
     /// ticket its result is checked with (`capture_valid`).
     pub fn capture_ticket(&self, cfg: &RecordingConfig) -> Option<u64> {
-        self.open(cfg).then_some(self.navigations)
+        (self.open(cfg) && !self.resolving()).then_some(self.navigations)
     }
 
     /// When a capture's result came: whether it may be written. Only a capture sent after
@@ -640,6 +731,110 @@ mod tests {
         // A screen-off navigation under way closes the stream too.
         g.navigation_started("http://screen-off.test/");
         assert!(!g.stream_open(&cfg, t0 + ms(60_000)));
+    }
+
+    #[test]
+    fn a_reattach_after_a_commit_while_away_waits_for_the_paint() {
+        // (1) The recorder was away while the tab went from the off page to b.
+        let cfg = off_list();
+        let t0 = Instant::now();
+        let mut g = ScreenGate::new(Some("http://screen-off.test/"));
+        g.navigated(&cfg, "http://screen-off.test/", "L0", false, t0);
+        g.attaching(Some("http://b.test/"));
+        assert!(!g.stream_open(&cfg, t0));
+        assert!(g.capture_ticket(&cfg).is_none());
+        g.attached(&cfg, "http://b.test/", "L1", false);
+        assert!(g.open(&cfg));
+        assert!(!g.stream_open(&cfg, t0 + ms(60_000)));
+        g.lifecycle("L1", "firstContentfulPaint");
+        assert!(g.stream_open(&cfg, t0));
+        // Already painted when the attach looked: open at once.
+        let mut g = ScreenGate::new(Some("http://screen-off.test/"));
+        g.attaching(None);
+        g.attached(&cfg, "http://b.test/", "L1", true);
+        assert!(g.stream_open(&cfg, t0));
+        // Even a tab that was open before: a document it does not know is not assumed.
+        let mut g = ScreenGate::new(Some("http://a.test/"));
+        g.navigated(&cfg, "http://a.test/", "L0", false, t0);
+        assert!(g.stream_open(&cfg, t0));
+        g.attaching(None);
+        g.attached(&cfg, "http://b.test/", "L1", false);
+        assert!(!g.stream_open(&cfg, t0));
+        // The same document as before: its state comes back, open or held.
+        let mut g = ScreenGate::new(Some("http://a.test/"));
+        g.navigated(&cfg, "http://a.test/", "L0", false, t0);
+        g.attaching(None);
+        g.attaching(None);
+        g.attached(&cfg, "http://a.test/", "L0", false);
+        assert!(g.stream_open(&cfg, t0));
+        let mut g = ScreenGate::new(Some("http://screen-off.test/"));
+        g.navigated(&cfg, "http://b.test/", "L1", false, t0);
+        assert!(!g.stream_open(&cfg, t0));
+        g.attaching(None);
+        g.attached(&cfg, "http://b.test/", "L1", false);
+        assert!(!g.stream_open(&cfg, t0));
+        g.lifecycle("L1", "firstContentfulPaint");
+        assert!(g.stream_open(&cfg, t0));
+    }
+
+    #[test]
+    fn the_frame_tree_and_a_late_event_of_the_same_document_agree() {
+        // (2) The tree (b) is read before the queued frameNavigated(b) is handled.
+        let cfg = off_list();
+        let t0 = Instant::now();
+        let mut g = ScreenGate::new(Some("http://screen-off.test/"));
+        g.attaching(Some("http://screen-off.test/"));
+        g.attached(&cfg, "http://b.test/", "L1", false);
+        g.navigated(&cfg, "http://b.test/", "L1", false, t0);
+        assert!(!g.stream_open(&cfg, t0), "the late event opened the gate");
+        g.lifecycle("L1", "firstContentfulPaint");
+        assert!(g.stream_open(&cfg, t0));
+        // The event first: the tree read later does not undo it.
+        let mut g = ScreenGate::new(Some("http://screen-off.test/"));
+        g.attaching(None);
+        g.navigated(&cfg, "http://b.test/", "L1", false, t0);
+        assert!(!g.stream_open(&cfg, t0));
+        g.attached(&cfg, "http://b.test/", "L1", true);
+        assert!(!g.stream_open(&cfg, t0));
+        // A paint seen before the tree was applied counts.
+        let mut g = ScreenGate::new(None);
+        g.attaching(None);
+        g.lifecycle("L1", "firstContentfulPaint");
+        g.attached(&cfg, "http://b.test/", "L1", false);
+        assert!(g.stream_open(&cfg, t0));
+    }
+
+    #[test]
+    fn a_commit_before_the_attach_saw_events_is_not_assumed_safe() {
+        // (3) getTargetInfo said off, the tab committed b before Page.enable: no event.
+        let cfg = off_list();
+        let t0 = Instant::now();
+        let mut g = ScreenGate::new(Some("http://screen-off.test/"));
+        g.attaching(Some("http://screen-off.test/"));
+        g.attached(&cfg, "http://b.test/", "L1", false);
+        assert!(!g.stream_open(&cfg, t0));
+        assert_eq!(g.current_url(), Some("http://b.test/"));
+        // Without a screen-off list nothing is ever held.
+        let none = RecordingConfig::default();
+        let mut g = ScreenGate::new(Some("http://screen-off.test/"));
+        g.attaching(None);
+        g.attached(&none, "http://b.test/", "L1", false);
+        assert!(g.stream_open(&none, t0));
+    }
+
+    #[test]
+    fn a_cancelled_navigation_to_an_off_page_reopens_the_gate() {
+        let cfg = off_list();
+        let t0 = Instant::now();
+        let mut g = ScreenGate::new(Some("http://a.test/"));
+        g.navigation_started("http://screen-off.test/");
+        assert!(!g.stream_open(&cfg, t0));
+        g.navigation_stopped();
+        assert!(g.stream_open(&cfg, t0));
+        // A committed off page stays off when it stops loading.
+        g.navigated(&cfg, "http://screen-off.test/", "L1", false, t0);
+        g.navigation_stopped();
+        assert!(!g.stream_open(&cfg, t0));
     }
 
     #[test]

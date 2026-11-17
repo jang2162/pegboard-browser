@@ -589,6 +589,15 @@ impl Daemon {
                     .await;
                 Ok(json!({ "recorded": recorded }))
             }
+            // Test hook: closes the recorder's browser connection and keeps it closed for
+            // `holdMs` (at most a minute). Needs a session's token, like the other hooks.
+            "test.dropRecorder" if crate::testenv::hooks() => {
+                let p: DropPolicyParams = params(p)?;
+                let id = checked_session(&p.session_id)?;
+                self.authorize(&id, p.token.as_deref())?;
+                let hold = Duration::from_millis(p.hold_ms.min(60_000));
+                Ok(json!({ "dropped": self.recorder.drop_connection_for_test(hold) }))
+            }
             "files.list" => {
                 let p: SessionIdParams = params(p)?;
                 let id = checked_session(&p.session_id)?;

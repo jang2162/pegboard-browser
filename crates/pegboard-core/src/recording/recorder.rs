@@ -1,10 +1,13 @@
 //! The recorder: the daemon's own browser connection that streams the screen of every
 //! session tab (spike F1, configuration B) and hands the frames to one writer per session.
 //!
-//! - Every frame is acknowledged as soon as it arrives (F2) and goes through the tab's
+//! - Every frame is acknowledged as soon as it arrives (F2) and goes through the target's
 //!   `ScreenGate` (F5) and `Throttle` (at most 2 a second, the settled screen last).
 //! - A tab is attached only after the browser confirms, on this connection, that it is in
 //!   the session's own context (`may_record`): never a tab of the human's profile.
+//! - What the recorder knows of a target's screen (gate, held frame, Off marker) belongs to
+//!   the session's recording and outlives an attach: a reattach or reconnect continues it
+//!   and assumes nothing about a document it did not see (`ScreenGate::attached`).
 //! - Disk writes happen on the session's writer thread, which owns each target's
 //!   `ScreenWriter` for the whole session (also across reconnects); event handling never
 //!   waits for them.
@@ -29,17 +32,26 @@ use crate::recording::screen::{
 /// Longest wait between two connection attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 const FIRST_BACKOFF: Duration = Duration::from_millis(250);
-/// How long `begin_session` waits for the connection (the session goes on without it).
-const BEGIN_WAIT: Duration = Duration::from_secs(2);
-/// How long the test hook waits for it.
+/// How long `begin_session` (inside `session create`) waits for the tabs' attach. An attach
+/// is four or five round trips on a local socket (tens of ms); the bound only keeps a slow
+/// or unreachable browser from delaying the session, whose tabs the connection task
+/// attaches later anyway. 300 ms is what one command may lose at most (design 4.6 allows
+/// 1 s in the worst case).
+const BEGIN_WAIT: Duration = Duration::from_millis(300);
+/// How long the test hook waits for the connection.
 const CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// Stopping a tab's stream when the recording ends, at most.
 const STOP_LIMIT: Duration = Duration::from_secs(1);
+/// Waiting for the writer to finish the recording's files, at most.
+const WRITER_LIMIT: Duration = Duration::from_secs(5);
 
 /// The stream's settings (design 4.2; F7 kept them).
 fn screencast_params() -> Value {
     json!({ "format": "jpeg", "quality": 60, "maxWidth": 1280, "everyNthFrame": 1 })
 }
+
+/// Read in an isolated world (a page's own scripts cannot change what it sees).
+const PAINTED_JS: &str = "performance.getEntriesByName('first-contentful-paint').length > 0";
 
 fn now_ts() -> String {
     time::OffsetDateTime::now_utc()
@@ -81,9 +93,30 @@ enum Job {
 struct Rec {
     jobs: std_mpsc::Sender<Job>,
     budget: Arc<ScreenBudget>,
+    /// The recording id, for daemon.log.
+    id: String,
     /// Kept for the session's other recorders (navigation, people, extras: later tasks).
     _log: SessionLog,
     _extras: Vec<RecordExtra>,
+}
+
+/// What the recording knows of one target's screen, for as long as the target is in the
+/// session's scope (across attaches and connections).
+struct Screen {
+    gate: ScreenGate,
+    throttle: Throttle<Shot>,
+    /// An Off marker was written since the last frame that was kept.
+    off_marked: bool,
+}
+
+impl Screen {
+    fn new(url: Option<&str>) -> Screen {
+        Screen {
+            gate: ScreenGate::new(url),
+            throttle: Throttle::new(MIN_FRAME_GAP),
+            off_marked: false,
+        }
+    }
 }
 
 /// A session as the recorder knows it: its context, the targets in its scope, and its
@@ -92,23 +125,28 @@ struct Sess {
     context: String,
     targets: BTreeSet<String>,
     rec: Option<Rec>,
+    screens: HashMap<String, Screen>,
 }
 
-/// A tab the recorder is attached to.
+impl Sess {
+    fn new(context: &str) -> Sess {
+        Sess {
+            context: context.to_string(),
+            targets: BTreeSet::new(),
+            rec: None,
+            screens: HashMap::new(),
+        }
+    }
+}
+
+/// A tab the recorder is attached to on the current connection.
 struct Tab {
     session: SessionId,
     /// The recorder's CDP session on it.
     cdp: String,
     /// The connection generation it was attached on.
     epoch: u64,
-    gate: ScreenGate,
-    throttle: Throttle<Shot>,
-    /// An Off marker was written since the last frame that was kept.
-    off_marked: bool,
     streaming: bool,
-    /// A main-frame document was committed after the attach (the frame tree read at attach
-    /// time is older then).
-    nav_seen: bool,
 }
 
 #[derive(Default)]
@@ -121,6 +159,8 @@ struct State {
     by_cdp: HashMap<String, String>,
     /// Targets being attached right now.
     attaching: HashSet<String>,
+    /// Test hook: no connection before this.
+    held_until: Option<Instant>,
 }
 
 impl State {
@@ -139,7 +179,7 @@ impl State {
 pub struct Recorder {
     opts: RecorderOptions,
     state: Mutex<State>,
-    /// Wakes the connection task when a recording begins.
+    /// Wakes the connection task when a recording begins or a test hold ends.
     wake: Arc<Notify>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -182,44 +222,54 @@ impl Recorder {
     pub fn add_target(self: &Arc<Self>, id: &SessionId, target_id: &str, context: &str) {
         let recording = {
             let mut st = self.state();
-            let sess = st.sessions.entry(id.clone()).or_insert_with(|| Sess {
-                context: context.to_string(),
-                targets: BTreeSet::new(),
-                rec: None,
-            });
+            let sess = st
+                .sessions
+                .entry(id.clone())
+                .or_insert_with(|| Sess::new(context));
             sess.targets.insert(target_id.to_string());
             sess.rec.is_some()
         };
         if recording {
-            let me = self.clone();
-            let target = target_id.to_string();
-            tokio::spawn(async move {
-                me.attach(&target).await;
-            });
+            self.spawn_attach(target_id);
         }
+    }
+
+    fn spawn_attach(self: &Arc<Self>, target: &str) -> tokio::task::JoinHandle<bool> {
+        let me = self.clone();
+        let target = target.to_string();
+        tokio::spawn(async move { me.attach(&target).await })
     }
 
     pub fn remove_target(&self, id: &SessionId, target_id: &str) {
         let detach = {
             let mut st = self.state();
-            let Some(sess) = st.sessions.get_mut(id) else {
+            let State {
+                sessions,
+                tabs,
+                by_cdp,
+                conn,
+                epoch,
+                ..
+            } = &mut *st;
+            let Some(sess) = sessions.get_mut(id) else {
                 return;
             };
             sess.targets.remove(target_id);
-            if sess.targets.is_empty() && sess.rec.is_none() {
-                st.sessions.remove(id);
+            if let (Some(mut screen), Some(rec)) = (sess.screens.remove(target_id), &sess.rec) {
+                self.flush_into(rec, target_id, &mut screen);
             }
-            if !st.tabs.get(target_id).is_some_and(|t| &t.session == id) {
+            if sess.targets.is_empty() && sess.rec.is_none() {
+                sessions.remove(id);
+            }
+            if !tabs.get(target_id).is_some_and(|t| &t.session == id) {
                 return;
             }
-            let Some(mut tab) = st.tabs.remove(target_id) else {
+            let Some(tab) = tabs.remove(target_id) else {
                 return;
             };
-            st.by_cdp.remove(&tab.cdp);
-            self.flush_tab(&st, target_id, &mut tab);
-            st.conn
-                .clone()
-                .filter(|_| tab.epoch == st.epoch)
+            by_cdp.remove(&tab.cdp);
+            conn.clone()
+                .filter(|_| tab.epoch == *epoch)
                 .map(|c| (c, tab.cdp))
         };
         if let Some((conn, cdp)) = detach {
@@ -232,6 +282,7 @@ impl Recorder {
     }
 
     /// From the daemon once the action log exists: starts the screen of the session's targets.
+    /// Waits at most `BEGIN_WAIT` for them; the connection task attaches the rest.
     pub async fn begin_session(
         self: &Arc<Self>,
         id: &SessionId,
@@ -242,60 +293,68 @@ impl Recorder {
     ) {
         let targets: Vec<String> = {
             let mut st = self.state();
-            let sess = st.sessions.entry(id.clone()).or_insert_with(|| Sess {
-                context: context.to_string(),
-                targets: BTreeSet::new(),
-                rec: None,
-            });
+            let sess = st
+                .sessions
+                .entry(id.clone())
+                .or_insert_with(|| Sess::new(context));
             if sess.rec.is_some() {
                 return;
             }
             sess.context = context.to_string();
             let budget = ScreenBudget::new(self.opts.config.max_per_recording_bytes());
+            let rid = manifest.get().recording_id;
             let jobs = spawn_writer(manifest, budget.clone());
             sess.rec = Some(Rec {
                 jobs,
                 budget,
+                id: rid,
                 _log: log,
                 _extras: extras,
             });
             sess.targets.iter().cloned().collect()
         };
         self.wake.notify_one();
-        // The tabs are attached once the connection is up (the connection task attaches
-        // every recorded tab when it connects, too).
-        if self.connected(BEGIN_WAIT).await.is_some() {
-            let attaches = targets.iter().map(|t| self.attach(t));
-            futures_util::future::join_all(attaches).await;
-        }
+        let me = self.clone();
+        let attach_all = async move {
+            // Without a connection yet, the connection task attaches them once it is up.
+            if me.connected(BEGIN_WAIT).await.is_some() {
+                let attaches: Vec<_> = targets.iter().map(|t| me.spawn_attach(t)).collect();
+                futures_util::future::join_all(attaches).await;
+            }
+        };
+        let _ = tokio::time::timeout(BEGIN_WAIT, attach_all).await;
     }
 
     /// Stops the streams, writes the pending (settled) frames and the screen status; idempotent.
+    /// Waits at most `WRITER_LIMIT` for the writer (then says so in daemon.log and goes on).
     pub async fn end_session(&self, id: &SessionId) {
-        let (done, stops) = {
+        let (done, stops, rid) = {
             let mut st = self.state();
-            let Some(sess) = st.sessions.remove(id) else {
+            let Some(mut sess) = st.sessions.remove(id) else {
                 return;
             };
+            if let Some(rec) = &sess.rec {
+                for (target, screen) in sess.screens.iter_mut() {
+                    self.flush_into(rec, target, screen);
+                }
+            }
             let mut stops = Vec::new();
             for target in &sess.targets {
-                let Some(mut tab) = st.tabs.remove(target) else {
+                let Some(tab) = st.tabs.remove(target) else {
                     continue;
                 };
                 st.by_cdp.remove(&tab.cdp);
-                if let Some(rec) = &sess.rec {
-                    self.flush_into(rec, target, &mut tab);
-                }
                 if let Some(conn) = st.conn.clone().filter(|_| tab.epoch == st.epoch) {
                     stops.push((conn, tab.cdp));
                 }
             }
+            let rid = sess.rec.as_ref().map(|r| r.id.clone());
             let done = sess.rec.map(|rec| {
                 let (tx, rx) = oneshot::channel();
                 let _ = rec.jobs.send(Job::End(tx));
                 rx
             });
-            (done, stops)
+            (done, stops, rid)
         };
         let stopping = stops.into_iter().map(|(conn, cdp)| async move {
             let stop = async {
@@ -310,7 +369,14 @@ impl Recorder {
         });
         futures_util::future::join_all(stopping).await;
         if let Some(done) = done {
-            let _ = done.await;
+            if tokio::time::timeout(WRITER_LIMIT, done).await.is_err() {
+                eprintln!(
+                    "pegboard: recording {}: the screen writer did not finish within {} s; \
+                     its last frames may be missing",
+                    rid.unwrap_or_default(),
+                    WRITER_LIMIT.as_secs()
+                );
+            }
         }
     }
 
@@ -332,9 +398,24 @@ impl Recorder {
         if !attached && added {
             if let Some(sess) = self.state().sessions.get_mut(id) {
                 sess.targets.remove(target_id);
+                sess.screens.remove(target_id);
             }
         }
         attached
+    }
+
+    /// Test hook (`test.dropRecorder`): closes the connection and makes no new one for
+    /// `hold`. Returns whether there was a connection.
+    pub fn drop_connection_for_test(&self, hold: Duration) -> bool {
+        let conn = {
+            let mut st = self.state();
+            st.held_until = Some(Instant::now() + hold);
+            st.conn.clone()
+        };
+        if let Some(conn) = &conn {
+            conn.close();
+        }
+        conn.is_some()
     }
 
     /// For a direct capture of `target_id` (later task): the recorder's connection and CDP
@@ -347,11 +428,16 @@ impl Recorder {
         if sess.rec.as_ref()?.budget.capped() || tab.epoch != st.epoch {
             return None;
         }
-        let navigation = tab.gate.capture_ticket(&self.opts.config)?;
+        let navigation = sess
+            .screens
+            .get(target_id)?
+            .gate
+            .capture_ticket(&self.opts.config)?;
         Some(CaptureTicket {
             conn: st.conn.clone()?,
             cdp_session: tab.cdp.clone(),
             target: target_id.to_string(),
+            session: id.clone(),
             epoch: tab.epoch,
             navigation,
         })
@@ -361,11 +447,16 @@ impl Recorder {
     /// tab is still on the document it was sent under, and that is not screen-off (F5).
     pub fn capture_valid(&self, ticket: &CaptureTicket) -> bool {
         let st = self.state();
-        st.tabs.get(&ticket.target).is_some_and(|t| {
-            t.epoch == ticket.epoch
-                && t.cdp == ticket.cdp_session
-                && t.gate.capture_valid(&self.opts.config, ticket.navigation)
-        })
+        let attached = st
+            .tabs
+            .get(&ticket.target)
+            .is_some_and(|t| t.epoch == ticket.epoch && t.cdp == ticket.cdp_session);
+        attached
+            && st
+                .sessions
+                .get(&ticket.session)
+                .and_then(|s| s.screens.get(&ticket.target))
+                .is_some_and(|s| s.gate.capture_valid(&self.opts.config, ticket.navigation))
     }
 
     /// The connection, waiting up to `limit` for it.
@@ -378,7 +469,7 @@ impl Recorder {
             if Instant::now() >= deadline {
                 return None;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -432,39 +523,12 @@ impl Recorder {
             }
             return false;
         }
-        let url = info["url"].as_str().map(String::from);
+        let url = info["url"].as_str();
         let Ok(cdp) = conn.attach(target).await else {
             return false;
         };
         // Known before any of its page events can come (they start with Page.enable).
-        let registered = {
-            let mut st = self.state();
-            let session = st
-                .recording_session_of(target)
-                .filter(|_| st.epoch == epoch)
-                .map(|(id, _)| id.clone());
-            match session {
-                Some(session) => {
-                    st.by_cdp.insert(cdp.clone(), target.to_string());
-                    st.tabs.insert(
-                        target.to_string(),
-                        Tab {
-                            session,
-                            cdp: cdp.clone(),
-                            epoch,
-                            gate: ScreenGate::new(url.as_deref()),
-                            throttle: Throttle::new(MIN_FRAME_GAP),
-                            off_marked: false,
-                            streaming: false,
-                            nav_seen: false,
-                        },
-                    );
-                    true
-                }
-                None => false,
-            }
-        };
-        if registered && self.start_stream(conn, target, &cdp).await {
+        if self.register(target, &cdp, epoch, url) && self.start_stream(conn, target, &cdp).await {
             return true;
         }
         // Left the scope meanwhile, or the tab did not take the stream.
@@ -481,9 +545,68 @@ impl Recorder {
         false
     }
 
+    /// The tab is attached as `cdp` on connection `epoch`: its events are followed from now
+    /// on, and its screen stays closed until `resolve` (`ScreenGate::attaching`).
+    fn register(&self, target: &str, cdp: &str, epoch: u64, url: Option<&str>) -> bool {
+        let mut st = self.state();
+        if st.epoch != epoch {
+            return false;
+        }
+        let Some(session) = st.recording_session_of(target).map(|(id, _)| id.clone()) else {
+            return false;
+        };
+        let Some(sess) = st.sessions.get_mut(&session) else {
+            return false;
+        };
+        sess.screens
+            .entry(target.to_string())
+            .or_insert_with(|| Screen::new(url))
+            .gate
+            .attaching(url);
+        st.by_cdp.insert(cdp.to_string(), target.to_string());
+        st.tabs.insert(
+            target.to_string(),
+            Tab {
+                session,
+                cdp: cdp.to_string(),
+                epoch,
+                streaming: false,
+            },
+        );
+        true
+    }
+
+    /// What the attach found the tab to show: the main frame's document and whether it has
+    /// painted. Returns whether the recording is capped (no stream then), or `None` when the
+    /// tab is no longer this attach's.
+    fn resolve(
+        &self,
+        target: &str,
+        cdp: &str,
+        url: &str,
+        loader: &str,
+        painted: bool,
+    ) -> Option<bool> {
+        let mut st = self.state();
+        let session = st
+            .tabs
+            .get(target)
+            .filter(|t| t.cdp == cdp)?
+            .session
+            .clone();
+        let sess = st.sessions.get_mut(&session)?;
+        let capped = sess.rec.as_ref().is_none_or(|r| r.budget.capped());
+        sess.screens
+            .get_mut(target)?
+            .gate
+            .attached(&self.opts.config, url, loader, painted);
+        Some(capped)
+    }
+
     async fn start_stream(&self, conn: &CdpConn, target: &str, cdp: &str) -> bool {
         let setup = async {
             conn.send("Page.enable", json!({}), Some(cdp)).await?;
+            // Before the tree is read: a paint after it comes as an event.
             conn.send(
                 "Page.setLifecycleEventsEnabled",
                 json!({ "enabled": true }),
@@ -495,22 +618,16 @@ impl Recorder {
         let Ok(tree) = setup.await else {
             return false;
         };
-        let capped = {
-            let mut st = self.state();
-            let capped = st
-                .recording_session_of(target)
-                .and_then(|(_, s)| s.rec.as_ref())
-                .is_none_or(|r| r.budget.capped());
-            let Some(tab) = st.tabs.get_mut(target).filter(|t| t.cdp == cdp) else {
-                return false;
-            };
-            // The main frame's URL as of now, unless an event already told a newer one.
-            if let Some(url) = tree.pointer("/frameTree/frame/url").and_then(Value::as_str) {
-                if !tab.nav_seen {
-                    tab.gate.committed(url);
-                }
-            }
-            capped
+        let frame = &tree["frameTree"]["frame"];
+        let url = frame["url"].as_str().unwrap_or_default();
+        let loader = frame["loaderId"].as_str().unwrap_or_default();
+        let cfg = &self.opts.config;
+        // Only a list of screen-off domains can make a document wait for its paint.
+        let painted = !cfg.screen_off_domains.is_empty()
+            && !cfg.screen_off(url)
+            && painted(conn, cdp, target).await;
+        let Some(capped) = self.resolve(target, cdp, url, loader, painted) else {
+            return false;
         };
         if capped {
             return true;
@@ -528,16 +645,10 @@ impl Recorder {
         true
     }
 
-    /// Hands the tab's held frame to the writer when it may be written.
-    fn flush_tab(&self, st: &State, target: &str, tab: &mut Tab) {
-        if let Some(rec) = st.sessions.get(&tab.session).and_then(|s| s.rec.as_ref()) {
-            self.flush_into(rec, target, tab);
-        }
-    }
-
-    fn flush_into(&self, rec: &Rec, target: &str, tab: &mut Tab) {
-        let open = tab.gate.stream_open(&self.opts.config, Instant::now());
-        match tab.throttle.flush() {
+    /// Hands the target's held frame to the writer when it may be written.
+    fn flush_into(&self, rec: &Rec, target: &str, screen: &mut Screen) {
+        let open = screen.gate.stream_open(&self.opts.config, Instant::now());
+        match screen.throttle.flush() {
             Some(shot) if open && !rec.budget.capped() => {
                 let _ = rec.jobs.send(Job::Frame {
                     target: target.to_string(),
@@ -613,11 +724,11 @@ impl Recorder {
         e: &CdpEvent,
         now: Instant,
     ) {
-        let State { tabs, sessions, .. } = st;
-        let (Some(tab), Some(rec)) = (
-            tabs.get_mut(target),
-            sessions.get(session).and_then(|s| s.rec.as_ref()),
-        ) else {
+        let Some(sess) = st.sessions.get_mut(session) else {
+            return;
+        };
+        let Sess { rec, screens, .. } = sess;
+        let (Some(rec), Some(screen)) = (rec.as_ref(), screens.get_mut(target)) else {
             return;
         };
         let cfg = &self.opts.config;
@@ -626,17 +737,17 @@ impl Recorder {
         let main = |key: &str| p[key].as_str() == Some(target);
         match e.method.as_str() {
             "Page.screencastFrame" => {
-                if !tab.gate.stream_open(cfg, now) {
-                    self.closed(rec, target, tab);
+                if !screen.gate.stream_open(cfg, now) {
+                    self.closed(rec, target, screen);
                     return;
                 }
-                tab.off_marked = false;
+                screen.off_marked = false;
                 let shot = Shot {
                     ts: now_ts(),
-                    url: tab.gate.current_url().map(url_for_log),
+                    url: screen.gate.current_url().map(url_for_log),
                     data: p["data"].as_str().unwrap_or_default().to_string(),
                 };
-                if let Some(shot) = tab.throttle.offer(now, shot) {
+                if let Some(shot) = screen.throttle.offer(now, shot) {
                     let _ = rec.jobs.send(Job::Frame {
                         target: target.to_string(),
                         shot,
@@ -647,8 +758,12 @@ impl Recorder {
             }
             "Page.frameStartedNavigating" if main("frameId") => {
                 if let Some(url) = p["url"].as_str() {
-                    tab.gate.navigation_started(url);
+                    screen.gate.navigation_started(url);
                 }
+            }
+            "Page.frameStoppedLoading" if main("frameId") => {
+                screen.gate.navigation_stopped();
+                return;
             }
             "Page.frameNavigated" if p.pointer("/frame/parentId").is_none() => {
                 let Some(url) = p.pointer("/frame/url").and_then(Value::as_str) else {
@@ -656,56 +771,53 @@ impl Recorder {
                 };
                 let loader = p.pointer("/frame/loaderId").and_then(Value::as_str);
                 let restored = p["type"] == "BackForwardCacheRestore";
-                tab.gate
+                screen
+                    .gate
                     .navigated(cfg, url, loader.unwrap_or_default(), restored, now);
-                tab.nav_seen = true;
             }
             "Page.navigatedWithinDocument" if main("frameId") => {
                 if let Some(url) = p["url"].as_str() {
-                    tab.gate.committed(url);
-                    tab.nav_seen = true;
+                    screen.gate.committed(url);
                 }
             }
             "Page.lifecycleEvent" if main("frameId") => {
                 if let (Some(loader), Some(name)) = (p["loaderId"].as_str(), p["name"].as_str()) {
-                    tab.gate.lifecycle(loader, name);
+                    screen.gate.lifecycle(loader, name);
                 }
                 return;
             }
             _ => return,
         }
         // A main-frame navigation event.
-        if !tab.gate.stream_open(cfg, now) {
-            self.closed(rec, target, tab);
+        if !screen.gate.stream_open(cfg, now) {
+            self.closed(rec, target, screen);
         }
     }
 
-    /// The gate is closed: the held frame goes, and an Off marker is written once.
-    fn closed(&self, rec: &Rec, target: &str, tab: &mut Tab) {
-        tab.throttle.discard();
-        if !tab.off_marked {
-            tab.off_marked = true;
+    /// The gate is closed: the held frame goes, and an Off marker is written once (not while
+    /// an attach is still finding out what the tab shows: that short gap has no marker).
+    fn closed(&self, rec: &Rec, target: &str, screen: &mut Screen) {
+        screen.throttle.discard();
+        if !screen.off_marked && !screen.gate.resolving() {
+            screen.off_marked = true;
             let _ = rec.jobs.send(Job::Mark {
                 target: target.to_string(),
                 ts: now_ts(),
                 kind: FrameKind::Off,
-                url: tab.gate.url().map(url_for_log),
+                url: screen.gate.url().map(url_for_log),
             });
         }
     }
 
-    /// The browser ended the recorder's session on a tab (the tab may live on): its held
-    /// frame is written, and a tab still in a recording session's scope is attached again.
+    /// The browser ended the recorder's session on a tab (the tab may live on): a tab still
+    /// in a recording session's scope is attached again. Its screen state is kept.
     fn detached(self: &Arc<Self>, cdp: &str) {
         let target = {
             let mut st = self.state();
             let Some(target) = st.by_cdp.remove(cdp) else {
                 return;
             };
-            let Some(mut tab) = st.tabs.remove(&target) else {
-                return;
-            };
-            self.flush_tab(&st, &target, &mut tab);
+            st.tabs.remove(&target);
             target
         };
         let me = self.clone();
@@ -718,34 +830,37 @@ impl Recorder {
     /// When the next held frame is due.
     fn next_due(&self) -> Option<Instant> {
         self.state()
-            .tabs
+            .sessions
             .values()
-            .filter_map(|t| t.throttle.due())
+            .flat_map(|s| s.screens.values())
+            .filter_map(|s| s.throttle.due())
             .min()
     }
 
     /// Hands out the held frames whose screen has been still for the gap.
     fn on_tick(&self, now: Instant) {
         let mut st = self.state();
-        let State { tabs, sessions, .. } = &mut *st;
-        for (target, tab) in tabs.iter_mut() {
-            let Some(rec) = sessions.get(&tab.session).and_then(|s| s.rec.as_ref()) else {
-                tab.throttle.discard();
-                continue;
-            };
-            if !tab.throttle.due().is_some_and(|due| due <= now) {
-                continue;
-            }
-            if !tab.gate.stream_open(&self.opts.config, now) || rec.budget.capped() {
-                tab.throttle.discard();
-                continue;
-            }
-            if let Some(shot) = tab.throttle.tick(now) {
-                let _ = rec.jobs.send(Job::Frame {
-                    target: target.clone(),
-                    shot,
-                    kind: FrameKind::Change,
-                });
+        for sess in st.sessions.values_mut() {
+            let Sess { rec, screens, .. } = sess;
+            for (target, screen) in screens.iter_mut() {
+                let Some(rec) = rec.as_ref() else {
+                    screen.throttle.discard();
+                    continue;
+                };
+                if !screen.throttle.due().is_some_and(|due| due <= now) {
+                    continue;
+                }
+                if !screen.gate.stream_open(&self.opts.config, now) || rec.budget.capped() {
+                    screen.throttle.discard();
+                    continue;
+                }
+                if let Some(shot) = screen.throttle.tick(now) {
+                    let _ = rec.jobs.send(Job::Frame {
+                        target: target.clone(),
+                        shot,
+                        kind: FrameKind::Change,
+                    });
+                }
             }
         }
     }
@@ -763,23 +878,47 @@ impl Recorder {
                 .collect()
         };
         for target in targets {
-            let me = self.clone();
-            tokio::spawn(async move {
-                me.attach(&target).await;
-            });
+            self.spawn_attach(&target);
         }
     }
 
-    /// The connection ended: the tabs' held frames are written, the tabs are no longer
-    /// attached. Frames that would have come meanwhile are missing from the index.
+    /// The connection ended: no tab is attached any more. What each recording knows of
+    /// its screens stays; frames that would have come meanwhile are missing from the index.
     fn disconnected(&self) {
         let mut st = self.state();
         st.conn = None;
         st.by_cdp.clear();
-        let tabs: Vec<(String, Tab)> = st.tabs.drain().collect();
-        for (target, mut tab) in tabs {
-            self.flush_tab(&st, &target, &mut tab);
-        }
+        st.tabs.clear();
+    }
+
+    /// The test hold, if one is running.
+    fn held_until(&self) -> Option<Instant> {
+        self.state().held_until.filter(|t| *t > Instant::now())
+    }
+}
+
+/// Whether the main frame's document has had its first contentful paint, read in an
+/// isolated world of the recorder's own. False when it cannot be told.
+async fn painted(conn: &CdpConn, cdp: &str, frame: &str) -> bool {
+    let read = async {
+        let world = conn
+            .send(
+                "Page.createIsolatedWorld",
+                json!({ "frameId": frame, "worldName": "pegboard-recorder" }),
+                Some(cdp),
+            )
+            .await?;
+        let context = world["executionContextId"].clone();
+        conn.send(
+            "Runtime.evaluate",
+            json!({ "expression": PAINTED_JS, "contextId": context, "returnByValue": true }),
+            Some(cdp),
+        )
+        .await
+    };
+    match read.await {
+        Ok(r) => r.pointer("/result/value") == Some(&Value::Bool(true)),
+        Err(_) => false,
     }
 }
 
@@ -789,6 +928,7 @@ pub struct CaptureTicket {
     pub conn: CdpConn,
     pub cdp_session: String,
     pub target: String,
+    session: SessionId,
     epoch: u64,
     navigation: u64,
 }
@@ -798,10 +938,17 @@ pub struct CaptureTicket {
 async fn supervise(recorder: Weak<Recorder>, wake: Arc<Notify>, ws_url: String) {
     let mut backoff = FIRST_BACKOFF;
     loop {
-        let wanted = match recorder.upgrade() {
-            Some(r) => r.state().wanted(),
+        let (wanted, held) = match recorder.upgrade() {
+            Some(r) => {
+                let wanted = r.state().wanted();
+                (wanted, r.held_until())
+            }
             None => return,
         };
+        if let Some(until) = held {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(until)).await;
+            continue;
+        }
         if !wanted {
             wake.notified().await;
             continue;
@@ -1148,34 +1295,20 @@ mod tests {
         let jobs = spawn_writer(manifest.clone(), budget.clone());
         {
             let mut st = recorder.state();
-            st.sessions.insert(
-                id.clone(),
-                Sess {
-                    context: "AGENT".into(),
-                    targets: [T1.to_string()].into(),
-                    rec: Some(Rec {
-                        jobs,
-                        budget,
-                        _log: log,
-                        _extras: Vec::new(),
-                    }),
-                },
-            );
-            st.by_cdp.insert("C1".into(), T1.into());
-            st.tabs.insert(
-                T1.into(),
-                Tab {
-                    session: id.clone(),
-                    cdp: "C1".into(),
-                    epoch: 0,
-                    gate: ScreenGate::new(Some(url)),
-                    throttle: Throttle::new(MIN_FRAME_GAP),
-                    off_marked: false,
-                    streaming: true,
-                    nav_seen: false,
-                },
-            );
+            let mut sess = Sess::new("AGENT");
+            sess.targets.insert(T1.to_string());
+            sess.rec = Some(Rec {
+                jobs,
+                budget,
+                id: "r_abcdefgh".into(),
+                _log: log,
+                _extras: Vec::new(),
+            });
+            st.sessions.insert(id.clone(), sess);
         }
+        // As an attach does: registered, then the frame tree (a painted document).
+        assert!(recorder.register(T1, "C1", 0, Some(url)));
+        assert_eq!(recorder.resolve(T1, "C1", url, "L0", true), Some(false));
         (recorder, id, manifest)
     }
 
@@ -1362,5 +1495,106 @@ mod tests {
         assert!(r.state().tabs.is_empty());
         r.end_session(&id).await;
         assert_eq!(index(&manifest, T1).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_reattach_keeps_what_the_recording_knew_of_the_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        feed(&r, &id, shot_event(1), ms(0)); // written
+                                             // The connection drops and comes back; the tab still shows the same document.
+        r.disconnected();
+        assert!(r.register(T1, "C2", 0, Some("http://a.test/")));
+        // Until the tree is read nothing is kept.
+        feed(&r, &id, shot_event(2), ms(100));
+        assert_eq!(
+            r.resolve(T1, "C2", "http://a.test/", "L0", false),
+            Some(false)
+        );
+        // The throttle went on: within the gap of the last frame a frame is held.
+        feed(&r, &id, shot_event(3), ms(200));
+        assert_eq!(r.next_due(), Some(ms(700)));
+        // Off, then away while the tab went on to b.
+        feed(
+            &r,
+            &id,
+            navigated("http://screen-off.test/", "L1", "Navigation"),
+            ms(1000),
+        );
+        feed(&r, &id, shot_event(4), ms(1100));
+        r.disconnected();
+        assert!(r.register(T1, "C3", 0, Some("http://screen-off.test/")));
+        assert_eq!(
+            r.resolve(T1, "C3", "http://b.test/", "L2", false),
+            Some(false)
+        );
+        // b has not painted: what is shown may still be the off page.
+        feed(&r, &id, shot_event(5), ms(2000));
+        feed(&r, &id, shot_event(6), ms(2600));
+        feed(
+            &r,
+            &id,
+            event(
+                "Page.lifecycleEvent",
+                json!({ "frameId": T1, "loaderId": "L2", "name": "firstContentfulPaint" }),
+            ),
+            ms(2700),
+        );
+        feed(&r, &id, shot_event(7), ms(2800)); // written
+        r.end_session(&id).await;
+        let lines = index(&manifest, T1);
+        let summary: Vec<(FrameKind, Option<String>)> =
+            lines.iter().map(|l| (l.kind, l.url.clone())).collect();
+        assert_eq!(
+            summary,
+            vec![
+                (FrameKind::Change, Some("http://a.test/".into())),
+                // One marker for the whole closed stretch, across the reattach.
+                (FrameKind::Off, Some("http://screen-off.test/".into())),
+                (FrameKind::Change, Some("http://b.test/".into())),
+            ]
+        );
+        let last = std::fs::read(
+            manifest
+                .dir()
+                .join("screen")
+                .join(T1)
+                .join(lines[2].file.as_deref().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            last,
+            data_encoding::BASE64.decode(frame(7).as_bytes()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_navigation_to_an_off_page_lets_frames_through_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        feed(
+            &r,
+            &id,
+            event(
+                "Page.frameStartedNavigating",
+                json!({ "frameId": T1, "url": "http://screen-off.test/" }),
+            ),
+            ms(0),
+        );
+        feed(&r, &id, shot_event(1), ms(100));
+        feed(
+            &r,
+            &id,
+            event("Page.frameStoppedLoading", json!({ "frameId": T1 })),
+            ms(200),
+        );
+        feed(&r, &id, shot_event(2), ms(300)); // written
+        r.end_session(&id).await;
+        let kinds: Vec<FrameKind> = index(&manifest, T1).iter().map(|l| l.kind).collect();
+        assert_eq!(kinds, vec![FrameKind::Off, FrameKind::Change]);
     }
 }
