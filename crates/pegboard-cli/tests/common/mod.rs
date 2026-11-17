@@ -511,6 +511,12 @@ extern "C" fn stop_limited_home() {
 /// A new home with this `config.toml` and a started daemon and browser, set up like
 /// `shared_home`'s (host rules, test hooks). Dropping it stops them.
 pub fn screen_home(config: &str) -> Home {
+    screen_home_with(config, &[])
+}
+
+/// `screen_home` whose daemon also gets `env` (test variables such as
+/// `PEGBOARD_TEST_CAPTURE_DELAY_MS`).
+pub fn screen_home_with(config: &str, env: &[(&str, &str)]) -> Home {
     let home = Home::new();
     std::fs::write(home.path().join("config.toml"), config).unwrap();
     let rules = host_rules();
@@ -527,7 +533,10 @@ pub fn screen_home(config: &str) -> Home {
             ("PEGBOARD_TEST_HOOKS", "1"),
             // Chrome counts the public listener's port as a public address.
             ("PEGBOARD_TEST_IP_SPACE_OVERRIDES", spaces.as_str()),
-        ],
+        ]
+        .into_iter()
+        .chain(env.iter().copied())
+        .collect::<Vec<_>>(),
         &["browser", "start"],
     );
     assert_eq!(code, 0, "{err}");

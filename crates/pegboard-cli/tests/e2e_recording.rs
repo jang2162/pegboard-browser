@@ -708,3 +708,467 @@ fn a_session_created_during_a_recorder_outage_is_recorded_once_it_ends() {
     );
     assert_eq!(manifest(&dir)["screen"], "recorded");
 }
+
+// ---- frames around commands (task 4) ----
+
+/// The recording's action entries.
+fn actions(dir: &Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("actions.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(json)
+        .collect()
+}
+
+/// The session's last action entry (read while the session runs).
+fn last_entry(home: &Home, handle: &str) -> Value {
+    actions(&recording_dir(home, handle))
+        .pop()
+        .expect("no action entry")
+}
+
+/// A command in the session: its exit code and its action entry.
+fn command(home: &Home, handle: &str, args: &[&str]) -> (i32, Value) {
+    let (code, _, _) = home.run_limited(&[("PEGBOARD_SESSION", handle)], args, 90);
+    (code, last_entry(home, handle))
+}
+
+/// The index line of a frame named `<targetId>/<file>`; its file must exist.
+fn frame_line(dir: &Path, name: &str) -> Value {
+    let (target, file) = name.split_once('/').unwrap_or_else(|| panic!("{name}"));
+    assert!(
+        dir.join("screen").join(target).join(file).is_file(),
+        "{name} is no file"
+    );
+    index(dir, target)
+        .into_iter()
+        .find(|l| l["file"] == file)
+        .unwrap_or_else(|| panic!("{name} has no index line"))
+}
+
+/// Every JPEG of the recording, as `<targetId>/<file>`.
+fn all_jpgs(dir: &Path) -> BTreeSet<String> {
+    screen_dirs(dir)
+        .into_iter()
+        .flat_map(|t| jpgs(dir, &t).into_iter().map(move |f| format!("{t}/{f}")))
+        .collect()
+}
+
+fn set_screen(home: &Home, handle: &str, on: bool) {
+    let r = hook(
+        home,
+        "test.setScreen",
+        json!({ "sessionId": id_of(handle), "token": token_of(handle), "on": on }),
+    );
+    assert_eq!(r["set"], true, "{r}");
+}
+
+fn has_no_frames(entry: &Value) -> bool {
+    entry.get("frameBefore").is_none() && entry.get("frameAfter").is_none()
+}
+
+#[test]
+#[ignore]
+fn every_command_has_frames_before_and_after() {
+    let origin = fixture();
+    let home = shared_home();
+    let form = format!("{origin}/form");
+    let counter = format!("{origin}/counter");
+    let h = create(home, &form);
+    let first = targets(home, &h)[0].clone();
+    // The stream's first frame of the start page is stored.
+    std::thread::sleep(Duration::from_secs(1));
+    let lines: Vec<Vec<&str>> = vec![
+        vec!["open", &form],
+        vec!["click", "#name"],
+        vec!["fill", "#name", "hello"],
+        vec!["get", "url"],
+        vec!["eval", "document.title"],
+        vec!["scroll", "down", "200"],
+        vec!["tab", "new", &counter],
+        vec!["tab", &first],
+    ];
+    let mut entries = Vec::new();
+    for args in &lines {
+        let (code, entry) = command(home, &h, args);
+        assert_eq!(code, 0, "{args:?}: {entry}");
+        entries.push((args.clone(), entry));
+    }
+    close(home, &h);
+    let dir = recording_dir(home, &h);
+    assert_index_matches_files(&dir);
+    for (args, e) in &entries {
+        let before = e["frameBefore"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{args:?}: no frame before: {e}"));
+        let after = e["frameAfter"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{args:?}: no frame after: {e}"));
+        // Before: the tab's last stored frame (stream or an earlier command's capture).
+        let kind = frame_line(&dir, before)["kind"].clone();
+        assert!(
+            kind == "change" || kind == "after",
+            "{args:?}: {before} is {kind}"
+        );
+        assert_eq!(
+            frame_line(&dir, after)["kind"],
+            "after",
+            "{args:?}: {after}"
+        );
+        assert_ne!(before, after, "{args:?}");
+    }
+    let after_dir = |i: usize| {
+        entries[i].1["frameAfter"]
+            .as_str()
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    // `tab new`: the picture after is of the new tab; `tab <first>` back on the first.
+    let new_tab = after_dir(6);
+    assert_ne!(new_tab, first, "{}", entries[6].1);
+    assert_eq!(
+        entries[6].1["targetId"],
+        new_tab.as_str(),
+        "{}",
+        entries[6].1
+    );
+    assert_eq!(after_dir(7), first, "{}", entries[7].1);
+    // The frame before `tab <first>` is the new tab's (the tab the command started on).
+    assert!(
+        entries[7].1["frameBefore"]
+            .as_str()
+            .unwrap()
+            .starts_with(&new_tab),
+        "{}",
+        entries[7].1
+    );
+}
+
+#[test]
+#[ignore]
+fn screen_turned_off_by_the_test_hook_writes_no_frames() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/animated"));
+    std::thread::sleep(Duration::from_secs(1));
+    set_screen(home, &h, false);
+    // A frame already on its way to the disk.
+    std::thread::sleep(Duration::from_millis(300));
+    let dir = recording_dir(home, &h);
+    let files = all_jpgs(&dir);
+    for args in [vec!["get", "url"], vec!["eval", "1"]] {
+        let (code, e) = command(home, &h, &args);
+        assert_eq!(code, 0, "{e}");
+        assert!(has_no_frames(&e), "{args:?}: {e}");
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(all_jpgs(&dir), files, "frames were written while off");
+    set_screen(home, &h, true);
+    std::thread::sleep(Duration::from_secs(1));
+    let (code, e) = command(home, &h, &["get", "url"]);
+    assert_eq!(code, 0, "{e}");
+    assert!(
+        e["frameBefore"].is_string() && e["frameAfter"].is_string(),
+        "{e}"
+    );
+    close(home, &h);
+    assert!(all_jpgs(&dir).len() > files.len() + 1);
+    // The hook needs the session's token.
+    let paths = pegboard_core::paths::paths_in(home.path());
+    let refused: Result<Value, _> = pegboard_core::api::Client::connect(&paths).unwrap().call(
+        "test.setScreen",
+        json!({ "sessionId": id_of(&h), "token": "wrong", "on": false }),
+    );
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+#[test]
+#[ignore]
+fn a_failed_command_still_has_both_frames() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/counter"));
+    std::thread::sleep(Duration::from_secs(1));
+    let (code, e) = command(home, &h, &["click", "#missing"]);
+    assert_ne!(code, 0, "{e}");
+    assert_eq!(e["ok"], false, "{e}");
+    assert!(
+        e["frameBefore"].is_string() && e["frameAfter"].is_string(),
+        "{e}"
+    );
+    close(home, &h);
+}
+
+#[test]
+#[ignore]
+fn refused_commands_have_no_frames() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/counter"));
+    std::thread::sleep(Duration::from_secs(1));
+    // The session has frames: an allowed command gets them.
+    let (code, e) = command(home, &h, &["get", "url"]);
+    assert_eq!(code, 0, "{e}");
+    assert!(e["frameBefore"].is_string(), "{e}");
+    // Refused by the policy, and by the grammar.
+    let (code, e) = command(home, &h, &["cookies", "set", "a", "b"]);
+    assert_ne!(code, 0);
+    assert!(
+        e["error"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("policy_denied"),
+        "{e}"
+    );
+    assert!(has_no_frames(&e), "{e}");
+    let (code, e) = command(home, &h, &["snapshot", "--cdp", "9222"]);
+    assert_eq!(code, 2);
+    assert!(
+        e["error"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("argv_rejected"),
+        "{e}"
+    );
+    assert!(has_no_frames(&e), "{e}");
+    close(home, &h);
+}
+
+#[test]
+#[ignore]
+fn commands_on_a_screen_off_domain_have_no_frames() {
+    let origin = fixture();
+    let home = shared_home();
+    let off = format!("{}/off", origin.replace("127.0.0.1", SCREEN_OFF_NAME));
+    let h = create(home, &format!("{origin}/counter"));
+    std::thread::sleep(Duration::from_secs(1));
+    let dir = recording_dir(home, &h);
+    let (code, e) = command(home, &h, &["open", &off]);
+    assert_eq!(code, 0, "{e}");
+    assert!(e.get("frameAfter").is_none(), "{e}");
+    std::thread::sleep(Duration::from_millis(300));
+    let files = all_jpgs(&dir);
+    for args in [vec!["get", "url"], vec!["click", "body"]] {
+        let (code, e) = command(home, &h, &args);
+        assert_eq!(code, 0, "{args:?}: {e}");
+        assert!(has_no_frames(&e), "{args:?}: {e}");
+    }
+    assert_eq!(all_jpgs(&dir), files, "frames of the off page");
+    // From a normal page into the off domain by a redirect: no picture after.
+    ok(home, &h, &["open", &format!("{origin}/counter")]);
+    std::thread::sleep(Duration::from_secs(1));
+    let (code, e) = command(home, &h, &["open", &format!("{origin}/to-off")]);
+    assert_eq!(code, 0, "{e}");
+    assert!(e["frameBefore"].is_string(), "{e}");
+    assert!(e.get("frameAfter").is_none(), "{e}");
+    close(home, &h);
+    for target in screen_dirs(&dir) {
+        for line in index(&dir, &target) {
+            if line["file"].is_string() {
+                let url = line["url"].as_str().unwrap_or("");
+                assert_ne!(host_of(url), SCREEN_OFF_NAME, "{target}: {line}");
+            }
+        }
+    }
+}
+
+fn duration_ms(entry: &Value) -> i64 {
+    entry["durationMs"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{entry}"))
+}
+
+#[test]
+#[ignore]
+fn a_slow_capture_never_delays_a_command_beyond_the_cap() {
+    let origin = fixture();
+    let home = screen_home_with(
+        SCREEN_OFF_CONFIG,
+        &[("PEGBOARD_TEST_CAPTURE_DELAY_MS", "5000")],
+    );
+    let h = create(&home, &format!("{origin}/counter"));
+    std::thread::sleep(Duration::from_secs(1));
+    // Without the screen: what the command takes alone.
+    set_screen(&home, &h, false);
+    let base = (0..3)
+        .map(|_| duration_ms(&command(&home, &h, &["get", "url"]).1))
+        .max()
+        .unwrap();
+    set_screen(&home, &h, true);
+    std::thread::sleep(Duration::from_millis(500));
+    let (code, e) = command(&home, &h, &["get", "url"]);
+    assert_eq!(code, 0, "{e}");
+    assert!(e.get("frameAfter").is_none(), "{e}");
+    assert!(duration_ms(&e) < base + 1200, "{e}; alone {base} ms");
+    // The page is still (no stream frame): the tab is not captured again for a while, so
+    // ten more commands cost about nothing.
+    let mut extra = 0;
+    for _ in 0..10 {
+        let (code, e) = command(&home, &h, &["get", "url"]);
+        assert_eq!(code, 0, "{e}");
+        assert!(e.get("frameAfter").is_none(), "{e}");
+        extra += (duration_ms(&e) - base).max(0);
+    }
+    assert!(extra < 10 * 1200, "{extra} ms more over ten commands");
+    assert!(
+        extra < 2000,
+        "{extra} ms more over ten commands: the timed-out tab was captured again"
+    );
+    close(&home, &h);
+}
+
+#[test]
+#[ignore]
+fn commands_run_while_the_recorder_is_disconnected() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/counter"));
+    std::thread::sleep(Duration::from_secs(1));
+    let base = (0..3)
+        .map(|_| duration_ms(&command(home, &h, &["get", "url"]).1))
+        .max()
+        .unwrap();
+    let r = hook(
+        home,
+        "test.dropRecorder",
+        json!({ "sessionId": id_of(&h), "token": token_of(&h), "holdMs": 5000 }),
+    );
+    assert_eq!(r["dropped"], true, "{r}");
+    let held_until = Instant::now() + Duration::from_millis(5000);
+    // The recorder sees its connection end.
+    std::thread::sleep(Duration::from_millis(200));
+    for _ in 0..3 {
+        let (code, e) = command(home, &h, &["get", "url"]);
+        assert_eq!(code, 0, "{e}");
+        assert!(has_no_frames(&e), "{e}");
+        assert!(
+            duration_ms(&e) < base + 100,
+            "{e}; with the recorder {base} ms"
+        );
+    }
+    wait_out(held_until);
+    std::thread::sleep(Duration::from_secs(1));
+    let (code, e) = command(home, &h, &["get", "url"]);
+    assert_eq!(code, 0, "{e}");
+    assert!(
+        e["frameBefore"].is_string() && e["frameAfter"].is_string(),
+        "frames did not come back: {e}"
+    );
+    close(home, &h);
+}
+
+fn median(v: &[i64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    let m = s.len() / 2;
+    if s.len() % 2 == 1 {
+        s[m] as f64
+    } else {
+        (s[m - 1] + s[m]) as f64 / 2.0
+    }
+}
+
+/// Design 4.6: what the recording adds to a command, median at most 50 ms and at most 1 s.
+/// The commands of spike S2, each run in pairs with the screen on and off (test hook; the
+/// order alternates), `PEGBOARD_OVERHEAD_REPS` pairs (default 20). Times are the entries'
+/// `durationMs` (the daemon's own measure, frames included). Prints a table.
+#[test]
+#[ignore]
+fn recording_overhead_meets_the_targets() {
+    let origin = fixture();
+    let home = shared_home();
+    let reps: usize = std::env::var("PEGBOARD_OVERHEAD_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let form = format!("{origin}/form");
+    let counter = format!("{origin}/counter");
+    let h = create(home, &form);
+    let first = targets(home, &h)[0].clone();
+    std::thread::sleep(Duration::from_secs(1));
+    let commands: Vec<(&str, Vec<&str>)> = vec![
+        ("open", vec!["open", &form]),
+        ("snapshot -i", vec!["snapshot", "-i"]),
+        ("click", vec!["click", "#name"]),
+        ("fill", vec!["fill", "#name", "hello"]),
+        ("type", vec!["type", "#name", " world"]),
+        ("press Enter", vec!["press", "Enter"]),
+        ("get url", vec!["get", "url"]),
+        ("get text", vec!["get", "text", "label"]),
+        ("eval", vec!["eval", "document.title"]),
+        ("scroll down 200", vec!["scroll", "down", "200"]),
+        ("wait 100", vec!["wait", "100"]),
+        ("screenshot", vec!["screenshot"]),
+        ("tab new", vec!["tab", "new", &counter]),
+        ("tab list", vec!["tab", "list"]),
+    ];
+    let mut rows = Vec::new();
+    let mut missing = Vec::new();
+    let mut leaked = Vec::new();
+    let mut pass = true;
+    for (name, args) in &commands {
+        let mut added = Vec::new();
+        let mut on_times = Vec::new();
+        for rep in 0..reps {
+            let order = if rep % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            };
+            let mut pair = [0i64; 2];
+            for on in order {
+                set_screen(home, &h, on);
+                if on {
+                    // The stream's first frames come right after it starts (as in S2).
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                let (code, e) = command(home, &h, args);
+                assert_eq!(code, 0, "{name}: {e}");
+                if on && !e["frameAfter"].is_string() {
+                    missing.push(format!("{name} #{rep}"));
+                }
+                if !on && !has_no_frames(&e) {
+                    leaked.push(format!("{name} #{rep}: {e}"));
+                }
+                pair[usize::from(on)] = duration_ms(&e);
+                if *name == "tab new" {
+                    ok(home, &h, &["tab", "close"]);
+                    ok(home, &h, &["tab", &first]);
+                }
+            }
+            added.push(pair[1] - pair[0]);
+            on_times.push(pair[1]);
+        }
+        let (m, x) = (median(&added), *added.iter().max().unwrap());
+        pass &= m <= 50.0 && x <= 1000;
+        rows.push(format!(
+            "| {name} | {:.0} | {m:.0} | {x} |",
+            median(&on_times)
+        ));
+    }
+    close(home, &h);
+    println!("recording overhead, {reps} pairs per command (ms, durationMs of the entries):");
+    println!("| command | on median | added median | added max |");
+    println!("|---|---|---|---|");
+    for r in &rows {
+        println!("{r}");
+    }
+    println!("on-runs without a frame after: {}", missing.len());
+    assert!(
+        leaked.is_empty(),
+        "frames while the screen was off: {leaked:?}"
+    );
+    // A run without its capture would make the recording look cheaper than it is.
+    assert!(
+        missing.is_empty(),
+        "on-runs without a frame after: {missing:?}"
+    );
+    assert!(
+        pass,
+        "over the targets (median <= 50 ms, max <= 1000 ms):\n{}",
+        rows.join("\n")
+    );
+}

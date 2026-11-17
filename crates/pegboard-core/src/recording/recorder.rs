@@ -818,6 +818,10 @@ impl Recorder {
                 for screen in sess.screens.values_mut() {
                     screen.throttle.discard();
                 }
+                // What the screens show from now on is not recorded: no frame names them.
+                if let Some(rec) = &sess.rec {
+                    rec.last.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                }
                 let stops: Vec<_> = tabs
                     .values_mut()
                     .filter(|t| &t.session == id && t.streaming)
@@ -2507,11 +2511,11 @@ mod tests {
         feed(&r, &id, shot_event(3), ms(1100));
         r.on_tick(ms(5000));
         assert!(r.set_screen_for_test(&id, true).await);
-        assert_eq!(
-            r.before_command(&id, Some(T1)),
-            Some(format!("{T1}/000001.jpg"))
-        );
+        // The frame from before the pause is not the screen now.
+        assert_eq!(r.before_command(&id, Some(T1)), None);
         feed(&r, &id, shot_event(4), ms(6000));
+        let next = eventually(|| r.before_command(&id, Some(T1))).await;
+        assert_eq!(next, format!("{T1}/000002.jpg"));
         r.end_session(&id).await;
         let lines = index(&manifest, T1);
         assert_eq!(lines.len(), 2, "{lines:?}");
