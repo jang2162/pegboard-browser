@@ -1277,10 +1277,22 @@ fn killed_mcp_server_leaves_sessions_that_expire() {
         "closed {:?} after the kill, before it was idle",
         killed.elapsed()
     );
+    // The session leaves the list when its close begins; its recording ends once its tabs
+    // are closed (downloads that end meanwhile are logged first), a moment later.
     let rid = format!("r_{}", &id[2..]);
-    let (code, out, err) = home.run(&["recording", "show", &rid, "--json"]);
-    assert_eq!(code, 0, "{err}");
-    assert!(json(&out)["manifest"]["endedAt"].is_string(), "{out}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (code, out, err) = home.run(&["recording", "show", &rid, "--json"]);
+        assert_eq!(code, 0, "{err}");
+        if json(&out)["manifest"]["endedAt"].is_string() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the expired session's recording never ended: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let (_, status, _) = home.run(&["browser", "status", "--json"]);
     assert_eq!(json(&status)["sessions"], 0, "{status}");
 }

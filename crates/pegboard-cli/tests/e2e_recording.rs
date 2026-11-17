@@ -957,8 +957,10 @@ fn commands_on_a_screen_off_domain_have_no_frames() {
         assert!(has_no_frames(&e), "{args:?}: {e}");
     }
     assert_eq!(all_jpgs(&dir), files, "frames of the off page");
-    // From a normal page into the off domain by a redirect: no picture after.
-    ok(home, &h, &["open", &format!("{origin}/counter")]);
+    // From a normal page into the off domain by a redirect: no picture after. The page
+    // keeps changing, so frames of it are stored once its first paint ends the hold that
+    // follows the off page (a still page would leave the tab without a frame before).
+    ok(home, &h, &["open", &format!("{origin}/animated")]);
     std::thread::sleep(Duration::from_secs(1));
     let (code, e) = command(home, &h, &["open", &format!("{origin}/to-off")]);
     assert_eq!(code, 0, "{e}");
@@ -1060,6 +1062,52 @@ fn commands_run_while_the_recorder_is_disconnected() {
     close(home, &h);
 }
 
+fn daemon_log_len(home: &Home) -> usize {
+    std::fs::metadata(home.path().join("daemon.log")).map_or(0, |m| m.len() as usize)
+}
+
+/// What daemon.log got after byte `from`.
+fn daemon_log_since(home: &Home, from: usize) -> String {
+    let bytes = std::fs::read(home.path().join("daemon.log")).unwrap_or_default();
+    String::from_utf8_lossy(bytes.get(from..).unwrap_or_default()).into_owned()
+}
+
+/// The number before " ms" that follows `key` in the first line containing `line_has`
+/// (the timing lines the daemon writes with test hooks on).
+fn timing(text: &str, line_has: &str, key: &str) -> Option<f64> {
+    let line = text.lines().find(|l| l.contains(line_has))?;
+    let rest = &line[line.find(key)? + key.len()..];
+    rest.trim_start().split(' ').next()?.parse().ok()
+}
+
+fn median_f(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let m = s.len() / 2;
+    if s.len() % 2 == 1 {
+        s[m]
+    } else {
+        (s[m - 1] + s[m]) / 2.0
+    }
+}
+
+#[test]
+fn timing_reads_the_daemon_lines() {
+    let text = "x\npegboard: command fill: probe 3.2 ms, frame after 41.0 ms\n\
+                pegboard: recorder: capture of T: ticket 0.1 ms, cdp 38.5 ms, handoff 0.2 ms\n";
+    assert_eq!(timing(text, "pegboard: command ", "probe"), Some(3.2));
+    assert_eq!(
+        timing(text, "pegboard: command ", "frame after"),
+        Some(41.0)
+    );
+    assert_eq!(timing(text, "capture of", "cdp"), Some(38.5));
+    assert_eq!(timing(text, "capture of", "handoff"), Some(0.2));
+    assert_eq!(timing(text, "nothing", "cdp"), None);
+}
+
 fn median(v: &[i64]) -> f64 {
     let mut s = v.to_vec();
     s.sort_unstable();
@@ -1074,7 +1122,9 @@ fn median(v: &[i64]) -> f64 {
 /// Design 4.6: what the recording adds to a command, median at most 50 ms and at most 1 s.
 /// The commands of spike S2, each run in pairs with the screen on and off (test hook; the
 /// order alternates), `PEGBOARD_OVERHEAD_REPS` pairs (default 20). Times are the entries'
-/// `durationMs` (the daemon's own measure, frames included). Prints a table.
+/// `durationMs` (the daemon's own measure, frames included). Prints a table, with where the
+/// time of the on-runs went (daemon.log timing lines: the focus probe and the frame after,
+/// which run at the same time, and the capture's CDP round trip).
 #[test]
 #[ignore]
 fn recording_overhead_meets_the_targets() {
@@ -1112,6 +1162,8 @@ fn recording_overhead_meets_the_targets() {
     for (name, args) in &commands {
         let mut added = Vec::new();
         let mut on_times = Vec::new();
+        let (mut probes, mut afters, mut cdps, mut handoffs) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for rep in 0..reps {
             let order = if rep % 2 == 0 {
                 [false, true]
@@ -1125,8 +1177,16 @@ fn recording_overhead_meets_the_targets() {
                     // The stream's first frames come right after it starts (as in S2).
                     std::thread::sleep(Duration::from_millis(150));
                 }
+                let log_from = daemon_log_len(home);
                 let (code, e) = command(home, &h, args);
                 assert_eq!(code, 0, "{name}: {e}");
+                if on {
+                    let text = daemon_log_since(home, log_from);
+                    probes.extend(timing(&text, "pegboard: command ", "probe"));
+                    afters.extend(timing(&text, "pegboard: command ", "frame after"));
+                    cdps.extend(timing(&text, "capture of", "cdp"));
+                    handoffs.extend(timing(&text, "capture of", "handoff"));
+                }
                 if on && !e["frameAfter"].is_string() {
                     missing.push(format!("{name} #{rep}"));
                 }
@@ -1145,14 +1205,20 @@ fn recording_overhead_meets_the_targets() {
         let (m, x) = (median(&added), *added.iter().max().unwrap());
         pass &= m <= 50.0 && x <= 1000;
         rows.push(format!(
-            "| {name} | {:.0} | {m:.0} | {x} |",
-            median(&on_times)
+            "| {name} | {:.0} | {m:.0} | {x} | {:.1} | {:.1} | {:.1} | {:.2} |",
+            median(&on_times),
+            median_f(&probes),
+            median_f(&afters),
+            median_f(&cdps),
+            median_f(&handoffs),
         ));
     }
     close(home, &h);
     println!("recording overhead, {reps} pairs per command (ms, durationMs of the entries):");
-    println!("| command | on median | added median | added max |");
-    println!("|---|---|---|---|");
+    println!(
+        "| command | on median | added median | added max | on: probe median | on: frame after median | on: capture cdp median | on: handoff median |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
     for r in &rows {
         println!("{r}");
     }
