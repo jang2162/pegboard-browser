@@ -3,7 +3,7 @@
 
 use serde::Deserialize;
 
-use crate::address::host_listed;
+use crate::address::{host_listed, target_of};
 use crate::paths::Paths;
 use crate::policy::{is_host, normalized_domains};
 
@@ -11,6 +11,9 @@ const MAX_AGE_DAYS: std::ops::RangeInclusive<u32> = 1..=3650;
 
 /// A gigabyte, as the settings count it.
 const GB: f64 = 1e9;
+
+/// Smallest size limit, in GB (1 MB): below it a limit is surely a typing error.
+const MIN_GB: f64 = 0.001;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -77,14 +80,17 @@ impl RecordingConfig {
             ("max_total_gb", self.max_total_gb),
             ("max_per_recording_gb", self.max_per_recording_gb),
         ] {
-            if !(value.is_finite() && value > 0.0) {
-                return Err(format!("{key} must be a number above 0 (is {value})"));
+            if !(value.is_finite() && value >= MIN_GB) {
+                return Err(format!(
+                    "{key} must be a number of GB, at least {MIN_GB} (1 MB) (is {value})"
+                ));
             }
         }
         if let Some(bad) = self.screen_off_domains.iter().find(|d| !is_host(d)) {
             return Err(format!(
                 "screen_off_domains: {bad:?} is not a host name or IP address \
-                 (no scheme, path, port or wildcard; subdomains are included)"
+                 (no scheme, path, port or wildcard; subdomains are included; write a name \
+                 that is not ASCII as punycode, xn--...)"
             ));
         }
         self.screen_off_domains = normalized_domains(&self.screen_off_domains);
@@ -105,16 +111,27 @@ impl RecordingConfig {
 
     /// Whether frames of a main frame at `url` must not be written. A URL that does not
     /// parse counts as off when the list is not empty; data: and about:blank are never off.
+    /// `blob:`, `view-source:` and `filesystem:` URLs are judged by the URL inside them; any
+    /// other URL without a host (`file:`, `about:srcdoc`, ...) cannot be told apart from a
+    /// listed page and counts as off too.
     pub fn screen_off(&self, url: &str) -> bool {
         if self.screen_off_domains.is_empty() {
             return false;
         }
-        let Ok(parsed) = url::Url::parse(url.trim()) else {
+        let url = url.trim();
+        let Ok(parsed) = url::Url::parse(url) else {
             return true;
         };
-        match parsed.scheme() {
+        let scheme = parsed.scheme();
+        match scheme {
             "data" => false,
             "about" if parsed.path() == "blank" => false,
+            // The inner URL, from the parsed form (tabs and newlines taken out, as the browser
+            // does), so the cut after `<scheme>:` is exact.
+            "blob" | "view-source" | "filesystem" => {
+                self.screen_off(&parsed.as_str()[scheme.len() + 1..])
+            }
+            _ if target_of(&parsed).is_none() => true,
             _ => host_listed(&parsed, &self.screen_off_domains),
         }
     }
@@ -184,6 +201,8 @@ mod tests {
             ("max_total_gb = -1", "max_total_gb"),
             ("max_total_gb = inf", "max_total_gb"),
             ("max_per_recording_gb = nan", "max_per_recording_gb"),
+            ("max_total_gb = 1e-12", "max_total_gb"),
+            ("max_per_recording_gb = 0.0009", "max_per_recording_gb"),
             ("max_per_recording_gb = \"1\"", "max_per_recording_gb"),
             (
                 "screen_off_domains = [\"https://bank.example\"]",
@@ -211,6 +230,16 @@ mod tests {
             let err = RecordingConfig::parse(&full).unwrap_err();
             assert!(err.contains(key), "{text}: {err}");
         }
+        // A name that is not ASCII is written as punycode, and the message says so.
+        let err = RecordingConfig::parse("[recording]\nscreen_off_domains = [\"bänk.example\"]")
+            .unwrap_err();
+        assert!(err.contains("xn--"), "{err}");
+        let c = RecordingConfig::parse(
+            "[recording]\nmax_total_gb = 0.001\nscreen_off_domains = [\"xn--bnk-qla.example\"]",
+        )
+        .unwrap();
+        assert_eq!(c.max_total_bytes(), 1_000_000);
+        assert!(c.screen_off("https://bänk.example/"));
         let err = RecordingConfig::parse("[other]\nx = 1\n").unwrap_err();
         assert!(err.contains("other"), "{err}");
         let err = RecordingConfig::parse("max_age_days = 3\n").unwrap_err();
@@ -271,12 +300,47 @@ mod tests {
         ] {
             assert!(!c.screen_off(url), "{url}");
         }
+        // A URL whose page is another URL's: blob: by its origin, view-source: and
+        // filesystem: by the URL inside.
+        for url in [
+            "blob:https://bank.example/0b5c7e6a-1f1e-4f6e-9a54-3c1a0d1f2b3c",
+            "blob:https://www.bank.example:8443/x",
+            "view-source:https://bank.example/login?x=1",
+            "view-source:view-source:https://bank.example/",
+            "bl\tob:https://bank.example/x",
+            "filesystem:https://bank.example/temporary/a.txt",
+        ] {
+            assert!(c.screen_off(url), "{url}");
+        }
+        for url in [
+            "blob:https://other.test/x",
+            "view-source:https://other.test/",
+            "filesystem:https://other.test/temporary/a.txt",
+            "view-source:data:text/html,x",
+        ] {
+            assert!(!c.screen_off(url), "{url}");
+        }
+        // Any other URL without a host cannot be told apart: off while the list is not empty.
+        for url in [
+            "file:///Users/x/bank.html",
+            "about:srcdoc",
+            "blob:null/x",
+            "javascript:1",
+        ] {
+            assert!(c.screen_off(url), "{url}");
+        }
         // An address matches only the same address.
         let c = off(&["10.0.0.1", "::1"]);
         assert!(c.screen_off("http://10.0.0.1/"));
         assert!(c.screen_off("http://[::1]:8080/"));
         assert!(!c.screen_off("http://10.0.0.10/"));
         assert!(!c.screen_off("http://1.10.0.0.1.test/"));
+        // An IPv6 form of a listed IPv4 address is that address, both ways round.
+        assert!(c.screen_off("http://[::ffff:10.0.0.1]/"));
+        let c = RecordingConfig::parse("[recording]\nscreen_off_domains = [\"::ffff:10.0.0.1\"]")
+            .unwrap();
+        assert!(c.screen_off("http://10.0.0.1/"));
+        assert!(!c.screen_off("http://10.0.0.2/"));
         // An empty list never turns the screen off.
         let c = off(&[]);
         for url in ["https://bank.example/", "not a url", "about:blank"] {
