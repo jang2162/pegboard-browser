@@ -257,16 +257,18 @@ setTimeout(() => {
             "popup",
             r#"<button id="pop" onclick="window.open('/animated')">Open</button>"#,
         )),
-        // Five changes within 300 ms once `start()` is called, then still; `settledAt` is
-        // the time of the last change.
+        // Five changes of the background within 300 ms once `start()` is called, then
+        // still; `settledAt` is the time of the last change. Nothing on it is contentful (no
+        // text, image or canvas), so it never has a first contentful paint: it is recorded
+        // only because nothing shows it was ever on a screen-off page.
         "/settle" => html(page(
             "settle",
-            r#"<h1 id="n">0</h1><script>
+            r#"<script>
 window.settledAt = null;
 window.start = () => {
   let n = 0;
   const t = setInterval(() => {
-    n++; document.getElementById('n').textContent = String(n);
+    n++;
     document.body.style.background = 'hsl(' + (n * 67) + ',70%,60%)';
     if (n === 5) { clearInterval(t); window.settledAt = Date.now(); }
   }, 60);

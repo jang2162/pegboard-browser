@@ -274,6 +274,9 @@ fn the_settled_screen_is_the_last_frame() {
     );
     // A frame came during the changes too, so the last one is not merely the only one.
     assert!(frames.len() >= 2, "{frames:?}");
+    // Never painted contentfully and never on an off page: the attach opened at once.
+    let log = recorder_log(home, &first);
+    assert!(log.iter().any(|l| l.contains("stream open")), "{log:?}");
 }
 
 #[test]
@@ -602,9 +605,10 @@ fn session_create_does_not_wait_for_the_recorder() {
     let r = hook(
         home,
         "test.dropRecorder",
-        json!({ "sessionId": id_of(&a), "token": token_of(&a), "holdMs": 8000 }),
+        json!({ "sessionId": id_of(&a), "token": token_of(&a), "holdMs": 3000 }),
     );
     assert_eq!(r["dropped"], true, "{r}");
+    let held_until = Instant::now() + Duration::from_millis(3000);
     let t = Instant::now();
     let c = create(home, &url);
     let held = t.elapsed();
@@ -621,4 +625,50 @@ fn session_create_does_not_wait_for_the_recorder() {
     );
     assert!(refused.is_err(), "{refused:?}");
     close(home, &a);
+    // The next test finds the recorder connected again.
+    wait_out(held_until);
+}
+
+/// Sleeps past `until` and the recorder's reconnect after a hold.
+fn wait_out(until: Instant) {
+    let reconnect = until + Duration::from_secs(1);
+    if let Some(left) = reconnect.checked_duration_since(Instant::now()) {
+        std::thread::sleep(left);
+    }
+}
+
+/// A session created while the recorder's connection is down is recorded once the connection
+/// is back: the connection task attaches every tab of every recording.
+#[test]
+#[ignore]
+fn a_session_created_during_a_recorder_outage_is_recorded_once_it_ends() {
+    let origin = fixture();
+    let home = shared_home();
+    let a = create(home, &format!("{origin}/counter"));
+    let r = hook(
+        home,
+        "test.dropRecorder",
+        json!({ "sessionId": id_of(&a), "token": token_of(&a), "holdMs": 2000 }),
+    );
+    assert_eq!(r["dropped"], true, "{r}");
+    let held_until = Instant::now() + Duration::from_millis(2000);
+    let back_ms = now_ms() + 2000;
+    let c = create(home, &format!("{origin}/animated"));
+    let target = targets(home, &c)[0].clone();
+    wait_out(held_until);
+    std::thread::sleep(Duration::from_secs(2));
+    close(home, &c);
+    close(home, &a);
+    let dir = recording_dir(home, &c);
+    let frames = changes(&dir, &target);
+    assert!(
+        frames
+            .iter()
+            .filter(|f| ts_ms(f["ts"].as_str().unwrap()) >= back_ms)
+            .count()
+            >= 2,
+        "{frames:?}; recorder: {:?}",
+        recorder_log(home, &target)
+    );
+    assert_eq!(manifest(&dir)["screen"], "recorded");
 }
