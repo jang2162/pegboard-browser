@@ -4,7 +4,7 @@
 //! too (0600), and a file is never opened twice for writing: the writers create theirs.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -100,8 +100,11 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Appends JSON lines to a file it created (mode 0600). Lines are written unbuffered, each
 /// in one write, so a reader sees whole lines (and at most a cut last one after a crash).
+/// After a write that failed (and may have left part of a line), the next line starts with
+/// a newline, so the cut one is skipped by readers and does not swallow it.
 pub struct JsonlWriter {
     file: File,
+    needs_newline: bool,
 }
 
 impl JsonlWriter {
@@ -112,7 +115,10 @@ impl JsonlWriter {
             .create_new(true)
             .mode(0o600)
             .open(path)?;
-        Ok(JsonlWriter { file })
+        Ok(JsonlWriter {
+            file,
+            needs_newline: false,
+        })
     }
 
     /// Writes the value as one line and returns the bytes written. A line longer than
@@ -126,31 +132,63 @@ impl JsonlWriter {
                 format!("a line of {} bytes is over the limit", bytes.len()),
             ));
         }
-        self.file.write_all(&bytes)?;
-        Ok(bytes.len() as u64)
+        if self.needs_newline {
+            bytes.insert(0, b'\n');
+        }
+        match self.file.write_all(&bytes) {
+            Ok(()) => {
+                self.needs_newline = false;
+                Ok(bytes.len() as u64)
+            }
+            Err(e) => {
+                self.needs_newline = true;
+                Err(e)
+            }
+        }
     }
 }
 
 /// The lines of a JSON-lines file. A missing file has none; a line that is not one `T`
 /// (empty, cut off, not UTF-8, another shape) is skipped.
 pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> std::io::Result<Vec<T>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
+    match File::open(path) {
+        Ok(file) => jsonl_lines(file),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The lines of an open JSON-lines file, as `read_jsonl` reads them. A line longer than
+/// `MAX_LINE_BYTES` (no writer writes one) is skipped without being held in memory whole.
+pub fn jsonl_lines<T: DeserializeOwned>(file: File) -> std::io::Result<Vec<T>> {
+    let mut reader = BufReader::new(file);
     let mut lines = Vec::new();
-    for line in BufReader::new(file).split(b'\n') {
-        if let Ok(value) = serde_json::from_slice(&line?) {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = (&mut reader)
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            return Ok(lines);
+        }
+        if buf.len() > MAX_LINE_BYTES {
+            // No newline within the limit: drop the rest of this line.
+            if buf.last() != Some(&b'\n') {
+                reader.skip_until(b'\n')?;
+            }
+            continue;
+        }
+        if let Ok(value) = serde_json::from_slice(&buf) {
             lines.push(value);
         }
     }
-    Ok(lines)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     fn mode(p: &Path) -> u32 {
@@ -229,6 +267,64 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.join("nav.jsonl")).unwrap();
         assert!(JsonlWriter::create(&dir.join("nav.jsonl")).is_err());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_line_after_a_failed_write_starts_on_its_own_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("index.jsonl");
+        let mut w = JsonlWriter::create(&path).unwrap();
+        // What a write that failed half way leaves behind.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"ts\":\"cut")
+            .unwrap();
+        w.needs_newline = true;
+        let line = IndexLine {
+            ts: "t".into(),
+            file: None,
+            url: None,
+            width: None,
+            height: None,
+            kind: FrameKind::Capped,
+        };
+        let n = w.append(&line).unwrap();
+        assert_eq!(n as usize, serde_json::to_vec(&line).unwrap().len() + 2);
+        w.append(&line).unwrap();
+        assert_eq!(
+            read_jsonl::<IndexLine>(&path).unwrap(),
+            vec![line.clone(), line]
+        );
+    }
+
+    #[test]
+    fn read_jsonl_skips_lines_over_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("navigation.jsonl");
+        let line = NavLine {
+            ts: "t".into(),
+            target_id: "T1".into(),
+            event: NavEvent::Closed,
+            url: None,
+            opener: None,
+        };
+        let mut bytes = serde_json::to_vec(&line).unwrap();
+        bytes.push(b'\n');
+        // Valid JSON, but longer than any writer writes.
+        let long = NavLine {
+            url: Some("x".repeat(3 * MAX_LINE_BYTES)),
+            ..line.clone()
+        };
+        bytes.extend(serde_json::to_vec(&long).unwrap());
+        bytes.push(b'\n');
+        bytes.extend(serde_json::to_vec(&line).unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            read_jsonl::<NavLine>(&path).unwrap(),
+            vec![line.clone(), line]
+        );
     }
 
     #[test]

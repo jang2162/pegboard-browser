@@ -12,7 +12,7 @@
 //! taken around a command, and the manifest's `keep`, `screen`, `record` and `sizes`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::argv;
 use crate::paths::Paths;
+use crate::recording::format::jsonl_lines;
 
 pub const REDACTED: &str = "[redacted]";
 
@@ -319,14 +320,24 @@ pub fn write_manifest_file(dir: &Path, m: &Manifest) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    file.write_all(&serde_json::to_vec_pretty(m).map_err(std::io::Error::other)?)?;
-    file.flush()?;
-    std::fs::rename(&tmp, dir.join("manifest.json"))
+    let written = (|| {
+        let bytes = serde_json::to_vec_pretty(m).map_err(std::io::Error::other)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        // On disk before it replaces the old one, so a crash leaves one whole manifest.
+        file.sync_all()?;
+        std::fs::rename(&tmp, dir.join("manifest.json"))
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
+    // The rename itself.
+    File::open(dir)?.sync_all()
 }
 
 /// The entry as one line of at most `MAX_LINE_BYTES`. Words are redacted before they get
@@ -374,14 +385,8 @@ pub fn read_manifest(dir: &Path) -> std::io::Result<Manifest> {
 pub fn read(paths: &Paths, recording_id: &str) -> std::io::Result<(Manifest, Vec<ActionEntry>)> {
     let dir = recording_dir(paths, recording_id)?;
     let manifest = read_manifest(&dir)?;
-    let mut entries = Vec::new();
-    for line in BufReader::new(File::open(dir.join("actions.jsonl"))?).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        entries.push(serde_json::from_str(&line).map_err(std::io::Error::other)?);
-    }
+    // A line cut off by a crash, or still being written, is skipped like any bad line.
+    let entries = jsonl_lines(File::open(dir.join("actions.jsonl"))?)?;
     Ok((manifest, entries))
 }
 
@@ -1222,6 +1227,43 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_or_bad_line_does_not_hide_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        // Format 1, with a last line cut off by a crash (or still being written).
+        write_format_1(&paths, "r_abcdefgh");
+        let actions = paths.recordings.join("r_abcdefgh/actions.jsonl");
+        let mut f = OpenOptions::new().append(true).open(&actions).unwrap();
+        f.write_all(br#"{"seq":3,"ts":"2026-01-01T00:00:03Z","sessionId":"s_ab"#)
+            .unwrap();
+        let (_, entries) = read(&paths, "r_abcdefgh").unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        // Format 2, with a bad line in the middle and a cut last one.
+        let mut log = ActionLog::open(&paths, manifest("r_bcdefghi")).unwrap();
+        log.append(entry("open", s(vec!["open", "http://a.test/"])))
+            .unwrap();
+        let actions = paths.recordings.join("r_bcdefghi/actions.jsonl");
+        let mut f = OpenOptions::new().append(true).open(&actions).unwrap();
+        f.write_all(b"not json\n\xff\n").unwrap();
+        log.append(entry("click", s(vec!["click", "#b"]))).unwrap();
+        f.write_all(br#"{"seq":3,"#).unwrap();
+        let (_, entries) = read(&paths, "r_bcdefghi").unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["open", "click"]
+        );
+        // A recording without its actions file is still an error.
+        std::fs::remove_file(&actions).unwrap();
+        assert!(read(&paths, "r_bcdefghi").is_err());
+    }
+
+    #[test]
     fn new_fields_are_left_out_when_empty() {
         let e = entry("click", s(vec!["click", "#b"]));
         let v = serde_json::to_value(&e).unwrap();
@@ -1329,11 +1371,17 @@ mod tests {
         // The manifest is replaced whole (a reader never sees half of one): an update that
         // cannot be written leaves the file and the shared copy as they were.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let failed = handle.update(|m| m.keep = false);
+        // (root writes into a read-only directory, so this part needs an ordinary user.)
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let failed = handle.update(|m| m.keep = false);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(failed.is_err());
+            assert!(handle.get().keep);
+            assert!(read_manifest(&dir).unwrap().keep);
+            assert!(!dir.join("manifest.json.tmp").exists());
+        }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(failed.is_err());
-        assert!(handle.get().keep);
-        assert!(read_manifest(&dir).unwrap().keep);
     }
 
     #[test]
