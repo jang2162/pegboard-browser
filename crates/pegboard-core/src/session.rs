@@ -30,6 +30,7 @@ use crate::policy::{self, PinGuard, PinTable};
 use crate::profiles::{profile_dir, rpc_error, valid_profile_name, Profiles, DEFAULT_PROFILE};
 use crate::proxy::filter::normalize_url;
 use crate::proxy::server::{Endpoint, ProxyServer};
+use crate::recording::recorder::Recorder;
 
 const GROUP_COLORS: &[&str] = &[
     "grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange",
@@ -176,6 +177,9 @@ struct Inner {
     resolver: Resolver,
     /// Browser context -> the profile it belongs to, for the guard's policy lookup.
     contexts: Arc<Mutex<HashMap<String, String>>>,
+    /// Records the screen of the sessions' tabs; told whenever a target joins or leaves a
+    /// session's scope.
+    recorder: Arc<Recorder>,
 }
 
 pub struct SessionManager {
@@ -197,6 +201,7 @@ impl SessionManager {
         profiles: Profiles,
         paths: Paths,
         cfg: BrowserConfig,
+        recorder: Arc<Recorder>,
     ) -> Self {
         let events = browser.conn.events();
         let pins = PinTable::default();
@@ -252,6 +257,7 @@ impl SessionManager {
             guard,
             resolver,
             contexts,
+            recorder,
         });
         let _ = late.set(Arc::downgrade(&inner));
         let weak = Arc::downgrade(&inner);
@@ -272,6 +278,16 @@ impl SessionManager {
         inner.proxy.on_target_added(move |id, target_id| {
             if let Some(inner) = weak.upgrade() {
                 inner.browser.downloads.own(target_id, id);
+                let context = inner
+                    .table
+                    .lock()
+                    .unwrap()
+                    .records
+                    .get(id)
+                    .map(|r| r.context.clone());
+                if let Some(context) = context {
+                    inner.recorder.add_target(id, target_id, &context);
+                }
                 let target_id = target_id.to_string();
                 tokio::spawn(async move {
                     let _ = inner.ensure_focus(&target_id).await;
@@ -415,6 +431,8 @@ impl SessionManager {
                 _pin: pin,
             },
         );
+        // The first tab entered the scope with `register`, which tells no one.
+        inner.recorder.add_target(&id, &first, &runtime.context);
         let setup = async {
             inner.ensure_focus(&first).await.map_err(browser_failed)?;
             if let Some(url) = &url {
@@ -513,6 +531,7 @@ impl SessionManager {
         };
         // Tabs that stay open (kept, or not closed after all) leave focus emulation.
         for t in &targets {
+            inner.recorder.remove_target(id, t);
             inner.release_focus(t).await;
         }
         // Only now, with its tabs closed (or out of its group), does the session let go of
@@ -662,7 +681,8 @@ impl SessionManager {
         early_setup_gate(self.inner.guard.early_pending(&context))
     }
 
-    fn context_of(&self, id: &SessionId) -> Result<String, RpcError> {
+    /// The browser context of the session's profile.
+    pub fn context_of(&self, id: &SessionId) -> Result<String, RpcError> {
         let table = self.inner.table.lock().unwrap();
         Ok(ready(&table, id)?.context.clone())
     }
@@ -1239,6 +1259,9 @@ impl Inner {
                 focus.remove(t);
             }
         }
+        for t in &targets {
+            self.recorder.remove_target(id, t);
+        }
         if let Some(record) = record {
             self.release_pin(id, record._pin, bridge, group, &targets)
                 .await;
@@ -1304,6 +1327,7 @@ impl Inner {
                 };
                 for (id, _) in self.scopes() {
                     self.proxy.remove_target(&id, target);
+                    self.recorder.remove_target(&id, target);
                 }
                 self.focus.lock().unwrap().remove(target);
             }
@@ -1375,6 +1399,7 @@ impl Inner {
             for t in self.proxy.targets(&id) {
                 if !live.contains(t.as_str()) {
                     self.proxy.remove_target(&id, &t);
+                    self.recorder.remove_target(&id, &t);
                     self.focus.lock().unwrap().remove(&t);
                 }
             }

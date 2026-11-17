@@ -3,4 +3,5 @@
 
 pub mod config;
 pub mod format;
+pub mod recorder;
 pub mod screen;

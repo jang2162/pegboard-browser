@@ -92,12 +92,20 @@ impl OwnHarness {
         let proxy = Arc::new(ProxyServer::start(upstream).await.unwrap());
         let profiles = Profiles::load(&env.paths).unwrap();
         let browser = Arc::new(browser);
+        let recorder = pegboard_core::recording::recorder::Recorder::start(
+            pegboard_core::recording::recorder::RecorderOptions {
+                ws_url: browser.ws_url.clone(),
+                human_context: browser.human_context.clone(),
+                config: Default::default(),
+            },
+        );
         let manager = SessionManager::new(
             browser.clone(),
             proxy.clone(),
             profiles,
             env.paths.clone(),
             env.cfg.clone(),
+            recorder,
         );
         OwnHarness {
             manager,

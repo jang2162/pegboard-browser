@@ -640,6 +640,7 @@ pub async fn client(endpoint: &pegboard_core::proxy::server::Endpoint) -> CdpCon
 
 use pegboard_core::profiles::Profiles;
 use pegboard_core::proxy::server::{Endpoint, ProxyServer, WsUpstream};
+use pegboard_core::recording::recorder::{Recorder, RecorderOptions};
 use pegboard_core::runner::Runner;
 use pegboard_core::session::SessionManager;
 use pegboard_protocol::{
@@ -710,6 +711,9 @@ pub struct Shared {
     pub proxy: Arc<ProxyServer>,
     pub manager: SessionManager,
     pub runner: Arc<Runner>,
+    /// The manager's recorder: it records a session's screen only once a test calls
+    /// `begin_session`.
+    pub recorder: Arc<Recorder>,
     agent: tokio::sync::OnceCell<(String, Arc<pegboard_core::bridge::Bridge>)>,
 }
 
@@ -762,12 +766,18 @@ impl Shared {
         });
         let proxy = Arc::new(ProxyServer::start(upstream).await.unwrap());
         let profiles = Profiles::load(&env.paths).unwrap();
+        let recorder = Recorder::start(RecorderOptions {
+            ws_url: browser.ws_url.clone(),
+            human_context: browser.human_context.clone(),
+            config: Default::default(),
+        });
         let manager = SessionManager::new(
             browser.clone(),
             proxy.clone(),
             profiles,
             env.paths.clone(),
             env.cfg.clone(),
+            recorder.clone(),
         );
         let runner = Arc::new(Runner::new(env.paths.clone()).unwrap());
         let scope = proxy.clone();
@@ -780,6 +790,7 @@ impl Shared {
             proxy,
             manager,
             runner,
+            recorder,
             agent: tokio::sync::OnceCell::new(),
         }
     }

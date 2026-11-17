@@ -27,6 +27,7 @@ use crate::paths::{ensure, Paths};
 use crate::profiles::{rpc_error, Profiles};
 use crate::proxy::server::{ProxyServer, WsUpstream};
 use crate::recording::config::RecordingConfig;
+use crate::recording::recorder::{Recorder, RecorderOptions};
 use crate::runner::{Runner, AGENT_BROWSER_VERSION};
 use crate::session::SessionManager;
 
@@ -97,6 +98,8 @@ pub struct Daemon {
     browser: Arc<Browser>,
     sessions: SessionManager,
     runner: Arc<Runner>,
+    /// Records the sessions' screens.
+    recorder: Arc<Recorder>,
     /// Kept alive for the daemon's lifetime (it serves the session endpoints).
     _proxy: Arc<ProxyServer>,
     chrome_version: String,
@@ -297,6 +300,15 @@ struct DropPolicyParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RecordTargetParams {
+    session_id: SessionId,
+    #[serde(default)]
+    token: Option<String>,
+    target_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RecordingParams {
     recording_id: String,
 }
@@ -309,7 +321,7 @@ impl Daemon {
     /// Starts the browser, the proxy and everything that depends on them.
     pub async fn start(paths: Paths) -> anyhow::Result<Arc<Daemon>> {
         // Before anything is started: a daemon does not run with settings it cannot use.
-        RecordingConfig::load(&paths).map_err(|e| anyhow!(e))?;
+        let recording = RecordingConfig::load(&paths).map_err(|e| anyhow!(e))?;
         ensure(&paths)?;
         // First, so a missing or wrong agent-browser fails before a window opens.
         let runner =
@@ -320,7 +332,7 @@ impl Daemon {
             extension_dir: find_extension()?,
         };
         let browser = Arc::new(Browser::launch(&paths, &cfg).await?);
-        match Self::assemble(paths, runner, browser.clone(), cfg).await {
+        match Self::assemble(paths, runner, browser.clone(), cfg, recording).await {
             Ok(daemon) => Ok(daemon),
             Err(e) => {
                 browser.close().await;
@@ -334,6 +346,7 @@ impl Daemon {
         runner: Arc<Runner>,
         browser: Arc<Browser>,
         cfg: BrowserConfig,
+        recording: RecordingConfig,
     ) -> anyhow::Result<Arc<Daemon>> {
         let version = browser
             .conn
@@ -348,8 +361,20 @@ impl Daemon {
             .await?,
         );
         let profiles = Profiles::load(&paths)?;
-        let sessions =
-            SessionManager::new(browser.clone(), proxy.clone(), profiles, paths.clone(), cfg);
+        // The settings read at start; the file is not read again.
+        let recorder = Recorder::start(RecorderOptions {
+            ws_url: browser.ws_url.clone(),
+            human_context: browser.human_context.clone(),
+            config: recording,
+        });
+        let sessions = SessionManager::new(
+            browser.clone(),
+            proxy.clone(),
+            profiles,
+            paths.clone(),
+            cfg,
+            recorder.clone(),
+        );
         // Once, here: it is what lets the runner tell `tab_gone` from other failures.
         runner.set_session_targets_provider(sessions.targets_fn());
         let (stop, _) = watch::channel(false);
@@ -359,6 +384,7 @@ impl Daemon {
             browser,
             sessions,
             runner,
+            recorder,
             _proxy: proxy,
             chrome_version,
             slots: Mutex::new(HashMap::new()),
@@ -551,6 +577,18 @@ impl Daemon {
                 let hold = Duration::from_millis(p.hold_ms.min(60_000));
                 Ok(json!({ "dropped": self.sessions.drop_download_policy_for_test(&id, hold) }))
             }
+            // Test hook: tells the recorder that the target is in the session's scope (as the
+            // session manager would) and answers whether it attached to it.
+            "test.recordTarget" if crate::testenv::hooks() => {
+                let p: RecordTargetParams = params(p)?;
+                let id = checked_session(&p.session_id)?;
+                self.authorize(&id, p.token.as_deref())?;
+                let recorded = self
+                    .recorder
+                    .record_target_for_test(&id, &p.target_id)
+                    .await;
+                Ok(json!({ "recorded": recorded }))
+            }
             "files.list" => {
                 let p: SessionIdParams = params(p)?;
                 let id = checked_session(&p.session_id)?;
@@ -614,13 +652,28 @@ impl Daemon {
             &self.chrome_version,
             AGENT_BROWSER_VERSION,
         );
-        let log = match ActionLog::open(&self.paths, manifest) {
-            Ok(log) => Arc::new(AsyncMutex::new(log)),
+        let (log, manifest) = match ActionLog::open(&self.paths, manifest) {
+            Ok(log) => {
+                let manifest = log.manifest_handle();
+                (Arc::new(AsyncMutex::new(log)), manifest)
+            }
             Err(e) => {
                 self.discard(&id, None, true).await;
                 return Err(internal(format!("could not open the action log: {e}")));
             }
         };
+        // The screen: when it cannot start, the session goes on without it.
+        match self.sessions.context_of(&id) {
+            Ok(context) => {
+                self.recorder
+                    .begin_session(&id, &context, log.clone(), manifest, Vec::new())
+                    .await
+            }
+            Err(e) => eprintln!(
+                "pegboard: session {}: the screen is not recorded: {}",
+                id.0, e.message
+            ),
+        }
         let attached = match self.sessions.endpoint(&id) {
             Ok(endpoint) => self.runner.attach(&id, &endpoint).await,
             Err(e) => Err(e),
@@ -655,6 +708,7 @@ impl Daemon {
     /// Takes back a session whose creation failed after the session existed.
     async fn discard(&self, id: &SessionId, log: Option<SessionLog>, close_tabs: bool) {
         let _ = self.runner.detach(id).await;
+        self.recorder.end_session(id).await;
         if close_tabs {
             let p = SessionCloseParams {
                 session_id: id.clone(),
@@ -777,6 +831,9 @@ impl Daemon {
         if let Err(e) = self.runner.detach(&id).await {
             eprintln!("pegboard: {}: {}", e.code, e.message);
         }
+        // Before the tabs close: the settled screen of each tab is written, and the
+        // manifest's screen status is final before the log ends.
+        self.recorder.end_session(&id).await;
         let result = if close_tabs {
             self.sessions.close(p).await
         } else {
