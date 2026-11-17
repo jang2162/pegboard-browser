@@ -49,7 +49,8 @@ pub enum BrowserDecision {
     },
 }
 
-/// The 23 methods agent-browser used in phase 0 plus the additions for phase 1.
+/// The methods agent-browser used in phase 0 (less the screencast, see `RECORDING_METHODS`)
+/// plus the additions for phase 1.
 /// `Page.bringToFront` and `Target.activateTarget` are excluded on purpose:
 /// they raise windows and steal the human's focus.
 pub const ALLOWED_METHODS: &[&str] = &[
@@ -65,8 +66,6 @@ pub const ALLOWED_METHODS: &[&str] = &[
     "Page.enable",
     "Page.getFrameTree",
     "Page.navigate",
-    "Page.startScreencast",
-    "Page.stopScreencast",
     "Runtime.callFunctionOn",
     "Runtime.enable",
     "Runtime.evaluate",
@@ -116,6 +115,17 @@ pub const ALLOWED_METHODS: &[&str] = &[
 ];
 
 const NOT_ALLOWED: &str = "not allowed in a pegboard session";
+
+/// The screen stream, which the daemon runs on its own connection for the recording (phase
+/// 2b). An agent neither starts, stops nor acknowledges one (`ALLOWED_METHODS` must not
+/// name them; a test pins it).
+pub const RECORDING_METHODS: &[&str] = &[
+    "Page.startScreencast",
+    "Page.stopScreencast",
+    "Page.screencastFrameAck",
+];
+pub const RECORDING_REFUSED: &str =
+    "not allowed in a pegboard session: pegboard records the session's screen itself";
 const REFUSED_METHODS: &[&str] = &[
     "Browser.close",
     "Browser.crash",
@@ -261,6 +271,11 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
     // 2b. Calls that could switch off or hide the daemon's request checks.
     if is_guard_method(method) {
         return error(-32000, GUARD_REFUSED);
+    }
+
+    // 2b'. The screen stream belongs to the recording.
+    if RECORDING_METHODS.contains(&method) {
+        return error(-32000, RECORDING_REFUSED);
     }
 
     // 2c. Scripts that would run before the clipboard shield, unless the clipboard is open.
@@ -632,6 +647,32 @@ mod tests {
             client_message(&binding, &allowed),
             ClientDecision::Error { .. }
         ));
+    }
+
+    #[test]
+    fn screencast_methods_are_refused_for_agents() {
+        for method in [
+            "Page.startScreencast",
+            "Page.stopScreencast",
+            "Page.screencastFrameAck",
+        ] {
+            assert!(RECORDING_METHODS.contains(&method), "{method}");
+            assert!(!ALLOWED_METHODS.contains(&method), "{method}");
+            for sid in [Some("S1"), None] {
+                let mut m = json!({ "id": 1, "method": method, "params": {} });
+                if let Some(s) = sid {
+                    m["sessionId"] = json!(s);
+                }
+                match client_message(&m, &scope()) {
+                    ClientDecision::Error { message, .. } => assert_eq!(
+                        message,
+                        "not allowed in a pegboard session: pegboard records the session's screen itself",
+                        "{method} {sid:?}"
+                    ),
+                    other => panic!("{method} {sid:?}: {other:?}"),
+                }
+            }
+        }
     }
 
     fn err_code(d: &ClientDecision) -> i64 {

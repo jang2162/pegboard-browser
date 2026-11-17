@@ -12,6 +12,10 @@ const MAX_AGE_DAYS: std::ops::RangeInclusive<u32> = 1..=3650;
 /// A gigabyte, as the settings count it.
 const GB: f64 = 1e9;
 
+/// How many `blob:`/`view-source:`/`filesystem:` wrappers `screen_off` unwraps; a URL
+/// nested deeper counts as off.
+pub const SCREEN_OFF_DEPTH: usize = 8;
+
 /// Smallest size limit, in GB (1 MB): below it a limit is surely a typing error.
 const MIN_GB: f64 = 0.001;
 
@@ -113,11 +117,16 @@ impl RecordingConfig {
     /// parse counts as off when the list is not empty; data: and about:blank are never off.
     /// `blob:`, `view-source:` and `filesystem:` URLs are judged by the URL inside them; any
     /// other URL without a host (`file:`, `about:srcdoc`, ...) cannot be told apart from a
-    /// listed page and counts as off too.
+    /// listed page and counts as off too, as does one nested more than `SCREEN_OFF_DEPTH`
+    /// deep.
     pub fn screen_off(&self, url: &str) -> bool {
         if self.screen_off_domains.is_empty() {
             return false;
         }
+        self.screen_off_within(url, SCREEN_OFF_DEPTH)
+    }
+
+    fn screen_off_within(&self, url: &str, depth: usize) -> bool {
         let url = url.trim();
         let Ok(parsed) = url::Url::parse(url) else {
             return true;
@@ -128,9 +137,10 @@ impl RecordingConfig {
             "about" if parsed.path() == "blank" => false,
             // The inner URL, from the parsed form (tabs and newlines taken out, as the browser
             // does), so the cut after `<scheme>:` is exact.
-            "blob" | "view-source" | "filesystem" => {
-                self.screen_off(&parsed.as_str()[scheme.len() + 1..])
-            }
+            "blob" | "view-source" | "filesystem" => match depth.checked_sub(1) {
+                Some(depth) => self.screen_off_within(&parsed.as_str()[scheme.len() + 1..], depth),
+                None => true,
+            },
             _ if target_of(&parsed).is_none() => true,
             _ => host_listed(&parsed, &self.screen_off_domains),
         }
@@ -341,6 +351,12 @@ mod tests {
             .unwrap();
         assert!(c.screen_off("http://10.0.0.1/"));
         assert!(!c.screen_off("http://10.0.0.2/"));
+        // Nesting deeper than SCREEN_OFF_DEPTH is not unwrapped: it counts as off.
+        let c = off(&["bank.example"]);
+        let nested = |n: usize| format!("{}https://other.test/", "view-source:".repeat(n));
+        assert!(!c.screen_off(&nested(SCREEN_OFF_DEPTH)));
+        assert!(c.screen_off(&nested(SCREEN_OFF_DEPTH + 1)));
+        assert!(c.screen_off(&nested(10_000)));
         // An empty list never turns the screen off.
         let c = off(&[]);
         for url in ["https://bank.example/", "not a url", "about:blank"] {
