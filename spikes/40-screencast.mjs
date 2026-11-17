@@ -589,6 +589,7 @@ if (want('s6')) {
       i, kind, order, reqSeq, startNavSeq, navigatedSeq, newSeq,
       requestedReason: requestedEv?.p?.reason, startedNavigationType: startedEv?.p?.navigationType,
       framesStartedToNavigated, captures: captureRows,
+      framesNavigatedToNew: evs.filter((e) => e.name === 'frame' && navigatedSeq != null && e.seq > navigatedSeq && (newSeq == null || e.seq < newSeq)).map(cls),
       otherFrames: evs.filter((e) => e.name === 'frame' && cls(e) === 'other').map((e) => e.y),
     });
     if (kind === 'popup-window-open') {
@@ -623,11 +624,15 @@ if (want('s6')) {
   }
   const between = trials.flatMap((t) => t.framesStartedToNavigated);
   line('S6 frames between frameStartedNavigating and frameNavigated', JSON.stringify({ total: between.length, old: between.filter((x) => x === 'old').length, new: between.filter((x) => x === 'new').length, other: between.filter((x) => x === 'other').length }));
+  const late = trials.flatMap((t) => t.framesNavigatedToNew || []);
+  line('S6 frames between frameNavigated and the first new-document frame', JSON.stringify({ total: late.length, old: late.filter((x) => x === 'old').length, other: late.filter((x) => x === 'other').length }));
   const caps = trials.flatMap((t) => t.captures);
   const newBeforeNavigated = caps.filter((c) => c.doc === 'new' && !c.afterNavigated).length;
   const newBeforeStarted = caps.filter((c) => c.doc === 'new' && !c.afterStarted).length;
   line('S6 mid-navigation captures', `${caps.length}: new doc ${caps.filter((c) => c.doc === 'new').length}, old ${caps.filter((c) => c.doc === 'old').length}, other ${caps.filter((c) => c.doc === 'other').length}`);
   line('S6 capture showed the new document before frameNavigated arrived', `${newBeforeNavigated} ${newBeforeNavigated === 0 ? 'PASS' : 'FAIL'}`);
+  const oldAfter = caps.filter((c) => c.doc === 'old' && c.afterNavigated).length;
+  line('S6 capture showed the old document after frameNavigated arrived', `${oldAfter}`);
   line('S6 capture showed the new document before frameStartedNavigating arrived', `${newBeforeStarted} ${newBeforeStarted === 0 ? 'PASS' : 'FAIL'}`);
   const other = trials.flatMap((t) => t.otherFrames);
   line('S6 frames matching neither document', `${other.length} (scrollY values ${JSON.stringify([...new Set(other)].slice(0, 20))})`);

@@ -631,3 +631,136 @@ Extended Stable 태그 `156.0.8078.96`을 받아 한 번 빌드했다. 스크립
 - G3의 세 이름은 한 번의 실행에서 매핑했다(따로 실행하지 않음).
 - (3라운드) 로드된 iframe 안 다운로드에서 iframe 타깃이 이미 사라진 뒤 최상위 탭을 찾는 방법, 권한을 준 상태에서 CSP 때문에 목록에 없는 호스트로의 웹소켓이 거절되는 것, 외부 DNS 질의가 필요한 이름의 조회 지연, 다른 사이트 iframe 안의 키 경로를 방어 없이 쟀을 때의 양성 대조, `data:` 주소의 `tabs.update` 이동(`bridge.rs`의 CDP 경로), 이미 열려 있던 탭에서 주입 세션과 에이전트 세션의 나이 순서.
 - (3라운드) 3라운드 마지막 일괄 실행 중 `23`의 둘째 실행과 `28`의 두 실행은 사용자 클립보드에 텍스트가 아닌 내용(이미지)이 들어와 스크립트의 안전 장치가 실행을 거절해(종료 코드 3) 일괄 로그가 없다. `28`은 같은 세션의 앞선 두 번의 성공 실행 중 저장된 결과(JSON)를 보고서에 넣었다.
+
+## 2b단계 측정
+
+2b단계(화면 녹화) 계획 작업 1. 설계 5절의 다섯 가지와 화면 기록 끄기에 필요한 이벤트 순서(S6)를 쟀다(2026-11-17). 두 번째 기계에서 Chrome for Testing 157.0.8103.78로 돌렸고, 화면 배율(`devicePixelRatio`)은 1이다(레티나가 아니다). 스크립트는 `spikes/40-screencast.mjs`(V1~V5, S6), `41-human-signals.mjs`와 시험용 확장 `spikes/ext-activity/`(H1~H8), `42-disk.mjs`(D)이고, 지연(S2)과 2a 방어와의 충돌(S4)은 `crates/pegboard-core/tests/probe_2b.rs`로 잰다. 원자료는 `spikes/out/40-screencast.json`, `41-human-signals.json`, `42-disk.json`(깃 제외). 표기는 위와 같다: [확인]은 직접 관찰한 것.
+
+공통 설정: 임시 user-data-dir에 `Agent` 프로필 하나. 연결 F는 포커스 유지 세션(`Emulation.setFocusEmulationEnabled`, `Page.setWebLifecycleState active`)을, 연결 R은 녹화기 역을 맡는다. 구성 A는 F의 세션에서, 구성 B는 R의 자기 세션에서 `Page.startScreencast {format: jpeg, quality: 60, maxWidth: 1280}`을 건다. 시험 페이지는 100ms마다 배경색이 바뀐다(그래서 화면이 보이면 초당 10장까지 나온다).
+
+**이번 실행에서 사람이 한 단계는 없다.** 41의 H1~H5는 모두 운영체제 수준의 합성 입력(System Events 키 입력, CGEvent 클릭, 앱 활성화)이다. Chrome은 이것을 실제 사용자 입력으로 받지만, 사람이 직접 한 입력과 같다는 것은 확인하지 않았다. H2는 접근성 트리에서 뒤로 단추를 찾지 못해 단추 클릭 대신 Cmd+[ 키로 했다.
+
+### V. 창 상태별 스트림과 직접 캡처 (`40-screencast.mjs`)
+
+**V1. 10초 동안의 스트림 프레임 수, 직접 캡처(JPEG 60) 10번** [확인]. 상태마다 두 번 들어가 A와 B를 각각 두 번 쟀다. 아래 값은 두 번의 범위다.
+
+| 상태 | 만든 방법 | 스트림 A | 스트림 B | 캡처 (A·B 모두) | 페이지의 `visibilityState`, `hasFocus` |
+|---|---|---|---|---|---|
+| 보이는 탭 | 없음 | 101 | 101 | 10/10, 중앙값 33~36ms, 최대 51ms | visible, true |
+| 같은 창의 뒤쪽 탭 | `Target.activateTarget`으로 다른 탭 활성화 | 41 | 37~40 | 10/10, 중앙값 33ms, 최대 62ms | visible, true |
+| 최소화한 창 | `Browser.setWindowBounds minimized` (확인됨) | 37~38 | 38~41 | 10/10, 중앙값 33ms, 최대 60ms | visible, true |
+| 다른 창에 가려진 창 | 스파이크가 띄운 두 번째 Chrome 창(마젠타)으로 전체를 덮음, 화면 픽셀로 확인 | 101 | 101 | 10/10, 중앙값 33ms, 최대 51ms | visible, true |
+| 다른 Space | Control+→(System Events) | **미측정** | **미측정** | | |
+| 화면 잠금 중 | 사람 단계 | **미측정** | **미측정** | | |
+| 디스플레이 절전 | `pmset displaysleepnow` | **미측정** | **미측정** | | |
+
+- 잰 네 상태 모두 두 구성에서 스트림 프레임이 왔고 캡처가 10번 모두 1초 안에 성공했다. 뒤쪽 탭과 최소화 창에서는 프레임이 초당 약 4장으로 줄었다(보이는 탭은 10장).
+- 다른 Space: 단축키로 Space를 바꾼 뒤에도 창이 화면 목록에 남아 상태를 만들지 못했다(Space가 하나뿐이거나 단축키가 꺼져 있었다고 본다). 스크립트는 SKIPPED로 기록했다.
+- 화면 잠금과 디스플레이 절전은 사람이 필요한 실행(`--with-lock --with-sleep`)을 아직 하지 않았다.
+
+**V2. 되돌린 뒤 스트림을 다시 걸지 않아도 프레임이 오는가** [확인]. 잰 네 상태에서 A와 B 모두 되돌린 뒤 5초에 50장(초당 10장)이 왔다. 잠금, 절전, 다른 Space에서는 미측정.
+
+**V3. 프레임 크기** [확인]. 배율 1 화면, 창 1280×860.
+
+| 방식 | 픽셀 | 바이트 | 시간 (10번) |
+|---|---|---|---|
+| 스트림 `maxWidth: 1280` | 1280×717 | 중앙값 7,853 (30장) | |
+| 직접 캡처 그대로 | 1280×717 | 8,400 | 중앙값 33.7ms, 최대 50.7ms |
+| 직접 캡처 `clip`(배율 1.0, 스크롤바를 뺀 1265×717) | 1265×717 | 6,876 | 중앙값 49.2ms, 최대 54.9ms |
+
+이 화면에서는 `clip`이 크기를 줄이지 않고 15ms 느리다(`Page.getLayoutMetrics` 호출은 시간에 넣지 않았다). 레티나 화면에서의 차이(그대로 찍으면 가로 2560이 된다)는 미측정.
+
+**V4. 확인(ack) 방식** [확인]. 구성 B, 10초씩. CPU는 `SystemInfo.getProcessInfo`의 `cpuTime` 차이(한 코어 = 100%).
+
+| 방식 | 초당 프레임 | 브라우저 | 렌더러 | GPU | 페이지가 멈춘 뒤 마지막 프레임이 마지막 상태인가 |
+|---|---|---|---|---|---|
+| 스트림 없음 | | 0.9% | 2.6% | 5.4% | |
+| 받자마자 확인 | 10.1 | 9.8% | 3.1% | 7.2% | 맞다 |
+| 500ms 늦춰 확인 | 5.1 | 5.7% | 2.8% | 7.2% | 맞다 |
+
+**V5. 다른 연결(에이전트 역)의 `Page.startScreencast`/`stopScreencast`** [확인]. R이 스트림을 거는 동안, 같은 탭에 붙은 세 번째 연결이 자기 세션에서 `startScreencast {maxWidth: 320}`, `stopScreencast`, 그리고 시작 없이 `stopScreencast`를 보냈다. R의 프레임은 3초에 30~31장 그대로였고 가로도 1280 그대로였다. 에이전트 쪽은 자기 스트림을 받았다(3초에 31장). **에이전트 세션은 녹화기의 스트림을 멈추지도 바꾸지도 못한다.** 프록시를 거친 경우는 S4에서 잰다(아래 미측정 참고).
+
+### S6. 탐색 이벤트와 새 문서의 첫 프레임의 순서 (`40-screencast.mjs`)
+
+R의 세션에서 탐색 50번을 했다: 직접 이동(F의 `Page.navigate`) 13번, 302로 다른 호스트(127.0.0.1과 localhost를 오감, 다른 사이트) 13번, 스크립트의 `location=` 12번, `window.open`으로 처음부터 그 주소인 팝업 12번(R이 브라우저 수준 `Target.setAutoAttach {waitForDebuggerOnStart}`로 붙어 스트림을 건 뒤 재개). 문서마다 처음 스크롤 위치를 다르게 두고 프레임의 `metadata.scrollOffsetY`로 어느 문서의 것인지 가렸다. 직접 캡처는 탐색을 시작하고 0, 30, 100, 250ms 뒤에 PNG로 보냈고, 고정 위치의 색 상자로 어느 문서의 그림인지 가렸다. 이벤트와 응답의 순서는 R의 웹소켓에 도착한 순서다 [확인].
+
+| 종류 | 순서 (모든 회차) | `frameRequestedNavigation.reason` | `frameStartedNavigating.navigationType` |
+|---|---|---|---|
+| 직접 이동 | started < navigated < 새 프레임 (13/13) | 오지 않음 | differentDocument |
+| 302, 다른 호스트 | started < navigated < 새 프레임 (13/13) | 오지 않음 | differentDocument |
+| 스크립트 `location=` | requested < started < navigated < 새 프레임 (12/12) | scriptInitiated | differentDocument |
+| 팝업 (`window.open`) | requested < started < navigated < 새 프레임 (12/12) | other | differentDocument |
+
+- `Page.frameStartedNavigating`과 `Page.frameNavigated`(주 프레임)는 50번 모두 새 문서의 첫 스트림 프레임보다 먼저 왔다. `frameRequestedNavigation`은 브라우저가 시작한 탐색(직접 이동, 302) 26번에는 오지 않았다.
+- `frameStartedNavigating`과 `frameNavigated` 사이에 온 스트림 프레임 10장은 모두 이전 문서의 것이었다.
+- 탐색 도중의 직접 캡처 147번: 새 문서 114, 이전 문서 33, 어느 쪽도 아님 0. **새 문서의 그림이 `frameNavigated`(또 `frameStartedNavigating`)보다 먼저 돌아온 적은 없다.**
+- **반대 방향은 있다: 이전 문서의 그림이 `frameNavigated`가 온 뒤에 돌아온 것이 29번이다.** 화면 기록을 끈 도메인에서 나가는 탐색이면, 새 주소의 `frameNavigated` 뒤에도 끈 도메인의 화면이 한동안 찍힌다는 뜻이다. 같은 구간의 스트림 프레임(`frameNavigated`와 새 문서의 첫 프레임 사이)은 이번 실행에서 따로 세지 않았다. 스크립트에 그 줄을 더했다(`S6 frames between frameNavigated and the first new-document frame`).
+- 302로 다른 사이트로 넘어갈 때 `frameStartedNavigating`의 `url`은 처음 주소다. 넘어간 곳의 주소는 `frameNavigated`에서야 안다.
+
+### H. 사람 개입 신호 (`41-human-signals.mjs`)
+
+같은 탭에서 사람 역 단계(H1~H5, 합성 운영체제 입력)와 에이전트·스크립트 단계(H6, H7)를 번갈아 했다. 신호의 출처: cdp는 R의 자기 페이지 세션, ext는 시험용 확장(권한 `tabs`만), page는 R이 페이지에 넣은 리스너(설계가 쓰지 않으려는 방법이고 비교용이다) [확인].
+
+| 단계 | 입력 | cdp | ext | page |
+|---|---|---|---|---|
+| H1 주소창 입력 | Cmd+L, 입력, Return | started(differentDocument), navigated | | keydown, blur, focus |
+| H6 `open` | agent-browser | started(differentDocument), navigated | | focus |
+| H2 뒤로 | Cmd+[ (단추를 못 찾음) | started(historyDifferentDocument), navigated(BackForwardCacheRestore) | | keydown, visibilitychange |
+| H6 `back` | agent-browser | started(historyDifferentDocument), navigated(BackForwardCacheRestore) | | visibilitychange |
+| H3 링크 클릭 | CGEvent 클릭 | requested(anchorClick), started, navigated | | pointerdown, focus |
+| H6 `click` 링크 | agent-browser | requested(anchorClick), started, navigated | | pointerdown, focus |
+| H4 탭 전환과 복귀 | Control+Tab, Control+Shift+Tab | | tabs.onActivated ×2 | blur, visibilitychange ×2, focus |
+| H6 `tab t3`, `tab t2` | agent-browser | | tabs.onActivated ×2 | blur, visibilitychange ×2, focus |
+| H5 다른 앱으로 갔다 옴 | Finder 활성화, 다시 Chrome | | windows.onFocusChanged | blur, focus |
+| H7 `location=` | 페이지 타이머 | requested(scriptInitiated), started, navigated | | focus |
+| H7 `<meta refresh>` | 페이지 | requested(metaTagRefresh), started, navigated | | focus |
+| H7 `history.pushState` | 페이지 타이머 | navigatedWithinDocument(historyApi) | | |
+
+- **탐색 이벤트로는 사람과 에이전트를 가를 수 없다.** 주소창 입력과 `open`, 뒤로와 `back`, 링크 클릭과 `click`, 탭 전환과 `tab`은 cdp와 ext 신호가 같다. 페이지의 `isTrusted`도 모두 true다. H1~H5에만 있던 신호는 `windows.onFocusChanged`(앱 전환. 에이전트는 하지 않는다)와 페이지의 `keydown`뿐이다.
+- 페이지 스크립트의 탐색은 구별된다: `frameRequestedNavigation`의 `reason`이 `scriptInitiated`나 `metaTagRefresh`이고, `pushState`는 `navigatedWithinDocument(historyApi)`다. 사람의 링크 클릭과 에이전트의 클릭은 둘 다 `anchorClick`이다. 스크립트의 `a.click()`이 어느 `reason`이 되는지는 재지 않았다.
+- **H8. 바인딩은 서비스 워커가 다시 시작되면 사라진다.** CDP 세션을 워커에 붙여 둔 채 30초 기다린 뒤(H8a)에는 워커가 그대로였고 탭 전환 신호가 왔다. 세션을 떼고 35초 기다리자 워커가 내려갔다(타깃이 사라짐). 그 상태의 탭 전환은 워커를 새로 띄웠고(새 타깃 ID), 그 워커에는 바인딩이 없었으며(`typeof pegActivity`가 `undefined`) 두 이벤트는 확장이 따로 모아 둔 목록(`pegMissed`)에만 남았다.
+
+### D. 30분 디스크 사용량 (`42-disk.mjs`)
+
+글 페이지, 그림이 많은 페이지(캔버스 48개, 그라디언트와 잡음), CSS 애니메이션 페이지를 20초마다 돌아가며 열었다. 2초마다 스크롤, 5초마다 흉내 낸 명령 하나(앞뒤 직접 캡처). 스트림(구성 B, JPEG 60, `maxWidth: 1280`, 받자마자 확인)은 초당 2장으로 묶어 실제로 파일에 썼다 [확인].
+
+| 항목 | 값 |
+|---|---|
+| 시간 | 30.0분 |
+| 전체 | 197.0MB, 파일 2,857개(`index.jsonl` 포함) |
+| 스트림 | 받은 프레임 37,072, 쓴 프레임 2,139 |
+| 직접 캡처 | 718(실패 0) |
+| 분당 / 시간당 | 6.6MB / 394MB |
+| 14일 추정 | 하루 24시간 녹화면 132GB, 하루 8시간이면 44GB |
+| 5GB로 남는 양 | 하루 24시간이면 0.53일, 8시간이면 1.59일(녹화 약 12.7시간) |
+
+화면이 계속 바뀌는 시험이라 상한에 가깝다. 실제 세션의 명령 빈도와 화면 변화는 재지 않았다.
+
+### 판정 줄
+
+작업 3~5는 아래 줄을 따른다. 아직 결과가 없는 줄은 "보류"라고 적었다.
+
+- F1: 스트림은 녹화기의 자기 연결에 건다(구성 B) (근거: V1, V2, V5. 잰 네 상태에서 A와 B의 프레임 수와 캡처가 같고, 에이전트 세션의 시작·중지가 B의 스트림에 영향이 없다. B를 고른 이유는 프레임이 포커스 유지 연결의 이벤트 방송을 채우지 않는다는 것이다. 다른 Space와 잠금에서의 A와 B 비교는 미측정)
+- F2: 받자마자 확인한다 (근거: V4. 두 방식 모두 마지막 상태의 프레임이 남는다. 늦춘 확인은 브라우저 CPU를 한 코어의 약 4%만큼 줄이지만, 초당 2장으로 묶으므로 받자마자 확인해도 저장량은 같다)
+- F3: 직접 캡처는 그대로(`clip` 없이) 찍는다 (근거: V3. 배율 1 화면에서 `clip`이 크기를 줄이지 않고 15ms 느리다. 레티나 화면에서는 그대로 찍으면 가로 2560이 되는데, 이것은 미측정이다. 레티나 기기에서 V3를 다시 재고 그때 바꿀 수 있다)
+- F4: 보이는 탭, 같은 창의 뒤쪽 탭, 최소화한 창, 다른 창에 가려진 창에서는 스트림과 직접 캡처가 모두 온다(뒤쪽 탭과 최소화는 초당 약 4장). 다른 Space, 화면 잠금, 디스플레이 절전은 **보류(미측정)**. 재생 화면의 "화면 없음"은 기록된 프레임이 없는 구간에 보인다(어느 상태에서 생기는지는 보류한 상태의 측정 뒤에 정한다) (근거: V1, V2)
+- F5: 화면 끄기의 기준은 주 프레임의 `Page.frameNavigated`다. 그 주소가 끈 도메인이면 그때부터 프레임과 캡처를 버린다. `frameStartedNavigating`도 늘 먼저 오지만, 302로 넘어간 곳의 주소는 `frameNavigated`에서야 안다. 탐색 시작부터 `frameNavigated`까지 온 프레임은 이전 문서의 것이었으므로, 끈 도메인에 **들어갈 때는** 시작부터 버릴 필요가 없다. **끈 도메인에서 나갈 때는** `frameNavigated` 뒤에도 이전(끈) 문서의 캡처가 29번 돌아왔으므로, `frameNavigated`에서 바로 다시 켜면 안 된다. 언제 다시 켜야 안전한지는 **보류**(S6을 다시 돌려 `frameNavigated`와 새 문서의 첫 프레임 사이의 스트림 프레임을 센다) (근거: S6)
+- F6: 탐색 이벤트나 확장 신호에는 사람과 에이전트를 가르는 신호가 없다. 판정은 시간으로 한다: 명령 실행 구간 밖에서 일어난 것만 사람 개입 후보다. 그 가운데 `frameRequestedNavigation` 없이 시작한 주 프레임 탐색(주소창, 뒤로·앞으로)과 `tabs.onActivated`(탭 전환)는 확실한 것으로 본다. `anchorClick` 탐색은 페이지 스크립트의 `a.click()`일 수도 있어서, `windows.onFocusChanged`(앱 전환)와 함께 "사람 개입 가능성"으로 본다. `scriptInitiated`, `metaTagRefresh`, `historyApi`는 페이지가 한 것이라 사람 개입이 아니다. 탭 전환은 CDP로는 보이지 않으므로 시험용 확장 방식의 탭 전환 신호를 브리지에 넣는다. 다만 워커가 다시 시작되면 바인딩이 사라지므로, 브리지가 워커를 (다시) 붙일 때마다 바인딩을 다시 걸고, 바인딩이 없던 동안의 이벤트는 확장이 모아 두었다가 넘긴다 (근거: H1~H8. 입력은 사람이 아니라 합성 운영체제 입력이다. 스크립트의 `a.click()`이 어느 `reason`이 되는지는 재지 않았다)
+- F7: **보류** (S2를 아직 재지 못함)
+- F8: 30분 197MB(분당 6.6MB, 시간당 394MB). 14일 추정은 하루 24시간 녹화면 132GB, 8시간이면 44GB. 5GB 한도로는 녹화 약 12.7시간 분량의 화면이 남는다 (근거: D)
+
+### 멈춤 조건 판정 (작업 1 6단계, 지금까지의 결과로)
+
+- **M1: 잰 상태에서는 해당 없음, 보류 셋.** 뒤쪽 탭, 최소화, 가려진 창에서 스트림 프레임이 오고 캡처도 10번 모두 1초 안에 성공했다. 다른 Space, 화면 잠금, 디스플레이 절전은 미측정이다.
+- M2: 보류(S2).
+- M3: 보류(S4). V5(프록시 없이)에서는 에이전트 세션이 녹화기의 스트림을 멈추지 못했다.
+- **M4: 해당 없음.** 새 문서의 프레임(스트림 50번, 캡처 147번)이 `frameStartedNavigating`이나 `frameNavigated`보다 먼저 온 적이 없다. 다만 반대 방향(끈 도메인에서 나갈 때 이전 문서가 `frameNavigated` 뒤에도 찍히는 것)은 M4의 조건이 아니지만 화면 끄기에 영향이 있다(F5).
+- **M5: 해당 없음.** 30분 197MB로 1GB 아래이고 보고 기준 250MB 아래다. 다만 5GB 한도에 화면 약 12.7시간 분량만 들어가므로, 화면을 보존하는 기간은 사실상 14일이 아니라 용량 한도가 정한다(설계 4.7절은 용량 한도로 지울 때 화면부터 지운다).
+
+### 미측정 (2b)
+
+- 다른 Space(이번 기계에서 상태를 만들지 못함), 화면 잠금과 디스플레이 절전(사람이 필요한 실행을 아직 안 함): V1, V2.
+- S2(명령 지연)와 S4(2a 방어 옆의 녹화): 첫 실행은 실행한 작업 공간에 `vendor/agent-browser`가 없어(깃 제외) 시작 전에 실패했다.
+- 레티나 화면에서의 V3.
+- 사람이 직접 한 H1~H5(이번은 합성 운영체제 입력), 뒤로 단추 클릭(Cmd+[로 대신함), 스크립트의 `a.click()`이 어느 `reason`이 되는지.
+- `frameNavigated`와 새 문서의 첫 프레임 사이에 온 스트림 프레임이 어느 문서의 것인지(스크립트에 더함, 다음 실행에서 잰다).

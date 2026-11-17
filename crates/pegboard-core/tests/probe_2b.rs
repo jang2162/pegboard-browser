@@ -228,6 +228,14 @@ impl Mimic {
 
 // ---- helpers ----
 
+/// Fails at once, with the fix, when the agent-browser binary is missing (it is not in git:
+/// `scripts/fetch-agent-browser.sh` fetches it). Nothing is measured without it.
+fn require_agent_browser() {
+    if let Err(e) = pegboard_core::runner::find_agent_browser() {
+        panic!("setup, nothing measured: {}", e.message);
+    }
+}
+
 fn log_for(h: &Harness, info: &SessionInfo) -> ActionLog {
     let manifest = Manifest::new(
         &info.recording_id,
@@ -338,6 +346,7 @@ async fn timed(
 #[test]
 #[ignore]
 fn probe_command_latency_with_and_without_recording() {
+    require_agent_browser();
     common::run(async {
         let h = Harness::start();
         let (info, _ep) = h.session("/form").await;
@@ -488,6 +497,7 @@ async fn agent_eval(c: &CdpConn, sid: &str, expr: &str, gesture: bool) -> String
 #[test]
 #[ignore]
 fn probe_recording_beside_the_2a_defences() {
+    require_agent_browser();
     common::run(async {
         let clip = Clipboard::take();
         let h = Harness::start();
