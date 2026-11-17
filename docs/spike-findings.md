@@ -634,7 +634,7 @@ Extended Stable 태그 `156.0.8078.96`을 받아 한 번 빌드했다. 스크립
 
 ## 2b단계 측정
 
-2b단계(화면 녹화) 계획 작업 1. 설계 5절의 다섯 가지와 화면 기록 끄기에 필요한 이벤트 순서(S6)를 쟀다(2026-11-17). 두 번째 기계에서 Chrome for Testing 157.0.8103.78로 돌렸고, 화면 배율(`devicePixelRatio`)은 1이다(레티나가 아니다). 스크립트는 `spikes/40-screencast.mjs`(V1~V5, S6), `41-human-signals.mjs`와 시험용 확장 `spikes/ext-activity/`(H1~H8), `42-disk.mjs`(D)이고, 지연(S2)과 2a 방어와의 충돌(S4)은 `crates/pegboard-core/tests/probe_2b.rs`로 잰다. 원자료는 `spikes/out/40-screencast.json`, `41-human-signals.json`, `42-disk.json`(깃 제외). 표기는 위와 같다: [확인]은 직접 관찰한 것.
+2b단계(화면 녹화) 계획 작업 1. 설계 5절의 다섯 가지와 화면 기록 끄기에 필요한 이벤트 순서(S6)를 쟀다(2026-11-17). 두 번째 기계에서 Chrome for Testing 157.0.8103.78로 돌렸고, 화면 배율(`devicePixelRatio`)은 1이다(레티나가 아니다). 스크립트는 `spikes/40-screencast.mjs`(V1~V5, S6), `41-human-signals.mjs`와 시험용 확장 `spikes/ext-activity/`(H1~H8), `42-disk.mjs`(D)이고, 지연(S2)과 2a 방어와의 충돌(S4)은 `crates/pegboard-core/tests/probe_2b.rs`로 쟀다(작업 4에서 지웠다. 그 질문은 작업 3·4의 시험이 이어받았다: 거부는 `e2e_proxy`의 `agent_cannot_start_or_stop_the_screencast`, 지연은 `e2e_recording`의 `recording_overhead_meets_the_targets`). 원자료는 `spikes/out/40-screencast.json`, `41-human-signals.json`, `42-disk.json`(깃 제외). 표기는 위와 같다: [확인]은 직접 관찰한 것.
 
 공통 설정: 임시 user-data-dir에 `Agent` 프로필 하나. 연결 F는 포커스 유지 세션(`Emulation.setFocusEmulationEnabled`, `Page.setWebLifecycleState active`)을, 연결 R은 녹화기 역을 맡는다. 구성 A는 F의 세션에서, 구성 B는 R의 자기 세션에서 `Page.startScreencast {format: jpeg, quality: 60, maxWidth: 1280}`을 건다. 시험 페이지는 100ms마다 배경색이 바뀐다(그래서 화면이 보이면 초당 10장까지 나온다).
 
@@ -679,7 +679,7 @@ Extended Stable 태그 `156.0.8078.96`을 받아 한 번 빌드했다. 스크립
 | 받자마자 확인 | 10.1 | 9.8% | 3.1% | 7.2% | 맞다 |
 | 500ms 늦춰 확인 | 5.1 | 5.7% | 2.8% | 7.2% | 맞다 |
 
-**V5. 다른 연결(에이전트 역)의 `Page.startScreencast`/`stopScreencast`** [확인]. R이 스트림을 거는 동안, 같은 탭에 붙은 세 번째 연결이 자기 세션에서 `startScreencast {maxWidth: 320}`, `stopScreencast`, 그리고 시작 없이 `stopScreencast`를 보냈다. R의 프레임은 3초에 30~31장 그대로였고 가로도 1280 그대로였다. 에이전트 쪽은 자기 스트림을 받았다(3초에 31장). **에이전트 세션은 녹화기의 스트림을 멈추지도 바꾸지도 못한다**(프록시를 거치지 않은 연결에서). 프록시를 거친 경우는 S4에 항목을 더했다(에이전트가 세션 프록시로 보낸 `startScreencast`/`stopScreencast`가 거부되고 녹화기의 스트림이 계속되는지). 아직 미측정이다.
+**V5. 다른 연결(에이전트 역)의 `Page.startScreencast`/`stopScreencast`** [확인]. R이 스트림을 거는 동안, 같은 탭에 붙은 세 번째 연결이 자기 세션에서 `startScreencast {maxWidth: 320}`, `stopScreencast`, 그리고 시작 없이 `stopScreencast`를 보냈다. R의 프레임은 3초에 30~31장 그대로였고 가로도 1280 그대로였다. 에이전트 쪽은 자기 스트림을 받았다(3초에 31장). **에이전트 세션은 녹화기의 스트림을 멈추지도 바꾸지도 못한다**(프록시를 거치지 않은 연결에서). 프록시를 거친 경우는 S4에 항목을 더했다(에이전트가 세션 프록시로 보낸 `startScreencast`/`stopScreencast`가 거부되고 녹화기의 스트림이 계속되는지). 결과는 아래 M3.
 
 ### S6. 탐색 이벤트와 새 문서의 첫 프레임의 순서 (`40-screencast.mjs`)
 
@@ -777,7 +777,7 @@ R의 세션에서 탐색 50번을 했다: 직접 이동(F의 `Page.navigate`) 13
 - 실패한 캡처는 종류마다 4~27번(302가 가장 많다)이다. 실패는 그 명령에 그림이 없다는 뜻이고, 이전 문서가 새는 것은 아니다. 실패한 캡처를 탐색의 어느 때에 보냈는지는 이 실행에서 세지 않았다.
 - 뒤로 가기에서 이전 문서의 마지막 스트림 프레임이 `frameNavigated`보다 몇 ms 뒤에 왔는지는 이 실행의 출력에 없다(도착 순서만 셌다). 스크립트에 그 시간과, 실패한 캡처를 `frameNavigated` 앞에 보냈는지 뒤에 보냈는지를 더했다(`S6b <종류> old stream frames after frameNavigated`, `S6b <종류> failed captures`).
 
-### S2. 녹화가 명령에 더하는 시간 (`probe_2b.rs`)
+### S2. 녹화가 명령에 더하는 시간 (`probe_2b.rs`, 작업 4에서 지웠다. 72f1db2에 있다)
 
 `cargo test -p pegboard-core --test probe_2b -- --ignored --test-threads=1 --nocapture`, 72f1db2. 녹화기 흉내: 브라우저에 두 번째 CDP 연결을 열어 세션 탭에 붙고, 스트림을 걸어 받자마자 확인하고 500ms 안의 프레임을 버린다. 직접 캡처는 명령 직전과 직후에 차례로 기다린다(상한 추정). 명령마다 흉내 꺼짐과 켜짐을 짝지어 20번(순서를 번갈아) `daemon::run_command`로 돌렸다. 더해진 시간 = 켜짐 − 꺼짐(짝마다), 그 중앙값과 최대. 설정마다 실패한 실행은 0이다 [확인].
 
@@ -795,6 +795,14 @@ base에서 명령별 더해진 시간 중앙값(ms): `open` 52, `snapshot -i` 52
 - **더해진 시간의 대부분은 차례로 기다리는 직접 캡처다.** base의 더해진 시간(중앙값 약 50~73ms)은 캡처 두 번(각 약 22~29ms)에 가깝다. 직후만 찍으면 캡처 한 번만큼(약 20~46ms)으로 줄어든다. 캡처를 뺀 나머지(스트림이 도는 동안 명령이 느려지는 것과 짝지은 실행 사이의 흔들림)는 명령마다 대략 0~15ms다.
 - 품질 40은 거의 차이가 없다. 가로 800은 `clip`을 위한 `Page.getLayoutMetrics` 호출과 `clip` 캡처가 더 느려(V3와 같은 방향) 오히려 늘었다. 효과가 있는 것은 직전 캡처를 빼는 것뿐이다.
 - 캡처 한 번의 최대는 183ms(q40의 `scroll`)였다. 1초나 500ms 제한에 닿은 적은 없다.
+
+### 작업 4: 실제 녹화기가 명령에 더하는 시간
+
+소유자 결정(2026-11-17, F7에 따라): 직전 캡처는 하지 않는다. `frameBefore`는 명령이 시작할 때 그 탭에 마지막으로 저장된 프레임(스트림 프레임, 또는 앞 명령의 직후 캡처)이고, 없으면 비운다. 직후 캡처 한 장(품질 60, 배율 1이면 그대로, 1보다 크면 `clip`으로 가로 1280 이하, F3)만 찍고, 제한은 500ms, 제한을 넘긴 탭은 30초 동안(또는 그 탭의 스트림 프레임이 올 때까지) 찍지 않는다.
+
+측정: `cargo test -p pegboard-cli --test e2e_recording recording_overhead_meets_the_targets -- --ignored --nocapture`. 세션 하나에서 S2의 14개 명령을 명령마다 20쌍, 시험 훅 `test.setScreen`으로 화면 기록을 켜고 끈 상태를 번갈아(순서도 번갈아) 돌린다. 시간은 동작 기록 항목의 `durationMs`(데몬이 잰 명령 시간, 직후 캡처 포함), 더해진 시간 = 켜짐 − 꺼짐(짝마다). 켜짐마다 스트림을 150ms 전에 다시 건다(S2와 같다).
+
+결과: 두 번째 기계에서 돌린 뒤 표(명령, 중앙값, 최대, 돌린 날짜, 기기 종류)를 여기와 설계 4.6절에 붙인다. **아직 돌리지 않았다.**
 
 ### 판정 줄
 
@@ -824,7 +832,7 @@ base에서 명령별 더해진 시간 중앙값(ms): `open` 52, `snapshot -i` 52
 
 - **M1: 잰 상태에서는 해당 없음, 보류 셋.** 뒤쪽 탭, 최소화, 가려진 창에서 스트림 프레임이 오고 캡처도 10번 모두 1초 안에 성공했다. 다른 Space, 화면 잠금, 디스플레이 절전은 미측정이다.
 - **M2: 해당 없음, 단 설계 변경이 필요하다.** 설계 그대로(base)는 14개 명령 중 12개의 더해진 시간 중앙값이 50ms를 넘는다(48~73ms, 최대 139ms; 1초를 넘은 것은 없다). 그러나 가벼운 설정(품질 40, 가로 800, 직후만: 19~49ms, 최대 142ms)과 직후 캡처만 하는 설정(20~46ms, 최대 71ms)으로 모두 맞춘다. M2는 "가벼운 설정으로도 못 맞춘다"일 때만 멈추므로 해당 없다. 맞추는 방법은 직전 캡처를 빼는 것이다(F7). after-only를 두 번 더 돌려 두 번 모두 맞췄고(실패한 캡처 0), 여유는 가장 좁을 때 2ms다.
-- **M3: 보류.** S4는 시작하자마자 멈췄다: 시스템 클립보드에 텍스트가 아닌 내용(`«class HTML»`, 서식 있는 복사)이 있어 클립보드 도우미가 아무것도 바꾸지 않고 실행을 거절했다. 일반 텍스트만 복사한 상태로 다시 돌린다. V5(프록시 없이)에서는 에이전트 세션이 녹화기의 스트림을 멈추지 못했다.
+- **M3: 해당 없음.** S4를 e48efe8에서 다시 돌렸다(클립보드에 일반 텍스트만 둔 상태). 녹화기 흉내 옆에서 2a 방어가 모두 그대로였다: 클립보드 쓰기와 읽기 막힘, 사설 주소 막힘, 내려받기가 세션 파일로 감, 팝업의 내려받기가 그 세션 것으로 기록됨, 대화 상자 수락, 팝업이 세션에 들어옴. S4의 스크린캐스트 항목은 "녹화기의 스트림이 계속 온다"는 조건만 실패했는데, 그 항목의 페이지(`/form`)가 바뀌지 않는 정적 페이지라 프레임이 오지 않았기 때문이다(방어와의 충돌이 아니다). 에이전트가 세션 프록시로 보낸 `startScreencast`/`stopScreencast`의 거부 자체는 `e2e_proxy`의 `agent_cannot_start_or_stop_the_screencast`가 확인한다(작업 3). V5(프록시 없이)에서도 에이전트 세션은 녹화기의 스트림을 멈추지 못했다.
 - **M4: 해당 없음.** 새 문서의 프레임(스트림 50번, 캡처 147번)이 `frameStartedNavigating`이나 `frameNavigated`보다 먼저 온 적이 없다. 다만 반대 방향(끈 도메인에서 나갈 때 이전 문서가 `frameNavigated` 뒤에도 찍히는 것)은 M4의 조건이 아니지만 화면 끄기에 영향이 있다(F5).
 - **M5: 해당 없음(배율 1 화면).** 30분 197MB로 1GB 아래이고 보고 기준 250MB 아래다. 다만 5GB 한도에 화면 약 12.7시간 분량만 들어가므로, 화면을 보존하는 기간은 사실상 14일이 아니라 용량 한도가 정한다(설계 4.7절은 용량 한도로 지울 때 화면부터 지운다).
 
@@ -832,7 +840,6 @@ base에서 명령별 더해진 시간 중앙값(ms): `open` 52, `snapshot -i` 52
 
 소유자의 기계 시간이 필요한 아래 항목은 작업 8의 수동 확인에서 한다. 그동안 작업 3은 위의 판정 줄대로 진행한다.
 
-- S4와 M3: 시스템 클립보드에 일반 텍스트만 둔 상태에서 `cargo test -p pegboard-core --test probe_2b probe_recording_beside_the_2a_defences -- --ignored --test-threads=1 --nocapture` (프록시를 거친 `startScreencast`/`stopScreencast` 항목 포함).
 - 화면 잠금과 디스플레이 절전(사람이 잠금을 푼다): `cd spikes && node 40-screencast.mjs --auto --with-lock --with-sleep --only=locked,display-sleep`.
 - 다른 Space(Space 두 개 이상, Control+←/→ 단축키 켬): `cd spikes && node 40-screencast.mjs --auto --only=other-space`.
 - 사람이 직접 하는 H1~H5: `cd spikes && node 41-human-signals.mjs` (`--auto` 없이).
@@ -841,7 +848,6 @@ base에서 명령별 더해진 시간 중앙값(ms): `open` 52, `snapshot -i` 52
 ### 미측정 (2b)
 
 - 다른 Space(이번 기계에서 상태를 만들지 못함), 화면 잠금과 디스플레이 절전(사람이 필요한 실행을 아직 안 함): V1, V2.
-- S4(2a 방어 옆의 녹화): 첫 실행은 `vendor/agent-browser`가 없어서, 둘째 실행은 클립보드에 HTML 서식이 있어서 시작 전에 멈췄다. S2는 둘째 실행에서 쟀다.
 - 레티나 화면(배율 2)에서의 V3, S2, D: 캡처 시간, 프레임 크기, 디스크 사용량. 쓸 수 있는 두 번째 레티나 기기가 없어 재지 않는다. F3의 규칙(배율이 1보다 크면 `clip`으로 가로 1280 이하)은 측정 없이 정했다.
 - 사람이 직접 한 H1~H5(이번은 합성 운영체제 입력), 뒤로 단추 클릭(Cmd+[로 대신함).
 - F5: 무거운 페이지에서 back/forward 캐시 복원 뒤 이전 문서 프레임이 오는 시간(250ms 한도가 충분한지), 뒤로 가기 외 종류에서 실패한 캡처를 보낸 때, 내용을 그리지 않는 페이지, 같은 문서 안의 탐색(`pushState`)에서 나가는 경우, 실제 사이트.
