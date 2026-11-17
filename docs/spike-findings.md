@@ -718,7 +718,7 @@ R의 세션에서 탐색 50번을 했다: 직접 이동(F의 `Page.navigate`) 13
 | H7 `history.pushState` | 페이지 타이머 | navigatedWithinDocument(historyApi) | | |
 
 - **탐색 이벤트로는 사람과 에이전트를 가를 수 없다.** 주소창 입력과 `open`, 뒤로와 `back`, 링크 클릭과 `click`, 탭 전환과 `tab`은 cdp와 ext 신호가 같다. 페이지의 `isTrusted`도 모두 true다. H1~H5에만 있던 신호는 `windows.onFocusChanged`(앱 전환. 에이전트는 하지 않는다)와 페이지의 `keydown`뿐이다.
-- 페이지 스크립트의 탐색은 구별된다: `frameRequestedNavigation`의 `reason`이 `scriptInitiated`나 `metaTagRefresh`이고, `pushState`는 `navigatedWithinDocument(historyApi)`다. 사람의 링크 클릭과 에이전트의 클릭은 둘 다 `anchorClick`이다. 스크립트의 `a.click()`이 어느 `reason`이 되는지는 재지 않았다.
+- 페이지 스크립트의 탐색 가운데 구별되는 것은 셋뿐이다: `location=`(`frameRequestedNavigation`의 `reason`이 `scriptInitiated`), `<meta refresh>`(`metaTagRefresh`), `pushState`(`navigatedWithinDocument(historyApi)`). 둘째 실행에서 잰 스크립트의 `history.back()`/`go(-1)`과 `a.click()`(`anchorClick`)은 사람의 입력과 구별되지 않는다(F6). 사람의 링크 클릭과 에이전트의 클릭도 둘 다 `anchorClick`이다.
 - **H8. 바인딩은 서비스 워커가 다시 시작되면 사라진다.** CDP 세션을 워커에 붙여 둔 채 30초 기다린 뒤(H8a)에는 워커가 그대로였고 탭 전환 신호가 왔다. 세션을 떼고 35초 기다리자 워커가 내려갔다(타깃이 사라짐). 그 상태의 탭 전환은 워커를 새로 띄웠고(새 타깃 ID), 그 워커에는 바인딩이 없었으며(`typeof pegActivity`가 `undefined`) 두 이벤트는 확장이 따로 모아 둔 목록(`pegMissed`)에만 남았다.
 
 ### D. 30분 디스크 사용량 (`42-disk.mjs`)
@@ -807,12 +807,12 @@ base에서 명령별 더해진 시간 중앙값(ms): `open` 52, `snapshot -i` 52
 - F5: **들어갈 때**의 기준은 주 프레임의 `Page.frameNavigated`다. 그 주소가 끈 도메인이면 그때부터 스트림 프레임과 직접 캡처를 버린다. `frameStartedNavigating`도 늘 먼저 오지만, 302로 넘어간 곳의 주소는 `frameNavigated`에서야 안다. 탐색 시작부터 `frameNavigated`까지 온 프레임은 이전 문서의 것이었으므로 시작부터 버릴 필요가 없다(S6 두 실행, 새 문서가 먼저 온 적 0). **끈 도메인에서 나갈 때**는 다음을 따른다.
   - 직접 캡처: 새 주 프레임의 `frameNavigated`가 도착한 **뒤에 보낸** 캡처만 쓴다. 그 전에 보낸 캡처는 응답이 늦게 와도 버린다. 근거: 그 뒤에 보낸 캡처 1,437번 중 이전 문서 0(S6b 여섯 종류).
   - 스트림 프레임: 새 문서(`frameNavigated`의 `loaderId`)의 `Page.lifecycleEvent` `firstContentfulPaint`까지 버린다. 그 전에 온 새 문서 프레임은 잃고(탐색 하나에 약 1장, 첫 그림이 늦는 페이지에서는 그림이 나올 때까지), 그 구간은 재생 화면에 "화면 기록 꺼짐"으로 보인다. 근거: 그 뒤의 이전 문서 프레임 0(다섯 종류, 150번). `networkAlmostIdle`은 쓰지 않는다: 긴 폴링 페이지에서 30번 모두 오지 않았고 back/forward 캐시 복원에서도 오지 않는다. `firstContentfulPaint`가 오지 않는 문서(내용을 그리지 않는 페이지)는 기록되지 않은 채로 남는다(닫힌 쪽으로 실패).
-  - back/forward 캐시 복원(`frameNavigated.type`이 `BackForwardCacheRestore`, lifecycle 이벤트가 오지 않는다): 스트림 프레임을 `frameNavigated`부터 **250ms** 동안 버리고, `frameNavigated` 뒤에 보낸 직접 캡처 한 장으로 그 구간의 그림을 남긴다. 250ms는 "잰 가장 긴 지연의 두 배와 250ms 중 큰 쪽"이다: 뒤로 가기 30번(f80a503)에서 `frameNavigated` 뒤에 이전 문서의 스트림 프레임이 온 것은 3번, 마지막 것은 `frameNavigated` 뒤 최대 14ms, 중앙값 5ms였다(두 배 28ms). 가벼운 페이지에서만 쟀으므로 아래 한도를 250ms로 두었다. 같은 실행에서 `frameNavigated` 뒤에 보낸 캡처 236번 중 이전 문서 0, 실패한 캡처 22번은 모두 `frameNavigated` 전에 보낸 것이었다.
+  - back/forward 캐시 복원(`frameNavigated.type`이 `BackForwardCacheRestore`, lifecycle 이벤트가 오지 않는다): 스트림 프레임을 `frameNavigated`부터 **250ms** 동안 버리고, `frameNavigated` 뒤에 보낸 직접 캡처 한 장으로 그 구간의 그림을 남긴다. 250ms는 "잰 가장 긴 지연의 두 배와 250ms 중 큰 쪽"이다: 뒤로 가기만 30번 돌린 따로 한 실행(f80a503, `--only=s6b --kinds=history-back`. 위 표의 84eec45 실행과 다르다)에서 `frameNavigated` 뒤에 이전 문서의 스트림 프레임이 온 것은 3번, 마지막 것은 `frameNavigated` 뒤 최대 14ms, 중앙값 5ms였다(두 배 28ms). 가벼운 페이지에서만 쟀으므로 아래 한도를 250ms로 두었다. 같은 실행에서 `frameNavigated` 뒤에 보낸 캡처 236번 중 이전 문서 0, 실패한 캡처 22번은 모두 `frameNavigated` 전에 보낸 것이었다.
   - 모두 가벼운 시험 페이지에서 잰 것이다(종류마다 30번) (근거: S6, S6b)
 - F6: 탐색 이벤트나 확장 신호에는 사람과 에이전트(또는 페이지 스크립트)를 확실히 가르는 신호가 없다. 판정은 시간으로 한다: 명령 실행 구간 밖에서 일어난 것만 사람 개입 후보다. 그리고 **어느 것도 확실한 것으로 보지 않는다. 모두 "사람 개입 가능성"이다.** 이유:
   - `frameRequestedNavigation` 없이 시작한 탐색(주소창, 뒤로·앞으로): 페이지 스크립트의 `history.back()`, `history.go(-1)`도 같은 모양이다(`frameStartedNavigating(historyDifferentDocument)`, `BackForwardCacheRestore`, `frameRequestedNavigation` 없음).
   - 링크 클릭(`anchorClick`): 스크립트의 `a.click()`도 `frameRequestedNavigation(anchorClick)`이다.
-  - 탭 전환(`tabs.onActivated`): 페이지가 `window.open`으로 연 팝업이 열리고 닫힐 때도 두 번 온다(사람 없이).
+  - 탭 전환(`tabs.onActivated`): 페이지가 `window.open`으로 연 팝업이 열리고 닫힐 때도 두 번 온다(사람 없이). 이 단계의 `window.open`은 CDP가 준 사용자 제스처(`Runtime.evaluate`의 `userGesture`)로 열었다. 제스처 없이 연 팝업은 팝업 차단에 막혔을 것이다.
   - 앱 전환(`windows.onFocusChanged`): 이번에 사람 쪽 단계에서만 보였지만, 페이지가 새 창을 열 때 오는지는 재지 않았다.
   - 사람 개입이 아닌 것: `frameRequestedNavigation`의 `scriptInitiated`, `metaTagRefresh`, 그리고 `navigatedWithinDocument(historyApi)`.
   - 탭 전환은 CDP로는 보이지 않으므로 시험용 확장 방식의 신호를 브리지에 넣는다. 워커가 다시 시작되면 바인딩이 사라진다(두 실행 모두). 브리지는 워커를 다시 붙일 때마다 바인딩을 다시 걸고, 확장이 모아 둔 이벤트를 넘겨받는다: 다시 건 바인딩으로 모아 둔 2건을 넘겨 2건 모두 받았다(H8 재전달, [확인]).
@@ -843,5 +843,5 @@ base에서 명령별 더해진 시간 중앙값(ms): `open` 52, `snapshot -i` 52
 - 다른 Space(이번 기계에서 상태를 만들지 못함), 화면 잠금과 디스플레이 절전(사람이 필요한 실행을 아직 안 함): V1, V2.
 - S4(2a 방어 옆의 녹화): 첫 실행은 `vendor/agent-browser`가 없어서, 둘째 실행은 클립보드에 HTML 서식이 있어서 시작 전에 멈췄다. S2는 둘째 실행에서 쟀다.
 - 레티나 화면(배율 2)에서의 V3, S2, D: 캡처 시간, 프레임 크기, 디스크 사용량. 쓸 수 있는 두 번째 레티나 기기가 없어 재지 않는다. F3의 규칙(배율이 1보다 크면 `clip`으로 가로 1280 이하)은 측정 없이 정했다.
-- 사람이 직접 한 H1~H5(이번은 합성 운영체제 입력), 뒤로 단추 클릭(Cmd+[로 대신함), 스크립트의 `a.click()`이 어느 `reason`이 되는지.
+- 사람이 직접 한 H1~H5(이번은 합성 운영체제 입력), 뒤로 단추 클릭(Cmd+[로 대신함).
 - F5: 무거운 페이지에서 back/forward 캐시 복원 뒤 이전 문서 프레임이 오는 시간(250ms 한도가 충분한지), 뒤로 가기 외 종류에서 실패한 캡처를 보낸 때, 내용을 그리지 않는 페이지, 같은 문서 안의 탐색(`pushState`)에서 나가는 경우, 실제 사이트.
