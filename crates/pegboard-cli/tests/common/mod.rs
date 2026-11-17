@@ -235,6 +235,24 @@ paint(); setInterval(paint, 100);
                 r#"<button id="pop" onclick="window.open('http://{SCREEN_OFF_NAME}:{port}/off')">Open</button>"#
             ),
         )),
+        // Its background changes every 100 ms (frames, but no contentful paint); text
+        // appears after 2.5 s, and `paintedAt` is the time of its first contentful paint.
+        "/late" => html(page(
+            "late",
+            r#"<script>
+let n = 0;
+setInterval(() => { n++; document.body.style.background = 'hsl(' + (n * 37 % 360) + ',70%,60%)'; }, 100);
+window.paintedAt = null;
+new PerformanceObserver(l => {
+  for (const e of l.getEntries()) {
+    if (e.name === 'first-contentful-paint') window.paintedAt = performance.timeOrigin + e.startTime;
+  }
+}).observe({ type: 'paint', buffered: true });
+setTimeout(() => {
+  const h = document.createElement('h1'); h.textContent = 'late'; document.body.appendChild(h);
+}, 2500);
+</script>"#,
+        )),
         "/popup" => html(page(
             "popup",
             r#"<button id="pop" onclick="window.open('/animated')">Open</button>"#,

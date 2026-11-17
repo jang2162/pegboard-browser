@@ -201,11 +201,18 @@ fn screen_frames_are_recorded_by_default() {
         "{} change frames in {secs:.1} s",
         frames.len()
     );
-    // At most two a second: consecutive frames are half a second apart (the clock reads
-    // around them allow a little less).
-    for pair in frames.windows(2) {
-        let gap = ts_ms(pair[1]["ts"].as_str().unwrap()) - ts_ms(pair[0]["ts"].as_str().unwrap());
-        assert!(gap >= 450, "{gap} ms between {} and {}", pair[0], pair[1]);
+    // At most two a second: no second holds more than two frames, plus the settled one a
+    // throttle hands out later with the time it arrived.
+    let times: Vec<i64> = frames
+        .iter()
+        .map(|f| ts_ms(f["ts"].as_str().unwrap()))
+        .collect();
+    for (i, t) in times.iter().enumerate() {
+        let within = times[i..].iter().filter(|u| **u < t + 1000).count();
+        assert!(
+            within <= 3,
+            "{within} frames within 1 s from {t}: {frames:?}"
+        );
     }
     for f in &frames {
         assert!(f["width"].as_u64().unwrap() > 0, "{f}");
@@ -501,4 +508,101 @@ fn hidden_tab_follows_the_measured_rule() {
         behind.len(),
         index(&dir, &a)
     );
+}
+
+fn hook(home: &Home, method: &str, params: Value) -> Value {
+    let paths = pegboard_core::paths::paths_in(home.path());
+    pegboard_core::api::Client::connect(&paths)
+        .unwrap()
+        .call(method, params)
+        .unwrap()
+}
+
+/// F5 across a reattach: the recorder lost the tab while it was on a screen-off page, and
+/// the tab went on to a page that paints late. Until that page's first contentful paint the
+/// screen may still be the off page's, so nothing is written before it.
+#[test]
+#[ignore]
+fn a_tab_reattached_after_leaving_an_off_page_writes_nothing_before_the_paint() {
+    let origin = fixture();
+    let home = shared_home();
+    let off = format!("{}/off", origin.replace("127.0.0.1", SCREEN_OFF_NAME));
+    let h = create(home, &off);
+    let a = targets(home, &h)[0].clone();
+    std::thread::sleep(Duration::from_secs(1));
+    let r = hook(
+        home,
+        "test.dropRecorder",
+        json!({ "sessionId": id_of(&h), "token": token_of(&h), "holdMs": 1500 }),
+    );
+    assert_eq!(r["dropped"], true, "{r}");
+    // While the recorder is away: to a page that paints 2.5 s after it loads.
+    ok(home, &h, &["open", &format!("{origin}/late")]);
+    std::thread::sleep(Duration::from_secs(5));
+    let painted = eval(home, &h, "window.paintedAt")
+        .as_f64()
+        .expect("no paint") as i64;
+    close(home, &h);
+
+    let dir = recording_dir(home, &h);
+    assert_index_matches_files(&dir);
+    let frames = changes(&dir, &a);
+    for f in &frames {
+        assert_ne!(
+            host_of(f["url"].as_str().unwrap_or("")),
+            SCREEN_OFF_NAME,
+            "{f}"
+        );
+        let t = ts_ms(f["ts"].as_str().unwrap());
+        // Clock reads of the page and of the daemon may differ by a few ms.
+        assert!(
+            t >= painted - 50,
+            "a frame {} ms before the paint: {f}",
+            painted - t
+        );
+    }
+    assert!(
+        frames
+            .iter()
+            .any(|f| ts_ms(f["ts"].as_str().unwrap()) >= painted),
+        "no frame after the paint: {:?}",
+        index(&dir, &a)
+    );
+}
+
+/// The recorder never holds up `session create`: with its connection down (test hook), a
+/// session is made about as fast as with it.
+#[test]
+#[ignore]
+fn session_create_does_not_wait_for_the_recorder() {
+    let origin = fixture();
+    let home = shared_home();
+    let url = format!("{origin}/counter");
+    let a = create(home, &url);
+    let t = Instant::now();
+    let b = create(home, &url);
+    let base = t.elapsed();
+    close(home, &b);
+    let r = hook(
+        home,
+        "test.dropRecorder",
+        json!({ "sessionId": id_of(&a), "token": token_of(&a), "holdMs": 8000 }),
+    );
+    assert_eq!(r["dropped"], true, "{r}");
+    let t = Instant::now();
+    let c = create(home, &url);
+    let held = t.elapsed();
+    close(home, &c);
+    assert!(
+        held <= base + Duration::from_millis(1000),
+        "session create took {held:?} without the recorder, {base:?} with it"
+    );
+    // The hook needs a session's token.
+    let paths = pegboard_core::paths::paths_in(home.path());
+    let refused: Result<Value, _> = pegboard_core::api::Client::connect(&paths).unwrap().call(
+        "test.dropRecorder",
+        json!({ "sessionId": id_of(&a), "token": "wrong", "holdMs": 10 }),
+    );
+    assert!(refused.is_err(), "{refused:?}");
+    close(home, &a);
 }

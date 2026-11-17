@@ -800,6 +800,11 @@ fn compatibility_matrix() {
             s(&["vitals"]),
             s(&["diff", "snapshot"]),
             s(&["read", &h.url("/counter")]),
+            // agent-browser's commands that stream the screen (Page.startScreencast), which the
+            // proxy refuses since phase 2b; argv already rejects them.
+            s(&["record", "start", "rec.webm"]),
+            s(&["record", "stop"]),
+            s(&["stream"]),
             s(&["tab", "close"]),
         ];
         for args in steps {
