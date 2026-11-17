@@ -8,7 +8,7 @@
 //
 // Usage: node 40-screencast.mjs [--auto] [--with-lock] [--with-sleep] [--only=<ids>]
 //   ids: visible,bg-tab,minimized,occluded,other-space,locked,display-sleep,v3,v4,v5,s6,s6b
-//   (s6b runs only when named: --only=s6b)
+//   (s6b runs only when named: --only=s6b [--navs <n per kind>] [--kinds=...])
 //   --auto        window states without a person: other Space by Control+Right (System Events), lock by
 //                 Control+Cmd+Q. Without it the script asks a person for those steps.
 //   --with-lock   run the screen-lock step (a person must unlock; the script waits for that).
@@ -45,7 +45,8 @@ probe.routes['/anim'] = (_req, res, url) => {
   const color = COLORS[Number(q(url, 'color', 0)) % 3];
   const stopAfter = Number(q(url, 'stopAfter', 0));
   const final = Number(q(url, 'final', 0));
-  res.writeHead(200, { 'content-type': 'text/html', 'cache-control': 'no-store' });
+  // `cache=1` leaves out `no-store`, so the page may go into the back/forward cache.
+  res.writeHead(200, { 'content-type': 'text/html', ...(q(url, 'cache', '0') === '1' ? {} : { 'cache-control': 'no-store' }) });
   res.end(
     html(
       `<style>body{margin:0;height:6000px;font:20px sans-serif}#id{position:fixed;left:0;top:0;width:80px;height:80px;background:${color}}</style>
@@ -64,6 +65,39 @@ const iv = setInterval(() => {
       `doc ${doc}`,
     ),
   );
+};
+// The same document as /anim, but its content (colour box, scroll position, changing background) is
+// shown only after `busyMs` of busy loop that starts `busyAfter` ms after the script runs; with `poll=n`
+// it keeps n requests to /hang open all the time.
+probe.routes['/late'] = (_req, res, url) => {
+  const scroll = Number(q(url, 'scroll', 0));
+  const color = COLORS[Number(q(url, 'color', 0)) % 3];
+  const busyAfter = Number(q(url, 'busyAfter', 0));
+  const busyMs = Number(q(url, 'busyMs', 0));
+  const poll = Number(q(url, 'poll', 0));
+  res.writeHead(200, { 'content-type': 'text/html', 'cache-control': 'no-store' });
+  res.end(
+    html(
+      `<style>body{margin:0;height:6000px;font:20px sans-serif}#id{position:fixed;left:0;top:0;width:80px;height:80px;background:${color};display:none}#p{margin:100px;display:none}</style>
+<div id="id"></div><p id="p">doc ${q(url, 'doc', 'x')}</p>
+<script>
+history.scrollRestoration = 'manual';
+function show() {
+  document.getElementById('id').style.display = 'block'; document.getElementById('p').style.display = 'block';
+  window.scrollTo(0, ${scroll});
+  let n = 0; setInterval(() => { n++; document.body.style.background = 'hsl(' + (n * 7 % 360) + ',70%,85%)'; }, 100);
+  for (let k = 0; k < ${poll}; k++) (async () => { for (;;) { try { await fetch('/hang?r=' + Math.random(), { cache: 'no-store' }); } catch (e) { await new Promise((r) => setTimeout(r, 200)); } } })();
+}
+if (${busyMs}) setTimeout(() => { const t = performance.now(); while (performance.now() - t < ${busyMs}); show(); }, ${busyAfter});
+else show();
+</script>`,
+      'late',
+    ),
+  );
+};
+probe.routes['/hang'] = (_req, res) => {
+  const t = setTimeout(() => (res.writeHead(200, { 'content-type': 'text/plain', 'cache-control': 'no-store' }), res.end('ok')), 4000);
+  res.on('close', () => clearTimeout(t));
 };
 probe.routes['/r302'] = (_req, res, url) => {
   res.writeHead(302, { location: url.searchParams.get('to'), 'cache-control': 'no-store' });
@@ -181,7 +215,8 @@ const STATES = [
       bgTab = await F.send('Target.createTarget', { url: anim(probe.origin, { doc: 'bg' }) });
       await sleep(800);
       await F.send('Target.activateTarget', { targetId: bgTab.targetId });
-      return true;
+      // Only the CDP reply says the other tab is in front; the screen is not checked.
+      return 'unverified (cdp reply only)';
     },
     restore: async () => {
       await F.send('Target.activateTarget', { targetId: page.targetId });
@@ -639,122 +674,176 @@ if (want('s6')) {
   line('S6 frames matching neither document', `${other.length} (scrollY values ${JSON.stringify([...new Set(other)].slice(0, 20))})`);
 }
 
-// ---- S6b: can the recorder tell the old document's frames from the new one's after frameNavigated? ----
+// ---- S6b: when do the old document's frames and captures stop after leaving it? ----
 // For leaving a screen-off domain: frames and captures of the old document still arrive after
-// frameNavigated (S6). Here, per navigation, every stream frame's `metadata.timestamp` (seconds since the
-// epoch, frame swap time) is set against the new document's `Page.lifecycleEvent`s and
-// `Page.loadEventFired` (monotonic seconds, mapped to the epoch with Network.requestWillBeSent's
-// `wallTime - timestamp`), and frames and captures are also placed by arrival order. Which document a
-// frame or capture shows is told, as in S6, by scroll offset and the colour box.
-// Usage: node 40-screencast.mjs --only=s6b [--navs <n>] (default 30: direct, 302 to another host, location=)
+// frameNavigated (S6). Per kind of navigation, every mark of the new main-frame document (its loaderId:
+// lifecycle events, loadEventFired, and the candidate "networkAlmostIdle and firstContentfulPaint both
+// arrived") is set against the old document's frames and captures by arrival order on R's socket. Which
+// document a frame or capture shows is told, as in S6, by scroll offset and the colour box.
+// Kinds: direct, redirect-302-other-host, script-location (light pages), history-back (back to a page
+// that may come from the back/forward cache), busy-first-paint (content shown after a 1.5 s busy loop
+// that starts 0.7 s after load, so after the network is idle), long-poll (three requests always open).
+// Usage: node 40-screencast.mjs --only=s6b [--navs <n per kind>] [--kinds=a,b]  (default 30 per kind, all)
 if (F_.only?.includes('s6b')) {
-  const KINDS = ['direct', 'redirect-302-other-host', 'script-location'];
-  const N = Number(F_.val('navs', 30));
+  const ALL = ['direct', 'redirect-302-other-host', 'script-location', 'history-back', 'busy-first-paint', 'long-poll'];
+  const KINDS = (F_.val('kinds', null) || ALL.join(',')).split(',');
+  const PER = Number(F_.val('navs', 30));
+  const CAPTURE_AT = [0, 30, 100, 250, 500, 1000, 1500, 2500, 4000];
+  const WAIT_MS = 8000;
   let seq = 0;
   const log = [];
-  const offsets = [];
   R.tap = (msg) => {
     seq++;
-    if (msg.sessionId !== sR && !(msg.id && msg.result && typeof msg.result.data === 'string')) return;
+    const t = performance.now();
+    if (msg.sessionId !== sR) return;
     const p = msg.params;
-    if (msg.method === 'Page.lifecycleEvent' && p.frameId === page.targetId) log.push({ seq, name: `lifecycle:${p.name}`, loaderId: p.loaderId, ts: p.timestamp });
-    else if (msg.method === 'Page.loadEventFired') log.push({ seq, name: 'loadEventFired', ts: p.timestamp });
-    else if (msg.method === 'Page.frameNavigated' && !p.frame.parentId) log.push({ seq, name: 'frameNavigated', loaderId: p.frame.loaderId });
-    else if (msg.method === 'Page.frameStartedNavigating' && p.frameId === page.targetId) log.push({ seq, name: 'frameStartedNavigating' });
-    else if (msg.method === 'Network.requestWillBeSent' && typeof p.wallTime === 'number') offsets.push(p.wallTime - p.timestamp);
-    else if (msg.method === 'Page.screencastFrame') log.push({ seq, name: 'frame', y: p.metadata?.scrollOffsetY, fts: p.metadata?.timestamp });
-    else if (msg.id && msg.result && typeof msg.result.data === 'string') {
-      const px = pngFirstPixel(msg.result.data);
-      log.push({ seq, name: 'capture', color: colorOf(px) });
-    }
+    if (msg.method === 'Page.lifecycleEvent' && p.frameId === page.targetId) log.push({ seq, t, name: `lifecycle:${p.name}`, loaderId: p.loaderId });
+    else if (msg.method === 'Page.loadEventFired') log.push({ seq, t, name: 'loadEventFired' });
+    else if (msg.method === 'Page.frameNavigated' && !p.frame.parentId) log.push({ seq, t, name: 'frameNavigated', loaderId: p.frame.loaderId, type: p.type });
+    else if (msg.method === 'Page.screencastFrame') log.push({ seq, t, name: 'frame', y: p.metadata?.scrollOffsetY });
   };
   R.on('Page.screencastFrame', (p, sid) => sid === sR && R.send('Page.screencastFrameAck', { sessionId: p.sessionId }, sR).catch(() => {}));
   await R.send('Page.setLifecycleEventsEnabled', { enabled: true }, sR);
-  await R.send('Network.enable', {}, sR);
-  await F.navigate(sF, anim(probe.origin, { doc: 'start', scroll: 150, color: 2 }));
-  await R.send('Page.startScreencast', { format: 'jpeg', quality: 60, maxWidth: 1280 }, sR);
-  await sleep(1000);
   const near = (y, s) => typeof y === 'number' && (Math.abs(y - s) <= 2 || Math.abs(y - s * out.dpr) <= 2);
   let host = probe.origin;
-  let prevScroll = 150;
-  let prevColor = 2;
-  const trials = [];
-  for (let i = 0; i < N; i++) {
-    const kind = KINDS[i % KINDS.length];
-    const scroll = 200 + i * 7;
-    const color = i % 3 === prevColor ? (i + 1) % 3 : i % 3;
-    const params = { doc: i, scroll, color };
+  let prev = { scroll: 150, color: 2 };
+  await F.navigate(sF, anim(host, { doc: 'start', scroll: 150, color: 2 }));
+  await R.send('Page.startScreencast', { format: 'jpeg', quality: 60, maxWidth: 1280 }, sR);
+  await sleep(1000);
+  let docNo = 0;
+  const nextDoc = (extra = {}) => {
+    const i = docNo++;
+    const scroll = 200 + (i % 500) * 7;
+    let color = i % 3;
+    if (color === prev.color) color = (color + 1) % 3;
+    return { doc: i, scroll, color, ...extra };
+  };
+  const settle = async (scroll) => {
+    const from = seq;
+    await waitFor(() => log.some((e) => e.seq > from && e.name === 'frame' && near(e.y, scroll)), 6000, 20);
+    await sleep(600);
+  };
+  // One measured navigation: `go()` starts it; `to` is the new document.
+  async function trial(kind, to, go) {
     const startSeq = seq;
-    let nav;
-    if (kind === 'direct') nav = F.send('Page.navigate', { url: anim(host, params) }, sF);
-    else if (kind === 'redirect-302-other-host') {
-      const to = host === probe.origin ? OTHER : probe.origin;
-      nav = F.send('Page.navigate', { url: `${host}/r302?to=${encodeURIComponent(anim(to, params))}` }, sF);
-      host = to;
-    } else nav = F.evaluate(sF, `setTimeout(() => { location.href = ${JSON.stringify(anim(host, params))}; }, 0); 1`);
-    nav.catch(() => {});
-    const caps = [0, 30, 100, 250, 500, 1000, 1500].map((at) => sleep(at).then(() => R.send('Page.captureScreenshot', { format: 'png' }, sR, 10000).catch(() => null)));
-    await Promise.all(caps);
-    await waitFor(() => log.some((e) => e.seq > startSeq && e.name === 'loadEventFired'), 6000, 20);
+    const t0 = performance.now();
+    const caps = [];
+    go().catch(() => {});
+    const sent = CAPTURE_AT.map((at) =>
+      sleep(at).then(async () => {
+        const c = { sentSeq: seq };
+        const r = await R.send('Page.captureScreenshot', { format: 'png' }, sR, 10000).catch(() => null);
+        c.replySeq = seq;
+        if (r) {
+          const col = colorOf(pngFirstPixel(r.data));
+          c.doc = col === to.color ? 'new' : col === prev.color ? 'old' : 'other';
+        } else c.doc = 'failed';
+        caps.push(c);
+      }),
+    );
+    let loader = null;
+    await waitFor(() => {
+      const evs = log.filter((e) => e.seq > startSeq);
+      loader = evs.find((e) => e.name === 'frameNavigated')?.loaderId ?? null;
+      return loader && ['lifecycle:networkAlmostIdle', 'lifecycle:firstContentfulPaint'].every((n) => evs.some((e) => e.name === n && e.loaderId === loader));
+    }, WAIT_MS, 20);
+    await Promise.all(sent);
     await sleep(800);
     const evs = log.filter((e) => e.seq > startSeq);
     const navd = evs.find((e) => e.name === 'frameNavigated');
-    const newLoader = navd?.loaderId;
     const marks = {};
-    if (navd) marks.frameNavigated = { seq: navd.seq };
-    const started = evs.find((e) => e.name === 'frameStartedNavigating');
-    if (started) marks.frameStartedNavigating = { seq: started.seq };
+    if (navd) marks.frameNavigated = { seq: navd.seq, ms: navd.t - t0 };
     for (const e of evs) {
-      if (e.name.startsWith('lifecycle:') && e.loaderId === newLoader && !marks[e.name]) marks[e.name] = { seq: e.seq, ts: e.ts };
-      if (e.name === 'loadEventFired' && navd && e.seq > navd.seq && !marks.loadEventFired) marks.loadEventFired = { seq: e.seq, ts: e.ts };
+      if (e.name.startsWith('lifecycle:') && navd && e.loaderId === navd.loaderId && !marks[e.name]) marks[e.name] = { seq: e.seq, ms: e.t - t0 };
+      if (e.name === 'loadEventFired' && navd && e.seq > navd.seq && !marks.loadEventFired) marks.loadEventFired = { seq: e.seq, ms: e.t - t0 };
     }
-    const cls = (e) => (near(e.y, scroll) ? 'new' : near(e.y, prevScroll) ? 'old' : 'other');
-    const frames = evs.filter((e) => e.name === 'frame').map((e) => ({ seq: e.seq, fts: e.fts, doc: cls(e) }));
-    const captures = evs.filter((e) => e.name === 'capture').map((e) => ({ seq: e.seq, doc: e.color === color ? 'new' : e.color === prevColor ? 'old' : 'other' }));
-    trials.push({ i, kind, marks, frames, captures });
-    prevScroll = scroll;
-    prevColor = color;
+    const a = marks['lifecycle:networkAlmostIdle'];
+    const b = marks['lifecycle:firstContentfulPaint'];
+    if (a && b) marks['networkAlmostIdle+firstContentfulPaint'] = a.seq > b.seq ? a : b;
+    const cls = (e) => (near(e.y, to.scroll) ? 'new' : near(e.y, prev.scroll) ? 'old' : 'other');
+    const frames = evs.filter((e) => e.name === 'frame').map((e) => ({ seq: e.seq, doc: cls(e) }));
+    const row = { kind, navigatedType: navd?.type ?? null, marks, frames, captures: caps };
+    prev = { scroll: to.scroll, color: to.color };
+    return row;
+  }
+  const RUN = {
+    direct: async () => {
+      const to = nextDoc();
+      return trial('direct', to, () => F.send('Page.navigate', { url: anim(host, to) }, sF));
+    },
+    'redirect-302-other-host': async () => {
+      const to = nextDoc();
+      const dest = host === probe.origin ? OTHER : probe.origin;
+      const from = host;
+      host = dest;
+      return trial('redirect-302-other-host', to, () => F.send('Page.navigate', { url: `${from}/r302?to=${encodeURIComponent(anim(dest, to))}` }, sF));
+    },
+    'script-location': async () => {
+      const to = nextDoc();
+      return trial('script-location', to, () => F.evaluate(sF, `setTimeout(() => { location.href = ${JSON.stringify(anim(host, to))}; }, 0); 1`));
+    },
+    'history-back': async () => {
+      // Two pages that the back/forward cache may keep (no `no-store`), then back from the second.
+      const x = nextDoc({ cache: 1 });
+      await F.navigate(sF, anim(host, x));
+      await settle(x.scroll);
+      prev = { scroll: x.scroll, color: x.color };
+      const y = nextDoc({ cache: 1 });
+      await F.navigate(sF, anim(host, y));
+      await settle(y.scroll);
+      prev = { scroll: y.scroll, color: y.color };
+      return trial('history-back', x, () => F.evaluate(sF, 'history.back(); 1'));
+    },
+    'busy-first-paint': async () => {
+      const to = nextDoc({ busyAfter: 700, busyMs: 1500 });
+      return trial('busy-first-paint', to, () => F.send('Page.navigate', { url: `${host}/late?${new URLSearchParams(to)}` }, sF));
+    },
+    'long-poll': async () => {
+      const to = nextDoc({ poll: 3 });
+      return trial('long-poll', to, () => F.send('Page.navigate', { url: `${host}/late?${new URLSearchParams(to)}` }, sF));
+    },
+  };
+  const trials = [];
+  for (let r = 0; r < PER; r++) {
+    for (const kind of KINDS) {
+      trials.push(await RUN[kind]());
+      // Back on a light page so that every trial leaves the same kind of old document.
+      const base = nextDoc();
+      await F.navigate(sF, anim(host, base)).catch(() => {});
+      await settle(base.scroll);
+      prev = { scroll: base.scroll, color: base.color };
+    }
   }
   R.tap = null;
   await R.send('Page.stopScreencast', {}, sR).catch(() => {});
-  const offset = median(offsets);
-  const spread = offsets.length ? Math.max(...offsets) - Math.min(...offsets) : null;
-  out.s6b = { offsetSeconds: offset, offsetSpreadSeconds: spread, offsetSamples: offsets.length, trials };
-  line('S6b clock', `wallTime - monotonic offset from ${offsets.length} requests, spread ${spread == null ? '?' : (spread * 1000).toFixed(1)} ms`);
-  const names = [...new Set(trials.flatMap((t) => Object.keys(t.marks)))];
-  for (const name of names) {
-    const r = { trials: 0, oldFramesArrivedAfter: 0, oldCapturesArrivedAfter: 0, newFramesArrivedBefore: 0, tsOldAtOrAfter: 0, tsNewBefore: 0, tsChecked: 0 };
-    for (const t of trials) {
-      const m = t.marks[name];
-      if (!m) continue;
-      r.trials++;
-      r.oldFramesArrivedAfter += t.frames.filter((f) => f.doc === 'old' && f.seq > m.seq).length;
-      r.oldCapturesArrivedAfter += t.captures.filter((c) => c.doc === 'old' && c.seq > m.seq).length;
-      r.newFramesArrivedBefore += t.frames.filter((f) => f.doc === 'new' && f.seq < m.seq).length;
-      if (typeof m.ts === 'number' && offset != null) {
-        const at = m.ts + offset;
-        for (const f of t.frames) {
-          if (typeof f.fts !== 'number' || f.doc === 'other') continue;
-          r.tsChecked++;
-          if (f.doc === 'old' && f.fts >= at) r.tsOldAtOrAfter++;
-          if (f.doc === 'new' && f.fts < at) r.tsNewBefore++;
-        }
+  out.s6b = { trials, captureAtMs: CAPTURE_AT, waitMs: WAIT_MS };
+  const MARKS = ['frameNavigated', 'loadEventFired', 'lifecycle:firstContentfulPaint', 'lifecycle:networkAlmostIdle', 'networkAlmostIdle+firstContentfulPaint', 'lifecycle:networkIdle'];
+  for (const kind of KINDS) {
+    const ts = trials.filter((t) => t.kind === kind);
+    const types = {};
+    for (const t of ts) types[t.navigatedType ?? '(none)'] = (types[t.navigatedType ?? '(none)'] || 0) + 1;
+    line(`S6b ${kind}`, `${ts.length} navigations; frameNavigated.type ${JSON.stringify(types)}; captures old ${ts.flatMap((t) => t.captures).filter((c) => c.doc === 'old').length}, failed ${ts.flatMap((t) => t.captures).filter((c) => c.doc === 'failed').length} of ${ts.flatMap((t) => t.captures).length}`);
+    for (const name of MARKS) {
+      const r = { present: 0, oldFramesAfter: 0, oldCapturesAfter: 0, capturesSentAfter: 0, oldOfCapturesSentAfter: 0, newFramesBefore: 0, ms: [] };
+      for (const t of ts) {
+        const m = t.marks[name];
+        if (!m) continue;
+        r.present++;
+        r.ms.push(m.ms);
+        r.oldFramesAfter += t.frames.filter((f) => f.doc === 'old' && f.seq > m.seq).length;
+        r.oldCapturesAfter += t.captures.filter((c) => c.doc === 'old' && c.replySeq > m.seq).length;
+        const after = t.captures.filter((c) => c.sentSeq > m.seq);
+        r.capturesSentAfter += after.length;
+        r.oldOfCapturesSentAfter += after.filter((c) => c.doc === 'old').length;
+        r.newFramesBefore += t.frames.filter((f) => f.doc === 'new' && f.seq < m.seq).length;
       }
+      const ok = r.present === ts.length && r.oldFramesAfter === 0 && r.oldCapturesAfter === 0;
+      line(
+        `S6b ${kind} ${name}`,
+        `arrived in ${r.present}/${ts.length} (median ${r.ms.length ? median(r.ms).toFixed(0) : '-'} ms, max ${r.ms.length ? Math.max(...r.ms).toFixed(0) : '-'} ms after the navigation started); after it: old frames ${r.oldFramesAfter}, old captures ${r.oldCapturesAfter}; captures sent after it ${r.capturesSentAfter} (old ${r.oldOfCapturesSentAfter}); new frames before it (lost) ${r.newFramesBefore} ${ok ? 'HOLDS' : r.present < ts.length ? 'MISSING in some navigations' : 'LEAKS'}`,
+      );
     }
-    out.s6b[name] = r;
-    const byTs = r.tsChecked ? `; by frame timestamp: old frames stamped at/after it ${r.tsOldAtOrAfter}, new frames stamped before it ${r.tsNewBefore} (of ${r.tsChecked}) ${r.tsOldAtOrAfter === 0 && r.tsNewBefore === 0 ? 'SEPARATES' : 'does not separate'}` : '';
-    line(`S6b ${name}`, `in ${r.trials}/${trials.length} navigations; by arrival: old frames after it ${r.oldFramesArrivedAfter}, old captures after it ${r.oldCapturesArrivedAfter}, new frames before it ${r.newFramesArrivedBefore}${byTs}`);
   }
-  const firstNewGap = trials
-    .map((t) => {
-      const n = t.frames.find((f) => f.doc === 'new');
-      const lastOld = [...t.frames].reverse().find((f) => f.doc === 'old');
-      return n && lastOld && typeof n.fts === 'number' && typeof lastOld.fts === 'number' ? (n.fts - lastOld.fts) * 1000 : null;
-    })
-    .filter((x) => x != null);
-  line('S6b gap between the last old and the first new frame timestamps', `median ${median(firstNewGap)?.toFixed(1)} ms, min ${firstNewGap.length ? Math.min(...firstNewGap).toFixed(1) : '?'} ms (${firstNewGap.length} navigations)`);
-  const oldCaps = trials.flatMap((t) => t.captures).filter((c) => c.doc === 'old').length;
-  line('S6b captures', `${trials.flatMap((t) => t.captures).length} sent at 0-1500 ms, old document ${oldCaps}`);
 }
 
 closePrompt();

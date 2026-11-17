@@ -25,3 +25,9 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
 chrome.windows.onFocusChanged.addListener((windowId) => {
   send({ ev: 'windows.onFocusChanged', windowId, none: windowId === chrome.windows.WINDOW_ID_NONE });
 });
+// Hands the kept events to the binding (after the spike set it again on a restarted worker); returns how many.
+self.pegReplay = () => {
+  const kept = self.pegMissed.splice(0);
+  for (const o of kept) send({ ...o, replayed: true });
+  return kept.length;
+};

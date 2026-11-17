@@ -67,6 +67,23 @@ export function activatePid(pid) {
   return osa(`tell application "System Events" to set frontmost of (first process whose unix id is ${pid}) to true`);
 }
 
+// Unix id of the frontmost application process, or null.
+export function frontmostPid() {
+  const r = osa('tell application "System Events" to unix id of first process whose frontmost is true');
+  return r.ok ? Number(r.out) : null;
+}
+
+// Brings the process to the front and checks that it is; tries twice. Keystrokes go to the frontmost app,
+// so a spike calls this before sending any.
+export async function ensureFront(pid) {
+  for (let i = 0; i < 2; i++) {
+    activatePid(pid);
+    await new Promise((r) => setTimeout(r, 600));
+    if (frontmostPid() === pid) return true;
+  }
+  throw new Error(`the spike's Chrome (pid ${pid}) is not the frontmost app (frontmost: ${frontmostPid()}); no keystroke sent`);
+}
+
 // A plain app every Mac has, used as "another app" (only activated, never given input).
 export function activateFinder() {
   return osa('tell application "Finder" to activate');

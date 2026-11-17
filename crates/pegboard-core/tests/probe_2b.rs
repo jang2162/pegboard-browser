@@ -316,29 +316,32 @@ async fn back_to_first(h: &Harness, log: &mut ActionLog, info: &SessionInfo) {
 }
 
 /// One timed run: (with the mimic on) a capture before, the command, a capture after.
-/// Returns (total time, capture times).
+/// Returns (total time, capture times, captures that failed, whether the command worked).
 async fn timed(
     h: &Harness,
     log: &mut ActionLog,
     info: &SessionInfo,
     argv: &[&str],
     mimic: Option<&Mimic>,
-) -> (Duration, Vec<f64>, bool) {
+) -> (Duration, Vec<f64>, usize, bool) {
     let mut caps = Vec::new();
+    let mut failed = 0;
     let t0 = Instant::now();
     if let Some(m) = mimic {
         if m.setting.before {
-            let (d, _) = m.capture(&current_target(h, info)).await;
+            let (d, worked) = m.capture(&current_target(h, info)).await;
             caps.push(ms(d));
+            failed += usize::from(!worked);
         }
     }
     let r = command(h, log, info, argv).await;
     if let Some(m) = mimic {
-        let (d, _) = m.capture(&current_target(h, info)).await;
+        let (d, worked) = m.capture(&current_target(h, info)).await;
         caps.push(ms(d));
+        failed += usize::from(!worked);
     }
     let worked = matches!(&r, Ok(r) if ok(r));
-    (t0.elapsed(), caps, worked)
+    (t0.elapsed(), caps, failed, worked)
 }
 
 // ---- S2 ----
@@ -356,7 +359,8 @@ fn probe_command_latency_with_and_without_recording() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(20);
         let variants = std::env::var("PROBE_2B_VARIANTS")
-            .unwrap_or_else(|_| "base,light,q40,w800,after-only".into());
+            // after-only twice: the second run checks the margin of the first.
+            .unwrap_or_else(|_| "base,light,q40,w800,after-only,after-only".into());
         let form = h.url("/form");
         let counter = h.url("/counter");
         let commands: Vec<(&str, Vec<&str>)> = vec![
@@ -377,14 +381,21 @@ fn probe_command_latency_with_and_without_recording() {
         ];
         println!("S2 reps {reps}, settings {variants}");
         let mut verdicts = Vec::new();
+        let mut runs_of: HashMap<String, usize> = HashMap::new();
         for name in variants.split(',').map(str::trim).filter(|v| !v.is_empty()) {
             let set = setting(name);
+            let run = {
+                let n = runs_of.entry(name.to_string()).or_default();
+                *n += 1;
+                *n
+            };
             let mimic = Mimic::start(&h.browser.ws_url, set).await;
             let mut added: HashMap<&str, Vec<f64>> = HashMap::new();
             let mut off_t: HashMap<&str, Vec<f64>> = HashMap::new();
             let mut on_t: HashMap<&str, Vec<f64>> = HashMap::new();
             let mut cap_t: HashMap<&str, Vec<f64>> = HashMap::new();
             let mut failures: HashMap<&str, usize> = HashMap::new();
+            let mut capture_failures: HashMap<&str, usize> = HashMap::new();
             for rep in 0..reps {
                 for (cname, argv) in &commands {
                     let order = if rep % 2 == 0 {
@@ -400,11 +411,12 @@ fn probe_command_latency_with_and_without_recording() {
                             // The stream's first frames come right after it starts.
                             tokio::time::sleep(Duration::from_millis(150)).await;
                         }
-                        let (d, caps, worked) =
+                        let (d, caps, cap_failed, worked) =
                             timed(&h, &mut log, &info, argv, on.then_some(&mimic)).await;
                         if on {
                             mimic.set_streaming(false).await;
                             cap_t.entry(cname).or_default().extend(caps);
+                            *capture_failures.entry(cname).or_default() += cap_failed;
                         }
                         if !worked {
                             *failures.entry(cname).or_default() += 1;
@@ -423,7 +435,7 @@ fn probe_command_latency_with_and_without_recording() {
             let stats = mimic.stats.lock().unwrap().clone_counts();
             mimic.stop().await;
             println!(
-                "\nS2 setting {} (quality {}, maxWidth {}, capture {}): stream frames received {}, kept {}, dropped {}, kept bytes {}",
+                "\nS2 setting {} run {run} (quality {}, maxWidth {}, capture {}; the stream starts 150 ms before each on-run): stream frames received {}, kept {}, dropped {}, kept bytes {}",
                 set.name,
                 set.quality,
                 set.max_width,
@@ -433,27 +445,34 @@ fn probe_command_latency_with_and_without_recording() {
                 stats.2,
                 stats.3
             );
-            println!("| command | off median ms | on median ms | added median ms | added max ms | capture median ms | capture max ms | failed runs |");
-            println!("|---|---|---|---|---|---|---|---|");
+            println!("| command | off median ms | on median ms | added median ms | added max ms | capture median ms | capture max ms | failed runs | failed captures |");
+            println!("|---|---|---|---|---|---|---|---|---|");
             let mut pass = true;
+            let total_capture_failures: usize = capture_failures.values().sum();
             for (cname, _) in &commands {
                 let a = &added[cname];
                 let c = cap_t.get(cname).cloned().unwrap_or_default();
                 let (am, ax) = (median(a), max(a));
                 pass &= am <= 50.0 && ax <= 1000.0;
                 println!(
-                    "| {cname} | {:.0} | {:.0} | {am:.0} | {ax:.0} | {:.0} | {:.0} | {} |",
+                    "| {cname} | {:.0} | {:.0} | {am:.0} | {ax:.0} | {:.0} | {:.0} | {} | {} |",
                     median(&off_t[cname]),
                     median(&on_t[cname]),
                     median(&c),
                     max(&c),
-                    failures.get(cname).copied().unwrap_or(0)
+                    failures.get(cname).copied().unwrap_or(0),
+                    capture_failures.get(cname).copied().unwrap_or(0)
                 );
             }
+            // A failed capture is quick and would make a setting look cheaper than it is.
             let v = format!(
-                "S2 {}: {} (every command: added median <= 50 ms and max <= 1000 ms)",
+                "S2 {} run {run}: {} (every command: added median <= 50 ms and max <= 1000 ms; failed captures {total_capture_failures})",
                 set.name,
-                if pass { "PASS" } else { "FAIL" }
+                if pass && total_capture_failures == 0 {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
             );
             println!("{v}");
             verdicts.push(v);
@@ -547,6 +566,36 @@ fn probe_recording_beside_the_2a_defences() {
             "clipboard read is blocked".into(),
             !r.contains(&marker),
             r.chars().take(80).collect(),
+        ));
+        // Page.startScreencast / stopScreencast from the agent's side, through the session proxy:
+        // refused, and the recorder's stream goes on.
+        let frames = || mimic.stats.lock().unwrap().received;
+        let before = frames();
+        let start = agent
+            .send(
+                "Page.startScreencast",
+                json!({ "format": "jpeg", "maxWidth": 320 }),
+                Some(&asid),
+            )
+            .await;
+        let stop = agent
+            .send("Page.stopScreencast", json!({}), Some(&asid))
+            .await;
+        let at_stop = frames();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after = frames();
+        let said = |r: &anyhow::Result<Value>| match r {
+            Ok(_) => "accepted".to_string(),
+            Err(e) => format!("refused: {e:#}"),
+        };
+        rows.push((
+            "agent Page.startScreencast/stopScreencast through the proxy are refused and the recorder streams on".into(),
+            start.is_err() && stop.is_err() && after > at_stop,
+            format!(
+                "start {}, stop {}, recorder frames {before} -> {at_stop} -> {after} (2 s after the stop)",
+                said(&start),
+                said(&stop)
+            ),
         ));
         let _ = agent
             .send(

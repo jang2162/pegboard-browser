@@ -18,7 +18,7 @@ import { connect } from './lib/cdp.mjs';
 import { startProbe, html } from './lib/probe.mjs';
 import { ab } from './lib/ab.mjs';
 import {
-  flags as readFlags, chromePids, activatePid, activateFinder, keystroke, keyCode, clickAt, axRect, keepAwake, waitEnter, closePrompt,
+  flags as readFlags, chromePids, activatePid, ensureFront, activateFinder, keystroke, keyCode, clickAt, axRect, keepAwake, waitEnter, closePrompt,
 } from './lib/desktop.mjs';
 
 const FL = readFlags();
@@ -39,6 +39,10 @@ probe.routes['/h'] = (_req, res, url) => {
 window.pegGo = (kind) => {
   if (kind === 'location') location = '/h?step=script-location';
   if (kind === 'push') history.pushState({}, '', '/h?step=pushed');
+  if (kind === 'back') history.back();
+  if (kind === 'go') history.go(-1);
+  if (kind === 'aclick') document.getElementById('go').click();
+  if (kind === 'openclose') { const w = window.open('/h?step=popup'); setTimeout(() => w && w.close(), 1500); }
 };
 </script>`,
       `h ${step}`,
@@ -90,7 +94,7 @@ await bindSw(swSid);
 F.on('Runtime.bindingCalled', (p, sid) => {
   if (p.name !== 'pegActivity') return;
   const o = JSON.parse(p.payload);
-  push('ext', o.ev, { tabId: o.tabId, windowId: o.windowId, url: o.url, none: o.none, sid: sid === swSid ? 'current' : 'old' });
+  push('ext', o.ev, { tabId: o.tabId, windowId: o.windowId, url: o.url, none: o.none, replayed: !!o.replayed, sid: sid === swSid ? 'current' : 'old' });
 });
 
 // The agent-browser tab (as 01-occluded does it), then R's session on it.
@@ -134,10 +138,8 @@ activatePid(mainPid());
 await sleep(1000);
 
 // ---- OS-level actions (auto mode) ----
-const front = async () => {
-  activatePid(mainPid());
-  await sleep(600);
-};
+// Every OS step starts with our Chrome checked to be the frontmost app (keystrokes go there).
+const front = () => ensureFront(mainPid());
 async function linkPoint() {
   const r = await R.evaluate(
     sR,
@@ -151,8 +153,10 @@ const os = {
     await front();
     keystroke('l', ['cmd']);
     await sleep(300);
+    await front();
     keystroke(U('H1-typed'));
     await sleep(200);
+    await front();
     keyCode(36);
     return 'synthetic-os (System Events: Cmd+L, typing, Return)';
   },
@@ -164,6 +168,7 @@ const os = {
       clickAt(r.x + r.w / 2, r.y + r.h / 2);
       return 'synthetic-os (CGEvent click on the Back button found through accessibility)';
     }
+    await front();
     keystroke('[', ['cmd']);
     return 'synthetic-os (Cmd+[ keystroke: the Back button was not found)';
   },
@@ -177,6 +182,7 @@ const os = {
     await front();
     keyCode(48, ['ctrl']); // Control+Tab: next tab
     await sleep(1500);
+    await front();
     keyCode(48, ['ctrl', 'shift']); // back
     return 'synthetic-os (Control+Tab, then Control+Shift+Tab)';
   },
@@ -253,6 +259,25 @@ if (want('H7-meta')) {
   await step('H7-meta', 'meta refresh (page loaded by the agent just before)', async () => 'page (meta refresh after 2 s)', 4000);
 }
 await step('H7-push', 'page script history.pushState', script(`setTimeout(() => pegGo('push'), 300); 1`, 'pushState'));
+// More page-script steps that could look like a person: history moves, a scripted link click, and a popup
+// that opens and closes (tab activations without anyone switching tabs).
+await ab(['open', U('before-H7-back')], { session });
+await ab(['open', U('H7-back-from')], { session });
+await step('H7-history-back', 'page script history.back()', script(`setTimeout(() => pegGo('back'), 300); 1`, 'history.back()'));
+await ab(['open', U('H7-go-from')], { session });
+await step('H7-history-go', 'page script history.go(-1)', script(`setTimeout(() => pegGo('go'), 300); 1`, 'history.go(-1)'));
+await step('H7-a-click', 'page script a.click()', script(`setTimeout(() => pegGo('aclick'), 300); 1`, 'a.click()'));
+await ab(['open', U('H7-openclose')], { session });
+await step(
+  'H7-open-close',
+  'page script window.open, then window.close after 1.5 s',
+  async () => {
+    // window.open needs user activation; the gesture comes from CDP, not from a person.
+    await R.send('Runtime.evaluate', { expression: `pegGo('openclose'); 1`, userGesture: true }, sR);
+    return 'page-script (window.open + close, CDP user gesture)';
+  },
+  4000,
+);
 
 // H8: does the binding survive the worker going idle and waking up?
 if (want('H8')) {
@@ -271,9 +296,16 @@ if (want('H8')) {
   if (now) {
     swSid = await F.attach(now.targetId);
     after = JSON.parse(await F.evaluate(swSid, `JSON.stringify({ binding: typeof self.pegActivity, missed: self.pegMissed.length, missedEvents: self.pegMissed.map((o) => o.ev) })`));
+    // Set the binding again on the new worker and have it hand over what it kept.
+    const t0 = Date.now();
+    await bindSw(swSid);
+    after.replayCalled = await F.evaluate(swSid, 'self.pegReplay()');
+    await sleep(500);
+    after.replayedReceived = signals.filter((s) => s.t >= t0 && s.src === 'ext' && s.detail?.replayed).length;
   }
   out.h8 = { workerTargetBefore: oldTarget, workerListedAfterIdle: stillThere, workerTargetNow: now?.targetId ?? null, sameTarget: now?.targetId === oldTarget, after, workerTargetEvents: swEvents };
   console.log(`H8 verdict: worker restarted ${now?.targetId !== oldTarget ? 'yes' : 'no'}; binding after re-attach ${after?.binding}; events missed while detached ${after?.missed} ${JSON.stringify(after?.missedEvents)}`);
+  console.log(`H8 replay: binding set again, pegReplay() handed over ${after?.replayCalled}, received through the binding ${after?.replayedReceived} ${after && after.missed > 0 && after.replayedReceived === after.missed ? 'PASS' : 'FAIL'}`);
 }
 
 // ---- summary ----
