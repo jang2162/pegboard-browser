@@ -256,15 +256,27 @@ impl ScreenGate {
     }
 
     /// The attach read the main frame (`url`, `loader_id`) from the frame tree, after
-    /// lifecycle events were turned on, and found whether that document has painted
-    /// (`painted`: its first contentful paint was already there; false when unknown).
+    /// lifecycle events were turned on, whether that document has painted (`painted`: its
+    /// first contentful paint was already there; false when it cannot be told, e.g. for a
+    /// tab in the background), and the URL of the history entry before it (`came_from`).
     ///
     /// - A commit event came meanwhile: that event's judgement stands (nothing to do).
     /// - The document it knew before (same loader): its previous state comes back.
-    /// - Any other document (first attach, or a commit while the recorder was away): the
-    ///   tab may have come from a screen-off page whose screen is still shown until this
-    ///   document paints, so frames stay out until it has painted (fail closed).
-    pub fn attached(&mut self, cfg: &RecordingConfig, url: &str, loader_id: &str, painted: bool) {
+    /// - Any other document is held until it has painted only when the screen it replaced
+    ///   could have been a screen-off page (F5: that page's screen may be shown until the
+    ///   new document paints): the gate had seen another document before (a commit while
+    ///   the recorder was away: unknown pages between), the URL the browser gave before the
+    ///   attach is screen-off or unknown (a commit before events were on), or the history
+    ///   entry before it is screen-off. Otherwise (a tab the recorder sees for the first
+    ///   time, never on a screen-off page) it opens: there is no off screen to wait out.
+    pub fn attached(
+        &mut self,
+        cfg: &RecordingConfig,
+        url: &str,
+        loader_id: &str,
+        painted: bool,
+        came_from: Option<&str>,
+    ) {
         if !self.resolving() {
             return;
         }
@@ -275,14 +287,23 @@ impl ScreenGate {
             self.hold = self.resume.take().flatten();
             return;
         }
+        let could_follow_off = self.loader.is_some()
+            || self.current.as_deref().is_none_or(|u| cfg.screen_off(u))
+            || came_from.is_some_and(|u| cfg.screen_off(u));
         self.resume = None;
         self.committed(url);
         self.loader = Some(loader_id.to_string()).filter(|l| !l.is_empty());
-        self.hold = if cfg.screen_off(url) || cfg.screen_off_domains.is_empty() {
+        self.hold = if cfg.screen_off_domains.is_empty() || cfg.screen_off(url) || !could_follow_off
+        {
             None
         } else {
             self.paint_hold(loader_id)
         };
+    }
+
+    /// Whether stream frames are held although the URL is not screen-off (for daemon.log).
+    pub fn held_at(&self, now: Instant) -> bool {
+        self.held(now)
     }
 
     /// Between `attaching` and `attached` (or the first commit event): nothing is known of
@@ -743,7 +764,7 @@ mod tests {
         g.attaching(Some("http://b.test/"));
         assert!(!g.stream_open(&cfg, t0));
         assert!(g.capture_ticket(&cfg).is_none());
-        g.attached(&cfg, "http://b.test/", "L1", false);
+        g.attached(&cfg, "http://b.test/", "L1", false, None);
         assert!(g.open(&cfg));
         assert!(!g.stream_open(&cfg, t0 + ms(60_000)));
         g.lifecycle("L1", "firstContentfulPaint");
@@ -751,30 +772,64 @@ mod tests {
         // Already painted when the attach looked: open at once.
         let mut g = ScreenGate::new(Some("http://screen-off.test/"));
         g.attaching(None);
-        g.attached(&cfg, "http://b.test/", "L1", true);
+        g.attached(&cfg, "http://b.test/", "L1", true, None);
         assert!(g.stream_open(&cfg, t0));
         // Even a tab that was open before: a document it does not know is not assumed.
         let mut g = ScreenGate::new(Some("http://a.test/"));
         g.navigated(&cfg, "http://a.test/", "L0", false, t0);
         assert!(g.stream_open(&cfg, t0));
         g.attaching(None);
-        g.attached(&cfg, "http://b.test/", "L1", false);
+        g.attached(&cfg, "http://b.test/", "L1", false, None);
         assert!(!g.stream_open(&cfg, t0));
         // The same document as before: its state comes back, open or held.
         let mut g = ScreenGate::new(Some("http://a.test/"));
         g.navigated(&cfg, "http://a.test/", "L0", false, t0);
         g.attaching(None);
         g.attaching(None);
-        g.attached(&cfg, "http://a.test/", "L0", false);
+        g.attached(&cfg, "http://a.test/", "L0", false, None);
         assert!(g.stream_open(&cfg, t0));
         let mut g = ScreenGate::new(Some("http://screen-off.test/"));
         g.navigated(&cfg, "http://b.test/", "L1", false, t0);
         assert!(!g.stream_open(&cfg, t0));
         g.attaching(None);
-        g.attached(&cfg, "http://b.test/", "L1", false);
+        g.attached(&cfg, "http://b.test/", "L1", false, None);
         assert!(!g.stream_open(&cfg, t0));
         g.lifecycle("L1", "firstContentfulPaint");
         assert!(g.stream_open(&cfg, t0));
+    }
+
+    #[test]
+    fn attached_to_an_already_painted_page_that_was_never_off_opens() {
+        let cfg = off_list();
+        let t0 = Instant::now();
+        // First attach; the paint cannot be confirmed (a background tab), but neither the
+        // browser's URL before the attach nor the history entry before was off.
+        let mut g = ScreenGate::new(Some("http://a.test/"));
+        g.attaching(Some("http://a.test/"));
+        g.attached(&cfg, "http://a.test/", "L1", false, Some("about:blank"));
+        assert!(g.stream_open(&cfg, t0));
+        let mut g = ScreenGate::new(Some("about:blank"));
+        g.attaching(Some("about:blank"));
+        g.attached(&cfg, "http://b.test/", "L1", false, None);
+        assert!(g.stream_open(&cfg, t0));
+        // The entry before was off: held until it paints.
+        let mut g = ScreenGate::new(Some("http://b.test/"));
+        g.attaching(Some("http://b.test/"));
+        g.attached(
+            &cfg,
+            "http://b.test/",
+            "L1",
+            false,
+            Some("http://screen-off.test/x"),
+        );
+        assert!(!g.stream_open(&cfg, t0));
+        g.lifecycle("L1", "firstContentfulPaint");
+        assert!(g.stream_open(&cfg, t0));
+        // An off page itself stays closed by its URL.
+        let mut g = ScreenGate::new(Some("http://screen-off.test/"));
+        g.attaching(None);
+        g.attached(&cfg, "http://screen-off.test/", "L1", true, None);
+        assert!(!g.stream_open(&cfg, t0));
     }
 
     #[test]
@@ -784,7 +839,7 @@ mod tests {
         let t0 = Instant::now();
         let mut g = ScreenGate::new(Some("http://screen-off.test/"));
         g.attaching(Some("http://screen-off.test/"));
-        g.attached(&cfg, "http://b.test/", "L1", false);
+        g.attached(&cfg, "http://b.test/", "L1", false, None);
         g.navigated(&cfg, "http://b.test/", "L1", false, t0);
         assert!(!g.stream_open(&cfg, t0), "the late event opened the gate");
         g.lifecycle("L1", "firstContentfulPaint");
@@ -794,13 +849,13 @@ mod tests {
         g.attaching(None);
         g.navigated(&cfg, "http://b.test/", "L1", false, t0);
         assert!(!g.stream_open(&cfg, t0));
-        g.attached(&cfg, "http://b.test/", "L1", true);
+        g.attached(&cfg, "http://b.test/", "L1", true, None);
         assert!(!g.stream_open(&cfg, t0));
         // A paint seen before the tree was applied counts.
         let mut g = ScreenGate::new(None);
         g.attaching(None);
         g.lifecycle("L1", "firstContentfulPaint");
-        g.attached(&cfg, "http://b.test/", "L1", false);
+        g.attached(&cfg, "http://b.test/", "L1", false, None);
         assert!(g.stream_open(&cfg, t0));
     }
 
@@ -811,14 +866,18 @@ mod tests {
         let t0 = Instant::now();
         let mut g = ScreenGate::new(Some("http://screen-off.test/"));
         g.attaching(Some("http://screen-off.test/"));
-        g.attached(&cfg, "http://b.test/", "L1", false);
+        g.attached(&cfg, "http://b.test/", "L1", false, None);
         assert!(!g.stream_open(&cfg, t0));
         assert_eq!(g.current_url(), Some("http://b.test/"));
         // Without a screen-off list nothing is ever held.
         let none = RecordingConfig::default();
         let mut g = ScreenGate::new(Some("http://screen-off.test/"));
         g.attaching(None);
-        g.attached(&none, "http://b.test/", "L1", false);
+        g.attached(&none, "http://b.test/", "L1", false, None);
+        assert!(g.stream_open(&none, t0));
+        let mut g = ScreenGate::new(None);
+        g.attaching(None);
+        g.attached(&none, "http://b.test/", "L1", false, None);
         assert!(g.stream_open(&none, t0));
     }
 

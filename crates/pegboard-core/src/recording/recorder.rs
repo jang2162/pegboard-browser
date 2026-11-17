@@ -586,6 +586,7 @@ impl Recorder {
         url: &str,
         loader: &str,
         painted: bool,
+        came_from: Option<&str>,
     ) -> Option<bool> {
         let mut st = self.state();
         let session = st
@@ -596,10 +597,23 @@ impl Recorder {
             .clone();
         let sess = st.sessions.get_mut(&session)?;
         let capped = sess.rec.as_ref().is_none_or(|r| r.budget.capped());
-        sess.screens
-            .get_mut(target)?
-            .gate
-            .attached(&self.opts.config, url, loader, painted);
+        let gate = &mut sess.screens.get_mut(target)?.gate;
+        gate.attached(&self.opts.config, url, loader, painted, came_from);
+        if crate::testenv::hooks() {
+            let now = Instant::now();
+            let stream = if gate.stream_open(&self.opts.config, now) {
+                "open"
+            } else if gate.held_at(now) {
+                "held until the page paints"
+            } else {
+                "closed"
+            };
+            eprintln!(
+                "pegboard: recorder: attached {target} on {} (painted {painted}, came from {}): stream {stream}",
+                url_for_log(url),
+                came_from.map_or_else(|| "-".to_string(), url_for_log),
+            );
+        }
         Some(capped)
     }
 
@@ -623,10 +637,15 @@ impl Recorder {
         let loader = frame["loaderId"].as_str().unwrap_or_default();
         let cfg = &self.opts.config;
         // Only a list of screen-off domains can make a document wait for its paint.
-        let painted = !cfg.screen_off_domains.is_empty()
-            && !cfg.screen_off(url)
-            && painted(conn, cdp, target).await;
-        let Some(capped) = self.resolve(target, cdp, url, loader, painted) else {
+        let judged = !cfg.screen_off_domains.is_empty() && !cfg.screen_off(url);
+        let painted = judged && painted(conn, cdp, target).await;
+        let came_from = if judged {
+            came_from(conn, cdp).await
+        } else {
+            None
+        };
+        let Some(capped) = self.resolve(target, cdp, url, loader, painted, came_from.as_deref())
+        else {
             return false;
         };
         if capped {
@@ -920,6 +939,18 @@ async fn painted(conn: &CdpConn, cdp: &str, frame: &str) -> bool {
         Ok(r) => r.pointer("/result/value") == Some(&Value::Bool(true)),
         Err(_) => false,
     }
+}
+
+/// The URL of the history entry before the current one (`None` when there is none or it
+/// cannot be read).
+async fn came_from(conn: &CdpConn, cdp: &str) -> Option<String> {
+    let h = conn
+        .send("Page.getNavigationHistory", json!({}), Some(cdp))
+        .await
+        .ok()?;
+    let current = h["currentIndex"].as_u64()?;
+    let before = usize::try_from(current.checked_sub(1)?).ok()?;
+    h["entries"][before]["url"].as_str().map(String::from)
 }
 
 /// What a later task needs to take a direct capture of a recorded tab and to check, when
@@ -1308,7 +1339,10 @@ mod tests {
         }
         // As an attach does: registered, then the frame tree (a painted document).
         assert!(recorder.register(T1, "C1", 0, Some(url)));
-        assert_eq!(recorder.resolve(T1, "C1", url, "L0", true), Some(false));
+        assert_eq!(
+            recorder.resolve(T1, "C1", url, "L0", true, None),
+            Some(false)
+        );
         (recorder, id, manifest)
     }
 
@@ -1510,7 +1544,7 @@ mod tests {
         // Until the tree is read nothing is kept.
         feed(&r, &id, shot_event(2), ms(100));
         assert_eq!(
-            r.resolve(T1, "C2", "http://a.test/", "L0", false),
+            r.resolve(T1, "C2", "http://a.test/", "L0", false, None),
             Some(false)
         );
         // The throttle went on: within the gap of the last frame a frame is held.
@@ -1527,7 +1561,7 @@ mod tests {
         r.disconnected();
         assert!(r.register(T1, "C3", 0, Some("http://screen-off.test/")));
         assert_eq!(
-            r.resolve(T1, "C3", "http://b.test/", "L2", false),
+            r.resolve(T1, "C3", "http://b.test/", "L2", false, None),
             Some(false)
         );
         // b has not painted: what is shown may still be the off page.

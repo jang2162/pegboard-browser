@@ -158,6 +158,16 @@ fn ts_ms_reads_rfc3339() {
     assert_eq!(ts_ms("2000-03-01T00:00:01.5Z"), 951_868_801_500);
 }
 
+/// What the recorder told daemon.log about `target` (test hooks are on in the test homes).
+fn recorder_log(home: &Home, target: &str) -> Vec<String> {
+    std::fs::read_to_string(home.path().join("daemon.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("recorder") && l.contains(target))
+        .map(String::from)
+        .collect()
+}
+
 fn host_of(url: &str) -> String {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split('/').next().unwrap_or("");
@@ -250,7 +260,13 @@ fn the_settled_screen_is_the_last_frame() {
 
     let dir = recording_dir(home, &h);
     let frames = changes(&dir, &first);
-    let last = frames.last().expect("no change frames");
+    let last = frames.last().unwrap_or_else(|| {
+        panic!(
+            "no change frames; index {:?}; recorder: {:?}",
+            index(&dir, &first),
+            recorder_log(home, &first)
+        )
+    });
     let last_ts = ts_ms(last["ts"].as_str().unwrap());
     assert!(
         last_ts >= settled,
