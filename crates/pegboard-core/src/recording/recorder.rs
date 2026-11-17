@@ -32,7 +32,7 @@ use crate::cdp::{CdpConn, CdpEvent};
 use crate::recording::config::RecordingConfig;
 use crate::recording::format::FrameKind;
 use crate::recording::screen::{
-    may_record, ScreenBudget, ScreenGate, ScreenWriter, Throttle, MIN_FRAME_GAP,
+    frame_name, may_record, ScreenBudget, ScreenGate, ScreenWriter, Throttle, MIN_FRAME_GAP,
 };
 
 /// Longest wait between two connection attempts.
@@ -164,6 +164,9 @@ enum Job {
         target: String,
         shot: Shot,
         kind: FrameKind,
+        /// The number given out when the job was sent (`Rec::reserve`); `None`: the
+        /// writer's next.
+        number: Option<u32>,
     },
     Mark {
         target: String,
@@ -171,12 +174,13 @@ enum Job {
         kind: FrameKind,
         url: Option<String>,
     },
-    /// A direct capture after a command: written as an `After` frame; its name (or `None`
-    /// when it was not written) goes back.
+    /// A direct capture after a command, written as an `After` frame under the number its
+    /// name was given with; whether it was written goes back.
     Capture {
         target: String,
         shot: Shot,
-        reply: oneshot::Sender<Option<String>>,
+        number: u32,
+        reply: oneshot::Sender<bool>,
     },
     /// Everything before it is written; the thread ends.
     End(oneshot::Sender<()>),
@@ -194,6 +198,10 @@ struct Rec {
     /// Per target, the last frame written (stream or capture) since its last Off marker:
     /// the frame before a command. Kept by the writer.
     last: LastFrames,
+    /// Per target, the number of its next frame. Given out when a frame is handed to the
+    /// writer (always under the recorder's state lock, so in the order of the jobs): a
+    /// capture's name is known before it is written.
+    numbers: Mutex<HashMap<String, u32>>,
     /// Kept for the session's other recorders (navigation, people, extras: later tasks).
     _log: SessionLog,
     _extras: Vec<RecordExtra>,
@@ -201,6 +209,47 @@ struct Rec {
 
 /// Target -> "<targetId>/<file>" of its last frame written.
 type LastFrames = Arc<Mutex<HashMap<String, String>>>;
+
+impl Rec {
+    fn reserve(&self, target: &str) -> u32 {
+        let mut numbers = self.numbers.lock().unwrap_or_else(|e| e.into_inner());
+        let next = numbers.entry(target.to_string()).or_insert(1);
+        let number = *next;
+        *next = next.saturating_add(1);
+        number
+    }
+
+    /// Hands a stream frame to the writer.
+    fn send_frame(&self, target: &str, shot: Shot, kind: FrameKind) {
+        let number = self.reserve(target);
+        let _ = self.jobs.send(Job::Frame {
+            target: target.to_string(),
+            shot,
+            kind,
+            number: Some(number),
+        });
+    }
+}
+
+/// The frame after a command: its name, known as soon as the capture was handed to the
+/// writer, and whether the writer wrote it (`unless_failed`).
+pub struct AfterFrame {
+    pub name: String,
+    written: oneshot::Receiver<bool>,
+}
+
+impl AfterFrame {
+    /// The name, unless the writer already said it could not write the frame (or is gone).
+    /// Called right before the action log line is written: a write still under way keeps
+    /// the name (one JPEG; it fails only when the disk does, or at the recording's limit).
+    pub fn unless_failed(mut self) -> Option<String> {
+        use tokio::sync::oneshot::error::TryRecvError;
+        match self.written.try_recv() {
+            Ok(true) | Err(TryRecvError::Empty) => Some(self.name),
+            Ok(false) | Err(TryRecvError::Closed) => None,
+        }
+    }
+}
 
 /// What the recording knows of one target's screen, for as long as the target is in the
 /// session's scope (across attaches and connections).
@@ -469,6 +518,7 @@ impl Recorder {
                 id: rid,
                 abandoned,
                 last,
+                numbers: Default::default(),
                 _log: log,
                 _extras: extras,
             });
@@ -611,23 +661,26 @@ impl Recorder {
         last.get(target).cloned()
     }
 
-    /// At the end of an agent command: one direct capture of `target`, written as an `After`
-    /// frame; its name. Takes at most `CAPTURE_LIMIT` in all and never fails the command:
-    /// `None` at once without a connection, for a tab that is not the recording's, on a
-    /// screen-off or held page, when paused or capped, and for a target whose last capture
-    /// timed out (`FROZEN_BACKOFF`); `None` after the limit.
+    /// At the end of an agent command: one direct capture of `target`, handed to the writer
+    /// as an `After` frame; its name (`AfterFrame`). Takes at most `CAPTURE_LIMIT` and never
+    /// fails the command; the JPEG is written after it returns. `None` at once without a
+    /// connection, for a tab that is not the recording's, on a screen-off or held page, when
+    /// paused or capped, and for a target whose last capture timed out (`FROZEN_BACKOFF`);
+    /// `None` after the limit.
     pub async fn after_command(
         self: &Arc<Self>,
         id: &SessionId,
         target: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<AfterFrame> {
         let target = target?;
-        let deadline = Instant::now() + CAPTURE_LIMIT;
-        if !self.state().health.may_capture(target, Instant::now()) {
+        let started = Instant::now();
+        let deadline = started + CAPTURE_LIMIT;
+        if !self.state().health.may_capture(target, started) {
             return None;
         }
         let ticket = bounded(CAPTURE_LIMIT, self.ticket_when_ready(id, target)).await?;
-        let left = deadline.saturating_duration_since(Instant::now());
+        let ready = Instant::now();
+        let left = deadline.saturating_duration_since(ready);
         let data = match tokio::time::timeout(left, self.capture(&ticket)).await {
             Ok(data) => data?,
             Err(_) => {
@@ -635,9 +688,19 @@ impl Recorder {
                 return None;
             }
         };
-        let written = self.keep_capture(&ticket.key, data)?;
-        let left = deadline.saturating_duration_since(Instant::now());
-        bounded(left, async { written.await.ok().flatten() }).await
+        let captured = Instant::now();
+        let frame = self.keep_capture(&ticket.key, data);
+        if crate::testenv::hooks() {
+            let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1000.0;
+            let done = Instant::now();
+            eprintln!(
+                "pegboard: recorder: capture of {target}: ticket {:.1} ms, cdp {:.1} ms, handoff {:.1} ms",
+                ms(started, ready),
+                ms(ready, captured),
+                ms(captured, done),
+            );
+        }
+        frame
     }
 
     /// A ticket for a capture of `target` once the tab can be told: waits while it is being
@@ -761,13 +824,8 @@ impl Recorder {
     }
 
     /// The capture's answer came: hands it to the writer if the tab is still on the document
-    /// it was sent on and that may be recorded (F5), and the screen is on. The receiver gets
-    /// its name once written.
-    fn keep_capture(
-        &self,
-        key: &CaptureKey,
-        data: String,
-    ) -> Option<oneshot::Receiver<Option<String>>> {
+    /// it was sent on and that may be recorded (F5), and the screen is on; its name.
+    fn keep_capture(&self, key: &CaptureKey, data: String) -> Option<AfterFrame> {
         let st = self.state();
         st.tabs
             .get(&key.target)
@@ -782,6 +840,7 @@ impl Recorder {
             return None;
         }
         let (reply, written) = oneshot::channel();
+        let number = rec.reserve(&key.target);
         rec.jobs
             .send(Job::Capture {
                 target: key.target.clone(),
@@ -790,10 +849,14 @@ impl Recorder {
                     url: gate.current_url().map(url_for_log),
                     data,
                 },
+                number,
                 reply,
             })
             .ok()?;
-        Some(written)
+        Some(AfterFrame {
+            name: frame_name(&key.target, number),
+            written,
+        })
     }
 
     /// Test hook (`test.setScreen`): switches the session's screen off (streams stopped, no
@@ -1094,11 +1157,7 @@ impl Recorder {
         let open = screen.gate.stream_open(&self.opts.config, Instant::now());
         match screen.throttle.flush() {
             Some(shot) if open && !rec.budget.capped() => {
-                let _ = rec.jobs.send(Job::Frame {
-                    target: target.to_string(),
-                    shot,
-                    kind: FrameKind::Change,
-                });
+                rec.send_frame(target, shot, FrameKind::Change);
             }
             _ => {}
         }
@@ -1209,11 +1268,7 @@ impl Recorder {
                     data: p["data"].as_str().unwrap_or_default().to_string(),
                 };
                 if let Some(shot) = screen.throttle.offer(now, shot) {
-                    let _ = rec.jobs.send(Job::Frame {
-                        target: target.to_string(),
-                        shot,
-                        kind: FrameKind::Change,
-                    });
+                    rec.send_frame(target, shot, FrameKind::Change);
                 }
                 return;
             }
@@ -1324,11 +1379,7 @@ impl Recorder {
                     continue;
                 }
                 if let Some(shot) = screen.throttle.tick(now) {
-                    let _ = rec.jobs.send(Job::Frame {
-                        target: target.clone(),
-                        shot,
-                        kind: FrameKind::Change,
-                    });
+                    rec.send_frame(target, shot, FrameKind::Change);
                 }
             }
         }
@@ -1537,8 +1588,13 @@ fn spawn_writer(
         };
         for job in rx {
             match job {
-                Job::Frame { target, shot, kind } => {
-                    w.frame(&target, shot, kind);
+                Job::Frame {
+                    target,
+                    shot,
+                    kind,
+                    number,
+                } => {
+                    w.frame(&target, shot, kind, number);
                 }
                 Job::Mark {
                     target,
@@ -1557,10 +1613,11 @@ fn spawn_writer(
                 Job::Capture {
                     target,
                     shot,
+                    number,
                     reply,
                 } => {
-                    let name = w.frame(&target, shot, FrameKind::After);
-                    let _ = reply.send(name);
+                    let written = w.frame(&target, shot, FrameKind::After, Some(number));
+                    let _ = reply.send(written.is_some());
                 }
                 Job::End(done) => {
                     let _ = done.send(());
@@ -1602,7 +1659,13 @@ impl Writer {
     }
 
     /// Writes a frame; its name when it was written.
-    fn frame(&mut self, target: &str, shot: Shot, kind: FrameKind) -> Option<String> {
+    fn frame(
+        &mut self,
+        target: &str,
+        shot: Shot,
+        kind: FrameKind,
+        number: Option<u32>,
+    ) -> Option<String> {
         let jpeg = match data_encoding::BASE64.decode(shot.data.as_bytes()) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1611,7 +1674,12 @@ impl Writer {
             }
         };
         let writer = self.writer(target)?;
-        match writer.write_frame(&shot.ts, shot.url.as_deref(), &jpeg, kind) {
+        let url = shot.url.as_deref();
+        let written = match number {
+            Some(n) => writer.write_frame_as(n, &shot.ts, url, &jpeg, kind),
+            None => writer.write_frame(&shot.ts, url, &jpeg, kind),
+        };
+        match written {
             Ok(Some(name)) => {
                 self.set_screen(ScreenStatus::Recorded);
                 self.lock_last().insert(target.to_string(), name.clone());
@@ -1761,6 +1829,7 @@ mod tests {
                 ..shot(1)
             },
             kind: FrameKind::Change,
+            number: None,
         })
         .unwrap();
         // Not a target id: nothing is made outside screen/.
@@ -1768,6 +1837,7 @@ mod tests {
             target: "../x".into(),
             shot: shot(2),
             kind: FrameKind::Change,
+            number: None,
         })
         .unwrap();
         end(&jobs).await;
@@ -1783,6 +1853,7 @@ mod tests {
             target: T2.into(),
             shot: shot(3),
             kind: FrameKind::Change,
+            number: None,
         })
         .unwrap();
         end(&jobs).await;
@@ -1817,6 +1888,7 @@ mod tests {
                 target: target.into(),
                 shot: shot(i as u8),
                 kind: FrameKind::Change,
+                number: None,
             })
             .unwrap();
         }
@@ -1868,6 +1940,7 @@ mod tests {
                 id: "r_abcdefgh".into(),
                 abandoned: Default::default(),
                 last,
+                numbers: Default::default(),
                 _log: log,
                 _extras: Vec::new(),
             });
@@ -2223,6 +2296,7 @@ mod tests {
             id: "r_abcdefgh".into(),
             abandoned: Default::default(),
             last,
+            numbers: Default::default(),
             _log: log,
             _extras: Vec::new(),
         });
@@ -2419,8 +2493,11 @@ mod tests {
         let Ticket::Ready(key) = r.ticket_now(&id, T1) else {
             panic!("an open tab can be captured");
         };
-        let name = r.keep_capture(&key, frame(7)).unwrap().await.unwrap();
+        let after = r.keep_capture(&key, frame(7)).unwrap();
+        let name = Some(after.name.clone());
         assert_eq!(name.as_deref(), Some(format!("{T1}/000001.jpg").as_str()));
+        // Known before it is written; written meanwhile.
+        assert!(after.written.await.unwrap());
         let lines = index(&manifest, T1);
         assert_eq!(lines[0].kind, FrameKind::After);
         assert_eq!(lines[0].url.as_deref(), Some("http://a.test/"));
@@ -2492,8 +2569,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (r, id, _manifest) = rig(tmp.path(), "http://a.test/");
         let t = Instant::now();
-        assert_eq!(r.after_command(&id, Some(T1)).await, None);
-        assert_eq!(r.after_command(&id, None).await, None);
+        assert!(r.after_command(&id, Some(T1)).await.is_none());
+        assert!(r.after_command(&id, None).await.is_none());
         assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
     }
 
@@ -2541,10 +2618,11 @@ mod tests {
         jobs.send(Job::Capture {
             target: T1.into(),
             shot: shot(1),
+            number: 1,
             reply: tx,
         })
         .unwrap();
-        assert_eq!(rx.await.unwrap(), Some(format!("{T1}/000001.jpg")));
+        assert!(rx.await.unwrap());
         assert_eq!(
             last.lock().unwrap().get(T1).cloned(),
             Some(format!("{T1}/000001.jpg"))
@@ -2564,14 +2642,79 @@ mod tests {
                 data: "not base64!".into(),
                 ..shot(2)
             },
+            number: 2,
             reply: tx,
         })
         .unwrap();
-        assert_eq!(rx.await.unwrap(), None);
+        assert!(!rx.await.unwrap());
         end(&jobs).await;
         assert_eq!(last.lock().unwrap().get(T1), None);
         let kinds: Vec<_> = index(&manifest, T1).iter().map(|l| l.kind).collect();
         assert_eq!(kinds, [FrameKind::After, FrameKind::Off]);
         assert_eq!(manifest.get().screen, ScreenStatus::Recorded);
+    }
+
+    #[tokio::test]
+    async fn a_capture_is_named_in_the_order_of_the_frames_around_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        let t0 = Instant::now();
+        feed(&r, &id, shot_event(1), t0);
+        let Ticket::Ready(key) = r.ticket_now(&id, T1) else {
+            panic!("an open tab can be captured");
+        };
+        // Named at once, before the writer got to it.
+        let after = r.keep_capture(&key, frame(2)).unwrap();
+        assert_eq!(after.name, format!("{T1}/000002.jpg"));
+        feed(&r, &id, shot_event(3), t0 + Duration::from_secs(2));
+        r.end_session(&id).await;
+        let lines: Vec<_> = index(&manifest, T1)
+            .into_iter()
+            .map(|l| (l.file.unwrap(), l.kind))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("000001.jpg".to_string(), FrameKind::Change),
+                ("000002.jpg".to_string(), FrameKind::After),
+                ("000003.jpg".to_string(), FrameKind::Change),
+            ]
+        );
+        assert_eq!(after.unless_failed(), Some(format!("{T1}/000002.jpg")));
+    }
+
+    #[tokio::test]
+    async fn a_frame_after_whose_write_failed_names_nothing() {
+        let named = |written: Option<bool>| {
+            let (tx, rx) = oneshot::channel();
+            if let Some(w) = written {
+                tx.send(w).unwrap();
+            } else {
+                // Still being written: the sender lives on.
+                std::mem::forget(tx);
+            }
+            AfterFrame {
+                name: format!("{T1}/000001.jpg"),
+                written: rx,
+            }
+            .unless_failed()
+        };
+        assert_eq!(
+            named(Some(true)).as_deref(),
+            Some(format!("{T1}/000001.jpg").as_str())
+        );
+        assert_eq!(
+            named(None).as_deref(),
+            Some(format!("{T1}/000001.jpg").as_str())
+        );
+        assert_eq!(named(Some(false)), None);
+        // The writer is gone without an answer.
+        let (tx, rx) = oneshot::channel::<bool>();
+        drop(tx);
+        let gone = AfterFrame {
+            name: "x".into(),
+            written: rx,
+        };
+        assert_eq!(gone.unless_failed(), None);
     }
 }

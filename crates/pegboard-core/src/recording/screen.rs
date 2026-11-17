@@ -459,6 +459,16 @@ pub fn valid_frame_name(name: &str) -> bool {
     valid_target_id(target) && valid_frame_file(file)
 }
 
+/// The file of frame `number` (`000001.jpg`).
+pub fn frame_file(number: u32) -> String {
+    format!("{number:06}.jpg")
+}
+
+/// The name `ScreenWriter` gives frame `number` of `target_id`.
+pub fn frame_name(target_id: &str, number: u32) -> String {
+    format!("{target_id}/{}", frame_file(number))
+}
+
 /// `000001.jpg`: six digits or more (at most ten) and `.jpg`.
 fn valid_frame_file(file: &str) -> bool {
     file.strip_suffix(".jpg")
@@ -515,13 +525,26 @@ impl ScreenWriter {
         jpeg: &[u8],
         kind: FrameKind,
     ) -> std::io::Result<Option<String>> {
+        self.write_frame_as(self.next, ts, url, jpeg, kind)
+    }
+
+    /// `write_frame` under the number `number`, given out before (`frame_name`): numbers
+    /// are never used twice, later frames are numbered after it.
+    pub fn write_frame_as(
+        &mut self,
+        number: u32,
+        ts: &str,
+        url: Option<&str>,
+        jpeg: &[u8],
+        kind: FrameKind,
+    ) -> std::io::Result<Option<String>> {
+        self.next = self.next.max(number.saturating_add(1));
         let n = jpeg.len() as u64;
         if !self.budget.try_take(n) {
             self.mark_capped(ts)?;
             return Ok(None);
         }
-        let file = format!("{:06}.jpg", self.next);
-        self.next = self.next.saturating_add(1);
+        let file = frame_file(number);
         let name = format!("{}/{file}", self.target);
         if !valid_frame_name(&name) {
             self.budget.give_back(n);

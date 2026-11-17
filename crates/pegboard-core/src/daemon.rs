@@ -16,6 +16,7 @@ use crate::downloads::Report;
 use crate::paths::Paths;
 use crate::policy;
 use crate::proxy::server::Endpoint;
+use crate::recording::recorder::AfterFrame;
 use crate::runner::{succeeded, Runner, DEFAULT_TIMEOUT_MS};
 use crate::session::SessionManager;
 use crate::upload;
@@ -258,10 +259,18 @@ pub async fn run_command_with_hook(
     // hides the text. The frame after (one capture of the tab the command ended on, at most
     // `CAPTURE_LIMIT`) is taken meanwhile.
     let after_target = screen_target(sessions, runner, id);
-    let (probe, frame_after) = tokio::join!(
-        probe(sessions, id),
-        recorder.after_command(id, after_target.as_deref())
+    let ((probe, probe_time), (frame_after, after_time)) = tokio::join!(
+        timed(probe(sessions, id)),
+        timed(recorder.after_command(id, after_target.as_deref()))
     );
+    if crate::testenv::hooks() {
+        eprintln!(
+            "pegboard: command {}: probe {:.1} ms, frame after {:.1} ms",
+            entry.command,
+            probe_time.as_secs_f64() * 1000.0,
+            after_time.as_secs_f64() * 1000.0,
+        );
+    }
     let succeeded = matches!(&outcome, Ok(r) if succeeded(r));
     let hide_typed =
         types_text && !(harmless_before && succeeded && !probe.failed && !probe.sensitive);
@@ -281,17 +290,25 @@ pub async fn run_command_with_hook(
     entry.args = logged_args(argv, hide_typed);
     entry.redacted = hide_typed || !at.always.is_empty() || eval_masked(argv, &entry.args);
     entry.frame_before = frame_before;
-    entry.frame_after = frame_after;
     entry.duration_ms = elapsed_ms(started);
     entry.ok = succeeded;
     // An expression's error can quote page values (a JSON parse error shows the text).
     entry.error = error_text(entry.redacted, is_expression_command(argv), &outcome);
+    // The frame after is being written meanwhile; a write that already failed names nothing.
+    entry.frame_after = frame_after.and_then(AfterFrame::unless_failed);
     // The command's own entry first: a failure to write a download report cannot drop it
     // (the reports wait for the next result).
     append(log, entry)?;
     report_downloads(sessions, log, id, &mut outcome)?;
     sessions.touch(id);
     outcome
+}
+
+/// `f` and how long it took.
+async fn timed<T>(f: impl Future<Output = T>) -> (T, Duration) {
+    let started = Instant::now();
+    let out = f.await;
+    (out, started.elapsed())
 }
 
 /// The tab a command's frames are of: the one agent-browser works on, or else the session's
