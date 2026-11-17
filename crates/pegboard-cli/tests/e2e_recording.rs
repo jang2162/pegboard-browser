@@ -537,12 +537,43 @@ fn hook(home: &Home, method: &str, params: Value) -> Value {
         .unwrap()
 }
 
-/// F5 across a reattach: the recorder lost the tab while it was on a screen-off page, and
-/// the tab went on to a page that paints late. Until that page's first contentful paint the
-/// screen may still be the off page's, so nothing is written before it.
-#[test]
-#[ignore]
-fn a_tab_reattached_after_leaving_an_off_page_writes_nothing_before_the_paint() {
+/// No change frame of `target` before the page's first contentful paint (`paintedAt`, read
+/// from the page), at least one after it, and none on the screen-off host.
+fn assert_nothing_before_the_paint(home: &Home, handle: &str, target: &str) {
+    let painted = eval(home, handle, "window.paintedAt")
+        .as_f64()
+        .expect("no paint") as i64;
+    close(home, handle);
+    let dir = recording_dir(home, handle);
+    assert_index_matches_files(&dir);
+    let frames = changes(&dir, target);
+    for f in &frames {
+        assert_ne!(
+            host_of(f["url"].as_str().unwrap_or("")),
+            SCREEN_OFF_NAME,
+            "{f}"
+        );
+        let t = ts_ms(f["ts"].as_str().unwrap());
+        // Clock reads of the page and of the daemon may differ by a few ms.
+        assert!(
+            t >= painted - 50,
+            "a frame {} ms before the paint: {f}; recorder: {:?}",
+            painted - t,
+            recorder_log(home, target)
+        );
+    }
+    assert!(
+        frames
+            .iter()
+            .any(|f| ts_ms(f["ts"].as_str().unwrap()) >= painted),
+        "no frame after the paint: {:?}",
+        index(&dir, target)
+    );
+}
+
+/// The recorder loses the tab on a screen-off page; meanwhile the tab goes on to `page`
+/// (on the fixture's address), which paints 2.5 s after it loads.
+fn reattach_after_an_off_page(page: &str) {
     let origin = fixture();
     let home = shared_home();
     let off = format!("{}/off", origin.replace("127.0.0.1", SCREEN_OFF_NAME));
@@ -555,38 +586,43 @@ fn a_tab_reattached_after_leaving_an_off_page_writes_nothing_before_the_paint() 
         json!({ "sessionId": id_of(&h), "token": token_of(&h), "holdMs": 1500 }),
     );
     assert_eq!(r["dropped"], true, "{r}");
-    // While the recorder is away: to a page that paints 2.5 s after it loads.
-    ok(home, &h, &["open", &format!("{origin}/late")]);
+    ok(home, &h, &["open", &format!("{origin}{page}")]);
     std::thread::sleep(Duration::from_secs(5));
-    let painted = eval(home, &h, "window.paintedAt")
-        .as_f64()
-        .expect("no paint") as i64;
-    close(home, &h);
+    assert_nothing_before_the_paint(home, &h, &a);
+}
 
-    let dir = recording_dir(home, &h);
-    assert_index_matches_files(&dir);
-    let frames = changes(&dir, &a);
-    for f in &frames {
-        assert_ne!(
-            host_of(f["url"].as_str().unwrap_or("")),
-            SCREEN_OFF_NAME,
-            "{f}"
-        );
-        let t = ts_ms(f["ts"].as_str().unwrap());
-        // Clock reads of the page and of the daemon may differ by a few ms.
-        assert!(
-            t >= painted - 50,
-            "a frame {} ms before the paint: {f}",
-            painted - t
-        );
-    }
-    assert!(
-        frames
-            .iter()
-            .any(|f| ts_ms(f["ts"].as_str().unwrap()) >= painted),
-        "no frame after the paint: {:?}",
-        index(&dir, &a)
+/// F5 across a reattach: until the new page's first contentful paint the screen may still
+/// be the off page's, so nothing is written before it.
+#[test]
+#[ignore]
+fn a_tab_reattached_after_leaving_an_off_page_writes_nothing_before_the_paint() {
+    reattach_after_an_off_page("/late");
+}
+
+/// The paint the reattach looks for is a real paint entry: a page that only makes a
+/// `performance.mark` of that name stays held until it really paints.
+#[test]
+#[ignore]
+fn a_page_cannot_fake_its_first_paint() {
+    reattach_after_an_off_page("/mark-late");
+}
+
+/// A session whose start page is screen-off and replaces itself at once (leaving no history
+/// entry): the recorder followed the tab before it was navigated, so nothing of the next
+/// page is written before it paints.
+#[test]
+#[ignore]
+fn a_screen_off_start_page_is_known_to_the_recording() {
+    let origin = fixture();
+    let home = shared_home();
+    let start = format!(
+        "{}/replace-late",
+        origin.replace("127.0.0.1", SCREEN_OFF_NAME)
     );
+    let h = create(home, &start);
+    let a = targets(home, &h)[0].clone();
+    std::thread::sleep(Duration::from_secs(5));
+    assert_nothing_before_the_paint(home, &h, &a);
 }
 
 /// The recorder never holds up `session create`: with its connection down (test hook), a

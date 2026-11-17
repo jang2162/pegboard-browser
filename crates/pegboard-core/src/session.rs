@@ -30,7 +30,7 @@ use crate::policy::{self, PinGuard, PinTable};
 use crate::profiles::{profile_dir, rpc_error, valid_profile_name, Profiles, DEFAULT_PROFILE};
 use crate::proxy::filter::normalize_url;
 use crate::proxy::server::{Endpoint, ProxyServer};
-use crate::recording::recorder::Recorder;
+use crate::recording::recorder::{Recorder, WATCH_WAIT};
 
 const GROUP_COLORS: &[&str] = &[
     "grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange",
@@ -431,8 +431,18 @@ impl SessionManager {
                 _pin: pin,
             },
         );
-        // The first tab entered the scope with `register`, which tells no one.
-        inner.recorder.add_target(&id, &first, &runtime.context);
+        // The first tab entered the scope with `register`, which tells no one. With a URL to
+        // open, the recorder follows the tab before it is navigated: the start page may be a
+        // screen-off page that moves on at once (e.g. a sign-in page's `location.replace`),
+        // and the recording must know it passed there.
+        if url.is_some() {
+            inner
+                .recorder
+                .watch_first(&id, &first, &runtime.context, WATCH_WAIT)
+                .await;
+        } else {
+            inner.recorder.add_target(&id, &first, &runtime.context);
+        }
         let setup = async {
             inner.ensure_focus(&first).await.map_err(browser_failed)?;
             if let Some(url) = &url {

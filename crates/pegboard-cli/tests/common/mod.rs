@@ -237,21 +237,17 @@ paint(); setInterval(paint, 100);
         )),
         // Its background changes every 100 ms (frames, but no contentful paint); text
         // appears after 2.5 s, and `paintedAt` is the time of its first contentful paint.
-        "/late" => html(page(
-            "late",
-            r#"<script>
-let n = 0;
-setInterval(() => { n++; document.body.style.background = 'hsl(' + (n * 37 % 360) + ',70%,60%)'; }, 100);
-window.paintedAt = null;
-new PerformanceObserver(l => {
-  for (const e of l.getEntries()) {
-    if (e.name === 'first-contentful-paint') window.paintedAt = performance.timeOrigin + e.startTime;
-  }
-}).observe({ type: 'paint', buffered: true });
-setTimeout(() => {
-  const h = document.createElement('h1'); h.textContent = 'late'; document.body.appendChild(h);
-}, 2500);
-</script>"#,
+        "/late" => html(page("late", &late_script(""))),
+        // `/late` that also makes a `mark` named like the paint entry, at once.
+        "/mark-late" => html(page(
+            "mark-late",
+            &late_script("performance.mark('first-contentful-paint');"),
+        )),
+        // A page on which a sign-in flow would start: it replaces itself with `/late` on
+        // the fixture's own address at once (no history entry is left of it).
+        "/replace-late" => html(page(
+            "replace-late",
+            &format!("<script>location.replace('http://127.0.0.1:{port}/late')</script>"),
         )),
         "/popup" => html(page(
             "popup",
@@ -278,6 +274,25 @@ window.start = () => {
         )),
         _ => return None,
     })
+}
+
+fn late_script(first: &str) -> String {
+    format!(
+        r#"<script>
+{first}
+let n = 0;
+setInterval(() => {{ n++; document.body.style.background = 'hsl(' + (n * 37 % 360) + ',70%,60%)'; }}, 100);
+window.paintedAt = null;
+new PerformanceObserver(l => {{
+  for (const e of l.getEntries()) {{
+    if (e.name === 'first-contentful-paint') window.paintedAt = performance.timeOrigin + e.startTime;
+  }}
+}}).observe({{ type: 'paint', buffered: true }});
+setTimeout(() => {{
+  const h = document.createElement('h1'); h.textContent = 'late'; document.body.appendChild(h);
+}}, 2500);
+</script>"#
+    )
 }
 
 /// Serves the fixture pages on a loopback port for as long as the test process lives.

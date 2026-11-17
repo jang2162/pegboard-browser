@@ -13,6 +13,7 @@
 //!   waits for them.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -38,6 +39,10 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(250);
 /// attaches later anyway. 300 ms is what one command may lose at most (design 4.6 allows
 /// 1 s in the worst case).
 const BEGIN_WAIT: Duration = Duration::from_millis(300);
+/// How long `watch_first` (inside `session create`, before the first tab is navigated)
+/// waits to attach. A first connection and an attach take tens of ms; past this the tab is
+/// navigated anyway and its first attach waits for the page to paint (fail closed).
+pub const WATCH_WAIT: Duration = Duration::from_millis(500);
 /// How long the test hook waits for the connection.
 const CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// Stopping a tab's stream when the recording ends, at most.
@@ -51,7 +56,9 @@ fn screencast_params() -> Value {
 }
 
 /// Read in an isolated world (a page's own scripts cannot change what it sees).
-const PAINTED_JS: &str = "performance.getEntriesByName('first-contentful-paint').length > 0";
+/// Only an entry of type `paint`: `performance.mark('first-contentful-paint')` is a `mark`.
+const PAINTED_JS: &str =
+    "performance.getEntriesByName('first-contentful-paint', 'paint').length > 0";
 
 fn now_ts() -> String {
     time::OffsetDateTime::now_utc()
@@ -95,6 +102,9 @@ struct Rec {
     budget: Arc<ScreenBudget>,
     /// The recording id, for daemon.log.
     id: String,
+    /// Set when the recording ended without waiting for the writer any longer: from then on
+    /// the writer leaves the manifest alone.
+    abandoned: Arc<AtomicBool>,
     /// Kept for the session's other recorders (navigation, people, extras: later tasks).
     _log: SessionLog,
     _extras: Vec<RecordExtra>,
@@ -126,6 +136,8 @@ struct Sess {
     targets: BTreeSet<String>,
     rec: Option<Rec>,
     screens: HashMap<String, Screen>,
+    /// Its tabs are followed before the recording begins (`watch_first`).
+    watched: bool,
 }
 
 impl Sess {
@@ -135,6 +147,7 @@ impl Sess {
             targets: BTreeSet::new(),
             rec: None,
             screens: HashMap::new(),
+            watched: false,
         }
     }
 }
@@ -164,15 +177,16 @@ struct State {
 }
 
 impl State {
-    /// The session whose recording is running and has `target` in its scope.
+    /// The session that has `target` in its scope and whose tabs are followed: its
+    /// recording runs, or `watch_first` asked for it.
     fn recording_session_of(&self, target: &str) -> Option<(&SessionId, &Sess)> {
         self.sessions
             .iter()
-            .find(|(_, s)| s.rec.is_some() && s.targets.contains(target))
+            .find(|(_, s)| (s.rec.is_some() || s.watched) && s.targets.contains(target))
     }
 
     fn wanted(&self) -> bool {
-        self.sessions.values().any(|s| s.rec.is_some())
+        self.sessions.values().any(|s| s.rec.is_some() || s.watched)
     }
 }
 
@@ -232,6 +246,48 @@ impl Recorder {
         if recording {
             self.spawn_attach(target_id);
         }
+    }
+
+    /// From the session manager, before the session's first tab is navigated: attaches to
+    /// it (its navigations are followed, no stream until the recording begins), so the
+    /// recording knows every page the tab shows from its first one, also a screen-off page
+    /// it only passes through. Waits at most `limit`; when the tab is not attached by then,
+    /// its first attach assumes it may come from a screen-off page (waits for its paint).
+    pub async fn watch_first(
+        self: &Arc<Self>,
+        id: &SessionId,
+        target_id: &str,
+        context: &str,
+        limit: Duration,
+    ) -> bool {
+        {
+            let mut st = self.state();
+            let sess = st
+                .sessions
+                .entry(id.clone())
+                .or_insert_with(|| Sess::new(context));
+            sess.watched = true;
+            sess.targets.insert(target_id.to_string());
+        }
+        self.wake.notify_one();
+        let me = self.clone();
+        let target = target_id.to_string();
+        // In a task of its own, so that an attach still running at the limit is not cut.
+        let attach =
+            tokio::spawn(
+                async move { me.connected(limit).await.is_some() && me.attach(&target).await },
+            );
+        let attached = matches!(tokio::time::timeout(limit, attach).await, Ok(Ok(true)));
+        if !attached {
+            if let Some(sess) = self.state().sessions.get_mut(id) {
+                sess.screens
+                    .entry(target_id.to_string())
+                    .or_insert_with(|| Screen::new(None))
+                    .gate
+                    .assume_unseen_past();
+            }
+        }
+        attached
     }
 
     fn spawn_attach(self: &Arc<Self>, target: &str) -> tokio::task::JoinHandle<bool> {
@@ -303,11 +359,13 @@ impl Recorder {
             sess.context = context.to_string();
             let budget = ScreenBudget::new(self.opts.config.max_per_recording_bytes());
             let rid = manifest.get().recording_id;
-            let jobs = spawn_writer(manifest, budget.clone());
+            let abandoned = Arc::new(AtomicBool::new(false));
+            let jobs = spawn_writer(manifest, budget.clone(), abandoned.clone());
             sess.rec = Some(Rec {
                 jobs,
                 budget,
                 id: rid,
+                abandoned,
                 _log: log,
                 _extras: extras,
             });
@@ -348,7 +406,10 @@ impl Recorder {
                     stops.push((conn, tab.cdp));
                 }
             }
-            let rid = sess.rec.as_ref().map(|r| r.id.clone());
+            let rid = sess
+                .rec
+                .as_ref()
+                .map(|r| (r.id.clone(), r.abandoned.clone()));
             let done = sess.rec.map(|rec| {
                 let (tx, rx) = oneshot::channel();
                 let _ = rec.jobs.send(Job::End(tx));
@@ -368,12 +429,13 @@ impl Recorder {
             let _ = tokio::time::timeout(STOP_LIMIT, stop).await;
         });
         futures_util::future::join_all(stopping).await;
-        if let Some(done) = done {
+        if let (Some(done), Some((rid, abandoned))) = (done, rid) {
             if tokio::time::timeout(WRITER_LIMIT, done).await.is_err() {
+                // The log ends now; the manifest must not change behind it.
+                abandoned.store(true, Ordering::SeqCst);
                 eprintln!(
-                    "pegboard: recording {}: the screen writer did not finish within {} s; \
+                    "pegboard: recording {rid}: the screen writer did not finish within {} s; \
                      its last frames may be missing",
-                    rid.unwrap_or_default(),
                     WRITER_LIMIT.as_secs()
                 );
             }
@@ -477,26 +539,54 @@ impl Recorder {
     /// browser's own answer on this connection, in that session's context; starts its
     /// stream. True when the tab is (or already was) attached on the current connection.
     async fn attach(self: &Arc<Self>, target: &str) -> bool {
-        let (conn, epoch, session_context) = {
+        enum Next {
+            Done(bool),
+            /// Attached since `watch_first`; the recording runs now: start the stream.
+            Stream(CdpConn, String),
+            Attach(CdpConn, u64, String),
+        }
+        let next = {
             let mut st = self.state();
-            let Some(conn) = st.conn.clone() else {
-                return false;
-            };
-            if st.tabs.get(target).is_some_and(|t| t.epoch == st.epoch) {
-                return true;
+            match st.conn.clone() {
+                None => Next::Done(false),
+                Some(conn) => match st.tabs.get(target).filter(|t| t.epoch == st.epoch) {
+                    Some(tab) => {
+                        let recording = st
+                            .sessions
+                            .get(&tab.session)
+                            .and_then(|s| s.rec.as_ref())
+                            .is_some_and(|r| !r.budget.capped());
+                        if tab.streaming || !recording {
+                            Next::Done(true)
+                        } else {
+                            Next::Stream(conn, tab.cdp.clone())
+                        }
+                    }
+                    None => match st
+                        .recording_session_of(target)
+                        .map(|(_, s)| s.context.clone())
+                    {
+                        None => Next::Done(false),
+                        Some(context) => {
+                            if st.attaching.insert(target.to_string()) {
+                                Next::Attach(conn, st.epoch, context)
+                            } else {
+                                Next::Done(false)
+                            }
+                        }
+                    },
+                },
             }
-            let Some((_, sess)) = st.recording_session_of(target) else {
-                return false;
-            };
-            let context = sess.context.clone();
-            if !st.attaching.insert(target.to_string()) {
-                return false;
-            }
-            (conn, st.epoch, context)
         };
-        let attached = self.attach_on(&conn, epoch, target, &session_context).await;
-        self.state().attaching.remove(target);
-        attached
+        match next {
+            Next::Done(attached) => attached,
+            Next::Stream(conn, cdp) => self.stream(&conn, target, &cdp).await,
+            Next::Attach(conn, epoch, context) => {
+                let attached = self.attach_on(&conn, epoch, target, &context).await;
+                self.state().attaching.remove(target);
+                attached
+            }
+        }
     }
 
     async fn attach_on(
@@ -586,7 +676,7 @@ impl Recorder {
         url: &str,
         loader: &str,
         painted: bool,
-        came_from: Option<&str>,
+        neighbours: &[String],
     ) -> Option<bool> {
         let mut st = self.state();
         let session = st
@@ -598,7 +688,8 @@ impl Recorder {
         let sess = st.sessions.get_mut(&session)?;
         let capped = sess.rec.as_ref().is_none_or(|r| r.budget.capped());
         let gate = &mut sess.screens.get_mut(target)?.gate;
-        gate.attached(&self.opts.config, url, loader, painted, came_from);
+        let neighbours: Vec<&str> = neighbours.iter().map(String::as_str).collect();
+        gate.attached(&self.opts.config, url, loader, painted, &neighbours);
         if crate::testenv::hooks() {
             let now = Instant::now();
             let stream = if gate.stream_open(&self.opts.config, now) {
@@ -609,9 +700,9 @@ impl Recorder {
                 "closed"
             };
             eprintln!(
-                "pegboard: recorder: attached {target} on {} (painted {painted}, came from {}): stream {stream}",
+                "pegboard: recorder: attached {target} on {} (painted {painted}, next to {:?}): stream {stream}",
                 url_for_log(url),
-                came_from.map_or_else(|| "-".to_string(), url_for_log),
+                neighbours.iter().map(|u| url_for_log(u)).collect::<Vec<_>>(),
             );
         }
         Some(capped)
@@ -639,18 +730,23 @@ impl Recorder {
         // Only a list of screen-off domains can make a document wait for its paint.
         let judged = !cfg.screen_off_domains.is_empty() && !cfg.screen_off(url);
         let painted = judged && painted(conn, cdp, target).await;
-        let came_from = if judged {
-            came_from(conn, cdp).await
+        let neighbours = if judged {
+            neighbours(conn, cdp).await
         } else {
-            None
+            Vec::new()
         };
-        let Some(capped) = self.resolve(target, cdp, url, loader, painted, came_from.as_deref())
-        else {
+        let Some(capped) = self.resolve(target, cdp, url, loader, painted, &neighbours) else {
             return false;
         };
+        // No recording yet (only watched), or over its limit: no stream.
         if capped {
             return true;
         }
+        self.stream(conn, target, cdp).await
+    }
+
+    /// Starts the tab's stream.
+    async fn stream(&self, conn: &CdpConn, target: &str, cdp: &str) -> bool {
         if conn
             .send("Page.startScreencast", screencast_params(), Some(cdp))
             .await
@@ -707,10 +803,12 @@ impl Recorder {
             let Some(session) = st.tabs.get(&target).map(|t| t.session.clone()) else {
                 return;
             };
-            let Some(rec) = st.sessions.get(&session).and_then(|s| s.rec.as_ref()) else {
-                return;
-            };
-            if frame && rec.budget.capped() {
+            let capped = st
+                .sessions
+                .get(&session)
+                .and_then(|s| s.rec.as_ref())
+                .is_some_and(|r| r.budget.capped());
+            if frame && capped {
                 // Over the recording's limit: every stream of the session stops.
                 st.tabs
                     .values_mut()
@@ -747,15 +845,20 @@ impl Recorder {
             return;
         };
         let Sess { rec, screens, .. } = sess;
-        let (Some(rec), Some(screen)) = (rec.as_ref(), screens.get_mut(target)) else {
+        let Some(screen) = screens.get_mut(target) else {
             return;
         };
+        // None while the tab is only watched: its navigations count, its frames do not.
+        let rec = rec.as_ref();
         let cfg = &self.opts.config;
         let p = &e.params;
         // A page target's main frame has the target's id.
         let main = |key: &str| p[key].as_str() == Some(target);
         match e.method.as_str() {
             "Page.screencastFrame" => {
+                let Some(rec) = rec else {
+                    return;
+                };
                 if !screen.gate.stream_open(cfg, now) {
                     self.closed(rec, target, screen);
                     return;
@@ -809,7 +912,10 @@ impl Recorder {
         }
         // A main-frame navigation event.
         if !screen.gate.stream_open(cfg, now) {
-            self.closed(rec, target, screen);
+            match rec {
+                Some(rec) => self.closed(rec, target, screen),
+                None => screen.throttle.discard(),
+            }
         }
     }
 
@@ -941,16 +1047,26 @@ async fn painted(conn: &CdpConn, cdp: &str, frame: &str) -> bool {
     }
 }
 
-/// The URL of the history entry before the current one (`None` when there is none or it
-/// cannot be read).
-async fn came_from(conn: &CdpConn, cdp: &str) -> Option<String> {
-    let h = conn
+/// The URLs of the history entries next to the current one (before and after it: a back
+/// navigation leaves the page it came from after it). Empty when they cannot be read.
+async fn neighbours(conn: &CdpConn, cdp: &str) -> Vec<String> {
+    let Ok(h) = conn
         .send("Page.getNavigationHistory", json!({}), Some(cdp))
         .await
-        .ok()?;
-    let current = h["currentIndex"].as_u64()?;
-    let before = usize::try_from(current.checked_sub(1)?).ok()?;
-    h["entries"][before]["url"].as_str().map(String::from)
+    else {
+        return Vec::new();
+    };
+    let Some(current) = h["currentIndex"]
+        .as_u64()
+        .and_then(|c| usize::try_from(c).ok())
+    else {
+        return Vec::new();
+    };
+    [current.checked_sub(1), current.checked_add(1)]
+        .into_iter()
+        .flatten()
+        .filter_map(|i| h["entries"][i]["url"].as_str().map(String::from))
+        .collect()
 }
 
 /// What a later task needs to take a direct capture of a recorded tab and to check, when
@@ -1043,7 +1159,11 @@ async fn run_events(
 /// The session's writer thread: owns its targets' `ScreenWriter`s for the whole recording
 /// and keeps the manifest's `screen` up to date. A write error drops that frame and is told
 /// in daemon.log once.
-fn spawn_writer(manifest: ManifestHandle, budget: Arc<ScreenBudget>) -> std_mpsc::Sender<Job> {
+fn spawn_writer(
+    manifest: ManifestHandle,
+    budget: Arc<ScreenBudget>,
+    abandoned: Arc<AtomicBool>,
+) -> std_mpsc::Sender<Job> {
     let (tx, rx) = std_mpsc::channel::<Job>();
     std::thread::spawn(move || {
         let mut w = Writer {
@@ -1051,6 +1171,7 @@ fn spawn_writer(manifest: ManifestHandle, budget: Arc<ScreenBudget>) -> std_mpsc
             recording: manifest.get().recording_id,
             manifest,
             budget,
+            abandoned,
             writers: HashMap::new(),
             told: HashSet::new(),
         };
@@ -1083,6 +1204,7 @@ struct Writer {
     recording: String,
     manifest: ManifestHandle,
     budget: Arc<ScreenBudget>,
+    abandoned: Arc<AtomicBool>,
     writers: HashMap<String, ScreenWriter>,
     /// Errors already in daemon.log.
     told: HashSet<String>,
@@ -1137,6 +1259,9 @@ impl Writer {
 
     /// `Recorded` only over `None`; `Capped` over anything but itself.
     fn set_screen(&mut self, status: ScreenStatus) {
+        if self.abandoned.load(Ordering::SeqCst) {
+            return;
+        }
         let current = self.manifest.get().screen;
         let change = match status {
             ScreenStatus::Recorded => current == ScreenStatus::None,
@@ -1227,7 +1352,7 @@ mod tests {
         let (_log, manifest) = open_log(tmp.path());
         assert_eq!(manifest.get().screen, ScreenStatus::None);
         let budget = ScreenBudget::new(1_000_000);
-        let jobs = spawn_writer(manifest.clone(), budget);
+        let jobs = spawn_writer(manifest.clone(), budget, Default::default());
         jobs.send(Job::Mark {
             target: T1.into(),
             ts: now_ts(),
@@ -1255,7 +1380,11 @@ mod tests {
         end(&jobs).await;
         assert_eq!(manifest.get().screen, ScreenStatus::None);
         assert!(!manifest.dir().join("x").exists());
-        let jobs = spawn_writer(manifest.clone(), ScreenBudget::new(1_000_000));
+        let jobs = spawn_writer(
+            manifest.clone(),
+            ScreenBudget::new(1_000_000),
+            Default::default(),
+        );
         jobs.send(Job::Frame {
             target: T2.into(),
             shot: shot(3),
@@ -1283,7 +1412,7 @@ mod tests {
             .unwrap()
             .len() as u64;
         let budget = ScreenBudget::new(2 * one);
-        let jobs = spawn_writer(manifest.clone(), budget.clone());
+        let jobs = spawn_writer(manifest.clone(), budget.clone(), Default::default());
         for (i, target) in [T1, T2, T1, T2, T1].into_iter().enumerate() {
             jobs.send(Job::Frame {
                 target: target.into(),
@@ -1323,7 +1452,7 @@ mod tests {
         let (log, manifest) = open_log(dir);
         let id = SessionId("s_abcdefgh".into());
         let budget = ScreenBudget::new(1_000_000);
-        let jobs = spawn_writer(manifest.clone(), budget.clone());
+        let jobs = spawn_writer(manifest.clone(), budget.clone(), Default::default());
         {
             let mut st = recorder.state();
             let mut sess = Sess::new("AGENT");
@@ -1332,6 +1461,7 @@ mod tests {
                 jobs,
                 budget,
                 id: "r_abcdefgh".into(),
+                abandoned: Default::default(),
                 _log: log,
                 _extras: Vec::new(),
             });
@@ -1340,7 +1470,7 @@ mod tests {
         // As an attach does: registered, then the frame tree (a painted document).
         assert!(recorder.register(T1, "C1", 0, Some(url)));
         assert_eq!(
-            recorder.resolve(T1, "C1", url, "L0", true, None),
+            recorder.resolve(T1, "C1", url, "L0", true, &[]),
             Some(false)
         );
         (recorder, id, manifest)
@@ -1544,7 +1674,7 @@ mod tests {
         // Until the tree is read nothing is kept.
         feed(&r, &id, shot_event(2), ms(100));
         assert_eq!(
-            r.resolve(T1, "C2", "http://a.test/", "L0", false, None),
+            r.resolve(T1, "C2", "http://a.test/", "L0", false, &[]),
             Some(false)
         );
         // The throttle went on: within the gap of the last frame a frame is held.
@@ -1561,7 +1691,7 @@ mod tests {
         r.disconnected();
         assert!(r.register(T1, "C3", 0, Some("http://screen-off.test/")));
         assert_eq!(
-            r.resolve(T1, "C3", "http://b.test/", "L2", false, None),
+            r.resolve(T1, "C3", "http://b.test/", "L2", false, &[]),
             Some(false)
         );
         // b has not painted: what is shown may still be the off page.
@@ -1630,5 +1760,93 @@ mod tests {
         r.end_session(&id).await;
         let kinds: Vec<FrameKind> = index(&manifest, T1).iter().map(|l| l.kind).collect();
         assert_eq!(kinds, vec![FrameKind::Off, FrameKind::Change]);
+    }
+
+    #[tokio::test]
+    async fn a_tab_watched_before_the_recording_remembers_an_off_start_page() {
+        // As `session create --url <off page that replaces itself>`: the recorder follows the
+        // first tab before it is navigated, the recording begins after.
+        let tmp = tempfile::tempdir().unwrap();
+        let r = Recorder::start(RecorderOptions {
+            ws_url: "ws://127.0.0.1:9/none".into(),
+            human_context: "HUMAN".into(),
+            config: off_config(),
+        });
+        let id = SessionId("s_abcdefgh".into());
+        {
+            let mut st = r.state();
+            let mut sess = Sess::new("AGENT");
+            sess.watched = true;
+            sess.targets.insert(T1.to_string());
+            st.sessions.insert(id.clone(), sess);
+        }
+        assert!(r.register(T1, "C1", 0, Some("about:blank")));
+        // No recording yet: no stream (reported as capped).
+        assert_eq!(
+            r.resolve(T1, "C1", "about:blank", "L0", false, &[]),
+            Some(true)
+        );
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        feed(
+            &r,
+            &id,
+            navigated("http://screen-off.test/sso", "L1", "Navigation"),
+            ms(0),
+        );
+        feed(&r, &id, shot_event(1), ms(10));
+        feed(
+            &r,
+            &id,
+            navigated("http://b.test/", "L2", "Navigation"),
+            ms(50),
+        );
+        // The recording begins (what begin_session adds).
+        let (log, manifest) = open_log(tmp.path());
+        let budget = ScreenBudget::new(1_000_000);
+        let jobs = spawn_writer(manifest.clone(), budget.clone(), Default::default());
+        r.state().sessions.get_mut(&id).unwrap().rec = Some(Rec {
+            jobs,
+            budget,
+            id: "r_abcdefgh".into(),
+            abandoned: Default::default(),
+            _log: log,
+            _extras: Vec::new(),
+        });
+        // b has not painted: the off page may still be on the screen.
+        feed(&r, &id, shot_event(2), ms(100));
+        feed(&r, &id, shot_event(3), ms(700));
+        feed(
+            &r,
+            &id,
+            event(
+                "Page.lifecycleEvent",
+                json!({ "frameId": T1, "loaderId": "L2", "name": "firstContentfulPaint" }),
+            ),
+            ms(800),
+        );
+        feed(&r, &id, shot_event(4), ms(900)); // written
+        r.end_session(&id).await;
+        let lines = index(&manifest, T1);
+        let kinds: Vec<FrameKind> = lines.iter().map(|l| l.kind).collect();
+        assert_eq!(kinds, vec![FrameKind::Off, FrameKind::Change], "{lines:?}");
+        let written = std::fs::read(
+            manifest
+                .dir()
+                .join("screen")
+                .join(T1)
+                .join(lines[1].file.as_deref().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            written,
+            data_encoding::BASE64.decode(frame(4).as_bytes()).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_paint_probe_reads_paint_entries_only() {
+        // `performance.mark('first-contentful-paint')` makes an entry of type `mark`.
+        assert!(PAINTED_JS.contains("getEntriesByName('first-contentful-paint', 'paint')"));
     }
 }

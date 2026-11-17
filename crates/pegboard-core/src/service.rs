@@ -841,7 +841,8 @@ impl Daemon {
             eprintln!("pegboard: {}: {}", e.code, e.message);
         }
         // Before the tabs close: the settled screen of each tab is written, and the
-        // manifest's screen status is final before the log ends.
+        // manifest's screen status is final before the log ends (a writer that does not
+        // finish within its limit no longer touches the manifest).
         self.recorder.end_session(&id).await;
         let result = if close_tabs {
             self.sessions.close(p).await
