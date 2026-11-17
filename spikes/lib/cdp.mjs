@@ -11,6 +11,8 @@ export function connect(wsUrl, { headers } = {}) {
     ws.on('unexpected-response', (_req, res) => rejectConn(new Error(`HTTP ${res.statusCode}`)));
     ws.on('message', (data) => {
       const msg = JSON.parse(data.toString());
+      // Optional observer of every message in arrival order (replies and events), set by a spike.
+      if (api.tap) api.tap(msg);
       if (msg.id && pending.has(msg.id)) {
         const { resolve, reject, method } = pending.get(msg.id);
         pending.delete(msg.id);

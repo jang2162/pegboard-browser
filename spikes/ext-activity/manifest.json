@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "Pegboard spike: tab activity",
+  "version": "0.0.1",
+  "description": "Throwaway phase 2b experiment. Not product code.",
+  "permissions": ["tabs"],
+  "background": { "service_worker": "sw.js" }
+}
