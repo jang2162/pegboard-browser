@@ -106,7 +106,7 @@ struct Tab {
     /// An Off marker was written since the last frame that was kept.
     off_marked: bool,
     streaming: bool,
-    /// A main-frame navigation event came after the attach (the frame tree read at attach
+    /// A main-frame document was committed after the attach (the frame tree read at attach
     /// time is older then).
     nav_seen: bool,
 }
@@ -658,10 +658,12 @@ impl Recorder {
                 let restored = p["type"] == "BackForwardCacheRestore";
                 tab.gate
                     .navigated(cfg, url, loader.unwrap_or_default(), restored, now);
+                tab.nav_seen = true;
             }
             "Page.navigatedWithinDocument" if main("frameId") => {
                 if let Some(url) = p["url"].as_str() {
                     tab.gate.committed(url);
+                    tab.nav_seen = true;
                 }
             }
             "Page.lifecycleEvent" if main("frameId") => {
@@ -673,7 +675,6 @@ impl Recorder {
             _ => return,
         }
         // A main-frame navigation event.
-        tab.nav_seen = true;
         if !tab.gate.stream_open(cfg, now) {
             self.closed(rec, target, tab);
         }
