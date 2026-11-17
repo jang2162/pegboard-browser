@@ -731,7 +731,7 @@ if (F_.only?.includes('s6b')) {
     go().catch(() => {});
     const sent = CAPTURE_AT.map((at) =>
       sleep(at).then(async () => {
-        const c = { sentSeq: seq };
+        const c = { sentSeq: seq, sentMs: performance.now() - t0 };
         const r = await R.send('Page.captureScreenshot', { format: 'png' }, sR, 10000).catch(() => null);
         c.replySeq = seq;
         if (r) {
@@ -751,8 +751,12 @@ if (F_.only?.includes('s6b')) {
     await sleep(800);
     const evs = log.filter((e) => e.seq > startSeq);
     const navd = evs.find((e) => e.name === 'frameNavigated');
+    const cls0 = (e) => (near(e.y, to.scroll) ? 'new' : near(e.y, prev.scroll) ? 'old' : 'other');
     const marks = {};
     if (navd) marks.frameNavigated = { seq: navd.seq, ms: navd.t - t0 };
+    // How long after frameNavigated the old document's last stream frame arrived (the hold window a
+    // back/forward-cache restore, which has no lifecycle events, would need).
+    const lastOldAfterNav = navd ? evs.filter((e) => e.name === 'frame' && e.seq > navd.seq && cls0(e) === 'old').map((e) => e.t - navd.t) : [];
     for (const e of evs) {
       if (e.name.startsWith('lifecycle:') && navd && e.loaderId === navd.loaderId && !marks[e.name]) marks[e.name] = { seq: e.seq, ms: e.t - t0 };
       if (e.name === 'loadEventFired' && navd && e.seq > navd.seq && !marks.loadEventFired) marks.loadEventFired = { seq: e.seq, ms: e.t - t0 };
@@ -760,9 +764,17 @@ if (F_.only?.includes('s6b')) {
     const a = marks['lifecycle:networkAlmostIdle'];
     const b = marks['lifecycle:firstContentfulPaint'];
     if (a && b) marks['networkAlmostIdle+firstContentfulPaint'] = a.seq > b.seq ? a : b;
-    const cls = (e) => (near(e.y, to.scroll) ? 'new' : near(e.y, prev.scroll) ? 'old' : 'other');
-    const frames = evs.filter((e) => e.name === 'frame').map((e) => ({ seq: e.seq, doc: cls(e) }));
-    const row = { kind, navigatedType: navd?.type ?? null, marks, frames, captures: caps };
+    const frames = evs.filter((e) => e.name === 'frame').map((e) => ({ seq: e.seq, ms: e.t - t0, doc: cls0(e) }));
+    const row = {
+      kind,
+      navigatedType: navd?.type ?? null,
+      marks,
+      frames,
+      captures: caps,
+      oldFrameLastMsAfterNavigated: lastOldAfterNav.length ? Math.max(...lastOldAfterNav) : null,
+      failedCapturesSentBeforeNavigated: navd ? caps.filter((c) => c.doc === 'failed' && c.sentSeq <= navd.seq).length : null,
+      failedCapturesSentAfterNavigated: navd ? caps.filter((c) => c.doc === 'failed' && c.sentSeq > navd.seq).length : null,
+    };
     prev = { scroll: to.scroll, color: to.color };
     return row;
   }
@@ -822,6 +834,15 @@ if (F_.only?.includes('s6b')) {
     const ts = trials.filter((t) => t.kind === kind);
     const types = {};
     for (const t of ts) types[t.navigatedType ?? '(none)'] = (types[t.navigatedType ?? '(none)'] || 0) + 1;
+    const lastOld = ts.map((t) => t.oldFrameLastMsAfterNavigated).filter((x) => x != null);
+    line(
+      `S6b ${kind} old stream frames after frameNavigated`,
+      `in ${lastOld.length}/${ts.length} navigations; last one arrived max ${lastOld.length ? Math.max(...lastOld).toFixed(0) : '-'} ms, median ${lastOld.length ? median(lastOld).toFixed(0) : '-'} ms after frameNavigated`,
+    );
+    line(
+      `S6b ${kind} failed captures`,
+      `sent before frameNavigated ${ts.reduce((n, t) => n + (t.failedCapturesSentBeforeNavigated || 0), 0)}, sent after ${ts.reduce((n, t) => n + (t.failedCapturesSentAfterNavigated || 0), 0)}`,
+    );
     line(`S6b ${kind}`, `${ts.length} navigations; frameNavigated.type ${JSON.stringify(types)}; captures old ${ts.flatMap((t) => t.captures).filter((c) => c.doc === 'old').length}, failed ${ts.flatMap((t) => t.captures).filter((c) => c.doc === 'failed').length} of ${ts.flatMap((t) => t.captures).length}`);
     for (const name of MARKS) {
       const r = { present: 0, oldFramesAfter: 0, oldCapturesAfter: 0, capturesSentAfter: 0, oldOfCapturesSentAfter: 0, newFramesBefore: 0, ms: [] };
