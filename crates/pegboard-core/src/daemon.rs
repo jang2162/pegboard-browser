@@ -212,6 +212,11 @@ pub async fn run_command_with_hook(
         }
     }
 
+    // The frame before: the tab's last stored frame (no capture), only for a command that
+    // passed every check above.
+    let recorder = sessions.recorder();
+    let frame_before = recorder.before_command(id, screen_target(sessions, runner, id).as_deref());
+
     runner.set_session_targets_provider(sessions.targets_fn());
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let endpoint = sessions.endpoint(id);
@@ -250,8 +255,13 @@ pub async fn run_command_with_hook(
     after_exec.await;
 
     // After: the focus may have moved (a submit, a script that blurs); anything unclear
-    // hides the text.
-    let probe = probe(sessions, id).await;
+    // hides the text. The frame after (one capture of the tab the command ended on, at most
+    // `CAPTURE_LIMIT`) is taken meanwhile.
+    let after_target = screen_target(sessions, runner, id);
+    let (probe, frame_after) = tokio::join!(
+        probe(sessions, id),
+        recorder.after_command(id, after_target.as_deref())
+    );
     let succeeded = matches!(&outcome, Ok(r) if succeeded(r));
     let hide_typed =
         types_text && !(harmless_before && succeeded && !probe.failed && !probe.sensitive);
@@ -270,6 +280,8 @@ pub async fn run_command_with_hook(
     entry.url = tab.and_then(|(_, u)| u.as_deref()).map(url_for_log);
     entry.args = logged_args(argv, hide_typed);
     entry.redacted = hide_typed || !at.always.is_empty() || eval_masked(argv, &entry.args);
+    entry.frame_before = frame_before;
+    entry.frame_after = frame_after;
     entry.duration_ms = elapsed_ms(started);
     entry.ok = succeeded;
     // An expression's error can quote page values (a JSON parse error shows the text).
@@ -280,6 +292,15 @@ pub async fn run_command_with_hook(
     report_downloads(sessions, log, id, &mut outcome)?;
     sessions.touch(id);
     outcome
+}
+
+/// The tab a command's frames are of: the one agent-browser works on, or else the session's
+/// only tab.
+fn screen_target(sessions: &SessionManager, runner: &Runner, id: &SessionId) -> Option<String> {
+    runner.bound_target(id).or_else(|| {
+        let mut targets = sessions.info(id).ok()?.targets;
+        (targets.len() == 1).then(|| targets.remove(0))
+    })
 }
 
 /// Downloads of the session that ended since its last result: one log entry each, and

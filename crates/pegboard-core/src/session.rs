@@ -491,6 +491,11 @@ impl SessionManager {
         records.into_iter().map(|r| self.inner.info_of(r)).collect()
     }
 
+    /// The screen recorder the sessions' tabs are recorded by (frames around commands).
+    pub fn recorder(&self) -> &Arc<Recorder> {
+        &self.inner.recorder
+    }
+
     pub fn info(&self, id: &SessionId) -> Result<SessionInfo, RpcError> {
         let table = self.inner.table.lock().unwrap();
         let record = ready(&table, id)?;

@@ -25,3 +25,5 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile.workspace = true
+# Paused time for the capture-limit test (`tokio::test(start_paused)`).
+tokio = { workspace = true, features = ["test-util"] }

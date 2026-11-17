@@ -309,6 +309,15 @@ struct RecordTargetParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetScreenParams {
+    session_id: SessionId,
+    #[serde(default)]
+    token: Option<String>,
+    on: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RecordingParams {
     recording_id: String,
 }
@@ -597,6 +606,15 @@ impl Daemon {
                 self.authorize(&id, p.token.as_deref())?;
                 let hold = Duration::from_millis(p.hold_ms.min(60_000));
                 Ok(json!({ "dropped": self.recorder.drop_connection_for_test(hold) }))
+            }
+            // Test hook: switches the session's screen recording off (no stream, no frames
+            // around commands) or on again, to compare command times. Needs the token.
+            "test.setScreen" if crate::testenv::hooks() => {
+                let p: SetScreenParams = params(p)?;
+                let id = checked_session(&p.session_id)?;
+                self.authorize(&id, p.token.as_deref())?;
+                let set = self.recorder.set_screen_for_test(&id, p.on).await;
+                Ok(json!({ "set": set }))
             }
             "files.list" => {
                 let p: SessionIdParams = params(p)?;
