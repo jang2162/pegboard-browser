@@ -26,6 +26,7 @@ use crate::downloads::list_files;
 use crate::paths::{ensure, Paths};
 use crate::profiles::{rpc_error, Profiles};
 use crate::proxy::server::{ProxyServer, WsUpstream};
+use crate::recording::config::RecordingConfig;
 use crate::runner::{Runner, AGENT_BROWSER_VERSION};
 use crate::session::SessionManager;
 
@@ -307,6 +308,8 @@ fn to_value<T: Serialize>(v: T) -> Result<Value, RpcError> {
 impl Daemon {
     /// Starts the browser, the proxy and everything that depends on them.
     pub async fn start(paths: Paths) -> anyhow::Result<Arc<Daemon>> {
+        // Before anything is started: a daemon does not run with settings it cannot use.
+        RecordingConfig::load(&paths).map_err(|e| anyhow!(e))?;
         ensure(&paths)?;
         // First, so a missing or wrong agent-browser fails before a window opens.
         let runner =

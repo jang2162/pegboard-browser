@@ -17,6 +17,7 @@ use pegboard_core::daemon::Daemon;
 use pegboard_core::lock::DaemonLock;
 use pegboard_core::paths::{ensure_home, paths, socket_path_fits, Paths};
 use pegboard_core::policy;
+use pegboard_core::recording::config::RecordingConfig;
 use pegboard_core::runner::succeeded;
 use pegboard_protocol::{
     codes, ActionClass, BrowserStatus, CommandExecParams, CommandExecResult, FileInfo, ProfileInfo,
@@ -758,8 +759,11 @@ fn daemon_is_usable(paths: &Paths) -> bool {
         .is_ok_and(|s| !s.stopping)
 }
 
-/// Starts the daemon unless one is usable; `true` when this call started it.
+/// Starts the daemon unless one is usable; `true` when this call started it. A
+/// `config.toml` that cannot be used is a usage error, found before anything starts (the
+/// daemon checks it again).
 pub(crate) fn browser_start(paths: &Paths) -> Result<bool, RpcError> {
+    RecordingConfig::load(paths).map_err(|e| error(codes::INVALID_PARAMS, e))?;
     ensure_home(paths).map_err(|e| io_failure("creating the pegboard home", e))?;
     let log_path = paths.home.join("daemon.log");
     let deadline = Instant::now() + START_TIMEOUT;

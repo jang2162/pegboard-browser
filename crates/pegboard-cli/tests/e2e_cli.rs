@@ -779,3 +779,38 @@ fn idle_session_is_closed_after_the_expiry() {
     assert_ne!(code, 0, "{err}");
     assert_eq!(home.run(&["session", "close", &kept]).0, 0);
 }
+
+#[test]
+fn browser_start_refuses_a_bad_config() {
+    let home = Home::new();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[recording]\nmax_age_days = 0\n",
+    )
+    .unwrap();
+    // No browser is needed: the check comes before the daemon is started. A missing Chrome
+    // keeps a daemon that did start from opening a window.
+    let env = [("PEGBOARD_CHROME", "/nonexistent/chrome")];
+    let (code, out, err) = home.run_limited(&env, &["browser", "start"], 30);
+    assert_eq!(code, 2, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("config.toml") && err.contains("max_age_days"),
+        "{err}"
+    );
+    for leftover in ["daemon.log", "daemon.pid", "pegboardd.sock"] {
+        assert!(!home.path().join(leftover).exists(), "{leftover}");
+    }
+    // The daemon reads it again when it starts, and does not start either.
+    let (code, _, err) = home.run_limited(&env, &["daemon"], 30);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("config.toml") && err.contains("max_age_days"),
+        "{err}"
+    );
+    assert!(!home.path().join("pegboardd.sock").exists());
+    // A missing file is the defaults (here the start fails later, on the missing Chrome).
+    std::fs::remove_file(home.path().join("config.toml")).unwrap();
+    let (_, _, err) = home.run_limited(&env, &["browser", "start"], 30);
+    assert!(!err.contains("config.toml"), "{err}");
+}

@@ -228,6 +228,13 @@ fn target_is_private(target: &Target) -> bool {
     }
 }
 
+/// Whether the URL's host is in `list` (lower-case names and IP literals, as the policy
+/// keeps its allowed domains): a name matches a listed name or is a subdomain of it, an IP
+/// literal only the same address. A URL without a host is in no list.
+pub fn host_listed(url: &Url, list: &[String]) -> bool {
+    target_of(url).is_some_and(|target| is_listed(&target, list))
+}
+
 /// A name matches a listed name or is a subdomain of it; an IP literal matches only the same
 /// address (no suffix matching on numbers).
 fn is_listed(target: &Target, list: &[String]) -> bool {

@@ -152,7 +152,7 @@ fn dedup_keeping_order(classes: &mut Vec<ActionClass>) {
     });
 }
 
-fn normalized_domains(domains: &[String]) -> Vec<String> {
+pub(crate) fn normalized_domains(domains: &[String]) -> Vec<String> {
     let mut list: Vec<String> = domains
         .iter()
         .map(|d| match d.parse::<IpAddr>() {
@@ -170,7 +170,7 @@ fn normalized_domains(domains: &[String]) -> Vec<String> {
 /// or starting or ending with a hyphen, at most 253 characters in all; its last label is not
 /// all digits and does not start with `0x`, because resolvers and URL parsers read such names
 /// as numbers (`1`, `127.1`, `2130706433`, `0x7f.0.0.1` are all 127.0.0.1 or near it).
-fn is_host(s: &str) -> bool {
+pub(crate) fn is_host(s: &str) -> bool {
     if s.parse::<IpAddr>().is_ok() {
         return true;
     }

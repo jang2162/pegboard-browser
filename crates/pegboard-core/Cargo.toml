@@ -21,6 +21,7 @@ httparse = "1"
 rand.workspace = true
 subtle = "2.6"
 data-encoding = "2"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile.workspace = true

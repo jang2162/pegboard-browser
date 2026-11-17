@@ -19,6 +19,8 @@ pub struct Paths {
     pub ab_socket_dir: PathBuf,
     /// HOME of the agent-browser processes, so they never share the user's `~/.agent-browser`.
     pub ab_home: PathBuf,
+    /// The user's settings (`recording::config`); optional.
+    pub config: PathBuf,
 }
 
 impl Paths {
@@ -51,6 +53,7 @@ pub fn paths_in(home: &Path) -> Paths {
         state: home.join("state.json"),
         ab_socket_dir: PathBuf::from(format!("/tmp/pegboard-{uid}/ab")),
         ab_home: home.join("agent-browser-home"),
+        config: home.join("config.toml"),
         home,
     }
 }
