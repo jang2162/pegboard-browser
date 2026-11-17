@@ -155,6 +155,7 @@ pub async fn run_command_with_hook(
         error: None,
         duration_ms: 0,
         redacted: false,
+        ..ActionEntry::default()
     };
 
     let checked = match argv::check(argv, &paths.session_files(id)) {
@@ -658,6 +659,7 @@ mod tests {
             error: None,
             duration_ms: 0,
             redacted: false,
+            ..ActionEntry::default()
         };
         let e = refuse(&mut log, entry, &argv, denied, Instant::now()).unwrap_err();
         assert_eq!(e.code, codes::POLICY_DENIED);

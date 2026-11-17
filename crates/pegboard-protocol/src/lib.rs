@@ -149,6 +149,15 @@ impl std::str::FromStr for ActionClass {
     }
 }
 
+/// What a recording keeps besides the actions, the navigation and the screen
+/// (`--record network`, `--record console`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordExtra {
+    Network,
+    Console,
+}
+
 /// What a session may do. Fixed when the session is created.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -286,6 +295,15 @@ mod tests {
             token: None,
             policy: SessionPolicy::default(),
         }
+    }
+
+    #[test]
+    fn record_extras_are_lower_case() {
+        assert_eq!(
+            serde_json::to_string(&[RecordExtra::Network, RecordExtra::Console]).unwrap(),
+            r#"["network","console"]"#
+        );
+        assert!(serde_json::from_str::<RecordExtra>(r#""Network""#).is_err());
     }
 
     #[test]

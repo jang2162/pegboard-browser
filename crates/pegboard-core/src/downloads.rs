@@ -435,6 +435,7 @@ impl Report {
             error,
             duration_ms: 0,
             redacted: false,
+            ..ActionEntry::default()
         }
     }
 }

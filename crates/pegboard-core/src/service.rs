@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
-use crate::actionlog::{self, valid_recording_id, ActionLog, Manifest};
+use crate::actionlog::{self, valid_recording_id, ActionLog, Manifest, SessionLog};
 use crate::browser::{find_chrome, Browser, BrowserConfig};
 use crate::daemon::run_command;
 use crate::downloads::list_files;
@@ -31,9 +31,6 @@ use crate::session::SessionManager;
 
 /// Time one session may take to close while the daemon shuts down.
 const SESSION_CLOSE_LIMIT: Duration = Duration::from_secs(15);
-
-/// A session's action log. Holding the lock is what serializes the session's commands.
-type SessionLog = Arc<AsyncMutex<ActionLog>>;
 
 /// What the daemon keeps per open session.
 struct Slot {

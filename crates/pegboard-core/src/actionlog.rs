@@ -6,13 +6,18 @@
 //! values (`cookies set`, `storage set`) and the strings inside `eval` expressions are
 //! never kept. The
 //! session endpoint's token is not a field of anything here.
+//!
+//! Format 2 (phase 2b) adds, all optional so a format-1 recording reads as before: the
+//! kind of an entry (a command, or something a person did in the browser), the frames
+//! taken around a command, and the manifest's `keep`, `screen`, `record` and `sizes`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use pegboard_protocol::SessionId;
+use pegboard_protocol::{RecordExtra, SessionId};
 use serde::{Deserialize, Serialize};
 
 use crate::argv;
@@ -29,9 +34,31 @@ pub const MAX_ERROR_CHARS: usize = 200;
 /// Longest line (with its newline) `ActionLog::append` writes.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
-const MANIFEST_FORMAT: u32 = 1;
+/// Format of the recordings this build writes. Format 1 (no screen, no entry kinds) is
+/// still read.
+pub const MANIFEST_FORMAT: u32 = 2;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A session's action log. Holding the lock is what serializes the session's commands.
+pub type SessionLog = Arc<tokio::sync::Mutex<ActionLog>>;
+
+/// Who did what an entry records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryKind {
+    /// A command of the session (every entry of a format-1 recording).
+    #[default]
+    Command,
+    /// Something a person did in one of the session's tabs.
+    Human,
+}
+
+impl EntryKind {
+    fn is_command(&self) -> bool {
+        *self == EntryKind::Command
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionEntry {
     /// Assigned by `ActionLog::append`, from 1.
@@ -46,6 +73,68 @@ pub struct ActionEntry {
     pub error: Option<String>,
     pub duration_ms: u64,
     pub redacted: bool,
+    #[serde(default, skip_serializing_if = "EntryKind::is_command")]
+    pub kind: EntryKind,
+    /// The screen just before and just after the command: `<targetId>/<file>`, relative to
+    /// the recording's `screen/` directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_after: Option<String>,
+    /// What a person did (`EntryKind::Human` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub what: Option<String>,
+    /// Whether it was certainly a person (`EntryKind::Human` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certain: Option<bool>,
+}
+
+impl ActionEntry {
+    /// An entry for something a person did in tab `target_id`: command `human`, no
+    /// arguments, `ok`. The URL is cleaned like every logged URL (`url_for_log`).
+    pub fn human(
+        session_id: &str,
+        ts: &str,
+        target_id: &str,
+        url: Option<String>,
+        what: &str,
+        certain: bool,
+    ) -> ActionEntry {
+        ActionEntry {
+            ts: ts.to_string(),
+            session_id: session_id.to_string(),
+            target_id: Some(target_id.to_string()),
+            url: url.as_deref().map(url_for_log),
+            command: "human".to_string(),
+            ok: true,
+            kind: EntryKind::Human,
+            what: Some(what.to_string()),
+            certain: Some(certain),
+            ..ActionEntry::default()
+        }
+    }
+}
+
+/// What became of a recording's screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenStatus {
+    /// No screen was recorded (every format-1 recording).
+    #[default]
+    None,
+    Recorded,
+    /// Recording the screen stopped at the per-recording limit; the actions went on.
+    Capped,
+    /// The screen was deleted to keep within the total limit.
+    Pruned,
+}
+
+/// Bytes on disk, counted when the recording ends and after a prune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sizes {
+    pub screen_bytes: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +149,16 @@ pub struct Manifest {
     pub ended_at: Option<String>,
     pub chrome_version: String,
     pub agent_browser_version: String,
+    /// Kept by a person: never deleted by the retention rules, not counted in their limits.
+    #[serde(default)]
+    pub keep: bool,
+    #[serde(default)]
+    pub screen: ScreenStatus,
+    /// What is recorded besides actions, navigation and screen.
+    #[serde(default)]
+    pub record: Vec<RecordExtra>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<Sizes>,
 }
 
 impl Manifest {
@@ -82,6 +181,10 @@ impl Manifest {
             ended_at: None,
             chrome_version: chrome_version.to_string(),
             agent_browser_version: agent_browser_version.to_string(),
+            keep: false,
+            screen: ScreenStatus::None,
+            record: Vec::new(),
+            sizes: None,
         }
     }
 }
@@ -99,16 +202,51 @@ fn invalid_id(id: &str) -> std::io::Error {
     )
 }
 
-fn recording_dir(paths: &Paths, recording_id: &str) -> std::io::Result<PathBuf> {
+/// `<recordings>/<recording id>`, once the id is checked.
+pub fn recording_dir(paths: &Paths, recording_id: &str) -> std::io::Result<PathBuf> {
     if !valid_recording_id(recording_id) {
         return Err(invalid_id(recording_id));
     }
     Ok(paths.recordings.join(recording_id))
 }
 
-pub struct ActionLog {
+/// The manifest of an open recording, shared by its writers; every update rewrites
+/// manifest.json atomically (tmp + rename, 0600).
+#[derive(Clone)]
+pub struct ManifestHandle {
     dir: PathBuf,
-    manifest: Manifest,
+    manifest: Arc<Mutex<Manifest>>,
+}
+
+impl ManifestHandle {
+    pub fn get(&self) -> Manifest {
+        self.lock().clone()
+    }
+
+    /// Changes the manifest and writes it. When it cannot be written, neither the file nor
+    /// the shared copy changes. The lock is held while writing, so updates never cross.
+    pub fn update(&self, f: impl FnOnce(&mut Manifest)) -> std::io::Result<()> {
+        let mut shared = self.lock();
+        let mut next = shared.clone();
+        f(&mut next);
+        write_manifest_file(&self.dir, &next)?;
+        *shared = next;
+        Ok(())
+    }
+
+    /// The recording's directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Manifest> {
+        // A writer that panicked mid-update left the previous manifest in place.
+        self.manifest.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+pub struct ActionLog {
+    manifest: ManifestHandle,
     actions: File,
     next_seq: u64,
 }
@@ -128,14 +266,15 @@ impl ActionLog {
             .append(true)
             .mode(0o600)
             .open(dir.join("actions.jsonl"))?;
-        let log = ActionLog {
-            dir,
-            manifest,
+        write_manifest_file(&dir, &manifest)?;
+        Ok(ActionLog {
+            manifest: ManifestHandle {
+                dir,
+                manifest: Arc::new(Mutex::new(manifest)),
+            },
             actions,
             next_seq: 1,
-        };
-        log.write_manifest()?;
-        Ok(log)
+        })
     }
 
     /// Writes the entry as one line, numbering it (`seq` is overwritten), and flushes.
@@ -150,26 +289,44 @@ impl ActionLog {
 
     /// Rewrites `manifest.json` with the end time.
     pub fn finish(&mut self, ended_at: &str) -> std::io::Result<()> {
-        self.manifest.ended_at = Some(ended_at.to_string());
-        self.write_manifest()
+        self.manifest
+            .update(|m| m.ended_at = Some(ended_at.to_string()))
     }
 
-    pub fn manifest(&self) -> &Manifest {
-        &self.manifest
+    /// The manifest as it is now (other writers may change it through their handles).
+    pub fn manifest(&self) -> Manifest {
+        self.manifest.get()
     }
 
-    fn write_manifest(&self) -> std::io::Result<()> {
-        let tmp = self.dir.join("manifest.json.tmp");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(&serde_json::to_vec_pretty(&self.manifest).map_err(std::io::Error::other)?)?;
-        file.flush()?;
-        std::fs::rename(&tmp, self.dir.join("manifest.json"))
+    /// A handle on the same manifest, for the recording's other writers.
+    pub fn manifest_handle(&self) -> ManifestHandle {
+        self.manifest.clone()
     }
+
+    /// The recording's directory.
+    pub fn dir(&self) -> &Path {
+        self.manifest.dir()
+    }
+}
+
+/// Replaces `<dir>/manifest.json` whole: written to `manifest.json.tmp` (a leftover one is
+/// removed first, so the new file is always created 0600 and never through a link), then
+/// renamed over it.
+pub fn write_manifest_file(dir: &Path, m: &Manifest) -> std::io::Result<()> {
+    let tmp = dir.join("manifest.json.tmp");
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(&serde_json::to_vec_pretty(m).map_err(std::io::Error::other)?)?;
+    file.flush()?;
+    std::fs::rename(&tmp, dir.join("manifest.json"))
 }
 
 /// The entry as one line of at most `MAX_LINE_BYTES`. Words are redacted before they get
@@ -188,6 +345,9 @@ fn capped_line(entry: &mut ActionEntry) -> std::io::Result<Vec<u8>> {
         if let Some(url) = entry.url.as_mut() {
             words.push(url);
         }
+        if let Some(what) = entry.what.as_mut() {
+            words.push(what);
+        }
         let longest = words
             .into_iter()
             .filter(|w| w.as_str() != REDACTED)
@@ -205,7 +365,8 @@ fn capped_line(entry: &mut ActionEntry) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn read_manifest(dir: &std::path::Path) -> std::io::Result<Manifest> {
+/// `<dir>/manifest.json`, of any format.
+pub fn read_manifest(dir: &Path) -> std::io::Result<Manifest> {
     let text = std::fs::read_to_string(dir.join("manifest.json"))?;
     serde_json::from_str(&text).map_err(std::io::Error::other)
 }
@@ -451,6 +612,7 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 
     fn s(v: Vec<&str>) -> Vec<String> {
@@ -470,6 +632,7 @@ mod tests {
             error: None,
             duration_ms: 3,
             redacted: false,
+            ..ActionEntry::default()
         }
     }
 
@@ -701,7 +864,7 @@ mod tests {
         log.finish("2026-01-01T00:05:00Z").unwrap();
         let (m, entries) = read(&paths, "r_abcdefgh").unwrap();
         assert_eq!(m.ended_at.as_deref(), Some("2026-01-01T00:05:00Z"));
-        assert_eq!(m.format, 1);
+        assert_eq!(m.format, MANIFEST_FORMAT);
         assert_eq!(
             entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
             vec![1, 2]
@@ -756,8 +919,11 @@ mod tests {
                 "chromeVersion",
                 "endedAt",
                 "format",
+                "keep",
                 "profile",
+                "record",
                 "recordingId",
+                "screen",
                 "sessionId",
                 "sessionName",
                 "startedAt"
@@ -999,5 +1165,192 @@ mod tests {
         assert!(text.len() <= MAX_LINE_BYTES);
         let got: ActionEntry = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(got.args.iter().filter(|a| *a == REDACTED).count(), 128);
+    }
+
+    /// A recording written before format 2: its manifest and its action lines have none of
+    /// the new fields.
+    fn write_format_1(paths: &Paths, rec: &str) {
+        let dir = paths.recordings.join(rec);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"format":1,"recordingId":"{rec}","sessionId":"s_abcdefgh","sessionName":"demo",
+"profile":"default","startedAt":"2026-01-01T00:00:00Z","endedAt":"2026-01-01T00:05:00Z",
+"chromeVersion":"157","agentBrowserVersion":"0.42.0"}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("actions.jsonl"),
+            concat!(
+                r#"{"seq":1,"ts":"2026-01-01T00:00:01Z","sessionId":"s_abcdefgh","targetId":"T1","url":"https://a.test/","command":"open","args":["open","https://a.test/"],"ok":true,"error":null,"durationMs":12,"redacted":false}"#,
+                "\n",
+                r##"{"seq":2,"ts":"2026-01-01T00:00:02Z","sessionId":"s_abcdefgh","targetId":null,"url":null,"command":"click","args":["click","#b"],"ok":false,"error":"x","durationMs":3,"redacted":true}"##,
+                "\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn format_1_recording_reads_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        write_format_1(&paths, "r_abcdefgh");
+        let (m, entries) = read(&paths, "r_abcdefgh").unwrap();
+        assert_eq!(m.format, 1);
+        assert!(!m.keep);
+        assert_eq!(m.screen, ScreenStatus::None);
+        assert!(m.record.is_empty());
+        assert_eq!(m.sizes, None);
+        assert_eq!(m.ended_at.as_deref(), Some("2026-01-01T00:05:00Z"));
+        assert_eq!(entries.len(), 2);
+        for e in &entries {
+            assert_eq!(e.kind, EntryKind::Command);
+            assert_eq!((&e.frame_before, &e.frame_after), (&None, &None));
+            assert_eq!((&e.what, e.certain), (&None, None));
+        }
+        assert_eq!(entries[0].command, "open");
+        assert_eq!(entries[0].duration_ms, 12);
+        assert!(entries[1].redacted && !entries[1].ok);
+        assert_eq!(list(&paths).unwrap().len(), 1);
+        assert_eq!(
+            read_manifest(&paths.recordings.join("r_abcdefgh")).unwrap(),
+            m
+        );
+    }
+
+    #[test]
+    fn new_fields_are_left_out_when_empty() {
+        let e = entry("click", s(vec!["click", "#b"]));
+        let v = serde_json::to_value(&e).unwrap();
+        for key in ["kind", "frameBefore", "frameAfter", "what", "certain"] {
+            assert!(v.get(key).is_none(), "{key} in {v}");
+        }
+        // Set, they are written under their camelCase names.
+        let mut e = e;
+        e.frame_before = Some("T1/000001.jpg".into());
+        e.frame_after = Some("T1/000002.jpg".into());
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["frameBefore"], "T1/000001.jpg");
+        assert_eq!(v["frameAfter"], "T1/000002.jpg");
+        assert!(v.get("kind").is_none());
+        assert_eq!(serde_json::from_value::<ActionEntry>(v).unwrap(), e);
+        // A manifest leaves out only the sizes until they are known.
+        let m = serde_json::to_value(manifest("r_abcdefgh")).unwrap();
+        assert!(m.get("sizes").is_none());
+        assert_eq!((&m["keep"], &m["screen"]), (&json!(false), &json!("none")));
+        assert_eq!(m["record"], json!([]));
+    }
+
+    #[test]
+    fn human_entry_round_trips() {
+        let e = ActionEntry::human(
+            "s_abcdefgh",
+            "2026-01-01T00:00:03Z",
+            "T1",
+            Some("https://admin:pw@a.test/p?t=1#f".into()),
+            "navigated",
+            false,
+        );
+        assert_eq!(e.kind, EntryKind::Human);
+        assert_eq!(e.command, "human");
+        assert!(e.args.is_empty() && e.ok && !e.redacted);
+        assert_eq!(e.target_id.as_deref(), Some("T1"));
+        // The URL is cleaned like every logged URL.
+        assert_eq!(e.url.as_deref(), Some("https://a.test/p"));
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "human");
+        assert_eq!(v["command"], "human");
+        assert_eq!(v["what"], "navigated");
+        assert_eq!(v["certain"], false);
+        assert_eq!(v["args"], json!([]));
+        assert!(v.get("frameBefore").is_none());
+        let back: ActionEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back, e);
+        // And through a log.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        let mut log = ActionLog::open(&paths, manifest("r_abcdefgh")).unwrap();
+        log.append(e.clone()).unwrap();
+        let (_, entries) = read(&paths, "r_abcdefgh").unwrap();
+        assert_eq!(entries, vec![ActionEntry { seq: 1, ..e }]);
+    }
+
+    #[test]
+    fn manifest_handle_updates_the_file_atomically_with_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        let mut log = ActionLog::open(&paths, manifest("r_abcdefgh")).unwrap();
+        let dir = paths.recordings.join("r_abcdefgh");
+        assert_eq!(log.dir(), dir.as_path());
+        let handle = log.manifest_handle();
+        assert_eq!(handle.dir(), dir.as_path());
+        // A leftover temporary file with loose permissions does not loosen the manifest.
+        std::fs::write(dir.join("manifest.json.tmp"), "junk").unwrap();
+        std::fs::set_permissions(
+            dir.join("manifest.json.tmp"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        handle
+            .update(|m| {
+                m.keep = true;
+                m.screen = ScreenStatus::Recorded;
+                m.record = vec![RecordExtra::Console];
+            })
+            .unwrap();
+        let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(dir.join("manifest.json")), 0o600);
+        assert!(!dir.join("manifest.json.tmp").exists());
+        let on_disk = read_manifest(&dir).unwrap();
+        assert!(on_disk.keep);
+        assert_eq!(on_disk.screen, ScreenStatus::Recorded);
+        assert_eq!(on_disk.record, vec![RecordExtra::Console]);
+        // Every holder sees the same manifest: the log, the handle and a clone of it.
+        assert_eq!(log.manifest(), on_disk);
+        assert_eq!(handle.clone().get(), on_disk);
+        // The log's own updates go through the same manifest.
+        log.finish("2026-01-01T00:05:00Z").unwrap();
+        let sizes = Sizes {
+            screen_bytes: 10,
+            total_bytes: 12,
+        };
+        handle.update(|m| m.sizes = Some(sizes)).unwrap();
+        let on_disk = read_manifest(&dir).unwrap();
+        assert_eq!(on_disk.ended_at.as_deref(), Some("2026-01-01T00:05:00Z"));
+        assert!(on_disk.keep);
+        assert_eq!(on_disk.sizes, Some(sizes));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["sizes"], json!({"screenBytes": 10, "totalBytes": 12}));
+        // The manifest is replaced whole (a reader never sees half of one): an update that
+        // cannot be written leaves the file and the shared copy as they were.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = handle.update(|m| m.keep = false);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err());
+        assert!(handle.get().keep);
+        assert!(read_manifest(&dir).unwrap().keep);
+    }
+
+    #[test]
+    fn new_recordings_are_format_2() {
+        assert_eq!(MANIFEST_FORMAT, 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        let log = ActionLog::open(&paths, manifest("r_abcdefgh")).unwrap();
+        let m = read_manifest(&paths.recordings.join("r_abcdefgh")).unwrap();
+        assert_eq!(m.format, 2);
+        assert_eq!(m, log.manifest());
+        assert!(!m.keep && m.record.is_empty() && m.sizes.is_none());
+        assert_eq!(m.screen, ScreenStatus::None);
+        assert_eq!(
+            recording_dir(&paths, "r_abcdefgh").unwrap(),
+            paths.recordings.join("r_abcdefgh")
+        );
+        assert!(recording_dir(&paths, "../x").is_err());
     }
 }
