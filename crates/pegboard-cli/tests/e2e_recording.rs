@@ -2233,6 +2233,23 @@ fn the_size_limit_deletes_finished_screens_first() {
         "{line}"
     );
     assert!(!all_jpgs(&dir).is_empty());
+    // The third finished one keeps its screen only when what is left is within the limit:
+    // whether the second capped recording (the running one) brings it over depends on
+    // where exactly each stopped under its own 2 MB.
+    let (code, out, _) = home.run(&["--json", "recording", "list"]);
+    assert_eq!(code, 0);
+    let list = json(&out);
+    let third = list["recordings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["recordingId"] == rid_of(&finished[2]).as_str())
+        .unwrap()
+        .clone();
+    if third["screen"] != "pruned" {
+        let total = list["totalBytes"].as_u64().unwrap();
+        assert!(total <= 4_000_000, "over the limit and {third}");
+    }
     let (code, out, _) = home.run(&["recording", "list"]);
     assert_eq!(code, 0);
     assert!(out.lines().last().unwrap().starts_with("total "), "{out}");

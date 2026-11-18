@@ -522,7 +522,7 @@ pegboard [--session S] fill @e2 "text"
 pegboard [--session S] <그 밖의 agent-browser 명령>
 
 # 녹화
-pegboard recording list [--session S] [--failed]
+pegboard recording list [--session S] [--failed] [--kept]
 pegboard recording show <id>          요약과 동작 로그
 pegboard recording open <id>          재생 화면 열기
 pegboard recording export <id> --format webm|zip

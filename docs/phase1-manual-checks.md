@@ -103,7 +103,7 @@ for i in $(seq 1 12); do
 done
 echo "failures: $fail (of 24 commands)"
 echo "clicks on the page: $(pegboard eval "document.getElementById('clicks').textContent" | grep '"result"')"
-pegboard recording show "$(pegboard recording list --json | python3 -c 'import sys,json; print(json.load(sys.stdin)[-1]["recordingId"])')"
+pegboard recording show "$(pegboard recording list --json | python3 -c 'import sys,json; print(json.load(sys.stdin)["recordings"][-1]["recordingId"])')"
 LOOP
 chmod +x /tmp/pegboard-m-loop.sh
 ```

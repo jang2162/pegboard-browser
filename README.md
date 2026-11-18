@@ -54,6 +54,8 @@ pegboard session close "$PEGBOARD_SESSION"   # 탭을 닫고 기록을 마감한
 pegboard browser stop
 ```
 
+`recording list --json`은 배열이 아니라 객체다: `{"recordings": [...], "totalBytes": …, "keptBytes": …}`. `--session`, `--failed`, `--kept`는 `recordings`만 거르고, `totalBytes`와 `keptBytes`는 거르지 않은 전체 녹화의 크기다.
+
 `--session <핸들>` 플래그로도 줄 수 있지만 `ps`에 노출되므로 권하지 않는다. 핸들이 없으면 종료 코드 2, 틀린 핸들이면 `session_not_found`와 종료 코드 1이다. 종료 코드: 0 성공, 1 명령 실패(정책 거부 `policy_denied` 포함), 2 사용법 오류나 거부된 명령(프로필 설정 충돌 `profile_policy_conflict` 포함), 3 pegboard가 떠 있지 않음.
 
 ### MCP
@@ -227,7 +229,7 @@ pegboard profile delete work                            # 열린 세션이 있�
 - 탭 전환은 브리지 확장의 서비스 워커가 알려 준다. 워커가 다시 뜨면 데몬이 다시 붙고 그동안 모아 둔 전환을 넘겨받게 되어 있지만, 실제 브라우저에서 브리지 워커가 다시 뜨는 것은 본 적이 없어 이 경로는 단위 시험으로만 확인했다.
 - Chrome이 브리지의 서비스 워커를 멈추면(강제로 멈추지 않고는 본 적이 없다) 새 탭 열기(`tab new`), 세션 만들기와 닫기가 `bridge_asleep`으로 곧바로 실패한다. 이미 있는 탭의 명령은 그대로 된다. 브라우저를 다시 시작하면(`pegboard browser stop`, `pegboard browser start`) 돌아온다.
 - 녹화는 저절로 지워진다: 끝난 지 14일(`config.toml`의 `[recording] max_age_days`)이 지난 녹화는 통째로, 그다음 전체 크기가 5 GB(`max_total_gb`)를 넘으면 끝난 녹화 중 오래된 것부터 화면(`screen/`)만 지운다("screen pruned"). 동작 기록은 크기 때문에 지우지 않고 14일까지 남는다. 진행 중인 녹화와 `recording keep`으로 표시한 녹화는 지우지 않고, keep한 것은 전체 크기에도 세지 않는다(쌓이면 `recording delete`로 지운다). 데몬이 시작할 때, 1시간마다, 세션이 끝날 때마다 정리한다. **2b 이전에 만든 동작 기록도 같은 14일 규칙을 따르므로, 2b를 처음 켜는 날 끝난 지 14일이 지난 기존 동작 기록이 지워진다.** 지우기 전에 남길 것은 `recording keep`으로 표시한다(데몬이 떠 있어야 한다).
-- 앞선 데몬이 끝을 적지 못하고 멈춘 녹화는 다음 시작 때 마지막으로 파일을 쓴 시각을 끝으로 적는다. `manifest.json`을 읽을 수 없는 녹화 디렉터리는 정리하지 않고 `daemon.log`에 한 줄 남긴다.
+- 앞선 데몬이 끝을 적지 못하고 멈춘 녹화는 다음 시작 때 마지막으로 파일을 쓴 시각을 끝으로 적는다. `manifest.json`을 읽을 수 없는 녹화 디렉터리는 정리하지 않고 `daemon.log`에 한 줄 남긴다(데몬이 뜰 때마다 녹화 하나에 한 번). 녹화를 통째로 지울 때는 먼저 `recordings/.deleting-<id>-…`로 이름을 바꾼 뒤 지우므로, 지우다 끊기면(데몬이 죽거나 디스크 오류) 그 디렉터리만 남고 다음 정리(데몬 시작 포함) 때 지워진다.
 - MCP 기본 모드에는 `pegboard_recording_keep`, `pegboard_recording_delete`가 없다(운영자 모드에만 있다). 보존과 삭제는 사람이 정한다.
 - `navigation.jsonl`, `network.jsonl`, `console.jsonl`은 녹화 하나에 파일마다 64 MiB까지다. 넘으면 `{"ts":…,"capped":true}` 한 줄로 끝나고 그 뒤로는 그 파일에 쓰지 않는다(화면의 녹화당 한도와 따로 센다).
 
