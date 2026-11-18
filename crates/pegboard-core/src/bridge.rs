@@ -308,8 +308,13 @@ impl Bridge {
                 };
                 let mut session = self.session.lock().await;
                 if let Ok(new) = self.conn.attach(target).await {
-                    *session = new;
+                    let old = std::mem::replace(&mut *session, new);
                     self.bind_if_following(&session).await;
+                    // Gone with the old worker, or (a call attached first) a second session.
+                    let _ = self
+                        .conn
+                        .send("Target.detachFromTarget", json!({ "sessionId": old }), None)
+                        .await;
                 }
             }
             _ => {}
@@ -338,7 +343,9 @@ async fn follow(bridge: std::sync::Weak<Bridge>, mut events: broadcast::Receiver
                 };
                 if e.method == "Target.targetCreated" {
                     // Attaching waits for calls in flight: not on this loop.
-                    tokio::spawn(async move { b.on_event(e).await });
+                    if is_worker_of(&e.params["targetInfo"], &b.agent_context) {
+                        tokio::spawn(async move { b.on_event(e).await });
+                    }
                 } else {
                     b.on_event(e).await;
                 }
