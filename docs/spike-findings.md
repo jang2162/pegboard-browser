@@ -720,6 +720,11 @@ R의 세션에서 탐색 50번을 했다: 직접 이동(F의 `Page.navigate`) 13
 - **탐색 이벤트로는 사람과 에이전트를 가를 수 없다.** 주소창 입력과 `open`, 뒤로와 `back`, 링크 클릭과 `click`, 탭 전환과 `tab`은 cdp와 ext 신호가 같다. 페이지의 `isTrusted`도 모두 true다. H1~H5에만 있던 신호는 `windows.onFocusChanged`(앱 전환. 에이전트는 하지 않는다)와 페이지의 `keydown`뿐이다.
 - 페이지 스크립트의 탐색 가운데 구별되는 것은 셋뿐이다: `location=`(`frameRequestedNavigation`의 `reason`이 `scriptInitiated`), `<meta refresh>`(`metaTagRefresh`), `pushState`(`navigatedWithinDocument(historyApi)`). 둘째 실행에서 잰 스크립트의 `history.back()`/`go(-1)`과 `a.click()`(`anchorClick`)은 사람의 입력과 구별되지 않는다(F6). 사람의 링크 클릭과 에이전트의 클릭도 둘 다 `anchorClick`이다.
 - **H8. 바인딩은 서비스 워커가 다시 시작되면 사라진다.** CDP 세션을 워커에 붙여 둔 채 30초 기다린 뒤(H8a)에는 워커가 그대로였고 탭 전환 신호가 왔다. 세션을 떼고 35초 기다리자 워커가 내려갔다(타깃이 사라짐). 그 상태의 탭 전환은 워커를 새로 띄웠고(새 타깃 ID), 그 워커에는 바인딩이 없었으며(`typeof pegActivity`가 `undefined`) 두 이벤트는 확장이 따로 모아 둔 목록(`pegMissed`)에만 남았다.
+- **H9. pegboard의 브리지 워커는 멈추는가, 멈추면 무엇이 다시 띄우는가** (작업 5, `e2e_recording.rs`의 `diag_bridge_worker_stop_and_wake`, Chrome for Testing 157, 두 번째 기계, 2026-11-18) [확인]. 경우마다 새 브라우저로 35가지를 돌렸다: 멈춤 방법 4가지(`Target.closeTarget`, `ServiceWorker.stopWorker`, `ServiceWorker.stopAllWorkers`, 저절로 멈추기를 기다림) × 데몬의 브리지가 워커에 붙어 있음/뗌(`test.detachBridge`) × 깨우기 5가지(`ServiceWorker.startWorker`, `ServiceWorker.dispatchSyncEvent`, 탭 전환(`Target.activateTarget`), 페이지의 `window.open`, `Target.createTarget`). 모든 경우에 시험의 페이지 세션 하나가 `ServiceWorker` 도메인을 켜 둔 채였다.
+  - 저절로 멈추기: 데몬이 워커에서 떨어진 채 90초를 기다린 5번 모두 워커가 멈추지 않았다. H8b(35초에 멈춤)와 다르다. 차이의 원인(위 페이지 세션의 `ServiceWorker` 도메인인지, 확장이 다른지)은 가르지 않았다.
+  - 강제 멈춤: 세 방법 모두 멈췄다(`closeTarget`과 `stopWorker` 약 110ms, `stopAllWorkers` 0~2ms). 그 뒤 페이지가 본 version은 `stopped`인데 registration은 `running`으로 남았다.
+  - 강제로 멈춘 뒤에는 어떤 깨우기도 10초 안에 새 워커를 띄우지 못했다(깨우기 호출은 모두 성공 응답). 예외는 한 줄뿐이다: `stopAllWorkers` + 뗌 + 페이지의 `window.open`에서 2ms 만에 새 워커가 떴고 답했다. 원인은 모르고, 한 번 본 것이라 제품은 이것에 기대지 않는다.
+  - 판정(제품): 브리지 호출은 먼저 워커에 2초 핑을 보내고, 답이 없으면 지금 떠 있는 워커 타깃을 한 번 다시 찾아 붙고, 그것도 없으면 곧바로 `bridge_asleep`으로 실패한다(30초 대기 없음). 강제로 멈춘 워커를 되살리지는 못한다. 워커가 새로 뜬 경우의 다시 붙기와 모아 둔 탭 전환 넘겨받기는 단위 시험(가짜 브라우저)으로만 확인했다. 실제로 브리지 워커가 다시 뜨는 것은 이 설정에서 본 적이 없다.
 
 ### D. 30분 디스크 사용량 (`42-disk.mjs`)
 
