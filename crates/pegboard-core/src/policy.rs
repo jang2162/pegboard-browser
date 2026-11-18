@@ -134,16 +134,17 @@ pub fn check_upload_dir_outside_home(policy: &SessionPolicy, home: &Path) -> Res
 }
 
 /// The policy as it is kept: domains lower-cased (IP literals in `IpAddr` form), sorted and
-/// without duplicates; `allow` and `deny` without duplicates, in the order given.
+/// without duplicates; `allow`, `deny` and `record` without duplicates, in the order given.
 pub fn normalized(policy: &SessionPolicy) -> SessionPolicy {
     let mut policy = policy.clone();
     policy.allow_domains = normalized_domains(&policy.allow_domains);
     dedup_keeping_order(&mut policy.allow);
     dedup_keeping_order(&mut policy.deny);
+    dedup_keeping_order(&mut policy.record);
     policy
 }
 
-fn dedup_keeping_order(classes: &mut Vec<ActionClass>) {
+fn dedup_keeping_order<T: PartialEq + Copy>(classes: &mut Vec<T>) {
     let mut seen = Vec::new();
     classes.retain(|c| {
         let fresh = !seen.contains(c);
@@ -597,6 +598,30 @@ mod tests {
             ..SessionPolicy::default()
         };
         assert_eq!(pins_of(&q), pins_of(&SessionPolicy::default()));
+    }
+
+    #[test]
+    fn record_is_deduplicated_and_not_pinned() {
+        use pegboard_protocol::RecordExtra::{Console, Network};
+        let p = SessionPolicy {
+            record: vec![Console, Network, Console, Network],
+            ..SessionPolicy::default()
+        };
+        assert_eq!(normalized(&p).record, vec![Console, Network]);
+        // Two sessions of one profile may record differently.
+        assert_eq!(pins_of(&p), pins_of(&SessionPolicy::default()));
+        let table = PinTable::default();
+        let _a = table.acquire("p", pins_of(&p)).unwrap();
+        assert!(table
+            .acquire("p", pins_of(&SessionPolicy::default()))
+            .is_ok());
+        // Unknown names are refused on the wire.
+        assert!(serde_json::from_value::<SessionPolicy>(
+            serde_json::json!({ "record": ["video"] })
+        )
+        .is_err());
+        let v = serde_json::to_value(normalized(&p)).unwrap();
+        assert_eq!(v["record"], serde_json::json!(["console", "network"]));
     }
 
     #[test]

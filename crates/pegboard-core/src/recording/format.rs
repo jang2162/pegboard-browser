@@ -63,6 +63,32 @@ pub struct NavLine {
     pub opener: Option<String>,
 }
 
+/// One line of network.jsonl (`--record network`): a request's metadata. No headers, no
+/// bodies; the URL as every logged URL (`url_for_log`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkLine {
+    pub ts: String,
+    pub target_id: String,
+    pub method: String,
+    pub url: String,
+    pub status: Option<u16>,
+    pub bytes: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// One line of console.jsonl (`--record console`): a console call or an uncaught
+/// exception of a page, its text cut to 1000 characters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsoleLine {
+    pub ts: String,
+    pub target_id: String,
+    pub level: String,
+    pub text: String,
+}
+
 /// Creates the directory with mode 0700 (its parent must exist). An existing directory is
 /// made 0700; an existing symlink (even to a directory) or anything else is refused.
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {

@@ -21,7 +21,7 @@ use pegboard_core::recording::config::RecordingConfig;
 use pegboard_core::runner::succeeded;
 use pegboard_protocol::{
     codes, ActionClass, BrowserStatus, CommandExecParams, CommandExecResult, FileInfo, ProfileInfo,
-    RpcError, SessionCreateParams, SessionId, SessionInfo, SessionPolicy,
+    RecordExtra, RpcError, SessionCreateParams, SessionId, SessionInfo, SessionPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -148,6 +148,26 @@ pub(crate) struct PolicyArgs {
     /// Do not expire the session after it has been idle.
     #[arg(long)]
     no_expire: bool,
+    /// Also record the session's network requests (metadata only, never headers or bodies)
+    /// and/or its console messages: network, console.
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "WHAT,...")]
+    record: Vec<RecordArg>,
+}
+
+/// What `--record` takes.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordArg {
+    Network,
+    Console,
+}
+
+impl From<RecordArg> for RecordExtra {
+    fn from(r: RecordArg) -> RecordExtra {
+        match r {
+            RecordArg::Network => RecordExtra::Network,
+            RecordArg::Console => RecordExtra::Console,
+        }
+    }
 }
 
 impl PolicyArgs {
@@ -161,6 +181,7 @@ impl PolicyArgs {
             no_localhost: self.no_localhost,
             upload_dir: self.upload_dir,
             no_expire: self.no_expire,
+            record: self.record.into_iter().map(RecordExtra::from).collect(),
         };
         if let Err(e) = policy::validate(&policy) {
             usage(&e.message);
@@ -466,9 +487,17 @@ fn describe_policy(p: &SessionPolicy) -> String {
         }
     };
     let (localhost, private) = address_rules(p);
+    let record: Vec<&str> = p
+        .record
+        .iter()
+        .map(|r| match r {
+            RecordExtra::Network => "network",
+            RecordExtra::Console => "console",
+        })
+        .collect();
     format!(
         "policy: allow {}; deny {}; allow-domain {}; localhost {localhost}; \
-         private network {private}; upload-dir {}; expires {}",
+         private network {private}; upload-dir {}; expires {}; record {}",
         names(&p.allow),
         names(&p.deny),
         if p.allow_domains.is_empty() {
@@ -478,6 +507,11 @@ fn describe_policy(p: &SessionPolicy) -> String {
         },
         p.upload_dir.as_deref().unwrap_or("-"),
         if p.no_expire { "never" } else { "when idle" },
+        if record.is_empty() {
+            "-".to_string()
+        } else {
+            record.join(",")
+        },
     )
 }
 
@@ -944,6 +978,45 @@ mod tests {
             no_localhost,
             ..SessionPolicy::default()
         }
+    }
+
+    #[test]
+    fn record_is_a_policy_option_of_session_create_and_mcp() {
+        use clap::Parser;
+        let policy_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Cmd::Session {
+                command: SessionCmd::Create { policy, .. },
+            } => policy.checked(),
+            Cmd::Mcp { policy, .. } => policy.checked(),
+            _ => panic!("{args:?}"),
+        };
+        assert_eq!(
+            policy_of(&[
+                "pegboard",
+                "session",
+                "create",
+                "--record",
+                "network,console"
+            ])
+            .record,
+            vec![RecordExtra::Network, RecordExtra::Console]
+        );
+        assert_eq!(
+            policy_of(&["pegboard", "mcp", "--record", "console"]).record,
+            vec![RecordExtra::Console]
+        );
+        assert!(policy_of(&["pegboard", "session", "create"])
+            .record
+            .is_empty());
+        assert!(
+            Cli::try_parse_from(["pegboard", "session", "create", "--record", "video"]).is_err()
+        );
+        let line = describe_policy(&SessionPolicy {
+            record: vec![RecordExtra::Network, RecordExtra::Console],
+            ..SessionPolicy::default()
+        });
+        assert!(line.ends_with("; record network,console"), "{line}");
+        assert!(describe_policy(&SessionPolicy::default()).ends_with("; record -"));
     }
 
     #[test]

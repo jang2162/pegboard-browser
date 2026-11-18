@@ -131,7 +131,9 @@ fn policy_schema() -> Value {
             "allowPrivateNetwork": { "type": "boolean" },
             "noLocalhost": { "type": "boolean" },
             "uploadDir": { "type": "string", "description": "Absolute path; needs allow upload." },
-            "noExpire": { "type": "boolean" }
+            "noExpire": { "type": "boolean" },
+            "record": { "type": "array", "items": { "enum": ["network", "console"] },
+                        "description": "Also record network requests (metadata only) and/or console messages." }
         },
         "additionalProperties": false,
     })

@@ -670,7 +670,7 @@ impl Daemon {
     async fn create_session_task(&self, p: SessionCreateParams) -> Result<SessionInfo, RpcError> {
         let info = self.sessions.create(p).await?;
         let id = info.id.clone();
-        let manifest = Manifest::new(
+        let mut manifest = Manifest::new(
             &info.recording_id,
             &id.0,
             &info.name,
@@ -679,6 +679,7 @@ impl Daemon {
             &self.chrome_version,
             AGENT_BROWSER_VERSION,
         );
+        manifest.record = info.policy.record.clone();
         let (log, manifest) = match ActionLog::open(&self.paths, manifest) {
             Ok(log) => {
                 let manifest = log.manifest_handle();
@@ -693,7 +694,13 @@ impl Daemon {
         match self.sessions.context_of(&id) {
             Ok(context) => {
                 self.recorder
-                    .begin_session(&id, &context, log.clone(), manifest, Vec::new())
+                    .begin_session(
+                        &id,
+                        &context,
+                        log.clone(),
+                        manifest,
+                        info.policy.record.clone(),
+                    )
                     .await
             }
             Err(e) => eprintln!(

@@ -497,6 +497,8 @@ fn policy_keys_are_refused_in_default_mode() {
         json!({ "allowDomains": [] }),
         json!({ "noExpire": true }),
         json!({ "uploadDir": "/" }),
+        json!({ "record": ["network"] }),
+        json!({ "name": "x", "policy": { "record": ["console"] } }),
     ] {
         let (err, text) = h.call("pegboard_session_create", args.clone());
         assert!(err, "{args}: {text}");
@@ -527,7 +529,29 @@ fn policy_keys_are_refused_in_default_mode() {
     );
     let sent = op.stub.calls_of("session.create");
     assert_eq!(sent[0]["policy"]["allow"], json!(["state"]));
+    // `record` is part of the operator's policy schema.
+    let tools = op.request("tools/list", json!({}))["result"]["tools"].clone();
+    let create = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "pegboard_session_create")
+        .unwrap();
+    assert_eq!(
+        create["inputSchema"]["properties"]["policy"]["properties"]["record"]["items"]["enum"],
+        json!(["network", "console"])
+    );
+    let (err, text) = op.call(
+        "pegboard_session_create",
+        json!({ "policy": { "record": ["network", "console"] } }),
+    );
+    assert!(!err && text.contains("record network,console"), "{text}");
+    assert_eq!(
+        op.stub.calls_of("session.create")[1]["policy"]["record"],
+        json!(["network", "console"])
+    );
     for bad in [
+        json!({ "policy": { "record": ["video"] } }),
         json!({ "policy": { "allow": ["eval"] } }),
         json!({ "policy": { "denny": ["eval"] } }),
         json!({ "policy": { "allow": ["upload"] } }),
@@ -535,7 +559,7 @@ fn policy_keys_are_refused_in_default_mode() {
         let (err, text) = op.call("pegboard_session_create", bad.clone());
         assert!(err && text.starts_with("invalid_params: "), "{bad}: {text}");
     }
-    assert_eq!(op.stub.calls_of("session.create").len(), 1);
+    assert_eq!(op.stub.calls_of("session.create").len(), 2);
 }
 
 #[test]

@@ -2,6 +2,7 @@
 //! `[recording]` settings of `config.toml`.
 
 pub mod config;
+pub mod events;
 pub mod format;
 pub mod recorder;
 pub mod screen;

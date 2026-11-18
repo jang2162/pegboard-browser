@@ -173,6 +173,9 @@ pub struct SessionPolicy {
     /// Absolute path, checked at `session.create`.
     pub upload_dir: Option<String>,
     pub no_expire: bool,
+    /// What the session's recording keeps besides actions, navigation and screen. A
+    /// session's own choice: not pinned to its profile.
+    pub record: Vec<RecordExtra>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
