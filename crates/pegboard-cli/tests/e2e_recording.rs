@@ -1723,11 +1723,12 @@ fn a_tab_switch_after_the_bridge_worker_restarted_is_marked() {
         }
     };
     std::thread::sleep(Duration::from_secs(2));
+    // Marked before any command made the daemon talk to the new worker.
+    let dir = recording_dir(home, &h);
+    let marks = human_entries(&dir);
     // The bridge still works after its worker restarted.
     ok(home, &h, &["tab", "new", &format!("{origin}/counter")]);
     close(home, &h);
-    let dir = recording_dir(home, &h);
-    let marks = human_entries(&dir);
     assert_eq!(marks.len(), 1, "worker {old} -> {new}: {marks:?}");
     assert_eq!(marks[0]["what"], "switched to this tab");
     assert_eq!(marks[0]["targetId"], first.as_str());
