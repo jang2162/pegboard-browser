@@ -10,10 +10,13 @@ use std::time::Duration;
 
 use pegboard_core::actionlog::{write_manifest_file, ActionEntry, Manifest, ScreenStatus};
 use pegboard_core::cdp::{page_targets, CdpConn};
-use pegboard_core::recording::format::{FrameKind, IndexLine, NavEvent, NavLine};
+use pegboard_core::recording::format::{
+    ConsoleLine, FrameKind, IndexLine, NavEvent, NavLine, NetworkLine,
+};
 use serde_json::{json, Value};
 
 const T1: &str = "0123456789ABCDEF0123456789ABCDEF";
+const T2: &str = "FEDCBA9876543210FEDCBA9876543210";
 const EVIL: &str = "<img src=x onerror=\"window.pwned=1\">";
 
 fn ts(sec: u32) -> String {
@@ -142,6 +145,54 @@ fn plant(p: Planted, jpeg: &[u8]) -> String {
         }
     }
     id
+}
+
+/// Adds a second tab (`T2`, with its index and frames) and network and console lines to a
+/// planted recording.
+fn plant_more(
+    id: &str,
+    t2_index: &[IndexLine],
+    network: &[NetworkLine],
+    console: &[ConsoleLine],
+    jpeg: &[u8],
+) {
+    let dir = common::shared().env.paths.recordings.join(id);
+    let lines = |v: Vec<String>| v.into_iter().map(|l| l + "\n").collect::<String>();
+    let tab = dir.join("screen").join(T2);
+    std::fs::create_dir_all(&tab).unwrap();
+    std::fs::write(
+        tab.join("index.jsonl"),
+        lines(
+            t2_index
+                .iter()
+                .map(|l| serde_json::to_string(l).unwrap())
+                .collect(),
+        ),
+    )
+    .unwrap();
+    for f in t2_index.iter().filter_map(|l| l.file.as_ref()) {
+        std::fs::write(tab.join(f), jpeg).unwrap();
+    }
+    std::fs::write(
+        dir.join("network.jsonl"),
+        lines(
+            network
+                .iter()
+                .map(|l| serde_json::to_string(l).unwrap())
+                .collect(),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("console.jsonl"),
+        lines(
+            console
+                .iter()
+                .map(|l| serde_json::to_string(l).unwrap())
+                .collect(),
+        ),
+    )
+    .unwrap();
 }
 
 /// The human profile's tab and a CDP session on it.
@@ -289,6 +340,20 @@ fn replay_page_starts_at_the_first_incident() {
         assert!(
             summary.contains("명령 3") && summary.contains("실패 1") && summary.contains("거부 1"),
             "{summary}"
+        );
+        // The recording is deleted while the page is open: the next frame it asks for is
+        // refused, and the page says the link no longer works (not "화면 없음").
+        std::fs::remove_dir_all(sh.env.paths.recordings.join(&id)).unwrap();
+        click(conn, &session, "#actions li[data-seq=\"1\"]").await;
+        let error = until(
+            conn,
+            &session,
+            "document.body.dataset.ready === 'error' ? document.getElementById('error').textContent : null",
+        )
+        .await;
+        assert!(
+            error.as_str().unwrap().contains("녹화를 열 수 없습니다"),
+            "{error}"
         );
         conn.navigate(&session, "about:blank").await.unwrap();
         scope.finish(conn).await;
@@ -449,6 +514,218 @@ fn replay_page_marks_screen_off_missing_and_pruned() {
         assert!(
             summary.as_str().unwrap().contains("화면 지워짐"),
             "{summary}"
+        );
+        conn.navigate(&session, "about:blank").await.unwrap();
+        scope.finish(conn).await;
+    });
+}
+
+/// `ts` at second `t` (`"03"`, `"01.5"`).
+fn at(t: &str) -> String {
+    format!("2026-11-17T10:00:{t}Z")
+}
+
+async fn key(conn: &CdpConn, session: &str, key: &str) {
+    let expr = format!(
+        "document.dispatchEvent(new KeyboardEvent('keydown', {{ key: '{key}', bubbles: true }})); true"
+    );
+    assert_eq!(conn.evaluate(session, &expr).await.unwrap(), json!(true));
+}
+
+/// Waits until the page shows frame `want` loaded, or (for "off", "capped", "missing",
+/// "pruned") says that it shows none for that reason.
+async fn shows(conn: &CdpConn, session: &str, want: &str) {
+    let expr = format!(
+        "(() => {{ const i = document.getElementById('frame'); const p = document.getElementById('no-frame'); \
+         const got = !i.hidden ? (i.complete && i.naturalWidth > 0 ? i.dataset.name : null) : (p.hidden ? null : p.dataset.reason); \
+         return got === '{want}' ? got : null; }})()"
+    );
+    for _ in 0..100 {
+        if !conn.evaluate(session, &expr).await.unwrap().is_null() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let state = conn
+        .evaluate(
+            session,
+            "[document.body.dataset.seq, document.body.dataset.side, document.body.dataset.tab, \
+              document.getElementById('frame').dataset.name, document.getElementById('no-frame').dataset.reason]",
+        )
+        .await
+        .unwrap();
+    panic!("the page does not show {want}: {state}");
+}
+
+/// The lines of the network/console box: `<kind>:<text>`.
+const EXTRAS: &str =
+    "[...document.querySelectorAll('#extra-lines li')].map(l => l.dataset.kind + ':' + l.textContent)";
+
+#[test]
+#[ignore]
+fn replay_page_follows_tabs_keys_extras_and_same_time_rules() {
+    common::run(async {
+        let sh = common::shared();
+        let conn = &sh.browser.conn;
+        let scope = common::PageScope::begin(conn).await;
+        let session = human_tab(conn).await;
+        let jpeg = a_jpeg(conn, &session).await;
+        let human = |seq: u64, ts: String, target: &str| ActionEntry {
+            seq,
+            ..ActionEntry::human("s_abcdefgh", &ts, target, None, "clicked", false)
+        };
+        let mut fill = command(1, 2, true, None, Some((1, 1)));
+        fill.command = "fill".into();
+        fill.args = vec!["@e1".into(), "[redacted]".into()];
+        fill.redacted = true;
+        let mut late = frame(0, 3);
+        late.ts = at("03.5");
+        let nav = |ts: String, target: &str, url: &str| NavLine {
+            ts,
+            target_id: target.into(),
+            event: NavEvent::Navigated,
+            url: Some(url.into()),
+            opener: None,
+        };
+        let id = plant(
+            Planted {
+                name: "two tabs",
+                screen: ScreenStatus::Recorded,
+                // seq 4 is written last but happened first, in T2.
+                actions: vec![
+                    fill,
+                    human(2, at("03"), T1),
+                    human(3, at("04"), T1),
+                    human(4, at("01"), T2),
+                ],
+                index: vec![frame(1, 1), late],
+                missing: vec![],
+                navigation: vec![
+                    nav(at("00.5"), T1, "https://one.test/"),
+                    nav(at("03"), T1, "https://one.test/next"),
+                    nav(at("03"), T2, "https://two.test/"),
+                ],
+            },
+            &jpeg,
+        );
+        let mut early = frame(0, 1);
+        early.ts = at("01.5");
+        plant_more(
+            &id,
+            &[early, frame(3, 2)],
+            &[NetworkLine {
+                ts: at("01"),
+                target_id: T2.into(),
+                method: "GET".into(),
+                url: "https://two.test/api".into(),
+                status: Some(200),
+                bytes: None,
+                duration_ms: None,
+                error: None,
+            }],
+            &[ConsoleLine {
+                ts: at("03.5"),
+                target_id: T1.into(),
+                level: "warn".into(),
+                text: "late warning".into(),
+            }],
+            &jpeg,
+        );
+        let t1 = |n: u32| format!("{T1}/{n:06}.jpg");
+        let t2 = |n: u32| format!("{T2}/{n:06}.jpg");
+        let one_extra = |got: &Value, kind: &str, text: &str| {
+            let lines = got.as_array().unwrap();
+            assert!(
+                lines.len() == 1
+                    && lines[0].as_str().unwrap().starts_with(&format!("{kind}:"))
+                    && lines[0].as_str().unwrap().contains(text),
+                "{got}"
+            );
+        };
+        open_page(conn, &session, &id).await;
+        // The first incident by time: seq 4 at :01 in T2, whose first frame is at :01.5.
+        assert_eq!(
+            conn.evaluate(
+                &session,
+                "[document.body.dataset.seq, document.body.dataset.tab]"
+            )
+            .await
+            .unwrap(),
+            json!(["4", T2])
+        );
+        shows(conn, &session, "missing").await;
+        one_extra(
+            &conn.evaluate(&session, EXTRAS).await.unwrap(),
+            "network",
+            "two.test/api",
+        );
+        // Its mark twice: the screen after (at the next action, :02).
+        click(conn, &session, "#timeline .mark[data-seq=\"4\"]").await;
+        click(conn, &session, "#timeline .mark[data-seq=\"4\"]").await;
+        shows(conn, &session, &t2(1)).await;
+        // The other tab at the same moment.
+        click(
+            conn,
+            &session,
+            &format!("#tabs button[data-target=\"{T1}\"]"),
+        )
+        .await;
+        shows(conn, &session, &t1(1)).await;
+        // Arrow right: seq 1, the fill, with its lock.
+        key(conn, &session, "ArrowRight").await;
+        shows(conn, &session, &t1(1)).await;
+        let line = conn
+            .evaluate(
+                &session,
+                "document.querySelector('#actions li[data-seq=\"1\"] .what').textContent",
+            )
+            .await
+            .unwrap();
+        assert_eq!(line, json!("fill @e1 [redacted] 🔒"));
+        // Arrow right: seq 2 at :03 in T1, which navigated at :03 after its :01 frame.
+        key(conn, &session, "ArrowRight").await;
+        assert_eq!(
+            conn.evaluate(&session, "document.body.dataset.seq")
+                .await
+                .unwrap(),
+            json!("2")
+        );
+        shows(conn, &session, "missing").await;
+        one_extra(
+            &conn.evaluate(&session, EXTRAS).await.unwrap(),
+            "console",
+            "late warning",
+        );
+        click(conn, &session, "#after").await;
+        shows(conn, &session, &t1(3)).await;
+        // T2 at :04, then at :03, where a frame and a navigation have the same time: the
+        // frame shows the new page.
+        click(
+            conn,
+            &session,
+            &format!("#tabs button[data-target=\"{T2}\"]"),
+        )
+        .await;
+        shows(conn, &session, &t2(2)).await;
+        click(conn, &session, "#before").await;
+        shows(conn, &session, &t2(2)).await;
+        // The tab buttons are named by each tab's address at that moment.
+        let labels = conn
+            .evaluate(
+                &session,
+                "[...document.querySelectorAll('#tabs button')].map(b => b.textContent)",
+            )
+            .await
+            .unwrap();
+        assert_eq!(labels, json!(["1: one.test", "2: two.test"]));
+        // Arrow left twice: back at seq 4.
+        key(conn, &session, "ArrowLeft").await;
+        key(conn, &session, "ArrowLeft").await;
+        assert_eq!(
+            conn.evaluate(&session, "document.body.dataset.seq")
+                .await
+                .unwrap(),
+            json!("4")
         );
         conn.navigate(&session, "about:blank").await.unwrap();
         scope.finish(conn).await;

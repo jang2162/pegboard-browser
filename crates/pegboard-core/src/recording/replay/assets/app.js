@@ -1,44 +1,10 @@
-// The replay page of one recording. Everything shown comes from `data` (the recording's own
-// files: page URLs, error texts, what a person did) and is put in as text only
-// (`textContent`); nothing is ever parsed as HTML.
+// The replay page of one recording. It draws what `data` says (the server judges which
+// screen goes with which action and tab: model.rs `views`) and makes no judgment of its own.
+// Everything shown comes from the recording's own files (page URLs, error texts, what a
+// person did) and is put in as text only (`textContent`); nothing is ever parsed as HTML.
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-
-// ---- the rules shared with model.rs (change both) ----
-
-// A time as a string that sorts as the time does (model.rs `ts_key`).
-function tsKey(ts) {
-  if (typeof ts !== 'string') return '';
-  const m = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?Z$/.exec(ts);
-  if (!m) return ts;
-  return m[1] + '.' + (m[2] || '').padEnd(9, '0');
-}
-
-// The screen of tab `target` at `ts` (model.rs `frame_at`).
-function frameAt(index, navigation, target, ts) {
-  const at = tsKey(ts);
-  let latest = null;
-  let latestKey = null;
-  for (const line of index || []) {
-    const key = tsKey(line.ts);
-    if (key > at) continue;
-    if (line.kind === 'capped') return { kind: 'capped' };
-    if (line.kind !== 'off' && !line.file) continue;
-    if (latest === null || key >= latestKey) {
-      latest = line;
-      latestKey = key;
-    }
-  }
-  if (latest === null) return { kind: 'missing' };
-  if (latest.kind === 'off') return { kind: 'off' };
-  const navigated = (navigation || []).some((n) => {
-    if (n.targetId !== target || n.event !== 'navigated') return false;
-    const k = tsKey(n.ts);
-    return k > latestKey && k <= at;
-  });
-  return navigated ? { kind: 'missing' } : { kind: 'frame', line: latest };
-}
 
 // ---- words ----
 
@@ -52,16 +18,16 @@ const NO_SCREEN = {
 const SIGN = { failed: '✗', denied: '⛔', human: '👤', ok: '✓' };
 const KIND_WORD = { failed: '실패', denied: '거부', human: '사람 개입' };
 
+// Only names the server's frame route takes are ever asked for.
 const FRAME_NAME = /^[0-9A-F]{32}\/[0-9]{6,10}\.jpg$/;
-const TARGET_ID = /^[0-9A-F]{32}$/;
 
 // ---- state ----
 
 const state = {
   model: null,
   actions: [],
+  views: [],
   incidentKind: new Map(), // seq -> failed | denied | human
-  tabs: [],
   index: 0, // the selected action
   side: 'before',
   tab: null, // the tab shown; null: the selected action's
@@ -103,24 +69,8 @@ function describe(action) {
   if (action.kind === 'human') {
     return '사람 개입: ' + (action.what || '') + (action.certain === false ? ' (가능성)' : '');
   }
-  return [action.command].concat(action.args || []).join(' ');
-}
-
-// The time "after" an action: the next action's, else the end of the recording.
-function afterTs(i) {
-  const next = state.actions[i + 1];
-  if (next) return next.ts;
-  return (state.model.manifest && state.model.manifest.endedAt) || '9999-12-31T23:59:59Z';
-}
-
-// The last URL a tab is known to have had at `ts`.
-function urlOf(target, ts) {
-  const at = tsKey(ts);
-  let url = null;
-  for (const n of state.model.navigation || []) {
-    if (n.targetId === target && n.url && tsKey(n.ts) <= at) url = n.url;
-  }
-  return url;
+  // A typed value the log did not keep is shown as it was logged, with a lock.
+  return [action.command].concat(action.args || []).join(' ') + (action.redacted ? ' 🔒' : '');
 }
 
 // ---- rendering ----
@@ -130,7 +80,7 @@ function renderHead() {
   $('title').textContent = '세션 "' + (m.sessionName || m.sessionId || '') + '"';
   document.title = 'pegboard 재생 · ' + (m.sessionName || m.recordingId || '');
   const commands = state.actions.filter((a) => a.kind !== 'human').length;
-  const count = (k) => state.model.incidents.filter((i) => i.kind === k).length;
+  const count = (k) => (state.model.incidents || []).filter((i) => i.kind === k).length;
   const parts = [
     clock(m.startedAt) + '–' + (m.endedAt ? clock(m.endedAt) : '진행 중'),
     '명령 ' + commands,
@@ -166,11 +116,13 @@ function renderTimeline() {
   line.replaceChildren();
   const m = state.model.manifest || {};
   const times = state.actions.map((a) => Date.parse(a.ts));
+  const known = times.filter((t) => !Number.isNaN(t));
+  const least = known.reduce((a, b) => Math.min(a, b), Infinity);
+  const most = known.reduce((a, b) => Math.max(a, b), -Infinity);
   let start = Date.parse(m.startedAt);
   let end = Date.parse(m.endedAt);
-  const known = times.filter((t) => !Number.isNaN(t));
-  if (Number.isNaN(start)) start = known.length ? Math.min(...known) : 0;
-  if (Number.isNaN(end)) end = known.length ? Math.max(...known) : start;
+  if (Number.isNaN(start)) start = known.length ? least : 0;
+  if (Number.isNaN(end)) end = known.length ? Math.max(most, start) : start;
   const span = Math.max(end - start, 1);
   state.actions.forEach((a, i) => {
     const kind = kindOf(a);
@@ -194,29 +146,13 @@ function renderTimeline() {
   });
 }
 
-// The tabs of the recording, in the order they first appear.
-function collectTabs() {
-  const first = new Map();
-  const see = (target, ts) => {
-    if (!target || !TARGET_ID.test(target)) return;
-    const k = tsKey(ts);
-    if (!first.has(target) || k < first.get(target)) first.set(target, k);
-  };
-  for (const a of state.actions) see(a.targetId, a.ts);
-  for (const n of state.model.navigation || []) see(n.targetId, n.ts);
-  for (const [target, index] of Object.entries(state.model.screens || {})) {
-    see(target, index.length ? index[0].ts : '9999');
-  }
-  return [...first.entries()].sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)).map((e) => e[0]);
-}
-
-function renderTabs(shown, ts) {
+function renderTabs(view, shown) {
   const box = $('tabs');
   box.replaceChildren();
-  state.tabs.forEach((target, n) => {
-    const url = urlOf(target, ts);
-    const label = (n + 1) + ': ' + (url ? hostOf(url) : target.slice(0, 8));
-    const b = el('button', 'tab', label);
+  (state.model.tabs || []).forEach((target, n) => {
+    const tv = view && view.tabs ? view.tabs[target] : null;
+    const url = tv && tv.url;
+    const b = el('button', 'tab', n + 1 + ': ' + (url ? hostOf(url) : target.slice(0, 8)));
     b.type = 'button';
     b.dataset.target = target;
     b.title = url || target;
@@ -231,55 +167,45 @@ function renderTabs(shown, ts) {
   });
 }
 
-function renderExtras(i) {
+function renderExtras(view) {
   const box = $('extra-lines');
   box.replaceChildren();
-  const from = i > 0 ? tsKey(state.actions[i - 1].ts) : '';
-  const to = tsKey(afterTs(i));
   const lines = [];
-  for (const n of state.model.network || []) {
-    const k = tsKey(n.ts);
-    if (k > from && k <= to) {
-      const status = n.error ? n.error : n.status === null || n.status === undefined ? '-' : String(n.status);
-      lines.push([k, clock(n.ts) + ' ' + n.method + ' ' + n.url + ' ' + status]);
-    }
+  const slice = (all, range) => (Array.isArray(range) ? (all || []).slice(range[0], range[1]) : []);
+  for (const n of slice(state.model.network, view && view.network)) {
+    const status = n.error ? n.error : n.status === null || n.status === undefined ? '-' : String(n.status);
+    lines.push(['network', clock(n.ts) + ' ' + n.method + ' ' + n.url + ' ' + status]);
   }
-  for (const c of state.model.console || []) {
-    const k = tsKey(c.ts);
-    if (k > from && k <= to) lines.push([k, clock(c.ts) + ' console.' + c.level + ': ' + c.text]);
+  for (const c of slice(state.model.console, view && view.console)) {
+    lines.push(['console', clock(c.ts) + ' console.' + c.level + ': ' + c.text]);
   }
-  lines.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-  for (const [, text] of lines) box.append(el('li', null, text));
+  for (const [kind, text] of lines) {
+    const li = el('li', kind, text);
+    li.dataset.kind = kind;
+    box.append(li);
+  }
   $('extras').hidden = lines.length === 0;
-}
-
-// What to show for the selection: a frame name, or why there is none.
-function chooseScreen(a, i, target) {
-  const m = state.model.manifest || {};
-  if (m.screen === 'pruned') return { none: 'pruned' };
-  const named = state.side === 'before' ? a.frameBefore : a.frameAfter;
-  if (target === a.targetId && named && FRAME_NAME.test(named)) {
-    return { name: named, ts: a.ts, url: a.url };
-  }
-  const ts = state.side === 'before' ? a.ts : afterTs(i);
-  const index = (state.model.screens || {})[target] || [];
-  const at = frameAt(index, state.model.navigation, target, ts);
-  if (at.kind === 'frame') {
-    const name = target + '/' + at.line.file;
-    if (FRAME_NAME.test(name)) return { name, ts: at.line.ts, url: at.line.url };
-    return { none: 'missing' };
-  }
-  return { none: at.kind };
 }
 
 function showNoFrame(reason) {
   const img = $('frame');
   img.hidden = true;
   img.removeAttribute('src');
+  delete img.dataset.name;
   const p = $('no-frame');
   p.textContent = NO_SCREEN[reason] || NO_SCREEN.missing;
-  p.dataset.reason = reason;
+  p.dataset.reason = NO_SCREEN[reason] ? reason : 'missing';
   p.hidden = false;
+}
+
+// The tab shown for action `i`: the one chosen, else the action's own, else the first.
+function shownTab(i) {
+  const a = state.actions[i];
+  const view = state.views[i];
+  const tabs = state.model.tabs || [];
+  if (state.tab) return state.tab;
+  if (a && a.targetId && view && view.tabs && view.tabs[a.targetId]) return a.targetId;
+  return tabs[0] || null;
 }
 
 function show() {
@@ -288,17 +214,18 @@ function show() {
     showNoFrame('missing');
     return;
   }
-  const target = state.tab || a.targetId || state.tabs[0] || null;
-  const screen = target ? chooseScreen(a, state.index, target) : { none: 'missing' };
+  const view = state.views[state.index];
+  const target = shownTab(state.index);
+  const tv = view && view.tabs && target ? view.tabs[target] : null;
+  const screen = (tv && tv[state.side]) || { kind: 'missing' };
   const img = $('frame');
-  if (screen.name) {
+  if (screen.kind === 'frame' && FRAME_NAME.test(screen.name)) {
     $('no-frame').hidden = true;
     img.dataset.name = screen.name;
     img.hidden = false;
     img.src = 'frames/' + screen.name;
   } else {
-    delete img.dataset.name;
-    showNoFrame(screen.none);
+    showNoFrame(screen.kind);
   }
   const info = [state.side === 'before' ? '직전' : '직후', describe(a)];
   if (screen.ts) info.push(clock(screen.ts));
@@ -311,10 +238,11 @@ function show() {
     node.setAttribute('aria-current', current ? 'true' : 'false');
     if (current && node.tagName === 'LI') node.scrollIntoView({ block: 'nearest' });
   }
-  renderTabs(target, state.side === 'before' ? a.ts : afterTs(state.index));
-  renderExtras(state.index);
+  renderTabs(view, target);
+  renderExtras(view);
   document.body.dataset.seq = String(a.seq);
   document.body.dataset.side = state.side;
+  document.body.dataset.tab = target || '';
 }
 
 function select(i, side) {
@@ -331,14 +259,18 @@ function select(i, side) {
 function start(model) {
   state.model = model;
   state.actions = Array.isArray(model.actions) ? model.actions : [];
+  state.views = Array.isArray(model.views) ? model.views : [];
   for (const inc of model.incidents || []) state.incidentKind.set(inc.seq, inc.kind);
-  state.tabs = collectTabs();
   renderHead();
   renderList();
   renderTimeline();
   const first = state.actions.findIndex((a) => a.seq === model.startSeq);
   $('frame').addEventListener('error', () => {
-    if (!$('frame').hidden) showNoFrame('missing');
+    if ($('frame').hidden) return;
+    // A frame the server will not give: gone, or the whole link (ended, recording deleted)?
+    fetch('data', { method: 'HEAD', cache: 'no-store', credentials: 'omit' })
+      .then((r) => (r.ok ? showNoFrame('missing') : fail()))
+      .catch(fail);
   });
   $('before').addEventListener('click', () => {
     state.lastMark = null;

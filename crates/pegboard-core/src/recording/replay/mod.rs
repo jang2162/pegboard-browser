@@ -14,7 +14,7 @@ pub mod model;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
@@ -44,12 +44,23 @@ const MAX_HEAD: usize = 8 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// Connections served at once; more wait.
 const MAX_CONNECTIONS: usize = 32;
+/// Longest a connection is served (a client that stops reading is cut off).
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest frame file served.
 const MAX_FRAME_BYTES: u64 = 32 * 1024 * 1024;
 
 struct Grant {
     recording_id: String,
+    /// The monotonic clock stops while the machine sleeps (macOS), so the wall clock is
+    /// kept too: the grant ends when either has passed.
     expires: Instant,
+    expires_wall: SystemTime,
+}
+
+impl Grant {
+    fn live(&self, now: Instant, wall: SystemTime) -> bool {
+        self.expires > now && self.expires_wall > wall
+    }
 }
 
 struct Inner {
@@ -122,7 +133,8 @@ impl ReplayServer {
                     Ok((sock, _)) => {
                         let inner = serving.clone();
                         tokio::spawn(async move {
-                            serve(&inner, sock).await;
+                            let _ =
+                                tokio::time::timeout(CONNECTION_TIMEOUT, serve(&inner, sock)).await;
                             drop(permit);
                         });
                     }
@@ -142,14 +154,15 @@ impl ReplayServer {
     /// expires. The caller has checked that the recording exists.
     pub fn grant(&self, recording_id: &str) -> (String, OffsetDateTime) {
         let token = new_token();
-        let now = Instant::now();
+        let (now, wall) = (Instant::now(), SystemTime::now());
         let mut grants = self.inner.lock();
-        grants.retain(|_, g| g.expires > now);
+        grants.retain(|_, g| g.live(now, wall));
         grants.insert(
             token.clone(),
             Grant {
                 recording_id: recording_id.to_string(),
                 expires: now + self.inner.ttl,
+                expires_wall: wall + self.inner.ttl,
             },
         );
         let url = format!("http://127.0.0.1:{}/r/{token}/", self.inner.port);
@@ -169,9 +182,9 @@ impl Inner {
 
     /// The recording a live token opens. Every token is compared in constant time.
     fn recording_of(&self, token: &str) -> Option<String> {
-        let now = Instant::now();
+        let (now, wall) = (Instant::now(), SystemTime::now());
         let mut grants = self.lock();
-        grants.retain(|_, g| g.expires > now);
+        grants.retain(|_, g| g.live(now, wall));
         let mut found = None;
         for (t, g) in grants.iter() {
             if bool::from(t.as_bytes().ct_eq(token.as_bytes())) {
@@ -334,6 +347,10 @@ async fn answer(inner: &Inner, method: &str, path: &str, hosts: &[String]) -> An
     let Some(recording_id) = inner.recording_of(token) else {
         return Answer::not_found();
     };
+    // A deleted recording: its page is gone too.
+    if real_recording_dir(&inner.paths, &recording_id).is_err() {
+        return Answer::not_found();
+    }
     match route(rest) {
         Route::Page => Answer::ok("text/html; charset=utf-8", INDEX_HTML.into()),
         Route::Asset("app.js") => Answer::ok("text/javascript; charset=utf-8", APP_JS.into()),
@@ -354,7 +371,7 @@ async fn answer(inner: &Inner, method: &str, path: &str, hosts: &[String]) -> An
         Route::Frame { target, file } => {
             let paths = inner.paths.clone();
             let read = tokio::task::spawn_blocking(move || {
-                read_frame(&paths, &recording_id, &target, &file)
+                read_frame(&paths, &recording_id, &target, &file, MAX_FRAME_BYTES)
             })
             .await;
             match read {
@@ -366,12 +383,13 @@ async fn answer(inner: &Inner, method: &str, path: &str, hosts: &[String]) -> An
 }
 
 /// `screen/<target>/<file>` of the recording: every directory on the way a real one, the
-/// file a regular file (never through a link).
+/// file a regular file (never through a link) of at most `limit` bytes.
 fn read_frame(
     paths: &Paths,
     recording_id: &str,
     target: &str,
     file: &str,
+    limit: u64,
 ) -> std::io::Result<Vec<u8>> {
     let refused = || std::io::Error::new(std::io::ErrorKind::NotFound, "no such frame");
     if !valid_target_id(target) || !valid_frame_name(&format!("{target}/{file}")) {
@@ -385,8 +403,8 @@ fn read_frame(
     }
     let f = open_regular(&tab.join(file))?;
     let mut bytes = Vec::new();
-    f.take(MAX_FRAME_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FRAME_BYTES {
+    f.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
         return Err(refused());
     }
     Ok(bytes)
@@ -559,8 +577,15 @@ mod tests {
         let s = setup(TOKEN_TTL).await;
         let port = s.server.port();
         let base = path_of(&s.server.grant(RA).0);
+        assert_eq!(get(port, &base).0, 200);
         std::fs::remove_dir_all(s.paths.recordings.join(RA)).unwrap();
-        for p in ["data".to_string(), format!("frames/{T1}/000001.jpg")] {
+        for p in [
+            String::new(),
+            "app.js".to_string(),
+            "app.css".to_string(),
+            "data".to_string(),
+            format!("frames/{T1}/000001.jpg"),
+        ] {
             let (code, _, body) = get(port, &format!("{base}{p}"));
             assert_eq!(
                 (code, body.as_slice()),
@@ -722,18 +747,71 @@ mod tests {
                 "Referrer-Policy: no-referrer".to_string(),
                 "Cache-Control: no-store".to_string(),
                 "X-Content-Type-Options: nosniff".to_string(),
+                "Cross-Origin-Resource-Policy: same-origin".to_string(),
                 format!("Content-Type: {content_type}"),
             ] {
                 assert!(head.contains(&header), "{path}: {header} in\n{head}");
             }
         }
-        // Also on a refused host.
-        let (code, head, _) = request(
-            port,
-            &format!("GET {base} HTTP/1.1\r\nHost: x.test\r\n\r\n"),
-        );
-        assert_eq!(code, 403);
-        assert!(head.contains(&format!("Content-Security-Policy: {CSP}")));
+        // Also on a refused host, a refused method and a request that is not HTTP.
+        for (raw, want) in [
+            (format!("GET {base} HTTP/1.1\r\nHost: x.test\r\n\r\n"), 403),
+            (
+                format!("POST {base} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+                405,
+            ),
+            ("NOT HTTP AT ALL\r\n\r\n".to_string(), 400),
+        ] {
+            let (code, head, _) = request(port, &raw);
+            assert_eq!(code, want, "{raw:?}");
+            for header in [
+                format!("Content-Security-Policy: {CSP}"),
+                "Referrer-Policy: no-referrer".to_string(),
+                "Cache-Control: no-store".to_string(),
+                "X-Content-Type-Options: nosniff".to_string(),
+                "Cross-Origin-Resource-Policy: same-origin".to_string(),
+                "Content-Type: text/plain; charset=utf-8".to_string(),
+            ] {
+                assert!(head.contains(&header), "{raw:?}: {header} in\n{head}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_grant_ends_by_either_clock() {
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let grant = |instant: Duration, wall_after: bool| Grant {
+            recording_id: RA.into(),
+            expires: now + instant,
+            expires_wall: if wall_after {
+                wall + Duration::from_secs(10)
+            } else {
+                wall - Duration::from_secs(1)
+            },
+        };
+        assert!(grant(Duration::from_secs(10), true).live(now, wall));
+        // The machine slept: the monotonic clock says 10 s are left, the wall clock says no.
+        assert!(!grant(Duration::from_secs(10), false).live(now, wall));
+        assert!(!grant(Duration::ZERO, true).live(now, wall));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_grants_are_dropped_when_another_is_made() {
+        let s = setup(Duration::from_millis(200)).await;
+        s.server.grant(RA);
+        s.server.grant(RB);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        s.server.grant(RA);
+        assert_eq!(s.server.inner.lock().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frame_over_the_limit_is_not_served() {
+        let s = setup(TOKEN_TTL).await;
+        let bytes = format!("jpeg {RA} 000001.jpg").len() as u64;
+        let read = |limit| read_frame(&s.paths, RA, T1, "000001.jpg", limit);
+        assert_eq!(read(bytes).unwrap().len() as u64, bytes);
+        assert!(read(bytes - 1).is_err());
     }
 
     #[test]
@@ -759,6 +837,17 @@ mod tests {
                 !INDEX_HTML.contains(forbidden),
                 "index.html uses {forbidden}"
             );
+        }
+        // The page judges nothing itself (model.rs `views` does): no copy of the rules.
+        for rule in [
+            "tsKey",
+            "frameAt",
+            "ts_key",
+            "frame_at",
+            "Date.parse(n.ts",
+            "navigation",
+        ] {
+            assert!(!APP_JS.contains(rule), "app.js has {rule}");
         }
         let html = INDEX_HTML.to_ascii_lowercase();
         // Scripts only by src, styles only by link, no handlers, no outside URL.

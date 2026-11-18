@@ -1055,9 +1055,7 @@ impl Daemon {
             return;
         }
         *done = true;
-        self.stopping.store(true, Ordering::SeqCst);
-        // No replay link outlives the daemon.
-        self.replay.revoke_all();
+        stop_taking_requests(&self.stopping, &self.replay);
         let slots: Vec<(SessionId, Arc<Slot>)> = self.slots.lock().unwrap().drain().collect();
         let browser_alive = !self.browser.has_exited();
         for (id, slot) in slots {
@@ -1071,6 +1069,13 @@ impl Daemon {
         }
         self.browser.close().await;
     }
+}
+
+/// The first step of shutting down: new sessions and commands are refused, and no replay
+/// link outlives the daemon.
+fn stop_taking_requests(stopping: &AtomicBool, replay: &ReplayServer) {
+    stopping.store(true, Ordering::SeqCst);
+    replay.revoke_all();
 }
 
 /// The retention rules, now; what was done goes to daemon.log.
@@ -1192,6 +1197,40 @@ mod tests {
         assert!(!slot.idle_for(period));
         std::thread::sleep(Duration::from_millis(80));
         assert!(slot.idle_for(period));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutting_down_ends_the_replay_links() {
+        use crate::recording::replay::model::testkit::{command, plant};
+        use std::io::{Read, Write};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        plant(
+            &paths,
+            "r_aaaaaaaa",
+            &[command(1, 1, "get", true, None)],
+            &[],
+        );
+        let replay = ReplayServer::start(paths).await.unwrap();
+        let (url, _) = replay.grant("r_aaaaaaaa");
+        let port = replay.port();
+        let path = url[url.find("/r/").unwrap()..].to_string();
+        let status = |path: &str| {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                s,
+                "GET {path}data HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+            )
+            .unwrap();
+            let mut all = String::new();
+            s.read_to_string(&mut all).unwrap();
+            all[9..12].to_string()
+        };
+        assert_eq!(status(&path), "200");
+        let stopping = AtomicBool::new(false);
+        stop_taking_requests(&stopping, &replay);
+        assert!(stopping.load(Ordering::SeqCst));
+        assert_eq!(status(&path), "404");
     }
 
     #[test]
