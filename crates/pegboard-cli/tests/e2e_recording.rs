@@ -1031,33 +1031,66 @@ fn a_slow_capture_never_delays_a_command_beyond_the_cap() {
     );
     let h = create(&home, &format!("{origin}/counter"));
     std::thread::sleep(Duration::from_secs(1));
+    // Every command: its entry and the daemon's lines while it ran (timing, recorder).
+    let mut runs: Vec<(Value, String)> = Vec::new();
+    let mut run = |home: &Home| {
+        let from = daemon_log_len(home);
+        let (code, e) = command(home, &h, &["get", "url"]);
+        assert_eq!(code, 0, "{e}");
+        let lines: String = daemon_log_since(home, from)
+            .lines()
+            .filter(|l| l.contains("pegboard: command ") || l.contains("recorder"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        runs.push((e.clone(), lines));
+        e
+    };
     // Without the screen: what the command takes alone.
     set_screen(&home, &h, false);
-    let base = (0..3)
-        .map(|_| duration_ms(&command(&home, &h, &["get", "url"]).1))
-        .max()
-        .unwrap();
+    let base = (0..3).map(|_| duration_ms(&run(&home))).max().unwrap();
     set_screen(&home, &h, true);
     std::thread::sleep(Duration::from_millis(500));
-    let (code, e) = command(&home, &h, &["get", "url"]);
-    assert_eq!(code, 0, "{e}");
-    assert!(e.get("frameAfter").is_none(), "{e}");
-    assert!(duration_ms(&e) < base + 1200, "{e}; alone {base} ms");
-    // The page is still (no stream frame): the tab is not captured again for a while, so
-    // ten more commands cost about nothing.
-    let mut extra = 0;
+    let first = run(&home);
+    // Ten more: the page is still (no stream frame), so the tab whose capture timed out is
+    // not captured again for a while.
     for _ in 0..10 {
-        let (code, e) = command(&home, &h, &["get", "url"]);
-        assert_eq!(code, 0, "{e}");
-        assert!(e.get("frameAfter").is_none(), "{e}");
-        extra += (duration_ms(&e) - base).max(0);
+        run(&home);
     }
-    assert!(extra < 10 * 1200, "{extra} ms more over ten commands");
+    close(&home, &h);
+    let report = runs
+        .iter()
+        .enumerate()
+        .map(|(i, (e, lines))| {
+            format!(
+                "#{i} durationMs {} frameAfter {}\n{lines}",
+                e["durationMs"], e["frameAfter"]
+            )
+        })
+        .collect::<String>();
+    let report = format!("alone {base} ms\n{report}");
+    assert!(first.get("frameAfter").is_none(), "{report}");
+    assert!(duration_ms(&first) < base + 1200, "{report}");
+    // The first command with the screen on and the ten after it.
+    let screen_on = &runs[3..];
+    for (e, lines) in screen_on {
+        assert!(e.get("frameAfter").is_none(), "{report}");
+        // The recorder's own share of each command, from the daemon's timing line.
+        let after = timing(lines, "pegboard: command ", "frame after")
+            .unwrap_or_else(|| panic!("no timing line\n{report}"));
+        assert!(after < 600.0, "frame after {after} ms\n{report}");
+    }
+    let extra: i64 = screen_on[1..]
+        .iter()
+        .map(|(e, _)| (duration_ms(e) - base).max(0))
+        .sum();
+    assert!(
+        extra < 10 * 1200,
+        "{extra} ms more over ten commands\n{report}"
+    );
     assert!(
         extra < 2000,
-        "{extra} ms more over ten commands: the timed-out tab was captured again"
+        "{extra} ms more over ten commands: the timed-out tab was captured again\n{report}"
     );
-    close(&home, &h);
 }
 
 #[test]
@@ -1137,7 +1170,7 @@ fn median_f(v: &[f64]) -> f64 {
 
 #[test]
 fn timing_reads_the_daemon_lines() {
-    let text = "x\npegboard: command fill: probe 3.2 ms, frame after 41.0 ms\n\
+    let text = "x\npegboard: command fill: checks 0.4 ms, exec 30.1 ms, probe 3.2 ms, frame after 41.0 ms, total 72 ms\n\
                 pegboard: recorder: capture of T: ticket 0.1 ms, cdp 38.5 ms, handoff 0.2 ms\n";
     assert_eq!(timing(text, "pegboard: command ", "probe"), Some(3.2));
     assert_eq!(
