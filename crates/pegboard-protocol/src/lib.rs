@@ -26,6 +26,8 @@ pub mod codes {
     /// A session asks for a profile-wide setting the profile is pinned to differently.
     pub const PROFILE_POLICY_CONFLICT: &str = "profile_policy_conflict";
     pub const LIMIT_EXCEEDED: &str = "limit_exceeded";
+    /// The recording is still being written (its session is open).
+    pub const RECORDING_RUNNING: &str = "recording_running";
     pub const INTERNAL: &str = "internal";
 }
 
@@ -278,6 +280,44 @@ pub struct BrowserStatus {
     /// Shutdown has begun: the daemon still answers but is about to go away.
     #[serde(default)]
     pub stopping: bool,
+}
+
+/// One recording as `recording.list` and `recording.keep` tell it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSummary {
+    pub recording_id: String,
+    pub session_id: String,
+    pub session_name: String,
+    pub profile: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    /// Its session is open: it is being written.
+    pub running: bool,
+    /// Kept by a person: never deleted by the retention rules.
+    pub keep: bool,
+    /// "none" | "recorded" | "capped" | "pruned".
+    pub screen: String,
+    pub screen_bytes: u64,
+    pub total_bytes: u64,
+    /// Commands (not what a person did).
+    pub commands: u64,
+    /// Commands that failed, refusals not counted.
+    pub failed: u64,
+    /// Commands refused (`policy_denied`, `argv_rejected`).
+    pub denied: u64,
+    /// Marks of what a person may have done.
+    pub human: u64,
+}
+
+/// The answer of `recording.list`: oldest first, with the bytes of all of them and of the
+/// kept ones.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingList {
+    pub recordings: Vec<RecordingSummary>,
+    pub total_bytes: u64,
+    pub kept_bytes: u64,
 }
 
 #[cfg(test)]
