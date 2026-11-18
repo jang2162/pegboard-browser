@@ -38,10 +38,18 @@ pub struct Bridge {
     bound: std::sync::Mutex<String>,
     /// Tab switches before this are not reported (`CLOSE_QUIET`).
     quiet_until: std::sync::Mutex<Option<SystemTime>>,
+    /// The worker's script URL (`chrome-extension://<id>/sw.js`): where to start it again.
+    script: std::sync::Mutex<String>,
 }
 
+/// How long `revive` waits for a worker it started.
+const WAKE_WAIT: Duration = Duration::from_secs(5);
+
+/// A worker target: (target id, script URL).
+type Worker = (String, String);
+
 /// Finds the bridge worker of `context`, waiting up to `wait` for it to start.
-async fn find_worker(conn: &CdpConn, context: &str, wait: Duration) -> Result<Option<String>> {
+async fn find_worker(conn: &CdpConn, context: &str, wait: Duration) -> Result<Option<Worker>> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let r = conn.send("Target.getTargets", json!({}), None).await?;
@@ -51,7 +59,9 @@ async fn find_worker(conn: &CdpConn, context: &str, wait: Duration) -> Result<Op
             .flatten()
             .find(|t| is_worker_of(t, context));
         if let Some(t) = found {
-            return Ok(t["targetId"].as_str().map(String::from));
+            return Ok(t["targetId"]
+                .as_str()
+                .map(|id| (id.to_string(), t["url"].as_str().unwrap_or("").to_string())));
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);
@@ -66,26 +76,27 @@ impl Bridge {
         let deadline = tokio::time::Instant::now() + WORKER_WAIT;
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let target = find_worker(conn, agent_context, left)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!("bridge service worker for the agent profile did not appear within 10s")
-                })?;
+            let (target, script) =
+                find_worker(conn, agent_context, left)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "bridge service worker for the agent profile did not appear within 10s"
+                        )
+                    })?;
             // A worker that is still starting (or being restarted) can accept a session
             // yet never answer, so require one answered ping before trusting it.
             if let Ok(session) = conn.attach(&target).await {
-                let ping = conn.evaluate(&session, "typeof self.peg");
-                if let Ok(Ok(v)) = tokio::time::timeout(PING_TIMEOUT, ping).await {
-                    if v == "object" {
-                        return Ok(Bridge {
-                            conn: conn.clone(),
-                            agent_context: agent_context.to_string(),
-                            session: Mutex::new(session),
-                            activity: std::sync::Mutex::new(None),
-                            bound: std::sync::Mutex::new(String::new()),
-                            quiet_until: std::sync::Mutex::new(None),
-                        });
-                    }
+                if answers(conn, &session).await {
+                    return Ok(Bridge {
+                        conn: conn.clone(),
+                        agent_context: agent_context.to_string(),
+                        session: Mutex::new(session),
+                        activity: std::sync::Mutex::new(None),
+                        bound: std::sync::Mutex::new(String::new()),
+                        quiet_until: std::sync::Mutex::new(None),
+                        script: std::sync::Mutex::new(script),
+                    });
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -95,7 +106,10 @@ impl Bridge {
         }
     }
 
-    /// Calls `self.peg.<func>(...args)` in the worker; retries once after re-attaching when the session is gone.
+    /// Calls `self.peg.<func>(...args)` in the worker. A worker that does not answer a ping
+    /// first (stopped, restarted, or a session that waits for a worker that will not come
+    /// back) is found or started again (`revive`), so a call never waits on a dead session
+    /// until the CDP limit; also retried once after re-attaching when the session is gone.
     async fn call(&self, func: &str, args: &[Value]) -> Result<Value> {
         // Arguments are serialized as JSON, never spliced in as raw text.
         let args = args
@@ -105,16 +119,13 @@ impl Bridge {
             .join(",");
         let expr = format!("(async () => JSON.stringify(await self.peg.{func}({args})))()");
         let mut session = self.session.lock().await;
+        if !answers(&self.conn, &session).await {
+            self.revive(&mut session).await?;
+        }
         let first = self.conn.evaluate(&session, &expr).await;
         let out = match first {
             Err(e) if is_session_gone(&e) => {
-                let target = find_worker(&self.conn, &self.agent_context, Duration::ZERO)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!("bridge_asleep: the bridge service worker is not running")
-                    })?;
-                *session = self.conn.attach(&target).await?;
-                self.bind_if_following(&session).await;
+                self.revive(&mut session).await?;
                 self.conn.evaluate(&session, &expr).await?
             }
             other => other?,
@@ -123,6 +134,91 @@ impl Bridge {
             .as_str()
             .ok_or_else(|| anyhow!("bridge call {func} returned no value"))?;
         serde_json::from_str(text).with_context(|| format!("parsing bridge reply of {func}"))
+    }
+
+    /// A new session on a worker that answers: the running worker, or one started again
+    /// (`wake`) when none runs or the one listed does not answer. Binds it when following.
+    async fn revive(&self, session: &mut String) -> Result<()> {
+        let mut woken = false;
+        loop {
+            let wait = if woken { WAKE_WAIT } else { Duration::ZERO };
+            if let Some((target, script)) =
+                find_worker(&self.conn, &self.agent_context, wait).await?
+            {
+                if let Ok(new) = self.conn.attach(&target).await {
+                    if answers(&self.conn, &new).await {
+                        let old = std::mem::replace(session, new);
+                        *lock(&self.script) = script;
+                        let _ = tokio::time::timeout(
+                            PING_TIMEOUT,
+                            self.conn.send(
+                                "Target.detachFromTarget",
+                                json!({ "sessionId": old }),
+                                None,
+                            ),
+                        )
+                        .await;
+                        self.bind_if_following(session).await;
+                        if crate::testenv::hooks() {
+                            eprintln!(
+                                "pegboard: bridge: attached again to its worker{}",
+                                if woken { " (started by pegboard)" } else { "" }
+                            );
+                        }
+                        return Ok(());
+                    }
+                    let _ = self
+                        .conn
+                        .send("Target.detachFromTarget", json!({ "sessionId": new }), None)
+                        .await;
+                }
+            }
+            if woken {
+                bail!("bridge_asleep: the bridge service worker is not running");
+            }
+            self.wake().await;
+            woken = true;
+        }
+    }
+
+    /// Asks the browser to start the bridge's worker (`ServiceWorker.startWorker` on a page
+    /// of the profile, whose storage holds the extension's registration). Best effort.
+    async fn wake(&self) {
+        let script = lock(&self.script).clone();
+        let Some(scope) = script.strip_suffix("sw.js").map(String::from) else {
+            return;
+        };
+        let start = async {
+            let pages = crate::cdp::page_targets(&self.conn).await?;
+            let page = pages
+                .iter()
+                .find(|t| t.browser_context_id.as_deref() == Some(self.agent_context.as_str()))
+                .ok_or_else(|| anyhow!("the profile has no page"))?;
+            let s = self.conn.attach(&page.target_id).await?;
+            let started = async {
+                self.conn
+                    .send("ServiceWorker.enable", json!({}), Some(&s))
+                    .await?;
+                self.conn
+                    .send(
+                        "ServiceWorker.startWorker",
+                        json!({ "scopeURL": scope }),
+                        Some(&s),
+                    )
+                    .await
+            }
+            .await;
+            let _ = self
+                .conn
+                .send("Target.detachFromTarget", json!({ "sessionId": s }), None)
+                .await;
+            started
+        };
+        match tokio::time::timeout(WAKE_WAIT, start).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("pegboard: bridge: could not start its worker: {e:#}"),
+            Err(_) => eprintln!("pegboard: bridge: starting its worker timed out"),
+        }
     }
 
     pub async fn create_group(&self, title: &str, color: &str) -> Result<(GroupId, String)> {
@@ -306,10 +402,16 @@ impl Bridge {
                 let Some(target) = e.params["targetInfo"]["targetId"].as_str() else {
                     return;
                 };
+                if let Some(url) = e.params["targetInfo"]["url"].as_str() {
+                    *lock(&self.script) = url.to_string();
+                }
                 let mut session = self.session.lock().await;
                 if let Ok(new) = self.conn.attach(target).await {
                     let old = std::mem::replace(&mut *session, new);
                     self.bind_if_following(&session).await;
+                    if crate::testenv::hooks() {
+                        eprintln!("pegboard: bridge: attached again to its worker (it restarted)");
+                    }
                     // Gone with the old worker, or (a call attached first) a second session.
                     let _ = self
                         .conn
@@ -380,6 +482,12 @@ fn is_worker_of(info: &Value, context: &str) -> bool {
             .is_some_and(|u| u.starts_with("chrome-extension://") && u.ends_with("/sw.js"))
 }
 
+/// Whether the worker behind `session` answers (within `PING_TIMEOUT`).
+async fn answers(conn: &CdpConn, session: &str) -> bool {
+    let ping = conn.evaluate(session, "typeof self.peg");
+    matches!(tokio::time::timeout(PING_TIMEOUT, ping).await, Ok(Ok(v)) if v == "object")
+}
+
 fn is_session_gone(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}");
     s.contains("Session with given id not found") || s.contains("No session with given id")
@@ -401,6 +509,113 @@ fn target_id(r: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A browser stand-in with one agent profile ("A", a page P1) and its bridge worker.
+    /// While `running` is false the worker is stopped: it is not listed, and a session on
+    /// the old worker takes requests and never answers them (what a session on a stopped
+    /// worker did on the second machine). `ServiceWorker.startWorker` starts a new one.
+    /// Returns the URL and the methods it was sent.
+    async fn fake_browser(
+        running: Arc<AtomicBool>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut worker = 1;
+            let mut live = String::from("S1");
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                let method = v["method"].as_str().unwrap_or("").to_string();
+                log.lock().unwrap().push(method.clone());
+                let on = v["sessionId"].as_str().unwrap_or("").to_string();
+                let result = match method.as_str() {
+                    "Target.getTargets" => {
+                        let mut infos = vec![json!({ "targetId": "P1", "type": "page",
+                            "url": "about:blank", "browserContextId": "A" })];
+                        if running.load(Ordering::SeqCst) {
+                            infos.push(json!({ "targetId": format!("W{worker}"),
+                                "type": "service_worker", "browserContextId": "A",
+                                "url": "chrome-extension://x/sw.js" }));
+                        }
+                        json!({ "targetInfos": infos })
+                    }
+                    "Target.attachToTarget" => {
+                        let target = v["params"]["targetId"].as_str().unwrap_or("");
+                        let session = format!("S-{target}");
+                        if target.starts_with('W') {
+                            live = session.clone();
+                        }
+                        json!({ "sessionId": session })
+                    }
+                    "ServiceWorker.startWorker" => {
+                        worker += 1;
+                        running.store(true, Ordering::SeqCst);
+                        json!({})
+                    }
+                    "Runtime.evaluate" if on.starts_with("S-W") && on != live => continue,
+                    "Runtime.evaluate"
+                        if on.starts_with("S-W") && !running.load(Ordering::SeqCst) =>
+                    {
+                        continue
+                    }
+                    "Runtime.evaluate" => {
+                        let expr = v["params"]["expression"].as_str().unwrap_or("");
+                        let value = if expr == "typeof self.peg" {
+                            json!("object")
+                        } else {
+                            json!(r#"{"targetIds":["T1"]}"#)
+                        };
+                        json!({ "result": { "value": value } })
+                    }
+                    _ => json!({}),
+                };
+                let reply = json!({ "id": v["id"], "result": result });
+                ws.send(Message::text(reply.to_string())).await.unwrap();
+            }
+        });
+        (format!("ws://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_call_after_the_worker_stopped_starts_it_again_without_waiting_out_the_limit() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (url, seen) = fake_browser(running.clone()).await;
+        let conn = CdpConn::connect(&url).await.unwrap();
+        let bridge = Bridge::attach(&conn, "A").await.unwrap();
+        assert_eq!(
+            bridge.members(&GroupId(1)).await.unwrap(),
+            vec!["T1".to_string()]
+        );
+        // The worker stops; its session stays and never answers again.
+        running.store(false, Ordering::SeqCst);
+        let t = std::time::Instant::now();
+        assert_eq!(
+            bridge.members(&GroupId(1)).await.unwrap(),
+            vec!["T1".to_string()]
+        );
+        let took = t.elapsed();
+        assert!(took < PING_TIMEOUT + Duration::from_secs(2), "{took:?}");
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|m| m == "ServiceWorker.startWorker"),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        // And the next call goes straight to the new worker.
+        let t = std::time::Instant::now();
+        bridge.members(&GroupId(1)).await.unwrap();
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn a_tab_switch_report_names_the_target_and_its_time() {
