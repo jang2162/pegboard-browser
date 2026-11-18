@@ -343,12 +343,54 @@ pub fn console_line(method: &str, p: &Value, ts: &str, target: &str) -> Option<C
         }
         _ => return None,
     };
+    // Cut (with room for URLs that shrink), URLs cleaned, cut again.
+    let text: String = text.chars().take(4 * MAX_CONSOLE_CHARS).collect();
     Some(ConsoleLine {
         ts: ts.to_string(),
         target_id: target.to_string(),
         level,
-        text: text.chars().take(MAX_CONSOLE_CHARS).collect(),
+        text: scrub_urls(&text).chars().take(MAX_CONSOLE_CHARS).collect(),
     })
+}
+
+/// Where a URL may start in page text.
+const URL_STARTS: &[&str] = &["https://", "http://", "wss://", "ws://", "blob:", "data:"];
+
+/// `text` with every URL in it (http, https, ws, wss, blob, data) as logged URLs are
+/// (`url_for_log`: no userinfo, query or fragment; `data:` only). A stack trace's
+/// `:line:column` after a URL stays.
+pub fn scrub_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(at) = URL_STARTS.iter().filter_map(|s| lower.find(s)).min() else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || "\"'<>()[]{}`".contains(c))
+            .unwrap_or(tail.len());
+        let token = &tail[..end];
+        let (url, position) = split_position(token);
+        out.push_str(&url_for_log(url));
+        out.push_str(position);
+        rest = &tail[end..];
+    }
+}
+
+/// A token's `:line:column` suffix (stack traces), split off.
+fn split_position(token: &str) -> (&str, &str) {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = token.rsplitn(3, ':');
+    if let (Some(col), Some(line), Some(url)) = (parts.next(), parts.next(), parts.next()) {
+        if digits(col) && digits(line) && url.contains("://") {
+            return (url, &token[url.len()..]);
+        }
+    }
+    (token, "")
 }
 
 /// How a console argument reads (`Runtime.RemoteObject`).
@@ -393,6 +435,61 @@ mod tests {
         w.end(ms(9000));
         assert!(w.covers(ms(9500)));
         assert!(!w.covers(ms(8999)));
+    }
+
+    #[test]
+    fn only_the_latest_windows_are_kept() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut w = CommandWindows::default();
+        for i in 0..=KEPT_WINDOWS as u64 {
+            w.begin(ms(i * 10_000));
+            w.end(ms(i * 10_000 + 100));
+        }
+        // The first window is forgotten; the oldest kept one still counts.
+        assert!(!w.covers(ms(50)));
+        assert!(w.covers(ms(10_050)));
+    }
+
+    #[test]
+    fn urls_in_console_text_lose_query_fragment_and_userinfo() {
+        let trace = "Error: boom\n    at f (https://u:p@a.test/app.js?token=SECRET1#x:10:5)\n    \
+                     at https://a.test/b.js?k=SECRET2:3:1\n    fetch ws://a.test/s?t=SECRET3, \
+                     blob:https://a.test/id?SECRET4 data:text/html,SECRET5 and http://a.test:8080/p";
+        let got = scrub_urls(trace);
+        for secret in ["SECRET", "u:p@", "#x"] {
+            assert!(!got.contains(secret), "{got}");
+        }
+        assert!(got.contains("(https://a.test/app.js:10:5)"), "{got}");
+        assert!(got.contains("at https://a.test/b.js:3:1"), "{got}");
+        // A comma does not end a URL (queries hold them): it goes with the query.
+        assert!(
+            got.contains("ws://a.test/s blob:https://a.test/id data:"),
+            "{got}"
+        );
+        assert!(got.contains("http://a.test:8080/p"), "{got}");
+        assert!(got.contains("data: and"), "{got}");
+        assert_eq!(
+            scrub_urls("plain text, no address"),
+            "plain text, no address"
+        );
+        // Through console_line, for both kinds.
+        let e = console_line(
+            "Runtime.exceptionThrown",
+            &json!({ "exceptionDetails": { "exception": { "description": trace } } }),
+            "t",
+            "T1",
+        )
+        .unwrap();
+        assert!(!e.text.contains("SECRET"), "{}", e.text);
+        let l = console_line(
+            "Runtime.consoleAPICalled",
+            &json!({ "type": "log", "args": [{ "type": "string", "value": "go https://a.test/?token=SECRET9" }] }),
+            "t",
+            "T1",
+        )
+        .unwrap();
+        assert_eq!(l.text, "go https://a.test/");
     }
 
     fn nav(requested: Option<&str>) -> Signal {
