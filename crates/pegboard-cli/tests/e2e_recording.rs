@@ -1119,7 +1119,8 @@ fn median(v: &[i64]) -> f64 {
     }
 }
 
-/// Design 4.6: what the recording adds to a command, median at most 50 ms and at most 1 s.
+/// Design 4.6: what the recording adds to a command, median at most 60 ms and at most 1 s
+/// (owner decision 2026-11-18: the after-command capture alone costs 20-40 ms in Chrome).
 /// The commands of spike S2, each run in pairs with the screen on and off (test hook; the
 /// order alternates), `PEGBOARD_OVERHEAD_REPS` pairs (default 20). Times are the entries'
 /// `durationMs` (the daemon's own measure, frames included). Prints a table, with where the
@@ -1203,7 +1204,7 @@ fn recording_overhead_meets_the_targets() {
             on_times.push(pair[1]);
         }
         let (m, x) = (median(&added), *added.iter().max().unwrap());
-        pass &= m <= 50.0 && x <= 1000;
+        pass &= m <= 60.0 && x <= 1000;
         rows.push(format!(
             "| {name} | {:.0} | {m:.0} | {x} | {:.1} | {:.1} | {:.1} | {:.2} |",
             median(&on_times),
@@ -1234,7 +1235,7 @@ fn recording_overhead_meets_the_targets() {
     );
     assert!(
         pass,
-        "over the targets (median <= 50 ms, max <= 1000 ms):\n{}",
+        "over the targets (median <= 60 ms, max <= 1000 ms):\n{}",
         rows.join("\n")
     );
 }
