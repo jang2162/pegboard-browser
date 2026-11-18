@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
-use crate::actionlog::{self, valid_recording_id, ActionLog, Manifest, SessionLog};
+use crate::actionlog::{ActionLog, Manifest, SessionLog};
 use crate::browser::{find_chrome, Browser, BrowserConfig};
 use crate::daemon::run_command;
 use crate::downloads::list_files;
@@ -28,11 +28,24 @@ use crate::profiles::{rpc_error, Profiles};
 use crate::proxy::server::{ProxyServer, WsUpstream};
 use crate::recording::config::RecordingConfig;
 use crate::recording::recorder::{Recorder, RecorderOptions};
+use crate::recording::store::RecordingStore;
 use crate::runner::{Runner, AGENT_BROWSER_VERSION};
 use crate::session::SessionManager;
 
 /// Time one session may take to close while the daemon shuts down.
 const SESSION_CLOSE_LIMIT: Duration = Duration::from_secs(15);
+
+/// How often the retention rules run (besides at start and after each session).
+const PRUNE_EVERY: Duration = Duration::from_secs(3600);
+
+/// The prune period: `PEGBOARD_TEST_PRUNE_SECS` (a test hook, with `PEGBOARD_TEST_HOOKS`)
+/// or `PRUNE_EVERY`.
+fn prune_period(var: Option<&str>) -> Duration {
+    match var.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => PRUNE_EVERY,
+    }
+}
 
 /// What the daemon keeps per open session.
 struct Slot {
@@ -100,6 +113,8 @@ pub struct Daemon {
     runner: Arc<Runner>,
     /// Records the sessions' screens.
     recorder: Arc<Recorder>,
+    /// The recordings on disk and their retention.
+    store: Arc<RecordingStore>,
     /// Kept alive for the daemon's lifetime (it serves the session endpoints).
     _proxy: Arc<ProxyServer>,
     chrome_version: String,
@@ -322,6 +337,26 @@ struct RecordingParams {
     recording_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KeepParams {
+    recording_id: String,
+    keep: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeleteParams {
+    recording_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PruneParams {
+    #[serde(default)]
+    dry_run: bool,
+}
+
 fn to_value<T: Serialize>(v: T) -> Result<Value, RpcError> {
     serde_json::to_value(v).map_err(|e| internal(e.to_string()))
 }
@@ -371,6 +406,7 @@ impl Daemon {
         );
         let profiles = Profiles::load(&paths)?;
         // The settings read at start; the file is not read again.
+        let store = RecordingStore::new(paths.clone(), recording.clone());
         let recorder = Recorder::start(RecorderOptions {
             ws_url: browser.ws_url.clone(),
             human_context: browser.human_context.clone(),
@@ -394,6 +430,7 @@ impl Daemon {
             sessions,
             runner,
             recorder,
+            store,
             _proxy: proxy,
             chrome_version,
             slots: Mutex::new(HashMap::new()),
@@ -422,6 +459,24 @@ impl Daemon {
                     d.request_stop();
                     return;
                 }
+            }
+        });
+        // Retention: recordings cut off by an earlier daemon get their end, then the rules
+        // run; again every prune period (and after each session, `finish_session`).
+        let store = daemon.store.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.close_orphans() {
+                eprintln!("pegboard: closing cut-off recordings: {e}");
+            }
+            prune_now(&store);
+        });
+        let weak = Arc::downgrade(&daemon);
+        let period = prune_period(crate::testenv::var("PEGBOARD_TEST_PRUNE_SECS").as_deref());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                let Some(d) = weak.upgrade() else { return };
+                d.prune_soon();
             }
         });
         // Sessions nobody has used for the idle period are closed like `session close` does.
@@ -631,11 +686,41 @@ impl Daemon {
                 to_value(list_files(&self.paths.session_files(&id)))
             }
             "recording.list" => {
-                to_value(actionlog::list(&self.paths).map_err(|e| internal(e.to_string()))?)
+                let store = self.store.clone();
+                let list = tokio::task::spawn_blocking(move || store.list())
+                    .await
+                    .map_err(|e| internal(e.to_string()))?
+                    .map_err(|e| internal(e.to_string()))?;
+                to_value(list)
             }
             "recording.get" => {
                 let p: RecordingParams = params(p)?;
-                self.recording(&p.recording_id)
+                let (manifest, actions) = self.store.get(&p.recording_id)?;
+                Ok(json!({ "manifest": manifest, "actions": actions }))
+            }
+            // Owner methods: what a person decides about recordings (the CLI, and
+            // `pegboard mcp --operator`).
+            "recording.keep" => {
+                let p: KeepParams = params(p)?;
+                to_value(self.store.set_keep(&p.recording_id, p.keep)?)
+            }
+            "recording.delete" => {
+                let p: DeleteParams = params(p)?;
+                let store = self.store.clone();
+                tokio::task::spawn_blocking(move || store.delete(&p.recording_id))
+                    .await
+                    .map_err(|e| internal(e.to_string()))??;
+                Ok(json!({}))
+            }
+            "recording.prune" => {
+                let p: PruneParams = params(p)?;
+                let store = self.store.clone();
+                let now = time::OffsetDateTime::now_utc();
+                let actions = tokio::task::spawn_blocking(move || store.prune(now, p.dry_run))
+                    .await
+                    .map_err(|e| internal(e.to_string()))?
+                    .map_err(|e| internal(e.to_string()))?;
+                Ok(json!({ "actions": actions }))
             }
             other => Err(rpc_error(
                 codes::UNKNOWN_METHOD,
@@ -688,7 +773,7 @@ impl Daemon {
             AGENT_BROWSER_VERSION,
         );
         manifest.record = info.policy.record.clone();
-        let (log, manifest) = match ActionLog::open(&self.paths, manifest) {
+        let (log, manifest) = match self.store.open(manifest) {
             Ok(log) => {
                 let manifest = log.manifest_handle();
                 (Arc::new(AsyncMutex::new(log)), manifest)
@@ -759,7 +844,7 @@ impl Daemon {
             let _ = self.sessions.close(p).await;
         }
         if let Some(log) = log {
-            let _ = log.lock().await.finish(&now());
+            let _ = self.store.finish(&mut *log.lock().await, &now());
         }
         self.remove_files(id);
     }
@@ -892,10 +977,22 @@ impl Daemon {
             for r in &reports {
                 let _ = log.append(r.log_entry(&id));
             }
-            let _ = log.finish(&now());
+            if let Err(e) = self.store.finish(&mut log, &now()) {
+                eprintln!("pegboard: recording of session {}: {e}", id.0);
+            }
         }
         self.remove_files(&id);
+        self.prune_soon();
         result
+    }
+
+    /// Runs the retention rules on a thread of their own (not while shutting down).
+    fn prune_soon(&self) {
+        if self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || prune_now(&store));
     }
 
     async fn exec(&self, p: CommandExecParams) -> Result<CommandExecResult, RpcError> {
@@ -926,20 +1023,6 @@ impl Daemon {
         result
     }
 
-    fn recording(&self, recording_id: &str) -> Result<Value, RpcError> {
-        if !valid_recording_id(recording_id) {
-            return Err(invalid(format!("{recording_id:?} is not a recording id")));
-        }
-        match actionlog::read(&self.paths, recording_id) {
-            Ok((manifest, actions)) => Ok(json!({ "manifest": manifest, "actions": actions })),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(rpc_error(
-                codes::RECORDING_NOT_FOUND,
-                format!("no recording {recording_id}"),
-            )),
-            Err(e) => Err(internal(e.to_string())),
-        }
-    }
-
     /// Closes every session and the browser. Safe to call more than once.
     pub async fn shutdown(&self) {
         let mut done = self.shutdown_done.lock().await;
@@ -960,6 +1043,18 @@ impl Daemon {
             let _ = tokio::time::timeout(SESSION_CLOSE_LIMIT, finish).await;
         }
         self.browser.close().await;
+    }
+}
+
+/// The retention rules, now; what was done goes to daemon.log.
+fn prune_now(store: &RecordingStore) {
+    match store.prune(time::OffsetDateTime::now_utc(), false) {
+        Ok(done) => {
+            for action in done {
+                eprintln!("pegboard: retention: {action:?}");
+            }
+        }
+        Err(e) => eprintln!("pegboard: retention: {e}"),
     }
 }
 
@@ -1070,6 +1165,32 @@ mod tests {
         assert!(!slot.idle_for(period));
         std::thread::sleep(Duration::from_millis(80));
         assert!(slot.idle_for(period));
+    }
+
+    #[test]
+    fn prune_period_comes_from_the_test_variable_or_is_an_hour() {
+        assert_eq!(prune_period(None), PRUNE_EVERY);
+        assert_eq!(PRUNE_EVERY, Duration::from_secs(3600));
+        assert_eq!(prune_period(Some("2")), Duration::from_secs(2));
+        for bad in ["", "0", "-1", "soon"] {
+            assert_eq!(prune_period(Some(bad)), PRUNE_EVERY, "{bad}");
+        }
+    }
+
+    #[test]
+    fn owner_recording_methods_refuse_misspelt_fields() {
+        assert!(params::<KeepParams>(&json!({"recordingId": "r_abcdefgh", "keep": true})).is_ok());
+        assert!(params::<KeepParams>(&json!({"recordingId": "r_abcdefgh"})).is_err());
+        assert!(
+            params::<DeleteParams>(&json!({"recordingId": "r_abcdefgh", "force": true})).is_err()
+        );
+        assert!(!params::<PruneParams>(&json!({})).unwrap().dry_run);
+        assert!(
+            params::<PruneParams>(&json!({"dryRun": true}))
+                .unwrap()
+                .dry_run
+        );
+        assert!(params::<PruneParams>(&json!({"dry_run": true})).is_err());
     }
 
     #[test]
