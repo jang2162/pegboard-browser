@@ -52,6 +52,19 @@ struct Inner {
     events_received: AtomicU64,
 }
 
+/// Removes a request's waiter when its reply future ends or is dropped (a no-op once the
+/// reader took it out to answer).
+struct Waiter {
+    inner: Arc<Inner>,
+    id: u64,
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        self.inner.pending.lock().unwrap().waiters.remove(&self.id);
+    }
+}
+
 /// Cheap to clone; all clones share one websocket.
 #[derive(Clone)]
 pub struct CdpConn {
@@ -222,9 +235,16 @@ impl CdpConn {
             }
             ok
         };
+        // A caller that stops waiting (a timeout of its own, a dropped future) takes its
+        // waiter out, so requests that are never answered do not pile up.
+        let waiter = Waiter {
+            inner: self.inner.clone(),
+            id,
+        };
         let inner = self.inner.clone();
         let method = method.to_string();
         async move {
+            let _waiter = waiter;
             if !sent {
                 bail!("CDP connection closed");
             }
@@ -375,6 +395,32 @@ mod tests {
         assert_eq!(first.await.unwrap().1, 0);
         assert_eq!(second.await.unwrap().1, 2);
         assert_eq!(queue.recv().await.unwrap().method, "Page.x");
+        conn.close();
+    }
+
+    /// A request whose caller stopped waiting leaves no waiter behind.
+    #[tokio::test]
+    async fn a_request_given_up_on_is_forgotten() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // Never answers.
+            while ws.next().await.is_some() {}
+        });
+        let conn = CdpConn::connect(&format!("ws://{addr}")).await.unwrap();
+        for _ in 0..3 {
+            let r = tokio::time::timeout(
+                Duration::from_millis(20),
+                conn.send("Runtime.evaluate", json!({}), Some("S")),
+            )
+            .await;
+            assert!(r.is_err());
+        }
+        // Dropped before it was ever polled, too.
+        drop(conn.send_now("Page.x", json!({}), None));
+        assert!(conn.inner.pending.lock().unwrap().waiters.is_empty());
         conn.close();
     }
 }
