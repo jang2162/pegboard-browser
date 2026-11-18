@@ -318,6 +318,14 @@ impl SessionManager {
                     inner.guard.wait_guarded(&target, GUARD_TIMEOUT).await
                 })
             }));
+        // A tab pegboard activates to put a profile's policy in place is no person's switch.
+        let recorder = inner.recorder.clone();
+        inner
+            .browser
+            .downloads
+            .on_activating(Arc::new(move |target: &str| {
+                recorder.expect_activation(target)
+            }));
         let watcher = tokio::spawn(watch(Arc::downgrade(&inner), events));
         SessionManager { inner, watcher }
     }
@@ -1143,13 +1151,19 @@ impl Inner {
                 return Ok(rt.clone());
             }
         }
-        let bridge = Bridge::attach(&self.browser.conn, &context)
-            .await
-            .map_err(browser_failed)?;
-        let rt = Arc::new(ProfileRuntime {
-            context,
-            bridge: Arc::new(bridge),
-        });
+        let bridge = Arc::new(
+            Bridge::attach(&self.browser.conn, &context)
+                .await
+                .map_err(browser_failed)?,
+        );
+        // Tab switches in the profile, for the recordings (a person's possible intervention).
+        let recorder = self.recorder.clone();
+        bridge
+            .follow_activity(Arc::new(move |context: &str, target: &str, at| {
+                recorder.activated(context, target, at)
+            }))
+            .await;
+        let rt = Arc::new(ProfileRuntime { context, bridge });
         runtimes.insert(name.to_string(), rt.clone());
         Ok(rt)
     }

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 mod mcp;
 
 use clap::{Parser, Subcommand};
-use pegboard_core::actionlog::{valid_recording_id, ActionEntry, Manifest};
+use pegboard_core::actionlog::{valid_recording_id, ActionEntry, EntryKind, Manifest};
 use pegboard_core::api::{serve, Client};
 use pegboard_core::daemon::Daemon;
 use pegboard_core::lock::DaemonLock;
@@ -515,6 +515,23 @@ fn describe_policy(p: &SessionPolicy) -> String {
     )
 }
 
+/// A line of `recording show` for something a person may have done in a session tab.
+fn describe_human(a: &ActionEntry) -> String {
+    format!(
+        "{}  {}  human  {}{}  tab {}  {}",
+        a.seq,
+        a.ts,
+        if a.certain == Some(true) {
+            ""
+        } else {
+            "possible: "
+        },
+        a.what.as_deref().unwrap_or("-"),
+        a.target_id.as_deref().unwrap_or("-"),
+        a.url.as_deref().unwrap_or("-"),
+    )
+}
+
 fn describe(s: &SessionInfo) -> String {
     format!(
         "{}  {}  {}  {:?}  {} tabs",
@@ -635,6 +652,10 @@ fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), Rpc
                 .map_err(|e| error(codes::INTERNAL, e.to_string()))?;
             println!("seq  time  command  result  duration");
             for a in &actions {
+                if a.kind == EntryKind::Human {
+                    println!("{}", describe_human(a));
+                    continue;
+                }
                 let words = std::iter::once(a.command.as_str())
                     .chain(a.args.iter().map(String::as_str))
                     .collect::<Vec<_>>()
@@ -978,6 +999,23 @@ mod tests {
             no_localhost,
             ..SessionPolicy::default()
         }
+    }
+
+    #[test]
+    fn recording_show_tells_a_possible_human_intervention() {
+        let mut a = ActionEntry::human(
+            "s_abcdefgh",
+            "2026-01-01T00:00:00Z",
+            "T1",
+            Some("https://a.test/x?q".into()),
+            "switched to this tab",
+            false,
+        );
+        a.seq = 7;
+        assert_eq!(
+            describe_human(&a),
+            "7  2026-01-01T00:00:00Z  human  possible: switched to this tab  tab T1  https://a.test/x"
+        );
     }
 
     #[test]

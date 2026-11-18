@@ -450,6 +450,8 @@ pub struct SessionView {
 
 /// A session's view, `None` once it is closed.
 pub type SessionLookup = Arc<dyn Fn(&SessionId) -> Option<SessionView> + Send + Sync>;
+/// See `Downloads::on_activating`.
+pub type Activating = Arc<dyn Fn(&str) + Send + Sync>;
 /// Called with a browser context whose download policy could not be set again in time.
 pub type PolicyLost = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -561,6 +563,9 @@ struct Inner {
     state: Mutex<State>,
     lookup: Mutex<Option<SessionLookup>>,
     lost: Mutex<Option<PolicyLost>>,
+    /// Told the tab just before `activate` makes it the active one (the recording must not
+    /// take that switch for a person's).
+    activating: Mutex<Option<Activating>>,
     /// Setting a policy is done by one caller at a time.
     applying: tokio::sync::Mutex<()>,
     /// Test hook (`drop_connection_for_test`): no new connection before this instant.
@@ -645,6 +650,7 @@ impl Downloads {
             state: Mutex::new(State::default()),
             lookup: Mutex::new(None),
             lost: Mutex::new(None),
+            activating: Mutex::new(None),
             applying: tokio::sync::Mutex::new(()),
             hold_until: Mutex::new(None),
         });
@@ -769,6 +775,11 @@ impl Downloads {
 
     pub fn set_session_lookup(&self, lookup: SessionLookup) {
         *self.inner.lookup.lock().unwrap() = Some(lookup);
+    }
+
+    /// `f` is told the target id of every tab pegboard activates itself, just before.
+    pub fn on_activating(&self, f: Activating) {
+        *self.inner.activating.lock().unwrap() = Some(f);
     }
 
     pub fn on_policy_lost(&self, lost: PolicyLost) {
@@ -1033,6 +1044,10 @@ impl Inner {
             .find(|t| t.browser_context_id.as_deref() == Some(context))
             .ok_or_else(|| anyhow!("the agent profile has no open tab"))?;
         self.state.lock().unwrap().activations += 1;
+        let activating = self.activating.lock().unwrap().clone();
+        if let Some(f) = activating {
+            f(&page.target_id);
+        }
         self.conn
             .send(
                 "Target.activateTarget",

@@ -44,6 +44,41 @@ function allowedUrl(url) {
   return parsed.href;
 }
 
+// Tab switches, for the session recordings (a switch outside an agent command may be a
+// person's). Each goes to `self.pegActivity`, a function the daemon adds over CDP
+// (`Runtime.addBinding`) to this worker. A restarted worker has lost it: switches are kept
+// here (the newest few, for a short while) until the daemon adds it again and asks for them
+// (`replayActivity`). Only tabs of this profile's own windows are reported. Nothing is kept
+// beyond that, and nothing here reads a page.
+const ACTIVITY_KEEP = 50;
+const ACTIVITY_MAX_AGE_MS = 60000;
+const keptActivity = [];
+
+function reportActivity(o) {
+  if (typeof self.pegActivity === 'function') {
+    try {
+      self.pegActivity(JSON.stringify(o));
+      return;
+    } catch (_) {
+      // fall through: kept for the next replay
+    }
+  }
+  keptActivity.push(o);
+  if (keptActivity.length > ACTIVITY_KEEP) keptActivity.shift();
+}
+
+chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+  const at = Date.now();
+  try {
+    const windows = await chrome.windows.getAll();
+    if (!windows.some((w) => w.id === windowId)) return;
+    const t = (await chrome.debugger.getTargets()).find((x) => x.type === 'page' && x.tabId === tabId);
+    if (t) reportActivity({ event: 'activated', targetId: t.id, at });
+  } catch (_) {
+    // a tab that is already gone
+  }
+});
+
 self.peg = {
   async createGroup(title, color) {
     const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
@@ -117,6 +152,14 @@ self.peg = {
     for (const id of targetIds) tabIds.push(await tabIdOf(id));
     if (tabIds.length) await chrome.tabs.ungroup(tabIds);
     return {};
+  },
+
+  // Hands the kept tab switches to `self.pegActivity` (set again by the daemon); how many.
+  replayActivity() {
+    const now = Date.now();
+    const kept = keptActivity.splice(0).filter((o) => now - o.at <= ACTIVITY_MAX_AGE_MS);
+    for (const o of kept) reportActivity(o);
+    return kept.length;
   },
 
   async ungroup(groupId) {
