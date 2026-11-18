@@ -250,6 +250,65 @@ fn operator_mode_lists_and_closes_but_does_not_drive_other_sessions() {
     assert_eq!(op.wait_exit(20), 0);
 }
 
+fn tool_names(mcp: &mut Mcp) -> Vec<String> {
+    mcp.request("tools/list", json!({}))["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+#[ignore]
+fn mcp_default_mode_cannot_keep_or_delete() {
+    let home = shared_home();
+    let mut agent = Mcp::start(home, &[]);
+    let mine = agent.create(json!({}));
+    let rid = format!("r_{}", &mine[2..]);
+    let names = tool_names(&mut agent);
+    for tool in ["pegboard_recording_keep", "pegboard_recording_delete"] {
+        assert!(!names.contains(&tool.to_string()), "{names:?}");
+        // Called by name, even on its own recording: no such tool.
+        let r = agent.request(
+            "tools/call",
+            json!({ "name": tool, "arguments": { "recordingId": rid, "keep": true } }),
+        );
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("unknown tool")),
+            "{r}"
+        );
+    }
+    let (err, text) = agent.call("pegboard_session_close", json!({ "sessionId": mine }));
+    assert!(!err, "{text}");
+    // Its recording is still there and not kept.
+    let (code, out, err) = home.run(&["--json", "recording", "list", "--session", &mine]);
+    assert_eq!(code, 0, "{err}");
+    let list = json(&out);
+    assert_eq!(list["recordings"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list["recordings"][0]["keep"], false, "{list}");
+    // The operator has both.
+    let mut op = Mcp::start(home, &["--operator"]);
+    let names = tool_names(&mut op);
+    for tool in ["pegboard_recording_keep", "pegboard_recording_delete"] {
+        assert!(names.contains(&tool.to_string()), "{names:?}");
+    }
+    let (err, text) = op.call(
+        "pegboard_recording_keep",
+        json!({ "recordingId": rid, "keep": true }),
+    );
+    assert!(!err && text == format!("kept {rid}"), "{text}");
+    let (err, text) = op.call("pegboard_recording_delete", json!({ "recordingId": rid }));
+    assert!(!err, "{text}");
+    assert!(!home.path().join("recordings").join(&rid).exists());
+    agent.close_stdin();
+    op.close_stdin();
+    assert_eq!(agent.wait_exit(20), 0);
+    assert_eq!(op.wait_exit(20), 0);
+}
+
 #[test]
 #[ignore]
 fn server_policy_is_attached_to_every_session() {

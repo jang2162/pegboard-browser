@@ -555,6 +555,13 @@ pub fn screen_home(config: &str) -> Home {
 /// `PEGBOARD_TEST_CAPTURE_DELAY_MS`).
 pub fn screen_home_with(config: &str, env: &[(&str, &str)]) -> Home {
     let home = Home::new();
+    start_screen_daemon(&home, config, env);
+    home
+}
+
+/// Writes `config` to `home`'s `config.toml` and starts its daemon and browser as
+/// `screen_home_with` does (for a test that puts files in the home first).
+pub fn start_screen_daemon(home: &Home, config: &str, env: &[(&str, &str)]) {
     std::fs::write(home.path().join("config.toml"), config).unwrap();
     let rules = host_rules();
     let browser_rules = browser_only_host_rules();
@@ -577,7 +584,6 @@ pub fn screen_home_with(config: &str, env: &[(&str, &str)]) -> Home {
         &["browser", "start"],
     );
     assert_eq!(code, 0, "{err}");
-    home
 }
 
 /// A name the shared browser (and its daemon) resolve to this machine's private LAN address

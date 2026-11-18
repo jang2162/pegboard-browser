@@ -1633,7 +1633,7 @@ fn a_human_navigation_outside_a_command_is_recorded() {
     let (code, out, err) = home.run(&["recording", "show", &rid]);
     assert_eq!(code, 0, "{err}");
     assert!(
-        out.contains("human  possible: navigated outside a command") && out.contains(&first),
+        out.contains("human: navigated outside a command") && out.contains(&first),
         "{out}"
     );
 }
@@ -2097,4 +2097,244 @@ fn diag_bridge_worker_stop_and_wake() {
             }
         }
     }
+}
+
+// Retention and the recording commands (task 6).
+
+/// An RFC 3339 time `ago` before now.
+fn rfc3339_ago(ago: time::Duration) -> String {
+    (time::OffsetDateTime::now_utc() - ago)
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+/// A recording as a build before 2b made it (format 1, actions only), ended `ended_days`
+/// ago, under `<home>/recordings/<id>`.
+fn plant_format_1(home: &Home, id: &str, ended_days: i64, keep: bool) -> PathBuf {
+    let recordings = home.path().join("recordings");
+    std::fs::create_dir_all(&recordings).unwrap();
+    std::fs::set_permissions(&recordings, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = recordings.join(id);
+    std::fs::create_dir(&dir).unwrap();
+    let ended = rfc3339_ago(time::Duration::days(ended_days));
+    let started = rfc3339_ago(time::Duration::days(ended_days) + time::Duration::minutes(5));
+    let mut manifest = json!({
+        "format": 1, "recordingId": id, "sessionId": format!("s_{}", &id[2..]),
+        "sessionName": "planted", "profile": "default", "startedAt": started,
+        "endedAt": ended, "chromeVersion": "157", "agentBrowserVersion": "0.42.0",
+    });
+    if keep {
+        manifest["keep"] = json!(true);
+    }
+    std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+    let line = json!({
+        "seq": 1, "ts": started, "sessionId": format!("s_{}", &id[2..]), "targetId": null,
+        "url": null, "command": "get", "args": ["get", "url"], "ok": true, "error": null,
+        "durationMs": 3, "redacted": false,
+    });
+    std::fs::write(dir.join("actions.jsonl"), format!("{line}\n")).unwrap();
+    dir
+}
+
+fn rid_of(handle: &str) -> String {
+    format!("r_{}", &id_of(handle)[2..])
+}
+
+/// The `recording list` line of `rid` (none when it is not listed).
+fn list_line(home: &Home, args: &[&str], rid: &str) -> Option<String> {
+    let mut all = vec!["recording", "list"];
+    all.extend_from_slice(args);
+    let (code, out, err) = home.run(&all);
+    assert_eq!(code, 0, "{err}");
+    out.lines()
+        .find(|l| l.starts_with(&format!("{rid} ")))
+        .map(String::from)
+}
+
+#[test]
+#[ignore]
+fn old_recordings_are_pruned_at_start_and_kept_ones_stay() {
+    let home = Home::new();
+    let old = plant_format_1(&home, "r_oldoldol", 15, false);
+    let kept = plant_format_1(&home, "r_keptkept", 15, true);
+    let recent = plant_format_1(&home, "r_recentrr", 3, false);
+    start_screen_daemon(&home, "", &[]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while old.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        !old.exists(),
+        "a recording that ended 15 days ago is still there"
+    );
+    assert!(kept.join("actions.jsonl").exists());
+    assert!(recent.join("actions.jsonl").exists());
+    let line = list_line(&home, &["--kept"], "r_keptkept").expect("the kept one is listed");
+    assert!(
+        line.contains("  kept  ") && line.contains("no screen"),
+        "{line}"
+    );
+    assert!(list_line(&home, &["--kept"], "r_recentrr").is_none());
+    assert!(list_line(&home, &[], "r_recentrr").is_some());
+    // Nothing more is due.
+    let (code, out, err) = home.run(&["recording", "prune", "--dry-run"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), "nothing to prune");
+}
+
+/// Runs commands in the session until its screen is capped (at most `limit`).
+fn until_capped(home: &Home, handle: &str, limit: Duration) {
+    let dir = recording_dir(home, handle);
+    let deadline = Instant::now() + limit;
+    while manifest(&dir)["screen"] != "capped" {
+        assert!(Instant::now() < deadline, "{}", manifest(&dir));
+        ok(home, handle, &["get", "url"]);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[test]
+#[ignore]
+fn the_size_limit_deletes_finished_screens_first() {
+    let origin = fixture();
+    // 4 MB in all, 2 MB a recording: two capped recordings are over the total.
+    let home = screen_home(&format!(
+        "{SCREEN_OFF_CONFIG}max_total_gb = 0.004\nmax_per_recording_gb = 0.002\n"
+    ));
+    let mut finished = Vec::new();
+    for _ in 0..3 {
+        let h = create(&home, &format!("{origin}/animated"));
+        until_capped(&home, &h, Duration::from_secs(60));
+        close(&home, &h);
+        finished.push(h);
+    }
+    let running = create(&home, &format!("{origin}/animated"));
+    until_capped(&home, &running, Duration::from_secs(60));
+    let (code, out, err) = home.run(&["recording", "prune", "--dry-run"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains(&rid_of(&running)), "{out}");
+    let (code, out, err) = home.run(&["recording", "prune"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains(&rid_of(&running)), "{out}");
+
+    for h in &finished[..2] {
+        let dir = recording_dir(&home, h);
+        let line = list_line(&home, &[], &rid_of(h)).expect("still listed");
+        assert!(line.contains("screen pruned"), "{line}");
+        assert_eq!(manifest(&dir)["screen"], "pruned");
+        assert!(!dir.join("screen").exists(), "{h}");
+        // The actions stay.
+        assert!(actions(&dir).iter().any(|a| a["command"] == "get"), "{h}");
+    }
+    let dir = recording_dir(&home, &running);
+    let line = list_line(&home, &[], &rid_of(&running)).expect("listed");
+    assert!(
+        line.contains("  running  ") && line.contains("screen capped"),
+        "{line}"
+    );
+    assert!(!all_jpgs(&dir).is_empty());
+    let (code, out, _) = home.run(&["recording", "list"]);
+    assert_eq!(code, 0);
+    assert!(out.lines().last().unwrap().starts_with("total "), "{out}");
+    close(&home, &running);
+}
+
+#[test]
+#[ignore]
+fn list_shows_sizes_screen_keep_and_filters() {
+    let origin = fixture();
+    let home = shared_home();
+    let kept = create(home, &format!("{origin}/counter"));
+    let failing = create(home, &format!("{origin}/counter"));
+    ok(home, &kept, &["get", "url"]);
+    let (code, _, _) = home.run_limited(
+        &[("PEGBOARD_SESSION", failing.as_str())],
+        &["click", "#missing"],
+        90,
+    );
+    assert_ne!(code, 0);
+    let (rk, rf) = (rid_of(&kept), rid_of(&failing));
+    let (code, out, err) = home.run(&["recording", "keep", &rk]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), format!("kept {rk}"));
+    // A running one is listed as running.
+    let line = list_line(home, &[], &rk).expect("listed");
+    assert!(
+        line.contains("  running  ") && line.contains("  kept  "),
+        "{line}"
+    );
+    close(home, &kept);
+    close(home, &failing);
+
+    let line = list_line(home, &[], &rk).expect("listed");
+    assert!(
+        !line.contains("running") && line.contains("  kept  "),
+        "{line}"
+    );
+    assert!(line.contains(" MB  ") || line.contains(" KB  "), "{line}");
+    assert!(line.contains("  screen  "), "{line}");
+    assert!(list_line(home, &["--kept"], &rk).is_some());
+    assert!(list_line(home, &["--kept"], &rf).is_none());
+    let failed = list_line(home, &["--failed"], &rf).expect("the failing one");
+    assert!(failed.contains("1 failed"), "{failed}");
+    assert!(list_line(home, &["--failed"], &rk).is_none());
+    let (code, out, err) = home.run(&["recording", "list", "--session", id_of(&kept)]);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(lines[0].starts_with(&rk), "{out}");
+    assert!(
+        lines[1].starts_with("total ") && lines[1].contains(", kept "),
+        "{out}"
+    );
+    // JSON: the same filter, the summary's fields.
+    let (code, out, _) = home.run(&[
+        "--json",
+        "recording",
+        "list",
+        "--kept",
+        "--session",
+        id_of(&kept),
+    ]);
+    assert_eq!(code, 0);
+    let list = json(&out);
+    assert_eq!(list["recordings"][0]["keep"], true, "{list}");
+    assert!(
+        list["keptBytes"].as_u64().unwrap()
+            >= list["recordings"][0]["totalBytes"].as_u64().unwrap()
+    );
+    let (code, out, _) = home.run(&["recording", "unkeep", &rk]);
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), format!("unkept {rk}"));
+    assert!(list_line(home, &["--kept"], &rk).is_none());
+    for rid in [&rk, &rf] {
+        let (code, _, err) = home.run(&["recording", "delete", rid]);
+        assert_eq!(code, 0, "{err}");
+    }
+}
+
+#[test]
+#[ignore]
+fn delete_refuses_a_running_recording_and_removes_a_finished_one() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/counter"));
+    let rid = rid_of(&h);
+    let dir = recording_dir(home, &h);
+    let (code, _, err) = home.run(&["recording", "delete", &rid]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("recording_running"), "{err}");
+    assert!(dir.join("actions.jsonl").exists());
+    // The session goes on, and so does its recording.
+    ok(home, &h, &["get", "url"]);
+    close(home, &h);
+    let (code, out, err) = home.run(&["recording", "delete", &rid]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), format!("deleted {rid}"));
+    assert!(!dir.exists());
+    let (code, _, err) = home.run(&["recording", "show", &rid]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("recording_not_found"), "{err}");
+    let (code, _, err) = home.run(&["recording", "delete", "../../etc"]);
+    assert_eq!(code, 2, "{err}");
 }

@@ -54,7 +54,8 @@ fn full_flow() {
 
     let (code, out, _) = home.run(&["recording", "list", "--json"]);
     assert_eq!(code, 0);
-    let manifests = json(&out);
+    let list = json(&out);
+    let manifests = &list["recordings"];
     assert_eq!(manifests.as_array().unwrap().len(), 1);
     let rid = manifests[0]["recordingId"].as_str().unwrap().to_string();
     let (code, out, _) = home.run(&["recording", "show", &rid]);
