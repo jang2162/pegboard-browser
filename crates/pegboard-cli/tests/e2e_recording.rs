@@ -1542,6 +1542,7 @@ fn agent_commands_are_never_taken_for_human_ones() {
     let origin = fixture();
     let home = shared_home();
     let search = format!("{origin}/search");
+    let slow = format!("{origin}/slow");
     let h = create(home, &search);
     let first = targets(home, &h)[0].clone();
     let lines: Vec<Vec<&str>> = vec![
@@ -1564,17 +1565,34 @@ fn agent_commands_are_never_taken_for_human_ones() {
         vec!["open", &search],
         vec!["fill", "#q", "again"],
         vec!["press", "Enter"],
-        vec!["get", "url"],
+        // Its page commits about 1.5 s after the command started: inside the command's
+        // window, past a grace counted from the command's start.
+        vec!["open", &slow],
+        // The page goes back 300 ms after the command returned: inside the grace only.
+        vec!["eval", "setTimeout(() => history.back(), 300); 1"],
     ];
-    assert_eq!(lines.len(), 20);
+    assert_eq!(lines.len(), 21);
     for args in &lines {
         ok(home, &h, args);
     }
-    // Late commits and switches of the last commands come within the grace.
+    // Late commits and switches of the last commands come within the grace (and the
+    // last command's own `history.back()` has happened by now).
     std::thread::sleep(Duration::from_secs(2));
     close(home, &h);
     let dir = recording_dir(home, &h);
     assert!(human_entries(&dir).is_empty(), "{:?}", human_entries(&dir));
+    // The slow page did commit, and the late `history.back()` took the tab off it again.
+    let navigated: Vec<String> = nav_lines(&dir)
+        .iter()
+        .filter(|l| l["event"] == "navigated")
+        .map(|l| l["url"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(navigated.contains(&slow), "{navigated:?}");
+    assert_eq!(
+        navigated.last(),
+        Some(&format!("{origin}/counter")),
+        "{navigated:?}"
+    );
     // The commands did navigate (the log saw them).
     let navigated = nav_lines(&dir)
         .iter()
@@ -1703,14 +1721,18 @@ fn a_tab_switch_after_the_bridge_worker_restarted_is_marked() {
     // daemon binds it again, spike H8) or come after the daemon bound it.
     person.on(&old, |p, s| {
         // The worker goes away with the call: its answer may never come.
-        let _ = p.rt.block_on(tokio::time::timeout(
-            Duration::from_secs(3),
-            p.conn.send(
-                "Runtime.evaluate",
-                json!({ "expression": "chrome.runtime.reload()" }),
-                Some(s),
-            ),
-        ));
+        // The timer is made inside the runtime (a tokio timer needs one).
+        let _ = p.rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                p.conn.send(
+                    "Runtime.evaluate",
+                    json!({ "expression": "chrome.runtime.reload()" }),
+                    Some(s),
+                ),
+            )
+            .await
+        });
     });
     std::thread::sleep(Duration::from_secs(2));
     person.activate(&first);

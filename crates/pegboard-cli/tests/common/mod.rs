@@ -256,6 +256,12 @@ paint(); setInterval(paint, 100);
             "popup",
             r#"<button id="pop" onclick="window.open('/animated')">Open</button>"#,
         )),
+        // Answered 1.5 s late: a command that opens it commits it more than a second after
+        // the command started.
+        "/slow" => {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            html(page("slow", "<p>slow</p>"))
+        }
         // A link and a search form (Enter submits it) to `/counter`.
         "/search" => html(page(
             "search",
