@@ -356,6 +356,8 @@ async fn answer(inner: &Inner, method: &str, path: &str, hosts: &[String]) -> An
         Route::Asset("app.js") => Answer::ok("text/javascript; charset=utf-8", APP_JS.into()),
         Route::Asset("app.css") => Answer::ok("text/css; charset=utf-8", APP_CSS.into()),
         Route::Asset(_) | Route::NotFound => Answer::not_found(),
+        // The page asks with HEAD whether its link still works: the checks above answer it.
+        Route::Data if method == "HEAD" => Answer::ok("application/json", Vec::new()),
         Route::Data => {
             let paths = inner.paths.clone();
             let built = tokio::task::spawn_blocking(move || {
@@ -877,5 +879,25 @@ mod tests {
         let b = new_token();
         assert!(valid_token(&a) && valid_token(&b), "{a}");
         assert_ne!(a, b);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn head_of_data_checks_the_link_without_reading_the_recording() {
+        let s = setup(TOKEN_TTL).await;
+        let port = s.server.port();
+        let base = path_of(&s.server.grant(RA).0);
+        // A manifest that cannot be read: GET fails, HEAD only asks whether the link works.
+        std::fs::write(s.paths.recordings.join(RA).join("manifest.json"), "{").unwrap();
+        let head = |path: &str| {
+            request(
+                port,
+                &format!("HEAD {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+            )
+            .0
+        };
+        assert_eq!(get(port, &format!("{base}data")).0, 404);
+        assert_eq!(head(&format!("{base}data")), 200);
+        std::fs::remove_dir_all(s.paths.recordings.join(RA)).unwrap();
+        assert_eq!(head(&format!("{base}data")), 404);
     }
 }

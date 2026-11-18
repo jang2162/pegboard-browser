@@ -217,7 +217,8 @@ function show() {
   const view = state.views[state.index];
   const target = shownTab(state.index);
   const tv = view && view.tabs && target ? view.tabs[target] : null;
-  const screen = (tv && tv[state.side]) || { kind: 'missing' };
+  // `after` is sent only when it differs from `before`.
+  const screen = (tv && (state.side === 'after' ? tv.after || tv.before : tv.before)) || { kind: 'missing' };
   const img = $('frame');
   if (screen.kind === 'frame' && FRAME_NAME.test(screen.name)) {
     $('no-frame').hidden = true;
@@ -266,11 +267,21 @@ function start(model) {
   renderTimeline();
   const first = state.actions.findIndex((a) => a.seq === model.startSeq);
   $('frame').addEventListener('error', () => {
-    if ($('frame').hidden) return;
+    const img = $('frame');
+    if (img.hidden) return;
+    const asked = img.dataset.name;
     // A frame the server will not give: gone, or the whole link (ended, recording deleted)?
+    // The answer counts only while that frame is still the one shown.
+    const still = () => !img.hidden && img.dataset.name === asked;
     fetch('data', { method: 'HEAD', cache: 'no-store', credentials: 'omit' })
-      .then((r) => (r.ok ? showNoFrame('missing') : fail()))
-      .catch(fail);
+      .then((r) => {
+        if (!still()) return;
+        if (r.ok) showNoFrame('missing');
+        else fail();
+      })
+      .catch(() => {
+        if (still()) fail();
+      });
   });
   $('before').addEventListener('click', () => {
     state.lastMark = null;

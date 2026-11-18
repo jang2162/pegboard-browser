@@ -71,7 +71,9 @@ pub struct TabView {
     /// The tab's address at the action (its last navigation then), if known.
     pub url: Option<String>,
     pub before: Screen,
-    pub after: Screen,
+    /// Only when it differs from `before` (the page shows `before` otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<Screen>,
 }
 
 /// What the page shows for one action (same position as in `actions`).
@@ -82,7 +84,7 @@ pub struct ActionView {
     /// The moment "after" stands for: the next action's time, else the recording's end
     /// (None while it runs: everything recorded so far).
     pub after_ts: Option<String>,
-    /// Every tab of `ReplayModel::tabs`.
+    /// The tabs of `ReplayModel::tabs` that have appeared by `after_ts`.
     pub tabs: BTreeMap<String, TabView>,
     /// `[from, to)` in `network` / `console`: the lines after the previous action, up to
     /// `after_ts`.
@@ -96,9 +98,12 @@ pub struct ReplayModel {
     pub manifest: Manifest,
     /// In time order.
     pub actions: Vec<ActionEntry>,
-    /// In time order.
+    /// In time order. Not sent to the page (`views` holds what it needs).
+    #[serde(skip)]
     pub navigation: Vec<NavLine>,
     /// Target id -> its screen index (markers, and lines naming a well-formed frame file).
+    /// Not sent to the page.
+    #[serde(skip)]
     pub screens: BTreeMap<String, Vec<IndexLine>>,
     /// In time order.
     pub network: Vec<NetworkLine>,
@@ -163,8 +168,11 @@ pub fn frame_at<'a>(
 
 /// One tab's index and navigation with their time keys, for many `frame_at` questions.
 struct Tab<'a> {
-    /// Index lines that count (markers and frames), in index order.
+    /// Index lines that count (markers and frames), sorted by time (lines with the same time
+    /// in index order).
     lines: Vec<(String, &'a IndexLine)>,
+    /// The time of the first `capped` marker.
+    capped: Option<String>,
     /// Keys of the tab's navigations, sorted.
     navigated: Vec<String>,
     /// (key, url) of the tab's navigations with an address, sorted.
@@ -180,11 +188,17 @@ impl<'a> Tab<'a> {
         target: &str,
         files: HashSet<String>,
     ) -> Tab<'a> {
-        let lines = index
+        let mut lines: Vec<(String, &IndexLine)> = index
             .iter()
             .filter(|l| matches!(l.kind, FrameKind::Off | FrameKind::Capped) || l.file.is_some())
             .map(|l| (ts_key(&l.ts), l))
             .collect();
+        // Stable: of lines with the same time the later one in the index stays later.
+        lines.sort_by(|a, b| a.0.cmp(&b.0));
+        let capped = lines
+            .iter()
+            .find(|(_, l)| l.kind == FrameKind::Capped)
+            .map(|(k, _)| k.clone());
         let mine = || {
             navigation
                 .iter()
@@ -198,6 +212,7 @@ impl<'a> Tab<'a> {
         urls.sort_by(|a, b| a.0.cmp(&b.0));
         Tab {
             lines,
+            capped,
             navigated,
             urls,
             files,
@@ -205,21 +220,15 @@ impl<'a> Tab<'a> {
     }
 
     fn frame_at(&self, at: &str) -> FrameAt<'a> {
-        let mut latest: Option<(&str, &'a IndexLine)> = None;
-        for (key, line) in &self.lines {
-            if key.as_str() > at {
-                continue;
-            }
-            if line.kind == FrameKind::Capped {
-                return FrameAt::Capped;
-            }
-            if latest.is_none_or(|(k, _)| key.as_str() >= k) {
-                latest = Some((key, line));
-            }
+        if self.capped.as_deref().is_some_and(|c| c <= at) {
+            return FrameAt::Capped;
         }
-        let Some((key, line)) = latest else {
+        // The last line at or before `at`.
+        let n = self.lines.partition_point(|(k, _)| k.as_str() <= at);
+        let Some((key, line)) = n.checked_sub(1).map(|i| &self.lines[i]) else {
             return FrameAt::Missing;
         };
+        let (key, line) = (key.as_str(), *line);
         if line.kind == FrameKind::Off {
             return FrameAt::Off;
         }
@@ -258,11 +267,12 @@ impl<'a> Tab<'a> {
         }
     }
 
-    /// A frame an action names (`<target>/<file>`), when its file is there.
-    fn named(&self, name: &str, ts: &str, url: &Option<String>) -> Screen {
+    /// A frame an action names (`<target>/<file>`), when it is of this tab (`target`) and
+    /// its file is there.
+    fn named(&self, target: &str, name: &str, ts: &str, url: &Option<String>) -> Screen {
         let present = name
             .split_once('/')
-            .is_some_and(|(_, file)| self.files.contains(file));
+            .is_some_and(|(t, file)| t == target && self.files.contains(file));
         if present {
             Screen::Frame {
                 name: name.to_string(),
@@ -382,12 +392,12 @@ fn incident_kind(e: &ActionEntry) -> Option<&'static str> {
 }
 
 /// The recording's tabs (target ids of actions, navigation and screens) in the order they
-/// first appear.
+/// first appear, with that time's key.
 fn tabs_of(
     actions: &[ActionEntry],
     navigation: &[NavLine],
     screens: &BTreeMap<String, Vec<IndexLine>>,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     let mut first: BTreeMap<String, String> = BTreeMap::new();
     let mut see = |target: &str, key: String| {
         if !valid_target_id(target) {
@@ -415,7 +425,7 @@ fn tabs_of(
     }
     let mut tabs: Vec<(String, String)> = first.into_iter().collect();
     tabs.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
-    tabs.into_iter().map(|(t, _)| t).collect()
+    tabs
 }
 
 /// After every key, so "after" the last action of a running recording is everything so far.
@@ -425,7 +435,7 @@ const END: &str = "9999-12-31T23:59:59.999999999";
 fn views(
     manifest: &Manifest,
     actions: &[ActionEntry],
-    tabs: &[String],
+    tabs: &[(String, String)],
     tab: &HashMap<&str, Tab<'_>>,
     network: &[NetworkLine],
     console: &[ConsoleLine],
@@ -447,7 +457,11 @@ fn views(
         let before_key = ts_key(&a.ts);
         let after_key = after_ts.as_deref().map_or(END.to_string(), ts_key);
         let mut by_tab = BTreeMap::new();
-        for t in tabs {
+        for (t, first) in tabs {
+            // Not there yet (a tab opened later): nothing to show.
+            if *first > after_key {
+                continue;
+            }
             let Some(view) = tab.get(t.as_str()) else {
                 continue;
             };
@@ -456,11 +470,11 @@ fn views(
                 (Screen::Pruned, Screen::Pruned)
             } else {
                 let before = match (&a.frame_before, own) {
-                    (Some(name), true) => view.named(name, &a.ts, &a.url),
+                    (Some(name), true) => view.named(t, name, &a.ts, &a.url),
                     _ => view.screen_at(t, &before_key),
                 };
                 let after = match (&a.frame_after, own) {
-                    (Some(name), true) => view.named(name, &a.ts, &a.url),
+                    (Some(name), true) => view.named(t, name, &a.ts, &a.url),
                     _ => view.screen_at(t, &after_key),
                 };
                 (before, after)
@@ -469,8 +483,8 @@ fn views(
                 t.clone(),
                 TabView {
                     url: view.url_at(&before_key),
+                    after: (after != before).then_some(after),
                     before,
-                    after,
                 },
             );
         }
@@ -528,7 +542,7 @@ pub fn build(paths: &Paths, recording_id: &str) -> std::io::Result<ReplayModel> 
     let empty: Vec<IndexLine> = Vec::new();
     let per_tab: HashMap<&str, Tab<'_>> = tabs
         .iter()
-        .map(|t| {
+        .map(|(t, _)| {
             let index = screens.get(t).unwrap_or(&empty);
             let present = files.remove(t).unwrap_or_default();
             (t.as_str(), Tab::new(index, &navigation, t, present))
@@ -539,7 +553,7 @@ pub fn build(paths: &Paths, recording_id: &str) -> std::io::Result<ReplayModel> 
     Ok(ReplayModel {
         start_seq: incidents.first().map(|i| i.seq),
         incidents,
-        tabs,
+        tabs: tabs.into_iter().map(|(t, _)| t).collect(),
         views,
         network,
         console,
@@ -783,6 +797,16 @@ mod tests {
             frame_at(&index, &same, T1, &ts(3)),
             FrameAt::Frame(&index[1])
         );
+        // An index written out of time order is read by time.
+        let shuffled = vec![frame(5, 3), frame(3, 2), frame(1, 1)];
+        assert_eq!(
+            frame_at(&shuffled, &none, T1, &ts(4)),
+            FrameAt::Frame(&shuffled[1])
+        );
+        assert_eq!(
+            frame_at(&shuffled, &none, T1, &ts(2)),
+            FrameAt::Frame(&shuffled[2])
+        );
         // Capped: nothing after it.
         let capped = vec![frame(1, 1), marker(2, FrameKind::Capped)];
         assert_eq!(
@@ -961,7 +985,7 @@ mod tests {
         assert_eq!(seqs, vec![4, 1, 2, 3]);
         let judged = |i: usize, t: &str| {
             let v = &m.views[i].tabs[t];
-            (word(&v.before), word(&v.after))
+            (word(&v.before), word(v.after.as_ref().unwrap_or(&v.before)))
         };
         let f = |t: &str, n: u32| format!("frame:{t}/{n:06}.jpg");
         // seq 4 at :01, tab T2: its first frame is at :01.5 (a fraction after a whole
@@ -1034,7 +1058,7 @@ mod tests {
         );
         let m = build(&paths, RA_ID).unwrap();
         assert_eq!(m.views[0].tabs[T1].before, Screen::Off);
-        assert_eq!(m.views[0].tabs[T1].after, Screen::Capped);
+        assert_eq!(m.views[0].tabs[T1].after, Some(Screen::Capped));
         assert_eq!(m.views[1].tabs[T1].before, Screen::Capped);
         // An index line whose file is not on disk (not written, or removed): no frame.
         let dir = plant(
@@ -1058,7 +1082,8 @@ mod tests {
         crate::actionlog::write_manifest_file(&dir, &manifest).unwrap();
         let m = build(&paths, "r_bbbbbbbb").unwrap();
         assert_eq!(m.views[0].tabs[T1].before, Screen::Pruned);
-        assert_eq!(m.views[0].tabs[T1].after, Screen::Pruned);
+        // The same before and after: after is left out.
+        assert_eq!(m.views[0].tabs[T1].after, None);
     }
 
     #[test]
@@ -1074,7 +1099,7 @@ mod tests {
         let m = build(&paths, RA_ID).unwrap();
         assert_eq!(m.views[0].after_ts, None);
         assert_eq!(
-            word(&m.views[0].tabs[T1].after),
+            word(m.views[0].tabs[T1].after.as_ref().unwrap()),
             format!("frame:{T1}/000003.jpg")
         );
     }
@@ -1094,5 +1119,54 @@ mod tests {
             ts_key("2026-11-17T10:00:01.5Z"),
             "2026-11-17T10:00:01.500000000"
         );
+    }
+
+    #[test]
+    fn views_leave_out_later_tabs_unchanged_afters_and_other_tabs_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let human = |seq: u64, sec: u32, target: &str| ActionEntry {
+            seq,
+            ..ActionEntry::human("s_abcdefgh", &ts(sec), target, None, "x", false)
+        };
+        // seq 1 names, for its tab T1, a frame of T2 (T1 has a file of that number too).
+        let odd = ActionEntry {
+            frame_before: Some(format!("{T2}/000001.jpg")),
+            frame_after: None,
+            ..command(1, 1, "get", true, None)
+        };
+        let dir = plant(
+            &paths,
+            RA_ID,
+            &[odd, human(2, 5, T1), human(3, 9, T2)],
+            &[frame(1, 1)],
+        );
+        // T2 is opened at :07.
+        let nav = NavLine {
+            ts: ts(7),
+            target_id: T2.into(),
+            event: NavEvent::Created,
+            url: None,
+            opener: Some(T1.into()),
+        };
+        std::fs::write(dir.join("navigation.jsonl"), lines(&[nav])).unwrap();
+        let m = build(&paths, RA_ID).unwrap();
+        assert_eq!(m.views[0].tabs[T1].before, Screen::Missing);
+        // Not there yet at seq 1 (after = :05); there at seq 2 (after = :09).
+        assert_eq!(m.views[0].tabs.keys().collect::<Vec<_>>(), vec![T1]);
+        assert_eq!(m.views[1].tabs.keys().count(), 2);
+        // seq 2: the :01 frame before (:05) and after (:09): after is not repeated.
+        assert_eq!(
+            word(&m.views[1].tabs[T1].before),
+            format!("frame:{T1}/000001.jpg")
+        );
+        assert_eq!(m.views[1].tabs[T1].after, None);
+        let json = serde_json::to_value(&m).unwrap();
+        assert!(
+            json["views"][1]["tabs"][T1].get("after").is_none(),
+            "{json}"
+        );
+        // The page gets the views, not the raw index and navigation.
+        assert!(json.get("screens").is_none() && json.get("navigation").is_none());
     }
 }
