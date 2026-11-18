@@ -214,8 +214,10 @@ pub async fn run_command_with_hook(
     }
 
     // The frame before: the tab's last stored frame (no capture), only for a command that
-    // passed every check above.
+    // passed every check above. From here until the command's end (and a grace after it)
+    // what happens in the session's tabs is the command's, not a person's.
     let recorder = sessions.recorder();
+    let _window = recorder.command_window(id);
     let frame_before = recorder.before_command(id, screen_target(sessions, runner, id).as_deref());
 
     runner.set_session_targets_provider(sessions.targets_fn());

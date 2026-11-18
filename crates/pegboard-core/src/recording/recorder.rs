@@ -15,22 +15,31 @@
 //!   last frame stored of the tab (no capture: owner decision after spike F7); the frame after
 //!   is one direct capture, sent only on a document the gate lets through and kept only if
 //!   the tab is still on it (F5), within `CAPTURE_LIMIT`.
+//! - Besides the screen: the session's navigation log (tabs opened, main-frame commits,
+//!   tabs closed), the marks of a possible human intervention (`events`: something in a
+//!   session tab outside the session's command windows, spike F6), and with `--record` the
+//!   network and console lines. All of it is written by the writer thread too.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use pegboard_protocol::{RecordExtra, SessionId};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use crate::actionlog::{url_for_log, ManifestHandle, ScreenStatus, SessionLog};
+use crate::actionlog::{url_for_log, ActionEntry, ManifestHandle, ScreenStatus, SessionLog};
 use crate::cdp::{CdpConn, CdpEvent};
 use crate::recording::config::RecordingConfig;
-use crate::recording::format::FrameKind;
+use crate::recording::events::{
+    classify, console_line, nav_line, CommandWindows, NavFollow, Requests, Signal,
+};
+use crate::recording::format::{
+    ConsoleLine, FrameKind, JsonlWriter, NavEvent, NavLine, NetworkLine,
+};
 use crate::recording::screen::{
     frame_name, may_record, ScreenBudget, ScreenGate, ScreenWriter, Throttle, MIN_FRAME_GAP,
 };
@@ -73,6 +82,8 @@ const FROZEN_MIN_CAPTURE: Duration = Duration::from_millis(250);
 const LIMIT_GRACE: Duration = Duration::from_millis(20);
 /// Between two looks at a tab that is being attached.
 const TICKET_POLL: Duration = Duration::from_millis(5);
+/// How long a tab switch pegboard announced (`expect_activation`) is waited for.
+const EXPECT_ACTIVATION: Duration = Duration::from_secs(5);
 
 /// `f`, or `None` when it takes longer than `limit`.
 pub async fn bounded<T>(limit: Duration, f: impl Future<Output = Option<T>>) -> Option<T> {
@@ -193,8 +204,27 @@ enum Job {
         number: u32,
         reply: oneshot::Sender<bool>,
     },
+    /// A line of navigation.jsonl, network.jsonl or console.jsonl.
+    Line(Line),
     /// Everything before it is written; the thread ends.
     End(oneshot::Sender<()>),
+}
+
+/// A line of one of the recording's logs besides the screen.
+enum Line {
+    Nav(NavLine),
+    Network(NetworkLine),
+    Console(ConsoleLine),
+}
+
+impl Line {
+    fn file(&self) -> &'static str {
+        match self {
+            Line::Nav(_) => "navigation.jsonl",
+            Line::Network(_) => "network.jsonl",
+            Line::Console(_) => "console.jsonl",
+        }
+    }
 }
 
 /// The recording of a session whose screen is being recorded.
@@ -213,9 +243,10 @@ struct Rec {
     /// writer (always under the recorder's state lock, so in the order of the jobs): a
     /// capture's name is known before it is written.
     numbers: Mutex<HashMap<String, u32>>,
-    /// Kept for the session's other recorders (navigation, people, extras: later tasks).
-    _log: SessionLog,
-    _extras: Vec<RecordExtra>,
+    /// The session's action log, for the marks of a possible human intervention.
+    log: SessionLog,
+    /// What `--record` asked for besides the screen.
+    extras: Vec<RecordExtra>,
 }
 
 /// Target -> "<targetId>/<file>" of its last frame written.
@@ -228,6 +259,41 @@ impl Rec {
         let number = *next;
         *next = next.saturating_add(1);
         number
+    }
+
+    fn line(&self, line: Line) {
+        let _ = self.jobs.send(Job::Line(line));
+    }
+
+    fn nav(&self, target: &str, event: NavEvent, url: Option<&str>, opener: Option<&str>) {
+        self.line(Line::Nav(nav_line(&now_ts(), target, event, url, opener)));
+    }
+
+    /// Appends a mark of a possible human intervention to the session's log, in a task of
+    /// its own (the log is locked while a command runs; events are not held up by it).
+    /// Nothing is written once the log has ended.
+    fn human(
+        &self,
+        session: &SessionId,
+        ts: &str,
+        target: &str,
+        url: Option<&str>,
+        what: &str,
+        certain: bool,
+    ) {
+        let entry =
+            ActionEntry::human(&session.0, ts, target, url.map(String::from), what, certain);
+        let log = self.log.clone();
+        let rid = self.id.clone();
+        tokio::spawn(async move {
+            let mut log = log.lock().await;
+            if log.manifest().ended_at.is_some() {
+                return;
+            }
+            if let Err(e) = log.append(entry) {
+                eprintln!("pegboard: recording {rid}: a human intervention was not logged: {e}");
+            }
+        });
     }
 
     /// Hands a stream frame to the writer.
@@ -293,6 +359,14 @@ struct Sess {
     /// The screen is switched off for now (test hook `test.setScreen`): no stream, no
     /// capture, no frame names.
     paused: bool,
+    /// When the session's commands ran (`command_window`).
+    windows: CommandWindows,
+    /// Per target, its navigations between request and commit.
+    follow: HashMap<String, NavFollow>,
+    /// Per target, its requests (`--record network`).
+    requests: HashMap<String, Requests>,
+    /// Targets whose `created` line is written.
+    created: HashSet<String>,
 }
 
 impl Sess {
@@ -304,6 +378,23 @@ impl Sess {
             screens: HashMap::new(),
             watched: false,
             paused: false,
+            windows: CommandWindows::default(),
+            follow: HashMap::new(),
+            requests: HashMap::new(),
+            created: HashSet::new(),
+        }
+    }
+
+    fn records(&self, extra: RecordExtra) -> bool {
+        self.rec.as_ref().is_some_and(|r| r.extras.contains(&extra))
+    }
+
+    /// The target's `created` line, once.
+    fn created(&mut self, target: &str, url: Option<&str>, opener: Option<&str>) {
+        if let Some(rec) = &self.rec {
+            if self.created.insert(target.to_string()) {
+                rec.nav(target, NavEvent::Created, url, opener);
+            }
         }
     }
 }
@@ -338,6 +429,8 @@ struct State {
     /// Events of the current connection handled so far, in the order the socket brought
     /// them (`Recorder::event_handled`).
     handled: u64,
+    /// Tabs pegboard is switching to itself, until when (`expect_activation`).
+    expected: HashMap<String, Instant>,
 }
 
 impl State {
@@ -408,7 +501,12 @@ impl Recorder {
                 .entry(id.clone())
                 .or_insert_with(|| Sess::new(context));
             sess.targets.insert(target_id.to_string());
-            sess.rec.is_some()
+            let recording = sess.rec.is_some();
+            // A tab that joins a running recording opens with its first page.
+            sess.follow
+                .entry(target_id.to_string())
+                .or_insert_with(|| NavFollow::new(recording));
+            recording
         };
         if recording {
             self.spawn_attach(target_id);
@@ -478,7 +576,14 @@ impl Recorder {
             let Some(sess) = sessions.get_mut(id) else {
                 return;
             };
-            sess.targets.remove(target_id);
+            if sess.targets.remove(target_id) {
+                if let Some(rec) = &sess.rec {
+                    rec.nav(target_id, NavEvent::Closed, None, None);
+                }
+            }
+            sess.follow.remove(target_id);
+            sess.requests.remove(target_id);
+            sess.created.remove(target_id);
             health.frame_seen(target_id);
             if let (Some(mut screen), Some(rec)) = (sess.screens.remove(target_id), &sess.rec) {
                 self.flush_into(rec, target_id, &mut screen);
@@ -538,10 +643,20 @@ impl Recorder {
                 abandoned,
                 last,
                 numbers: Default::default(),
-                _log: log,
-                _extras: extras,
+                log,
+                extras,
             });
-            sess.targets.iter().cloned().collect()
+            // `session create` counts as a command: what its start page does is not a person's.
+            sess.windows.end(Instant::now());
+            let targets: Vec<String> = sess.targets.iter().cloned().collect();
+            for target in &targets {
+                let url = sess
+                    .screens
+                    .get(target)
+                    .and_then(|s| s.gate.current_url().map(String::from));
+                sess.created(target, url.as_deref(), None);
+            }
+            targets
         };
         self.wake.notify_one();
         let me = self.clone();
@@ -650,6 +765,75 @@ impl Recorder {
             conn.close();
         }
         conn.is_some()
+    }
+
+    /// A command of the session runs from now until the window is dropped (a command that
+    /// passed its checks; a refused one opens none). What happens in its tabs meanwhile and
+    /// for `GRACE` after is the command's (`events`).
+    pub fn command_window(self: &Arc<Self>, id: &SessionId) -> CommandWindow {
+        if let Some(sess) = self.state().sessions.get_mut(id) {
+            sess.windows.begin(Instant::now());
+        }
+        CommandWindow {
+            recorder: self.clone(),
+            id: id.clone(),
+        }
+    }
+
+    /// pegboard itself is about to make `target` the active tab of its window (to put a
+    /// profile's policy in place): the next switch to it within 5 s is not a person's.
+    pub fn expect_activation(&self, target_id: &str) {
+        self.state()
+            .expected
+            .insert(target_id.to_string(), Instant::now() + EXPECT_ACTIVATION);
+    }
+
+    /// From the bridge of the profile whose context is `context`: `target` became the
+    /// active tab of its window at `at` (the extension's clock; a switch the bridge kept
+    /// while its worker restarted arrives late). A switch to a tab of a running recording,
+    /// outside the session's command windows, is a possible human intervention. A tab's
+    /// first switch to it before its first page (a new popup) is its opening.
+    pub fn activated(&self, context: &str, target: &str, at: SystemTime) {
+        self.activated_as_of(context, target, at, (SystemTime::now(), Instant::now()));
+    }
+
+    /// `activated`, with the clocks' "now" given (wall clock and monotonic, read together).
+    fn activated_as_of(
+        &self,
+        context: &str,
+        target: &str,
+        at: SystemTime,
+        (wall, now): (SystemTime, Instant),
+    ) {
+        let age = wall.duration_since(at).unwrap_or_default();
+        let at_instant = now.checked_sub(age).unwrap_or(now);
+        let mut st = self.state();
+        let expected = st
+            .expected
+            .remove(target)
+            .is_some_and(|until| until >= at_instant);
+        st.expected.retain(|_, until| *until > now);
+        let Some((id, sess)) = st
+            .sessions
+            .iter()
+            .find(|(_, s)| s.rec.is_some() && s.context == context && s.targets.contains(target))
+        else {
+            return;
+        };
+        if sess.follow.get(target).is_some_and(NavFollow::is_fresh) {
+            return;
+        }
+        let Some(rec) = &sess.rec else {
+            return;
+        };
+        let in_command = sess.windows.covers(at_instant);
+        if let Some((what, certain)) = classify(&Signal::Activated, in_command, expected) {
+            let ts = time::OffsetDateTime::from(at)
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            let url = sess.screens.get(target).and_then(|s| s.gate.current_url());
+            rec.human(id, &ts, target, url, &what, certain);
+        }
     }
 
     /// At the start of an agent command (after its checks passed): the frame before it, the
@@ -1051,7 +1235,10 @@ impl Recorder {
         };
         match next {
             Next::Done(attached) => attached,
-            Next::Stream(conn, cdp) => self.stream(&conn, target, &cdp).await,
+            Next::Stream(conn, cdp) => {
+                self.enable_extras(&conn, target, &cdp).await;
+                self.stream(&conn, target, &cdp).await
+            }
             Next::Attach(conn, epoch, context) => {
                 let attached = self.attach_on(&conn, epoch, target, &context).await;
                 self.state().attaching.remove(target);
@@ -1089,8 +1276,12 @@ impl Recorder {
             return false;
         };
         // Known before any of its page events can come (they start with Page.enable).
-        if self.register(target, &cdp, epoch, url) && self.start_stream(conn, target, &cdp).await {
-            return true;
+        if self.register(target, &cdp, epoch, url) {
+            self.created(target, url, info["openerId"].as_str());
+            self.enable_extras(conn, target, &cdp).await;
+            if self.start_stream(conn, target, &cdp).await {
+                return true;
+            }
         }
         // Left the scope meanwhile, or the tab did not take the stream.
         {
@@ -1138,6 +1329,38 @@ impl Recorder {
         true
     }
 
+    /// The target's `created` line, if its recording has none yet (a tab that joined it).
+    fn created(&self, target: &str, url: Option<&str>, opener: Option<&str>) {
+        let mut st = self.state();
+        let Some(session) = st.tabs.get(target).map(|t| t.session.clone()) else {
+            return;
+        };
+        if let Some(sess) = st.sessions.get_mut(&session) {
+            sess.created(target, url, opener);
+        }
+    }
+
+    /// Turns on what `--record` asked for on the recorder's session of the tab: the network
+    /// metadata and the console. Also on a screen-off page (they are not the screen).
+    async fn enable_extras(&self, conn: &CdpConn, target: &str, cdp: &str) {
+        let (network, console) = {
+            let st = self.state();
+            match st.recording_session_of(target) {
+                Some((_, s)) => (
+                    s.records(RecordExtra::Network),
+                    s.records(RecordExtra::Console),
+                ),
+                None => return,
+            }
+        };
+        if network {
+            let _ = conn.send("Network.enable", json!({}), Some(cdp)).await;
+        }
+        if console {
+            let _ = conn.send("Runtime.enable", json!({}), Some(cdp)).await;
+        }
+    }
+
     /// What the attach found the tab to show: the main frame's document and whether it has
     /// painted. Returns whether the tab gets no stream (no recording yet, capped or paused),
     /// or `None` when the tab is no longer this attach's.
@@ -1159,6 +1382,10 @@ impl Recorder {
             .clone();
         let sess = st.sessions.get_mut(&session)?;
         let capped = sess.paused || sess.rec.as_ref().is_none_or(|r| r.budget.capped());
+        sess.follow
+            .entry(target.to_string())
+            .or_default()
+            .seen_on(url);
         let gate = &mut sess.screens.get_mut(target)?.gate;
         let neighbours: Vec<&str> = neighbours.iter().map(String::as_str).collect();
         gate.attached(&self.opts.config, url, loader, painted, &neighbours);
@@ -1316,6 +1543,57 @@ impl Recorder {
         let Some(sess) = st.sessions.get_mut(session) else {
             return;
         };
+        let p = &e.params;
+        // A page target's main frame has the target's id.
+        let main = |key: &str| p[key].as_str() == Some(target);
+        // What is not the screen: the extras, and who asked for a navigation.
+        if e.method.starts_with("Network.") {
+            if sess.records(RecordExtra::Network) {
+                let requests = sess.requests.entry(target.to_string()).or_default();
+                if let (Some(line), Some(rec)) =
+                    (requests.event(&e.method, p, &now_ts(), target), &sess.rec)
+                {
+                    rec.line(Line::Network(line));
+                }
+            }
+            return;
+        }
+        if e.method == "Runtime.consoleAPICalled" || e.method == "Runtime.exceptionThrown" {
+            if let (true, Some(rec)) = (sess.records(RecordExtra::Console), &sess.rec) {
+                if let Some(line) = console_line(&e.method, p, &now_ts(), target) {
+                    rec.line(Line::Console(line));
+                }
+            }
+            return;
+        }
+        let follow = sess.follow.entry(target.to_string()).or_default();
+        match e.method.as_str() {
+            "Page.frameRequestedNavigation" if main("frameId") => {
+                follow.requested(
+                    p["url"].as_str().unwrap_or_default(),
+                    p["reason"].as_str().unwrap_or_default(),
+                    p["disposition"].as_str().unwrap_or_default(),
+                );
+                return;
+            }
+            "Page.frameStartedNavigating" if main("frameId") => {
+                follow.started(p["url"].as_str().unwrap_or_default());
+            }
+            "Page.frameNavigated" if p.pointer("/frame/parentId").is_none() => {
+                let Some(url) = p.pointer("/frame/url").and_then(Value::as_str) else {
+                    return;
+                };
+                let signal = follow.committed(url);
+                if let Some(rec) = &sess.rec {
+                    rec.nav(target, NavEvent::Navigated, Some(url), None);
+                    let mark = signal.and_then(|s| classify(&s, sess.windows.covers(now), false));
+                    if let Some((what, certain)) = mark {
+                        rec.human(session, &now_ts(), target, Some(url), &what, certain);
+                    }
+                }
+            }
+            _ => {}
+        }
         let Sess {
             rec,
             screens,
@@ -1328,9 +1606,6 @@ impl Recorder {
         // None while the tab is only watched: its navigations count, its frames do not.
         let rec = rec.as_ref();
         let cfg = &self.opts.config;
-        let p = &e.params;
-        // A page target's main frame has the target's id.
-        let main = |key: &str| p[key].as_str() == Some(target);
         match e.method.as_str() {
             "Page.screencastFrame" => {
                 let Some(rec) = rec.filter(|_| !*paused) else {
@@ -1496,6 +1771,21 @@ impl Recorder {
     /// The test hold, if one is running.
     fn held_until(&self) -> Option<Instant> {
         self.state().held_until.filter(|t| *t > Instant::now())
+    }
+}
+
+/// A command's window (`Recorder::command_window`); it ends when dropped, also when the
+/// command's future is.
+pub struct CommandWindow {
+    recorder: Arc<Recorder>,
+    id: SessionId,
+}
+
+impl Drop for CommandWindow {
+    fn drop(&mut self) {
+        if let Some(sess) = self.recorder.state().sessions.get_mut(&self.id) {
+            sess.windows.end(Instant::now());
+        }
     }
 }
 
@@ -1681,6 +1971,7 @@ fn spawn_writer(
             abandoned,
             last,
             writers: HashMap::new(),
+            logs: HashMap::new(),
             told: HashSet::new(),
         };
         for job in rx {
@@ -1716,6 +2007,7 @@ fn spawn_writer(
                     let written = w.frame(&target, shot, FrameKind::After, Some(number));
                     let _ = reply.send(written.is_some());
                 }
+                Job::Line(line) => w.line(line),
                 Job::End(done) => {
                     let _ = done.send(());
                     return;
@@ -1734,6 +2026,8 @@ struct Writer {
     abandoned: Arc<AtomicBool>,
     last: LastFrames,
     writers: HashMap<String, ScreenWriter>,
+    /// navigation.jsonl, network.jsonl, console.jsonl: made on their first line.
+    logs: HashMap<&'static str, JsonlWriter>,
     /// Errors already in daemon.log.
     told: HashSet<String>,
 }
@@ -1799,6 +2093,30 @@ impl Writer {
             Err(e) => self.tell(&format!("a frame of {target} was not written: {e}")),
         }
         None
+    }
+
+    /// Appends a line to its log. A line that cannot be written is dropped (told once).
+    fn line(&mut self, line: Line) {
+        let name = line.file();
+        if !self.logs.contains_key(name) {
+            match JsonlWriter::create(&self.manifest.dir().join(name)) {
+                Ok(w) => {
+                    self.logs.insert(name, w);
+                }
+                Err(e) => return self.tell(&format!("{name}: {e}")),
+            }
+        }
+        let Some(log) = self.logs.get_mut(name) else {
+            return;
+        };
+        let written = match &line {
+            Line::Nav(l) => log.append(l),
+            Line::Network(l) => log.append(l),
+            Line::Console(l) => log.append(l),
+        };
+        if let Err(e) = written {
+            self.tell(&format!("a line of {name} was not written: {e}"));
+        }
     }
 
     fn lock_last(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
@@ -2012,6 +2330,14 @@ mod tests {
     /// A recorder with one recording session and one attached tab on `url`, and the
     /// session's manifest. No browser: events are handed to `handle` directly.
     fn rig(dir: &std::path::Path, url: &str) -> (Arc<Recorder>, SessionId, ManifestHandle) {
+        rig_with(dir, url, Vec::new())
+    }
+
+    fn rig_with(
+        dir: &std::path::Path,
+        url: &str,
+        extras: Vec<RecordExtra>,
+    ) -> (Arc<Recorder>, SessionId, ManifestHandle) {
         let recorder = Recorder::start(RecorderOptions {
             ws_url: "ws://127.0.0.1:9/none".into(),
             human_context: "HUMAN".into(),
@@ -2038,8 +2364,8 @@ mod tests {
                 abandoned: Default::default(),
                 last,
                 numbers: Default::default(),
-                _log: log,
-                _extras: Vec::new(),
+                log,
+                extras,
             });
             st.sessions.insert(id.clone(), sess);
         }
@@ -2394,8 +2720,8 @@ mod tests {
             abandoned: Default::default(),
             last,
             numbers: Default::default(),
-            _log: log,
-            _extras: Vec::new(),
+            log,
+            extras: Vec::new(),
         });
         // b has not painted: the off page may still be on the screen.
         feed(&r, &id, shot_event(2), ms(100));
@@ -2973,5 +3299,352 @@ mod tests {
         let (r, id) = rig_on(tmp.path(), &fake_browser(true, 0).await).await;
         let after = r.after_command(&id, Some(T1)).await.unwrap();
         assert_eq!(after.name, format!("{T1}/000001.jpg"));
+    }
+
+    // ---- navigation, people, extras (task 5) ----
+
+    fn lines<T: serde::de::DeserializeOwned>(manifest: &ManifestHandle, file: &str) -> Vec<T> {
+        read_jsonl(&manifest.dir().join(file)).unwrap()
+    }
+
+    fn humans(manifest: &ManifestHandle) -> Vec<ActionEntry> {
+        lines::<ActionEntry>(manifest, "actions.jsonl")
+            .into_iter()
+            .filter(|e| e.kind == crate::actionlog::EntryKind::Human)
+            .collect()
+    }
+
+    fn requested(url: &str, reason: &str) -> CdpEvent {
+        event(
+            "Page.frameRequestedNavigation",
+            json!({ "frameId": T1, "url": url, "reason": reason, "disposition": "currentTab" }),
+        )
+    }
+
+    fn started(url: &str) -> CdpEvent {
+        event(
+            "Page.frameStartedNavigating",
+            json!({ "frameId": T1, "url": url, "loaderId": "L", "navigationType": "differentDocument" }),
+        )
+    }
+
+    /// Lets the tasks that append to the action log run.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn navigations_outside_a_command_are_possible_human_interventions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        // In a command, and within its grace.
+        let window = r.command_window(&id);
+        feed(
+            &r,
+            &id,
+            navigated("http://a.test/1", "L1", "Navigation"),
+            Instant::now(),
+        );
+        drop(window);
+        let ended = Instant::now();
+        feed(
+            &r,
+            &id,
+            navigated("http://a.test/2", "L2", "Navigation"),
+            ended + Duration::from_millis(900),
+        );
+        // Outside: a person typing an address (or a script's history.back()).
+        let later = ended + Duration::from_secs(2);
+        feed(
+            &r,
+            &id,
+            navigated("http://u:p@b.test/x?token=SECRET", "L3", "Navigation"),
+            later,
+        );
+        // A link click outside (or a script's a.click()).
+        feed(&r, &id, requested("http://b.test/y", "anchorClick"), later);
+        feed(&r, &id, started("http://b.test/y"), later);
+        feed(
+            &r,
+            &id,
+            navigated("http://b.test/y", "L4", "Navigation"),
+            later,
+        );
+        // The page's own script: never a person.
+        feed(
+            &r,
+            &id,
+            requested("http://b.test/z", "scriptInitiated"),
+            later,
+        );
+        feed(&r, &id, started("http://b.test/z"), later);
+        feed(
+            &r,
+            &id,
+            navigated("http://b.test/z", "L5", "Navigation"),
+            later,
+        );
+        // A subframe is not the tab's page.
+        feed(
+            &r,
+            &id,
+            event(
+                "Page.frameNavigated",
+                json!({ "frame": { "id": "F2", "parentId": T1, "url": "http://c.test/" } }),
+            ),
+            later,
+        );
+        settle().await;
+        r.end_session(&id).await;
+
+        let marks = humans(&manifest);
+        let got: Vec<(String, Option<bool>, Option<String>)> = marks
+            .iter()
+            .map(|e| (e.what.clone().unwrap(), e.certain, e.url.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "navigated outside a command: http://b.test/x".to_string(),
+                    Some(false),
+                    Some("http://b.test/x".to_string())
+                ),
+                (
+                    "followed a link or form outside a command".to_string(),
+                    Some(false),
+                    Some("http://b.test/y".to_string())
+                ),
+            ]
+        );
+        assert!(marks
+            .iter()
+            .all(|e| e.target_id.as_deref() == Some(T1) && e.command == "human"));
+        let nav: Vec<NavLine> = lines(&manifest, "navigation.jsonl");
+        let urls: Vec<(NavEvent, Option<String>)> =
+            nav.iter().map(|l| (l.event, l.url.clone())).collect();
+        assert_eq!(
+            urls,
+            [
+                "http://a.test/1",
+                "http://a.test/2",
+                "http://b.test/x",
+                "http://b.test/y",
+                "http://b.test/z"
+            ]
+            .iter()
+            .map(|u| (NavEvent::Navigated, Some(u.to_string())))
+            .collect::<Vec<_>>()
+        );
+        let text = std::fs::read_to_string(manifest.dir().join("navigation.jsonl")).unwrap();
+        assert!(!text.contains("SECRET") && !text.contains("u:p@"), "{text}");
+        assert_eq!(mode(&manifest.dir().join("navigation.jsonl")), 0o600);
+    }
+
+    fn mode(p: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[tokio::test]
+    async fn tabs_joining_and_leaving_are_in_the_navigation_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        // A popup joins the running recording; its first page is its opening, not a mark.
+        r.add_target(&id, T2, "AGENT");
+        r.state()
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .created(T2, Some("about:blank"), Some(T1));
+        let later = Instant::now() + Duration::from_secs(5);
+        {
+            let mut st = r.state();
+            st.tabs.insert(
+                T2.into(),
+                Tab {
+                    session: id.clone(),
+                    cdp: "C2".into(),
+                    epoch: 0,
+                    streaming: false,
+                    clip: None,
+                },
+            );
+            st.by_cdp.insert("C2".into(), T2.into());
+        }
+        let popup = |url: &str| CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({ "frame": { "id": T2, "url": url, "loaderId": "P1" }, "type": "Navigation" }),
+            session_id: Some("C2".into()),
+        };
+        // A switch to it before its first page: its opening too.
+        r.activated("AGENT", T2, SystemTime::now());
+        {
+            let mut st = r.state();
+            r.handle(&mut st, T2, &id, &popup("http://a.test/popup?s=1"), later);
+        }
+        r.remove_target(&id, T2);
+        settle().await;
+        r.end_session(&id).await;
+        let nav: Vec<NavLine> = lines(&manifest, "navigation.jsonl");
+        let got: Vec<(String, NavEvent, Option<String>, Option<String>)> = nav
+            .iter()
+            .map(|l| {
+                (
+                    l.target_id.clone(),
+                    l.event,
+                    l.url.clone(),
+                    l.opener.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    T2.into(),
+                    NavEvent::Created,
+                    Some("about:blank".into()),
+                    Some(T1.into())
+                ),
+                (
+                    T2.into(),
+                    NavEvent::Navigated,
+                    Some("http://a.test/popup".into()),
+                    None
+                ),
+                (T2.into(), NavEvent::Closed, None, None),
+            ]
+        );
+        assert!(humans(&manifest).is_empty(), "{:?}", humans(&manifest));
+    }
+
+    #[tokio::test]
+    async fn a_tab_switch_outside_a_command_is_marked_unless_pegboard_made_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        // In a command, and a late report of a switch made during one (a replay, 2 s on).
+        let window = r.command_window(&id);
+        let during = SystemTime::now();
+        r.activated("AGENT", T1, during);
+        drop(window);
+        let later = (
+            SystemTime::now() + Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(2),
+        );
+        r.activated_as_of("AGENT", T1, during, later);
+        // Announced by pegboard.
+        r.expect_activation(T1);
+        r.activated_as_of("AGENT", T1, later.0, later);
+        // Another profile's bridge, a tab of no session.
+        r.activated_as_of("OTHER", T1, later.0, later);
+        r.activated_as_of("AGENT", T2, later.0, later);
+        // A person.
+        r.activated_as_of("AGENT", T1, later.0, later);
+        settle().await;
+        r.end_session(&id).await;
+        let marks = humans(&manifest);
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        assert_eq!(marks[0].what.as_deref(), Some("switched to this tab"));
+        assert_eq!(marks[0].certain, Some(false));
+        assert_eq!(marks[0].target_id.as_deref(), Some(T1));
+        assert_eq!(marks[0].url.as_deref(), Some("http://a.test/"));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_marked_after_the_log_ended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        let log = r.state().sessions[&id].rec.as_ref().unwrap().log.clone();
+        log.lock().await.finish("2026-01-01T00:00:01Z").unwrap();
+        r.activated("AGENT", T1, SystemTime::now() + Duration::from_secs(2));
+        settle().await;
+        assert!(humans(&manifest).is_empty());
+    }
+
+    #[tokio::test]
+    async fn network_and_console_lines_only_when_asked() {
+        let network = |id: &str, m: &str, p: Value| {
+            let mut p = p;
+            p["requestId"] = json!(id);
+            event(m, p)
+        };
+        let feed_all = |r: &Arc<Recorder>, id: &SessionId| {
+            let now = Instant::now();
+            feed(
+                r,
+                id,
+                network(
+                    "1",
+                    "Network.requestWillBeSent",
+                    json!({ "timestamp": 1.0,
+                "request": { "method": "POST", "url": "http://a.test/api?token=SECRET1",
+                             "headers": { "Authorization": "Bearer SECRET2" }, "postData": "SECRET4" } }),
+                ),
+                now,
+            );
+            feed(
+                r,
+                id,
+                network(
+                    "1",
+                    "Network.responseReceived",
+                    json!({ "timestamp": 1.1,
+                "response": { "status": 201, "headers": { "set-cookie": "SECRET3" } } }),
+                ),
+                now,
+            );
+            feed(
+                r,
+                id,
+                network(
+                    "1",
+                    "Network.loadingFinished",
+                    json!({ "timestamp": 1.2, "encodedDataLength": 10 }),
+                ),
+                now,
+            );
+            feed(
+                r,
+                id,
+                event(
+                    "Runtime.consoleAPICalled",
+                    json!({ "type": "error", "args": [{ "type": "string", "value": "hello" }] }),
+                ),
+                now,
+            );
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        feed_all(&r, &id);
+        r.end_session(&id).await;
+        assert!(!manifest.dir().join("network.jsonl").exists());
+        assert!(!manifest.dir().join("console.jsonl").exists());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig_with(
+            tmp.path(),
+            "http://a.test/",
+            vec![RecordExtra::Network, RecordExtra::Console],
+        );
+        feed_all(&r, &id);
+        r.end_session(&id).await;
+        let net: Vec<NetworkLine> = lines(&manifest, "network.jsonl");
+        assert_eq!(net.len(), 1, "{net:?}");
+        assert_eq!(
+            (net[0].method.as_str(), net[0].url.as_str(), net[0].status),
+            ("POST", "http://a.test/api", Some(201))
+        );
+        let text = std::fs::read_to_string(manifest.dir().join("network.jsonl")).unwrap();
+        for secret in ["SECRET", "Authorization", "ookie"] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        let console: Vec<ConsoleLine> = lines(&manifest, "console.jsonl");
+        assert_eq!(console.len(), 1);
+        assert_eq!(
+            (console[0].level.as_str(), console[0].text.as_str()),
+            ("error", "hello")
+        );
+        assert_eq!(mode(&manifest.dir().join("console.jsonl")), 0o600);
     }
 }

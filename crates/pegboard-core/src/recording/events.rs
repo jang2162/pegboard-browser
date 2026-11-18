@@ -166,6 +166,11 @@ impl NavFollow {
             .map(|(_, reason)| reason);
     }
 
+    /// Its first page has not committed yet.
+    pub fn is_fresh(&self) -> bool {
+        self.fresh
+    }
+
     /// The tab was found on a page (an attach): its first page has committed.
     pub fn seen_on(&mut self, url: &str) {
         if !is_blank(url) {
