@@ -106,6 +106,7 @@ impl OwnHarness {
             env.paths.clone(),
             env.cfg.clone(),
             recorder,
+            Vec::new(),
         );
         OwnHarness {
             manager,

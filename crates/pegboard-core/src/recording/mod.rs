@@ -5,6 +5,7 @@ pub mod config;
 pub mod events;
 pub mod format;
 pub mod recorder;
+pub mod replay;
 pub mod retention;
 pub mod screen;
 pub mod store;

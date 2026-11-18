@@ -520,6 +520,30 @@ fn default_mode_has_no_profile_or_stop_tools() {
     assert!(h.stub.methods().is_empty(), "{:?}", h.stub.methods());
 }
 
+/// The replay page is for the person only: no mode offers it, and nothing reaches
+/// `recording.open`.
+#[test]
+fn no_mode_offers_the_replay_page() {
+    for operator in [false, true] {
+        let mut h = Harness::new(operator);
+        let names = h.tool_names();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("open") && n.contains("recording") || n.contains("replay")),
+            "{names:?}"
+        );
+        for tool in ["pegboard_recording_open", "pegboard_replay"] {
+            let r = h.request(
+                "tools/call",
+                json!({ "name": tool, "arguments": { "recordingId": "r_aaaaaaaa" } }),
+            );
+            assert!(r["error"].is_object(), "{r}");
+        }
+        assert!(h.stub.calls_of("recording.open").is_empty());
+    }
+}
+
 #[test]
 fn default_mode_has_no_keep_or_delete_tools() {
     let mut h = Harness::new(false);

@@ -239,6 +239,9 @@ enum RecordingCmd {
     },
     /// Show the actions of a recording.
     Show { recording_id: String },
+    /// Open the replay page of a recording in the default browser (a link that works for 30
+    /// minutes, on this computer only).
+    Open { recording_id: String },
     /// Keep a recording: the retention rules never delete it.
     Keep { recording_id: String },
     /// Let the retention rules delete a kept recording again.
@@ -804,6 +807,7 @@ fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), Rpc
                 }
             }
         }
+        RecordingCmd::Open { recording_id } => open_replay(paths, &recording_id, json)?,
         RecordingCmd::Keep { recording_id } => set_keep(paths, &recording_id, true, json)?,
         RecordingCmd::Unkeep { recording_id } => set_keep(paths, &recording_id, false, json)?,
         RecordingCmd::Delete { recording_id } => {
@@ -835,6 +839,88 @@ fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), Rpc
         }
     }
     Ok(())
+}
+
+/// Whether `url` is a replay link as the daemon makes them: `http://127.0.0.1:<port>/r/<token>/`.
+fn is_replay_link(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://127.0.0.1:") else {
+        return false;
+    };
+    let Some((port, path)) = rest.split_once('/') else {
+        return false;
+    };
+    let token = path.strip_prefix("r/").and_then(|p| p.strip_suffix('/'));
+    port.parse::<u16>().is_ok_and(|p| p > 0)
+        && token.is_some_and(|t| {
+            !t.is_empty()
+                && t.bytes()
+                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+        })
+}
+
+/// Opens `url` in the person's default browser (macOS `open`). With the test hook
+/// `PEGBOARD_TEST_OPEN_LOG=<file>` the URL is appended to that file instead.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    if let Some(log) = pegboard_core::testenv::var("PEGBOARD_TEST_OPEN_LOG") {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .map_err(|e| format!("{log}: {e}"))?;
+        return writeln!(f, "{url}").map_err(|e| format!("{log}: {e}"));
+    }
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("/usr/bin/open: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("/usr/bin/open: {status}"))
+    }
+}
+
+fn open_replay(paths: &Paths, recording_id: &str, json: bool) -> Result<(), RpcError> {
+    checked_recording_id(recording_id);
+    let v: Value = call(
+        paths,
+        "recording.open",
+        json!({ "recordingId": recording_id }),
+    )?;
+    let url = v["url"].as_str().unwrap_or_default().to_string();
+    if !is_replay_link(&url) {
+        return Err(error(
+            codes::INTERNAL,
+            format!("the daemon answered with an unexpected link: {url:?}"),
+        ));
+    }
+    let opened = open_in_browser(&url);
+    if json {
+        print_json(&json!({
+            "url": url,
+            "expiresAt": v["expiresAt"],
+            "opened": opened.is_ok(),
+        }));
+    }
+    match opened {
+        Ok(()) => {
+            if !json {
+                println!(
+                    "opened {recording_id} in the default browser (the link works for 30 minutes)"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("pegboard: could not open the default browser: {e}");
+            if !json {
+                println!("{url}");
+            }
+            std::process::exit(EXIT_FAILURE)
+        }
+    }
 }
 
 fn set_keep(paths: &Paths, recording_id: &str, keep: bool, json: bool) -> Result<(), RpcError> {
@@ -1372,6 +1458,27 @@ mod tests {
     }
 
     #[test]
+    fn only_a_loopback_replay_link_is_opened() {
+        let token = "a".repeat(52);
+        assert!(is_replay_link(&format!("http://127.0.0.1:4321/r/{token}/")));
+        for bad in [
+            format!("http://127.0.0.1:4321/r/{token}"),
+            format!("https://127.0.0.1:4321/r/{token}/"),
+            format!("http://localhost:4321/r/{token}/"),
+            format!("http://127.0.0.1:0/r/{token}/"),
+            format!("http://127.0.0.1:x/r/{token}/"),
+            format!("http://127.0.0.1:4321/r/{token}/x"),
+            format!("http://127.0.0.1:4321/r/A{token}/"),
+            "http://127.0.0.1:4321/r//".to_string(),
+            format!("file:///r/{token}/"),
+            format!("-a Calculator http://127.0.0.1:4321/r/{token}/"),
+            String::new(),
+        ] {
+            assert!(!is_replay_link(&bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn recording_subcommands_parse() {
         use clap::Parser;
         let rec = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
@@ -1385,6 +1492,10 @@ mod tests {
         assert!(matches!(
             rec(&["pegboard", "recording", "prune", "--dry-run"]),
             RecordingCmd::Prune { dry_run: true }
+        ));
+        assert!(matches!(
+            rec(&["pegboard", "recording", "open", "r_aaaaaaaa"]),
+            RecordingCmd::Open { recording_id } if recording_id == "r_aaaaaaaa"
         ));
         for (word, id) in [
             ("keep", "r_aaaaaaaa"),

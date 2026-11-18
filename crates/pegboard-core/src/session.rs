@@ -180,6 +180,8 @@ struct Inner {
     /// Records the screen of the sessions' tabs; told whenever a target joins or leaves a
     /// session's scope.
     recorder: Arc<Recorder>,
+    /// pegboard's own ports besides the browser's and the proxy's (the replay server's).
+    extra_own_ports: Arc<[u16]>,
 }
 
 pub struct SessionManager {
@@ -195,6 +197,8 @@ impl Drop for SessionManager {
 
 impl SessionManager {
     /// Must be called inside a tokio runtime (it starts the browser event watcher).
+    /// `extra_own_ports`: pegboard's other loopback ports (the replay server's), which agent
+    /// sessions never reach, like the browser's and the proxy's.
     pub fn new(
         browser: Arc<Browser>,
         proxy: Arc<ProxyServer>,
@@ -202,7 +206,9 @@ impl SessionManager {
         paths: Paths,
         cfg: BrowserConfig,
         recorder: Arc<Recorder>,
+        extra_own_ports: Vec<u16>,
     ) -> Self {
+        let extra_own_ports: Arc<[u16]> = extra_own_ports.into();
         let events = browser.conn.events();
         let pins = PinTable::default();
         let contexts: Arc<Mutex<HashMap<String, String>>> = Arc::default();
@@ -239,7 +245,7 @@ impl SessionManager {
                 policy_of,
                 clipboard_of,
                 before_ready,
-                own_ports_fn(&browser, &proxy),
+                own_ports_fn(&browser, &proxy, &extra_own_ports),
                 resolver.clone(),
             )
         };
@@ -258,6 +264,7 @@ impl SessionManager {
             resolver,
             contexts,
             recorder,
+            extra_own_ports,
         });
         let _ = late.set(Arc::downgrade(&inner));
         let weak = Arc::downgrade(&inner);
@@ -1086,12 +1093,17 @@ fn guard_down() -> RpcError {
     )
 }
 
-/// pegboard's own ports, read when a request is judged: the browser's debugging port and the
-/// session proxy's port.
-fn own_ports_fn(browser: &Arc<Browser>, proxy: &Arc<ProxyServer>) -> crate::guard::OwnPorts {
+/// pegboard's own ports, read when a request is judged: the browser's debugging port, the
+/// session proxy's port and the `extra` ones (the replay server's).
+fn own_ports_fn(
+    browser: &Arc<Browser>,
+    proxy: &Arc<ProxyServer>,
+    extra: &Arc<[u16]>,
+) -> crate::guard::OwnPorts {
     let (browser, proxy) = (Arc::downgrade(browser), Arc::downgrade(proxy));
+    let extra = extra.clone();
     Arc::new(move || {
-        let mut ports = Vec::new();
+        let mut ports = extra.to_vec();
         if let Some(p) = browser.upgrade().and_then(|b| b.debugging_port()) {
             ports.push(p);
         }
@@ -1117,7 +1129,7 @@ impl Inner {
     }
 
     async fn judge_navigation(&self, policy: &SessionPolicy, url: &str) -> Result<(), RpcError> {
-        let own_ports = own_ports_fn(&self.browser, &self.proxy)();
+        let own_ports = own_ports_fn(&self.browser, &self.proxy, &self.extra_own_ports)();
         match judge_request(url, policy, &own_ports, &self.resolver).await {
             Verdict::Allow => Ok(()),
             Verdict::Deny(reason) => Err(rpc_error(

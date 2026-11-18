@@ -641,6 +641,7 @@ pub async fn client(endpoint: &pegboard_core::proxy::server::Endpoint) -> CdpCon
 use pegboard_core::profiles::Profiles;
 use pegboard_core::proxy::server::{Endpoint, ProxyServer, WsUpstream};
 use pegboard_core::recording::recorder::{Recorder, RecorderOptions};
+use pegboard_core::recording::replay::ReplayServer;
 use pegboard_core::runner::Runner;
 use pegboard_core::session::SessionManager;
 use pegboard_protocol::{
@@ -714,6 +715,8 @@ pub struct Shared {
     /// The manager's recorder: it records a session's screen only once a test calls
     /// `begin_session`.
     pub recorder: Arc<Recorder>,
+    /// Serves replay pages of recordings under `env.paths` (`grant` gives a link).
+    pub replay: Arc<ReplayServer>,
     agent: tokio::sync::OnceCell<(String, Arc<pegboard_core::bridge::Bridge>)>,
 }
 
@@ -771,6 +774,8 @@ impl Shared {
             human_context: browser.human_context.clone(),
             config: Default::default(),
         });
+        // The replay server of this home; its port is one of pegboard's own, as in the daemon.
+        let replay = ReplayServer::start(env.paths.clone()).await.unwrap();
         let manager = SessionManager::new(
             browser.clone(),
             proxy.clone(),
@@ -778,6 +783,7 @@ impl Shared {
             env.paths.clone(),
             env.cfg.clone(),
             recorder.clone(),
+            vec![replay.port()],
         );
         let runner = Arc::new(Runner::new(env.paths.clone()).unwrap());
         let scope = proxy.clone();
@@ -791,6 +797,7 @@ impl Shared {
             manager,
             runner,
             recorder,
+            replay,
             agent: tokio::sync::OnceCell::new(),
         }
     }

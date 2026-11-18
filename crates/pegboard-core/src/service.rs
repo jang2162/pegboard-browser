@@ -28,6 +28,7 @@ use crate::profiles::{rpc_error, Profiles};
 use crate::proxy::server::{ProxyServer, WsUpstream};
 use crate::recording::config::RecordingConfig;
 use crate::recording::recorder::{Recorder, RecorderOptions};
+use crate::recording::replay::ReplayServer;
 use crate::recording::store::RecordingStore;
 use crate::runner::{Runner, AGENT_BROWSER_VERSION};
 use crate::session::SessionManager;
@@ -115,6 +116,8 @@ pub struct Daemon {
     recorder: Arc<Recorder>,
     /// The recordings on disk and their retention.
     store: Arc<RecordingStore>,
+    /// Serves the replay page (`recording.open`); its tokens end with the daemon.
+    replay: Arc<ReplayServer>,
     /// Kept alive for the daemon's lifetime (it serves the session endpoints).
     _proxy: Arc<ProxyServer>,
     chrome_version: String,
@@ -346,6 +349,12 @@ struct KeepParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OpenParams {
+    recording_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeleteParams {
     recording_id: String,
 }
@@ -412,6 +421,8 @@ impl Daemon {
             human_context: browser.human_context.clone(),
             config: recording,
         });
+        // Before the sessions: its port is one of pegboard's own, which they never reach.
+        let replay = ReplayServer::start(paths.clone()).await?;
         let sessions = SessionManager::new(
             browser.clone(),
             proxy.clone(),
@@ -419,6 +430,7 @@ impl Daemon {
             paths.clone(),
             cfg,
             recorder.clone(),
+            vec![replay.port()],
         );
         // Once, here: it is what lets the runner tell `tab_gone` from other failures.
         runner.set_session_targets_provider(sessions.targets_fn());
@@ -431,6 +443,7 @@ impl Daemon {
             runner,
             recorder,
             store,
+            replay,
             _proxy: proxy,
             chrome_version,
             slots: Mutex::new(HashMap::new()),
@@ -697,6 +710,18 @@ impl Daemon {
                 let p: RecordingParams = params(p)?;
                 let (manifest, actions) = self.store.get(&p.recording_id)?;
                 Ok(json!({ "manifest": manifest, "actions": actions }))
+            }
+            // Owner method (the CLI only): a link to the replay page of a recording, for the
+            // person's own browser.
+            "recording.open" => {
+                let p: OpenParams = params(p)?;
+                // Checks the id and that the recording is there (and not being deleted).
+                self.store.get(&p.recording_id)?;
+                let (url, expires) = self.replay.grant(&p.recording_id);
+                let expires_at = expires
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+                Ok(json!({ "url": url, "expiresAt": expires_at }))
             }
             // Owner methods: what a person decides about recordings (the CLI, and
             // `pegboard mcp --operator`).
@@ -1031,6 +1056,8 @@ impl Daemon {
         }
         *done = true;
         self.stopping.store(true, Ordering::SeqCst);
+        // No replay link outlives the daemon.
+        self.replay.revoke_all();
         let slots: Vec<(SessionId, Arc<Slot>)> = self.slots.lock().unwrap().drain().collect();
         let browser_alive = !self.browser.has_exited();
         for (id, slot) in slots {
@@ -1179,6 +1206,8 @@ mod tests {
 
     #[test]
     fn owner_recording_methods_refuse_misspelt_fields() {
+        assert!(params::<OpenParams>(&json!({"recordingId": "r_abcdefgh"})).is_ok());
+        assert!(params::<OpenParams>(&json!({"recordingId": "r_abcdefgh", "agent": 1})).is_err());
         assert!(params::<KeepParams>(&json!({"recordingId": "r_abcdefgh", "keep": true})).is_ok());
         assert!(params::<KeepParams>(&json!({"recordingId": "r_abcdefgh"})).is_err());
         assert!(

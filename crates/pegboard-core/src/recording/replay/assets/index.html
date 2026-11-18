@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>pegboard 녹화 재생</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="head">
+  <h1 id="title">녹화</h1>
+  <p id="summary"></p>
+</header>
+<p id="error" hidden></p>
+<main id="main">
+  <section id="stage" aria-label="화면">
+    <div id="screen">
+      <img id="frame" alt="그 시점의 화면" hidden>
+      <p id="no-frame" hidden></p>
+    </div>
+    <p id="frame-info"></p>
+    <div id="controls">
+      <div id="tabs" role="group" aria-label="탭"></div>
+      <div id="sides">
+        <button id="before" type="button">◀ 직전</button>
+        <button id="after" type="button">직후 ▶</button>
+      </div>
+    </div>
+    <div id="timeline" role="group" aria-label="시간축"></div>
+    <details id="extras">
+      <summary>네트워크 · 콘솔 (이 동작 전후)</summary>
+      <ol id="extra-lines"></ol>
+    </details>
+  </section>
+  <aside id="list-pane" aria-label="동작 목록">
+    <h2>동작 목록</h2>
+    <ol id="actions"></ol>
+  </aside>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
