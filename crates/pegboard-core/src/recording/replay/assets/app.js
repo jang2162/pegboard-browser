@@ -65,6 +65,7 @@ const state = {
   index: 0, // the selected action
   side: 'before',
   tab: null, // the tab shown; null: the selected action's
+  lastMark: null, // the timeline mark clicked last, while nothing else was chosen since
 };
 
 // ---- helpers ----
@@ -185,8 +186,9 @@ function renderTimeline() {
     mark.style.left = where + '%';
     mark.addEventListener('click', () => {
       // First the screen before; once more, the screen after.
-      const again = state.index === i && state.side === 'before' && state.tab === null;
+      const again = state.lastMark === i && state.side === 'before' && state.tab === null;
       select(i, again ? 'after' : 'before');
+      state.lastMark = i;
     });
     line.append(mark);
   });
@@ -222,6 +224,7 @@ function renderTabs(shown, ts) {
     b.addEventListener('click', () => {
       const a = state.actions[state.index];
       state.tab = a && a.targetId === target ? null : target;
+      state.lastMark = null;
       show();
     });
     box.append(b);
@@ -319,6 +322,7 @@ function select(i, side) {
   state.index = i;
   state.side = side;
   state.tab = null;
+  state.lastMark = null;
   show();
 }
 
@@ -337,10 +341,12 @@ function start(model) {
     if (!$('frame').hidden) showNoFrame('missing');
   });
   $('before').addEventListener('click', () => {
+    state.lastMark = null;
     state.side = 'before';
     show();
   });
   $('after').addEventListener('click', () => {
+    state.lastMark = null;
     state.side = 'after';
     show();
   });

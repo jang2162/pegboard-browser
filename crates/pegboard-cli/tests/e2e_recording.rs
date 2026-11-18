@@ -2355,3 +2355,258 @@ fn delete_refuses_a_running_recording_and_removes_a_finished_one() {
     let (code, _, err) = home.run(&["recording", "delete", "../../etc"]);
     assert_eq!(code, 2, "{err}");
 }
+
+// The replay page (task 7).
+
+/// `recording open <rid>` with the open log hook: its exit code, stderr and the URL it logged
+/// (the last line of `log`).
+fn open_logged(home: &Home, rid: &str, log: &Path) -> (i32, String, Option<String>) {
+    let log_text = log.to_str().unwrap();
+    let (code, out, err) = home.run_env(
+        &[
+            ("PEGBOARD_TEST_HOOKS", "1"),
+            ("PEGBOARD_TEST_OPEN_LOG", log_text),
+        ],
+        &["recording", "open", rid],
+    );
+    if code == 0 {
+        assert_eq!(
+            out.trim(),
+            format!("opened {rid} in the default browser (the link works for 30 minutes)"),
+            "{err}"
+        );
+    }
+    let url = std::fs::read_to_string(log)
+        .ok()
+        .and_then(|t| t.lines().last().map(String::from));
+    (code, err, url)
+}
+
+/// The port and path of a replay link, checked to be `http://127.0.0.1:<port>/r/<token>/`.
+fn replay_parts(url: &str) -> (u16, String) {
+    let rest = url.strip_prefix("http://127.0.0.1:").expect(url);
+    let (port, path) = rest.split_once('/').expect(url);
+    let token = path
+        .strip_prefix("r/")
+        .and_then(|p| p.strip_suffix('/'))
+        .expect(url);
+    assert_eq!(token.len(), 52, "{url}");
+    assert!(token
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)));
+    (port.parse().expect(url), format!("/{path}"))
+}
+
+/// A GET to the replay server as a browser on this machine sends it: the status and body,
+/// or None when nothing listens there.
+fn replay_get(port: u16, path: &str) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").ok()?;
+    let mut all = Vec::new();
+    s.read_to_end(&mut all).ok()?;
+    let text = String::from_utf8_lossy(&all).into_owned();
+    let code = text.get(9..12)?.parse().ok()?;
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string())?;
+    Some((code, body))
+}
+
+/// A fetch of `url` from the page: `REACHED` when it got an answer (opaque or not),
+/// `FAIL:...` when it failed. Stored in `window.__pegReplay` once settled.
+fn fetch_into_window(url: &str) -> String {
+    format!(
+        "(() => {{ window.__pegReplay = null; Promise.race([fetch('{url}', {{mode: 'no-cors'}}).then(() => 'REACHED', e => 'FAIL:' + e.message), \
+         new Promise(r => setTimeout(() => r('TIMEOUT'), 5000))]).then(v => {{ window.__pegReplay = v; }}); return 'started'; }})()"
+    )
+}
+
+/// What `fetch_into_window(url)` settled on in the session's page.
+fn fetched(home: &Home, handle: &str, url: &str) -> String {
+    assert_eq!(eval(home, handle, &fetch_into_window(url)), "started");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(v) = eval(home, handle, "window.__pegReplay").as_str() {
+            return v.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fetch of {url} did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A fresh recording id for a planted recording.
+fn planted_id(prefix: &str) -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tail: String = (0..8 - prefix.len())
+        .map(|i| (b'a' + ((n >> (5 * i)) % 26) as u8) as char)
+        .collect();
+    format!("r_{prefix}{tail}")
+}
+
+#[test]
+#[ignore]
+fn recording_open_gives_a_loopback_link_for_that_recording() {
+    let home = shared_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("open.log");
+    let rid = planted_id("open");
+    plant_format_1(home, &rid, 0, false);
+    let other = planted_id("othr");
+    plant_format_1(home, &other, 0, false);
+
+    let (code, err, url) = open_logged(home, &rid, &log);
+    assert_eq!(code, 0, "{err}");
+    let url = url.expect("the link was logged");
+    let (port, path) = replay_parts(&url);
+    let (status, page) = replay_get(port, &path).expect("the replay server answers");
+    assert_eq!(status, 200);
+    assert!(page.contains("app.js"), "{page}");
+    let (status, data) = replay_get(port, &format!("{path}data")).unwrap();
+    assert_eq!(status, 200);
+    assert!(
+        data.contains(&format!("\"recordingId\":\"{rid}\"")),
+        "{data}"
+    );
+    assert!(!data.contains(&other), "{data}");
+
+    // Each open gives a new token; both work.
+    let (code, err, second) = open_logged(home, &rid, &log);
+    assert_eq!(code, 0, "{err}");
+    let second = second.unwrap();
+    assert_ne!(second, url);
+    assert_eq!(replay_parts(&second).0, port);
+    assert_eq!(replay_get(port, &replay_parts(&second).1).unwrap().0, 200);
+    assert_eq!(replay_get(port, &path).unwrap().0, 200);
+    // The hook took the place of `open`: exactly the two links were logged, nothing else.
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+
+    // A recording that is not there, and a malformed id.
+    let (code, err, _) = open_logged(home, "r_nothere2", &log);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("recording_not_found"), "{err}");
+    let (code, _, err) = home.run(&["recording", "open", "../../etc"]);
+    assert_eq!(code, 2, "{err}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+}
+
+#[test]
+#[ignore]
+fn agent_session_cannot_reach_the_replay_server() {
+    let home = shared_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("open.log");
+    let rid = planted_id("agnt");
+    plant_format_1(home, &rid, 0, false);
+    let (code, err, url) = open_logged(home, &rid, &log);
+    assert_eq!(code, 0, "{err}");
+    let url = url.unwrap();
+    let (port, path) = replay_parts(&url);
+    let data = format!("http://127.0.0.1:{port}{path}data");
+    // The link is live (for the person).
+    assert_eq!(replay_get(port, &format!("{path}data")).unwrap().0, 200);
+
+    let page = format!("{}/settle", fixture());
+    for options in [
+        &[][..],
+        &["--allow-private-network"][..],
+        &["--allow-domain", "127.0.0.1"][..],
+    ] {
+        let h = create_with(home, &page, options);
+        for args in [vec!["open", url.as_str()], vec!["tab", "new", url.as_str()]] {
+            let (code, out, err) = home.run_limited(&[("PEGBOARD_SESSION", h.as_str())], &args, 90);
+            assert_ne!(code, 0, "{options:?} {args:?}: {out}");
+            assert!(
+                err.contains("policy_denied") && err.contains("pegboard's own port"),
+                "{options:?} {args:?}: {err}"
+            );
+        }
+        for target in [data.as_str(), url.as_str()] {
+            let got = fetched(home, &h, target);
+            assert!(got.starts_with("FAIL:"), "{options:?} {target}: {got}");
+        }
+        // Positive control: the page's own server answers the same fetch.
+        assert_eq!(fetched(home, &h, &page), "REACHED", "{options:?}");
+        close(home, &h);
+    }
+
+    // Through MCP too.
+    let mut mcp = common::mcp::Mcp::start(home, &["--tools", "all"]);
+    let id = mcp.create(json!({ "url": page }));
+    for (tool, args) in [
+        ("pegboard_open", json!({ "sessionId": id, "url": url })),
+        (
+            "pegboard_tab",
+            json!({ "sessionId": id, "command": "new", "url": url }),
+        ),
+    ] {
+        let (is_error, text) = mcp.call(tool, args);
+        assert!(
+            is_error && text.starts_with("policy_denied: ") && text.contains("pegboard's own port"),
+            "{tool}: {text}"
+        );
+    }
+    let (is_error, text) = mcp.call(
+        "pegboard_eval",
+        json!({ "sessionId": id, "expression": fetch_into_window(&data) }),
+    );
+    assert!(!is_error && text.contains("started"), "{text}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let text = loop {
+        let (_, text) = mcp.call(
+            "pegboard_eval",
+            json!({ "sessionId": id, "expression": "window.__pegReplay || 'PENDING'" }),
+        );
+        if !text.contains("PENDING") {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fetch did not settle: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        text.contains("FAIL:") && !text.contains("REACHED"),
+        "{text}"
+    );
+    let (is_error, text) = mcp.call("pegboard_session_close", json!({ "sessionId": id }));
+    assert!(!is_error, "{text}");
+}
+
+#[test]
+#[ignore]
+fn tokens_end_with_the_daemon() {
+    let home = screen_home("");
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("open.log");
+    let rid = planted_id("dmon");
+    plant_format_1(&home, &rid, 0, false);
+    let (code, err, url) = open_logged(&home, &rid, &log);
+    assert_eq!(code, 0, "{err}");
+    let (port, path) = replay_parts(&url.unwrap());
+    assert_eq!(replay_get(port, &path).unwrap().0, 200);
+    let (code, _, err) = home.run(&["browser", "stop"]);
+    assert_eq!(code, 0, "{err}");
+    // Stopped: nothing answers the old link.
+    assert!(
+        replay_get(port, &path).is_none_or(|(code, _)| code == 404),
+        "the link outlived its daemon"
+    );
+    start_screen_daemon(&home, "", &[]);
+    // A new daemon (even if its server got the same port) does not know the old token.
+    assert!(
+        replay_get(port, &path).is_none_or(|(code, _)| code == 404),
+        "the link works with the next daemon"
+    );
+    // Its own links work.
+    let (code, err, url) = open_logged(&home, &rid, &log);
+    assert_eq!(code, 0, "{err}");
+    let (port, path) = replay_parts(&url.unwrap());
+    assert_eq!(replay_get(port, &path).unwrap().0, 200);
+}
