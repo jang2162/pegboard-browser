@@ -1706,54 +1706,165 @@ fn a_tab_switch_outside_a_command_is_marked_possible() {
     assert_eq!(marks[0]["targetId"], first.as_str());
 }
 
+/// Stops the bridge worker of the profile `target` is in, as Chrome stops an idle one, and
+/// waits until its target is gone (the premise of the tests below). Tried in turn:
+/// `Target.closeTarget` on the worker (how Puppeteer's `worker.close()` simulates the
+/// termination of an extension's service worker), then `ServiceWorker.stopWorker` of its
+/// version from a page of the profile. Returns the old worker's target id and the method
+/// that worked (printed, for the record).
+fn stop_bridge_worker(person: &Person, target: &str) -> (String, &'static str) {
+    let old = person.bridge_worker(target).expect("no bridge worker");
+    let gone = |limit: Duration| {
+        let deadline = Instant::now() + limit;
+        loop {
+            if person.bridge_worker(target).as_deref() != Some(old.as_str()) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let _ = person.rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            person
+                .conn
+                .send("Target.closeTarget", json!({ "targetId": old }), None),
+        )
+        .await
+    });
+    if gone(Duration::from_secs(3)) {
+        eprintln!("stopped the bridge worker with Target.closeTarget");
+        return (old, "closeTarget");
+    }
+    // The version of the worker, from the page's ServiceWorker domain.
+    let mut events = person.conn.events();
+    let stopped = person.on(target, |p, s| {
+        p.send("ServiceWorker.enable", json!({}), Some(s));
+        let version = p.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let Ok(e) = events.recv().await else {
+                        return None;
+                    };
+                    if e.method != "ServiceWorker.workerVersionUpdated" {
+                        continue;
+                    }
+                    for v in e.params["versions"].as_array().into_iter().flatten() {
+                        if v["targetId"] == old.as_str()
+                            || v["scriptURL"]
+                                .as_str()
+                                .is_some_and(|u| u.ends_with("/sw.js"))
+                                && v["runningStatus"] == "running"
+                        {
+                            return v["versionId"].as_str().map(String::from);
+                        }
+                    }
+                }
+            })
+            .await
+            .ok()
+            .flatten()
+        });
+        let Some(version) = version else {
+            return false;
+        };
+        let _ = p.rt.block_on(p.conn.send(
+            "ServiceWorker.stopWorker",
+            json!({ "versionId": version }),
+            Some(s),
+        ));
+        true
+    });
+    assert!(
+        stopped && gone(Duration::from_secs(3)),
+        "premise: neither Target.closeTarget nor ServiceWorker.stopWorker stopped the bridge worker"
+    );
+    eprintln!("stopped the bridge worker with ServiceWorker.stopWorker");
+    (old, "stopWorker")
+}
+
 #[test]
 #[ignore]
 fn a_tab_switch_after_the_bridge_worker_restarted_is_marked() {
+    // A browser of its own: a test that stops the bridge's worker never touches the
+    // shared one (the home is dropped, with its browser, at the end).
     let origin = fixture();
-    let home = shared_home();
-    let h = create(home, &format!("{origin}/counter"));
-    let first = targets(home, &h)[0].clone();
-    in_front_of(home, &h, &first, &format!("{origin}/marker"));
-    let person = Person::connect(home);
-    let old = person.bridge_worker(&first).expect("no bridge worker");
-    // The worker starts again (as after Chrome stopped it): the binding is gone with it.
-    // The switch below may be what wakes the new worker (then it keeps the switch until the
-    // daemon binds it again, spike H8) or come after the daemon bound it.
-    person.on(&old, |p, s| {
-        // The worker goes away with the call: its answer may never come.
-        // The timer is made inside the runtime (a tokio timer needs one).
-        let _ = p.rt.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                p.conn.send(
-                    "Runtime.evaluate",
-                    json!({ "expression": "chrome.runtime.reload()" }),
-                    Some(s),
-                ),
-            )
-            .await
-        });
-    });
+    let home = screen_home(SCREEN_OFF_CONFIG);
+    let h = create(&home, &format!("{origin}/counter"));
+    let first = targets(&home, &h)[0].clone();
+    in_front_of(&home, &h, &first, &format!("{origin}/marker"));
     std::thread::sleep(Duration::from_secs(2));
+    let person = Person::connect(&home);
+    let (old, how) = stop_bridge_worker(&person, &first);
+    // The switch is what wakes the worker again (Chrome starts a stopped extension worker
+    // for an event it listens to); it keeps the switch until the daemon binds it (spike H8).
     person.activate(&first);
     let deadline = Instant::now() + Duration::from_secs(10);
     let new = loop {
         match person.bridge_worker(&first) {
             Some(w) if w != old => break w,
-            _ if Instant::now() > deadline => panic!("premise: the bridge worker did not restart"),
+            _ if Instant::now() > deadline => {
+                panic!("premise: no new bridge worker after the switch ({how})")
+            }
             _ => std::thread::sleep(Duration::from_millis(200)),
         }
     };
     std::thread::sleep(Duration::from_secs(2));
     // Marked before any command made the daemon talk to the new worker.
-    let dir = recording_dir(home, &h);
+    let dir = recording_dir(&home, &h);
     let marks = human_entries(&dir);
     // The bridge still works after its worker restarted.
-    ok(home, &h, &["tab", "new", &format!("{origin}/counter")]);
-    close(home, &h);
-    assert_eq!(marks.len(), 1, "worker {old} -> {new}: {marks:?}");
+    ok(&home, &h, &["tab", "new", &format!("{origin}/counter")]);
+    close(&home, &h);
+    assert_eq!(marks.len(), 1, "worker {old} -> {new} ({how}): {marks:?}");
     assert_eq!(marks[0]["what"], "switched to this tab");
     assert_eq!(marks[0]["targetId"], first.as_str());
+}
+
+#[test]
+#[ignore]
+fn a_bridge_call_after_its_worker_stopped_recovers_at_once() {
+    // The daemon must not wait on a session whose worker is gone: the next call that needs
+    // the bridge finds the worker stopped, starts it again and goes on.
+    let origin = fixture();
+    let home = screen_home(SCREEN_OFF_CONFIG);
+    let h = create(&home, &format!("{origin}/counter"));
+    let first = targets(&home, &h)[0].clone();
+    let person = Person::connect(&home);
+    let (old, how) = stop_bridge_worker(&person, &first);
+    // Nothing else happens in the profile: no event wakes the worker.
+    let started = Instant::now();
+    let (code, _, err) = home.run_limited(
+        &[("PEGBOARD_SESSION", h.as_str())],
+        &["tab", "new", &format!("{origin}/marker")],
+        90,
+    );
+    let took = started.elapsed();
+    let log = std::fs::read_to_string(home.path().join("daemon.log")).unwrap_or_default();
+    let bridge_lines: Vec<&str> = log.lines().filter(|l| l.contains("bridge")).collect();
+    assert_eq!(
+        code, 0,
+        "tab new after the worker stopped ({how}): {err}\n{bridge_lines:?}"
+    );
+    assert!(
+        took < Duration::from_secs(10),
+        "tab new took {took:?} ({how}): {bridge_lines:?}"
+    );
+    assert!(
+        person.bridge_worker(&first).is_some_and(|w| w != old),
+        "no new worker"
+    );
+    // Closing the session (the bridge closes its tabs) works too.
+    close(&home, &h);
+    assert!(
+        bridge_lines
+            .iter()
+            .any(|l| l.contains("attached again to its worker")),
+        "{bridge_lines:?}"
+    );
 }
 
 #[test]
