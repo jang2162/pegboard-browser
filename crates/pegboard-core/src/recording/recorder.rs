@@ -68,6 +68,9 @@ const CAPTURE_MAX_WIDTH: f64 = 1280.0;
 /// A capture that ran out of the limit counts as a frozen screen only if it had at least
 /// this long itself (not when waiting for the tab used up the limit).
 const FROZEN_MIN_CAPTURE: Duration = Duration::from_millis(250);
+/// How much later than `CAPTURE_LIMIT` the hard stop of `after_command` comes (its steps'
+/// own limits come first, so a frozen tab is still marked).
+const LIMIT_GRACE: Duration = Duration::from_millis(20);
 /// Between two looks at a tab that is being attached.
 const TICKET_POLL: Duration = Duration::from_millis(5);
 
@@ -690,19 +693,35 @@ impl Recorder {
     ) -> Option<AfterFrame> {
         let target = target?;
         let started = Instant::now();
+        // The steps keep to the limit themselves (and mark a frozen tab first); this makes
+        // the bound hold whatever a step does.
+        let hard = tokio::time::Instant::from_std(started + CAPTURE_LIMIT + LIMIT_GRACE);
+        tokio::time::timeout_at(hard, self.capture_after(id, target, started))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn capture_after(
+        self: &Arc<Self>,
+        id: &SessionId,
+        target: &str,
+        started: Instant,
+    ) -> Option<AfterFrame> {
         let deadline = started + CAPTURE_LIMIT;
         if !self.state().health.may_capture(target, started) {
             return None;
         }
-        let ticket =
-            match tokio::time::timeout(CAPTURE_LIMIT, self.ticket_when_ready(id, target)).await {
-                Ok(ticket) => ticket?,
-                Err(_) => {
-                    // The tab did not settle (attach, or what it shows) within the limit.
-                    self.state().health.timed_out(target, Instant::now());
-                    return None;
-                }
-            };
+        let until = tokio::time::Instant::from_std(deadline);
+        let ticket = match tokio::time::timeout_at(until, self.ticket_when_ready(id, target)).await
+        {
+            Ok(ticket) => ticket?,
+            Err(_) => {
+                // The tab did not settle (attach, or what it shows) within the limit.
+                self.state().health.timed_out(target, Instant::now());
+                return None;
+            }
+        };
         let ready = Instant::now();
         let left = deadline.saturating_duration_since(ready);
         let (data, before) = match tokio::time::timeout(left, self.capture(&ticket)).await {
@@ -2880,5 +2899,79 @@ mod tests {
         // A new connection whose attach has not come yet: the old attach says nothing.
         r.state().epoch += 1;
         assert_eq!(r.before_command(&id, Some(T1)), None);
+    }
+
+    /// A browser stand-in on a local websocket. `answer`: replies to the capture's requests
+    /// after sending `events_first` events (never handled: the rig runs no event loop);
+    /// otherwise it never replies.
+    async fn fake_browser(answer: bool, events_first: usize) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                if !answer {
+                    continue;
+                }
+                let v: Value = serde_json::from_str(&t).unwrap();
+                for _ in 0..events_first {
+                    let e = json!({ "method": "Page.x", "params": {} });
+                    ws.send(Message::text(e.to_string())).await.unwrap();
+                }
+                let result = match v["method"].as_str() {
+                    Some("Page.getLayoutMetrics") => metrics(1200, 1200),
+                    _ => json!({ "data": frame(1) }),
+                };
+                let reply = json!({ "id": v["id"], "result": result });
+                ws.send(Message::text(reply.to_string())).await.unwrap();
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn rig_on(dir: &std::path::Path, url: &str) -> (Arc<Recorder>, SessionId) {
+        let (r, id, _manifest) = rig(dir, "http://a.test/");
+        let (conn, _queue) = CdpConn::connect_queued(url).await.unwrap();
+        r.state().conn = Some(conn);
+        (r, id)
+    }
+
+    /// The bound of design 4.6 holds whatever the browser does: no answer at all, or an
+    /// answer whose earlier events are never handled.
+    #[tokio::test]
+    async fn a_command_never_waits_longer_than_the_capture_limit() {
+        let cap = CAPTURE_LIMIT + Duration::from_millis(100);
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id) = rig_on(tmp.path(), &fake_browser(false, 0).await).await;
+        let t = Instant::now();
+        assert!(r.after_command(&id, Some(T1)).await.is_none());
+        let first = t.elapsed();
+        assert!(
+            first >= CAPTURE_LIMIT - Duration::from_millis(20) && first < cap,
+            "{first:?}"
+        );
+        // Timed out: frozen, so the next command does not wait at all.
+        let t = Instant::now();
+        assert!(r.after_command(&id, Some(T1)).await.is_none());
+        assert!(t.elapsed() < Duration::from_millis(20), "{:?}", t.elapsed());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id) = rig_on(tmp.path(), &fake_browser(true, 3).await).await;
+        let t = Instant::now();
+        assert!(r.after_command(&id, Some(T1)).await.is_none());
+        let waited = t.elapsed();
+        assert!(waited < cap, "{waited:?}");
+    }
+
+    /// With every event before the answer handled, the same browser gives a frame.
+    #[tokio::test]
+    async fn an_answered_capture_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id) = rig_on(tmp.path(), &fake_browser(true, 0).await).await;
+        let after = r.after_command(&id, Some(T1)).await.unwrap();
+        assert_eq!(after.name, format!("{T1}/000001.jpg"));
     }
 }

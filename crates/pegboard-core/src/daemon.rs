@@ -241,6 +241,7 @@ pub async fn run_command_with_hook(
     };
 
     let had_no_tab = sessions.info(id).is_ok_and(|i| i.targets.is_empty());
+    let exec_started = Instant::now();
     let mut outcome = match &endpoint {
         Ok(ep) => runner.exec(id, ep, &run_argv, timeout_ms).await,
         Err(e) => Err(e.clone()),
@@ -253,6 +254,7 @@ pub async fn run_command_with_hook(
             sessions.close_blank_tabs_except(id, &bound).await;
         }
     }
+    let exec_time = exec_started.elapsed();
     after_exec.await;
 
     // After: the focus may have moved (a submit, a script that blurs); anything unclear
@@ -263,14 +265,6 @@ pub async fn run_command_with_hook(
         timed(probe(sessions, id)),
         timed(recorder.after_command(id, after_target.as_deref()))
     );
-    if crate::testenv::hooks() {
-        eprintln!(
-            "pegboard: command {}: probe {:.1} ms, frame after {:.1} ms",
-            entry.command,
-            probe_time.as_secs_f64() * 1000.0,
-            after_time.as_secs_f64() * 1000.0,
-        );
-    }
     let succeeded = matches!(&outcome, Ok(r) if succeeded(r));
     let hide_typed =
         types_text && !(harmless_before && succeeded && !probe.failed && !probe.sensitive);
@@ -291,6 +285,19 @@ pub async fn run_command_with_hook(
     entry.redacted = hide_typed || !at.always.is_empty() || eval_masked(argv, &entry.args);
     entry.frame_before = frame_before;
     entry.duration_ms = elapsed_ms(started);
+    if crate::testenv::hooks() {
+        // Where the command's time went (the probe and the frame after run at once).
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        eprintln!(
+            "pegboard: command {}: checks {:.1} ms, exec {:.1} ms, probe {:.1} ms, frame after {:.1} ms, total {} ms",
+            entry.command,
+            ms(exec_started.duration_since(started)),
+            ms(exec_time),
+            ms(probe_time),
+            ms(after_time),
+            entry.duration_ms,
+        );
+    }
     entry.ok = succeeded;
     // An expression's error can quote page values (a JSON parse error shows the text).
     entry.error = error_text(entry.redacted, is_expression_command(argv), &outcome);
