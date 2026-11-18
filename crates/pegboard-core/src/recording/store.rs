@@ -4,12 +4,15 @@
 //! One lock orders everything that judges "running" against what changes a recording:
 //! opening and finishing one, keeping, deleting and pruning. So a recording cannot start
 //! running while it is being deleted, and a live recording's manifest is only ever changed
-//! through its `ManifestHandle`.
+//! through its `ManifestHandle`. Removing files (which may be gigabytes of frames) happens
+//! outside the lock: under it a recording is marked as going, which keeps every other call
+//! away from it (a recording going whole is no longer listed, kept or read), and the mark is
+//! cleared under it again once the files are gone.
 //!
 //! Only real directories directly under `recordings/` whose name is a recording id are read
 //! or deleted; a symbolic link is never followed, here or inside a recording.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -32,8 +35,35 @@ pub struct RecordingStore {
     paths: Paths,
     /// Parsed once when the daemon started.
     config: RecordingConfig,
+    state: Mutex<State>,
+    /// Removes a directory tree (`remove_dir_all`; slowed down in tests).
+    remove_tree: Remover,
+}
+
+type Remover = Box<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+
+/// What the store's lock guards.
+#[derive(Default)]
+struct State {
     /// The manifests of the recordings being written, by recording id.
-    running: Mutex<HashMap<String, ManifestHandle>>,
+    running: HashMap<String, ManifestHandle>,
+    /// Recordings whose files are being removed outside the lock: `Whole` ones count as
+    /// gone already; a `Screen` one is listed and may be kept meanwhile.
+    going: HashMap<String, Going>,
+    /// Recordings whose unreadable manifest was told in daemon.log (once per daemon run).
+    told: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Going {
+    Whole,
+    Screen,
+}
+
+impl State {
+    fn gone(&self, id: &str) -> bool {
+        self.going.get(id) == Some(&Going::Whole)
+    }
 }
 
 /// The code an entry's `error` starts with (`policy_denied`, `timeout`, ...): what comes
@@ -202,10 +232,19 @@ struct Found {
 
 impl RecordingStore {
     pub fn new(paths: Paths, config: RecordingConfig) -> Arc<RecordingStore> {
+        RecordingStore::with_remover(paths, config, Box::new(|p| std::fs::remove_dir_all(p)))
+    }
+
+    fn with_remover(
+        paths: Paths,
+        config: RecordingConfig,
+        remove_tree: Remover,
+    ) -> Arc<RecordingStore> {
         Arc::new(RecordingStore {
             paths,
             config,
-            running: Mutex::new(HashMap::new()),
+            state: Mutex::new(State::default()),
+            remove_tree,
         })
     }
 
@@ -213,22 +252,29 @@ impl RecordingStore {
         &self.config
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, ManifestHandle>> {
-        self.running.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Creates the recording (see `ActionLog::open`) and registers it as running.
     pub fn open(&self, manifest: Manifest) -> std::io::Result<ActionLog> {
-        let mut running = self.lock();
+        let mut st = self.lock();
+        if st.going.contains_key(&manifest.recording_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("recording {} is being deleted", manifest.recording_id),
+            ));
+        }
         let log = ActionLog::open(&self.paths, manifest)?;
-        running.insert(log.manifest().recording_id, log.manifest_handle());
+        st.running
+            .insert(log.manifest().recording_id, log.manifest_handle());
         Ok(log)
     }
 
     /// Writes the end time and the sizes into the manifest (through its handle) and
     /// unregisters the recording, also when the manifest could not be written.
     pub fn finish(&self, log: &mut ActionLog, ended_at: &str) -> std::io::Result<()> {
-        let mut running = self.lock();
+        let mut st = self.lock();
         let sizes = measure(log.dir()).ok();
         let written = log.manifest_handle().update(|m| {
             m.ended_at = Some(ended_at.to_string());
@@ -236,7 +282,7 @@ impl RecordingStore {
                 m.sizes = sizes;
             }
         });
-        running.remove(&log.manifest().recording_id);
+        st.running.remove(&log.manifest().recording_id);
         written
     }
 
@@ -252,6 +298,15 @@ impl RecordingStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(not_found(id)),
             Err(e) => Err(internal(e)),
         }
+    }
+
+    /// `dir_of`, for a recording that is not going whole.
+    fn present_dir(&self, st: &State, id: &str) -> Result<PathBuf, RpcError> {
+        let dir = self.dir_of(id)?;
+        if st.gone(id) {
+            return Err(not_found(id));
+        }
+        Ok(dir)
     }
 
     /// The recording directories: real directories directly under `recordings/` named like
@@ -281,13 +336,8 @@ impl RecordingStore {
     }
 
     /// The recording `id`, with its manifest (a running one's as its writers hold it).
-    fn found(
-        &self,
-        running: &HashMap<String, ManifestHandle>,
-        id: &str,
-        dir: PathBuf,
-    ) -> std::io::Result<Found> {
-        let (manifest, live) = match running.get(id) {
+    fn found(&self, st: &State, id: &str, dir: PathBuf) -> std::io::Result<Found> {
+        let (manifest, live) = match st.running.get(id) {
             Some(handle) => (handle.get(), true),
             None => (manifest_of(&dir)?, false),
         };
@@ -309,18 +359,18 @@ impl RecordingStore {
         })
     }
 
-    /// Every recording whose manifest can be read; the others are told in daemon.log when
-    /// `tell` and left out.
-    fn all(
-        &self,
-        running: &HashMap<String, ManifestHandle>,
-        tell: bool,
-    ) -> std::io::Result<Vec<Found>> {
+    /// Every recording whose manifest can be read, except those going whole (and, with
+    /// `skip_going`, except every going one). An unreadable one is told in daemon.log once
+    /// per daemon run when `tell`, and left out.
+    fn all(&self, st: &mut State, tell: bool, skip_going: bool) -> std::io::Result<Vec<Found>> {
         let mut found = Vec::new();
         for (id, dir) in self.dirs()? {
-            match self.found(running, &id, dir) {
+            if st.gone(&id) || (skip_going && st.going.contains_key(&id)) {
+                continue;
+            }
+            match self.found(st, &id, dir) {
                 Ok(f) => found.push(f),
-                Err(e) if tell => {
+                Err(e) if tell && st.told.insert(id.clone()) => {
                     eprintln!(
                         "pegboard: recording {id} is left alone: its manifest cannot be read: {e}"
                     )
@@ -339,8 +389,8 @@ impl RecordingStore {
     /// Every recording, oldest first, and their bytes.
     pub fn list(&self) -> std::io::Result<RecordingList> {
         let found = {
-            let running = self.lock();
-            self.all(&running, false)?
+            let mut st = self.lock();
+            self.all(&mut st, false, false)?
         };
         let mut recordings: Vec<RecordingSummary> =
             found.iter().map(RecordingStore::summary_of).collect();
@@ -362,9 +412,13 @@ impl RecordingStore {
 
     /// The manifest and actions of a recording (`recording.get`).
     pub fn get(&self, id: &str) -> Result<(Manifest, Vec<ActionEntry>), RpcError> {
-        let dir = self.dir_of(id)?;
-        let manifest = match self.lock().get(id) {
-            Some(handle) => handle.get(),
+        let (dir, live) = {
+            let st = self.lock();
+            let dir = self.present_dir(&st, id)?;
+            (dir, st.running.get(id).map(ManifestHandle::get))
+        };
+        let manifest = match live {
+            Some(m) => m,
             None => manifest_of(&dir).map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => not_found(id),
                 _ => internal(e),
@@ -378,11 +432,12 @@ impl RecordingStore {
     }
 
     /// Marks a recording kept (or not). A running one is changed through its handle, so its
-    /// writers keep the mark.
+    /// writers keep the mark. One whose screen is being pruned keeps the mark too (the prune
+    /// rereads the manifest when it is done).
     pub fn set_keep(&self, id: &str, keep: bool) -> Result<RecordingSummary, RpcError> {
-        let dir = self.dir_of(id)?;
-        let running = self.lock();
-        if let Some(handle) = running.get(id) {
+        let st = self.lock();
+        let dir = self.present_dir(&st, id)?;
+        if let Some(handle) = st.running.get(id) {
             handle.update(|m| m.keep = keep).map_err(internal)?;
         } else {
             let mut m = manifest_of(&dir).map_err(|e| match e.kind() {
@@ -392,29 +447,44 @@ impl RecordingStore {
             m.keep = keep;
             write_manifest_file(&dir, &m).map_err(internal)?;
         }
-        let found = self.found(&running, id, dir).map_err(internal)?;
+        let found = self.found(&st, id, dir).map_err(internal)?;
+        drop(st);
         Ok(RecordingStore::summary_of(&found))
     }
 
-    /// Deletes a recording that is not running (`recording_running` for one that is).
+    /// Deletes a recording that is not running (`recording_running` for one that is, and
+    /// for one whose screen the retention rules are deleting right now). The files are
+    /// removed outside the store's lock.
     pub fn delete(&self, id: &str) -> Result<(), RpcError> {
-        let dir = self.dir_of(id)?;
-        let running = self.lock();
-        if running.contains_key(id) {
-            return Err(rpc_error(
-                codes::RECORDING_RUNNING,
-                format!("recording {id} is still being written; close its session first"),
-            ));
-        }
-        std::fs::remove_dir_all(&dir).map_err(internal)
+        let dir = {
+            let mut st = self.lock();
+            let dir = self.present_dir(&st, id)?;
+            if st.running.contains_key(id) {
+                return Err(rpc_error(
+                    codes::RECORDING_RUNNING,
+                    format!("recording {id} is still being written; close its session first"),
+                ));
+            }
+            if st.going.contains_key(id) {
+                return Err(rpc_error(
+                    codes::RECORDING_RUNNING,
+                    format!("the screen of recording {id} is being deleted; try again shortly"),
+                ));
+            }
+            st.going.insert(id.to_string(), Going::Whole);
+            dir
+        };
+        let removed = (self.remove_tree)(&dir);
+        self.lock().going.remove(id);
+        removed.map_err(internal)
     }
 
     /// Startup: a recording that is not running and has no ended_at gets the time of its last write.
     pub fn close_orphans(&self) -> std::io::Result<usize> {
-        let running = self.lock();
+        let st = self.lock();
         let mut closed = 0;
         for (id, dir) in self.dirs()? {
-            if running.contains_key(&id) {
+            if st.running.contains_key(&id) || st.going.contains_key(&id) {
                 continue;
             }
             let Ok(mut m) = manifest_of(&dir) else {
@@ -438,52 +508,47 @@ impl RecordingStore {
         Ok(closed)
     }
 
-    /// Applies the retention rules: what `retention::plan` says, judged and carried out
-    /// under the store's lock. A dry run only answers the plan. Otherwise the answer is
-    /// what was done; what could not be done is told in daemon.log.
+    /// Applies the retention rules: what `retention::plan` says, judged under the store's
+    /// lock, which also marks each target as going. The files are then removed outside the
+    /// lock, and a pruned screen is written into its manifest under it again. A dry run only
+    /// answers the plan. Otherwise the answer is what was done; what could not be done is
+    /// told in daemon.log.
     pub fn prune(&self, now: OffsetDateTime, dry_run: bool) -> std::io::Result<Vec<PruneAction>> {
-        let running = self.lock();
-        let found = self.all(&running, true)?;
-        let facts: Vec<Facts> = found
-            .iter()
-            .map(|f| {
-                let last = || last_write(&f.dir);
-                let started_at = parse_time(&f.manifest.started_at)
-                    .or_else(last)
-                    .unwrap_or(now);
-                // A recording cut off without an end counts from its last write.
-                let ended_at = if f.running {
-                    None
-                } else {
-                    f.manifest
-                        .ended_at
-                        .as_deref()
-                        .and_then(parse_time)
-                        .or_else(last)
-                        .or(Some(started_at))
+        let plan = {
+            let mut st = self.lock();
+            // What another prune or a delete is removing right now is theirs.
+            let found = self.all(&mut st, true, true)?;
+            let facts: Vec<Facts> = found.iter().map(|f| facts_of(f, now)).collect();
+            let plan = retention::plan(&facts, now, &self.config);
+            if dry_run {
+                return Ok(plan);
+            }
+            let plan: Vec<PruneAction> = plan
+                .into_iter()
+                .filter(|a| !st.running.contains_key(a.id()))
+                .collect();
+            for action in &plan {
+                let going = match action {
+                    PruneAction::Delete { .. } => Going::Whole,
+                    PruneAction::DeleteScreen { .. } => Going::Screen,
                 };
-                Facts {
-                    id: f.manifest.recording_id.clone(),
-                    started_at,
-                    ended_at,
-                    running: f.running,
-                    keep: f.manifest.keep,
-                    screen_bytes: f.sizes.screen_bytes,
-                    other_bytes: f.sizes.total_bytes.saturating_sub(f.sizes.screen_bytes),
-                }
-            })
-            .collect();
-        let plan = retention::plan(&facts, now, &self.config);
-        if dry_run {
-            return Ok(plan);
-        }
+                st.going.insert(action.id().to_string(), going);
+            }
+            plan
+        };
         let mut done = Vec::new();
         for action in plan {
-            // Judged once more under the same lock: nothing running is touched.
-            if running.contains_key(action.id()) {
-                continue;
-            }
-            match self.carry_out(&action) {
+            let removed = self.remove_files(&action);
+            let finished = {
+                let mut st = self.lock();
+                let finished = match (&removed, &action) {
+                    (Ok(dir), PruneAction::DeleteScreen { .. }) => mark_screen_pruned(dir),
+                    _ => Ok(()),
+                };
+                st.going.remove(action.id());
+                finished
+            };
+            match removed.and(finished) {
                 Ok(()) => done.push(action),
                 Err(e) => eprintln!("pegboard: recording {}: not pruned: {e}", action.id()),
             }
@@ -491,27 +556,62 @@ impl RecordingStore {
         Ok(done)
     }
 
-    fn carry_out(&self, action: &PruneAction) -> std::io::Result<()> {
+    /// Removes what the action deletes (outside the lock); the recording's directory.
+    fn remove_files(&self, action: &PruneAction) -> std::io::Result<PathBuf> {
         let dir = self
             .dir_of(action.id())
             .map_err(|e| std::io::Error::other(e.message))?;
         match action {
-            PruneAction::Delete { .. } => std::fs::remove_dir_all(&dir),
+            PruneAction::Delete { .. } => (self.remove_tree)(&dir)?,
             PruneAction::DeleteScreen { .. } => {
                 let screen = dir.join("screen");
                 match std::fs::symlink_metadata(&screen) {
-                    Ok(m) if m.is_dir() => std::fs::remove_dir_all(&screen)?,
+                    Ok(m) if m.is_dir() => (self.remove_tree)(&screen)?,
                     Ok(_) => std::fs::remove_file(&screen)?,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
                 }
-                let mut m = manifest_of(&dir)?;
-                m.screen = ScreenStatus::Pruned;
-                m.sizes = Some(measure(&dir)?);
-                write_manifest_file(&dir, &m)
             }
         }
+        Ok(dir)
     }
+}
+
+/// What the plan needs of a recording found on disk.
+fn facts_of(f: &Found, now: OffsetDateTime) -> Facts {
+    let last = || last_write(&f.dir);
+    let started_at = parse_time(&f.manifest.started_at)
+        .or_else(last)
+        .unwrap_or(now);
+    // A recording cut off without an end counts from its last write.
+    let ended_at = if f.running {
+        None
+    } else {
+        f.manifest
+            .ended_at
+            .as_deref()
+            .and_then(parse_time)
+            .or_else(last)
+            .or(Some(started_at))
+    };
+    Facts {
+        id: f.manifest.recording_id.clone(),
+        started_at,
+        ended_at,
+        running: f.running,
+        keep: f.manifest.keep,
+        screen_bytes: f.sizes.screen_bytes,
+        other_bytes: f.sizes.total_bytes.saturating_sub(f.sizes.screen_bytes),
+    }
+}
+
+/// After its screen was removed: the manifest (read again, so a keep made meanwhile stays)
+/// says so, with its sizes counted again.
+fn mark_screen_pruned(dir: &Path) -> std::io::Result<()> {
+    let mut m = manifest_of(dir)?;
+    m.screen = ScreenStatus::Pruned;
+    m.sizes = Some(measure(dir)?);
+    write_manifest_file(dir, &m)
 }
 
 #[cfg(test)]
@@ -893,6 +993,159 @@ mod tests {
             store.prune(OffsetDateTime::now_utc(), false).unwrap(),
             vec![]
         );
+    }
+
+    /// A remover that says when it starts and waits to be let go.
+    fn slow_remover() -> (
+        Remover,
+        std::sync::mpsc::Receiver<PathBuf>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered) = std::sync::mpsc::channel::<PathBuf>();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let remover: Remover = Box::new(move |p: &Path| {
+            entered_tx.lock().unwrap().send(p.to_path_buf()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap();
+            std::fs::remove_dir_all(p)
+        });
+        (remover, entered, release)
+    }
+
+    /// Runs `f` on a thread of its own; its answer, or a failure when it takes over 2 s.
+    fn promptly<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocked behind a removal")
+    }
+
+    #[test]
+    fn calls_during_a_slow_removal_return_promptly() {
+        let fx = Fixture::new();
+        let old = ago(Duration::days(30));
+        let gone = fx.plant(&manifest("r_goinggoi", &old, Some(&old)), 0, &[]);
+        let fresh = ago(Duration::hours(1));
+        let other = fx.plant(&manifest("r_staystay", &fresh, Some(&fresh)), 0, &[]);
+        let (remover, entered, release) = slow_remover();
+        let store =
+            RecordingStore::with_remover(fx.paths.clone(), RecordingConfig::default(), remover);
+        let pruning = {
+            let store = store.clone();
+            std::thread::spawn(move || store.prune(OffsetDateTime::now_utc(), false).unwrap())
+        };
+        let removing = entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(removing, gone);
+        // Meanwhile: listed without the going one, kept, refused for the going one, opened.
+        let s = store.clone();
+        let list = promptly(move || s.list().unwrap());
+        let ids: Vec<&str> = list
+            .recordings
+            .iter()
+            .map(|r| r.recording_id.as_str())
+            .collect();
+        assert_eq!(ids, ["r_staystay"]);
+        let s = store.clone();
+        assert!(
+            promptly(move || s.set_keep("r_staystay", true))
+                .unwrap()
+                .keep
+        );
+        let s = store.clone();
+        let e = promptly(move || s.set_keep("r_goinggoi", true)).unwrap_err();
+        assert_eq!(e.code, codes::RECORDING_NOT_FOUND);
+        let s = store.clone();
+        let e = promptly(move || s.delete("r_goinggoi")).unwrap_err();
+        assert_eq!(e.code, codes::RECORDING_NOT_FOUND);
+        let s = store.clone();
+        assert_eq!(
+            promptly(move || s.get("r_goinggoi")).unwrap_err().code,
+            codes::RECORDING_NOT_FOUND
+        );
+        let s = store.clone();
+        let fresh_m = manifest("r_newnewne", &fresh, None);
+        let mut log = promptly(move || s.open(fresh_m)).unwrap();
+        // Another prune leaves it to the first.
+        let s = store.clone();
+        let plan = promptly(move || s.prune(OffsetDateTime::now_utc(), true).unwrap());
+        assert!(plan.is_empty(), "{plan:?}");
+        store.finish(&mut log, &fresh).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            pruning.join().unwrap(),
+            vec![PruneAction::Delete {
+                id: "r_goinggoi".into()
+            }]
+        );
+        assert!(!gone.exists());
+        assert!(read_manifest(&other).unwrap().keep);
+        // Its mark is gone with it.
+        assert!(store.lock().going.is_empty());
+    }
+
+    #[test]
+    fn a_keep_while_the_screen_is_pruned_stays() {
+        let fx = Fixture::new();
+        let t = ago(Duration::hours(1));
+        let dir = fx.plant(&manifest("r_screenss", &t, Some(&t)), 1_500_000, &[]);
+        let (remover, entered, release) = slow_remover();
+        let store = RecordingStore::with_remover(fx.paths.clone(), tight(), remover);
+        let pruning = {
+            let store = store.clone();
+            std::thread::spawn(move || store.prune(OffsetDateTime::now_utc(), false).unwrap())
+        };
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            dir.join("screen")
+        );
+        let s = store.clone();
+        assert!(
+            promptly(move || s.set_keep("r_screenss", true))
+                .unwrap()
+                .keep
+        );
+        // A person's delete waits for the screen's removal to end (refused meanwhile).
+        let s = store.clone();
+        let e = promptly(move || s.delete("r_screenss")).unwrap_err();
+        assert_eq!(e.code, codes::RECORDING_RUNNING);
+        release.send(()).unwrap();
+        assert_eq!(
+            pruning.join().unwrap(),
+            vec![PruneAction::DeleteScreen {
+                id: "r_screenss".into()
+            }]
+        );
+        let m = read_manifest(&dir).unwrap();
+        assert!(m.keep);
+        assert_eq!(m.screen, ScreenStatus::Pruned);
+    }
+
+    #[test]
+    fn an_unreadable_manifest_is_told_once() {
+        let fx = Fixture::new();
+        let dir = fx.dir("r_garbageg");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), "{not json").unwrap();
+        let store = fx.store(RecordingConfig::default());
+        let mut st = store.lock();
+        assert!(store.all(&mut st, true, true).unwrap().is_empty());
+        assert!(st.told.contains("r_garbageg"));
+        // `told` is what keeps the second line out: the insert says whether it was new.
+        assert!(!st.told.insert("r_garbageg".into()));
+        drop(st);
+        store.prune(OffsetDateTime::now_utc(), false).unwrap();
+        assert_eq!(store.lock().told.len(), 1);
     }
 
     #[test]
