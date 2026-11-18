@@ -235,6 +235,63 @@ mod tests {
     }
 
     #[test]
+    fn a_pruned_screen_takes_only_its_own_bytes_off() {
+        // 7 GB: A's screen goes (its 3 GB of actions stay, 6 GB left), then B's (4 GB).
+        let recs = [
+            Facts {
+                other_bytes: 3 * GB,
+                ..finished("r_aaaaaaaa", Duration::hours(3), GB)
+            },
+            Facts {
+                other_bytes: 0,
+                ..finished("r_bbbbbbbb", Duration::hours(2), 2 * GB)
+            },
+            Facts {
+                other_bytes: 0,
+                ..finished("r_cccccccc", Duration::hours(1), GB)
+            },
+        ];
+        assert_eq!(
+            plan(&recs, now(), &cfg()),
+            vec![screen("r_aaaaaaaa"), screen("r_bbbbbbbb")]
+        );
+    }
+
+    #[test]
+    fn the_oldest_end_goes_first_not_the_oldest_start() {
+        // A started first but ran long; B started later and ended first.
+        let a = Facts {
+            started_at: now() - Duration::hours(10),
+            ..finished("r_aaaaaaaa", Duration::hours(1), 3 * GB)
+        };
+        let b = Facts {
+            started_at: now() - Duration::hours(5),
+            ..finished("r_bbbbbbbb", Duration::hours(4), 3 * GB)
+        };
+        assert_eq!(plan(&[a, b], now(), &cfg()), vec![screen("r_bbbbbbbb")]);
+    }
+
+    #[test]
+    fn exactly_the_limit_is_within_it() {
+        let at_limit = |id: &str, ago: Duration, screen_bytes: u64| Facts {
+            other_bytes: 0,
+            ..finished(id, ago, screen_bytes)
+        };
+        let recs = [
+            at_limit("r_aaaaaaaa", Duration::hours(2), 2 * GB),
+            at_limit("r_bbbbbbbb", Duration::hours(1), 3 * GB),
+        ];
+        assert_eq!(plan(&recs, now(), &cfg()), vec![]);
+        // One byte over: the oldest screen goes, which brings it to the limit exactly.
+        let recs = [
+            at_limit("r_aaaaaaaa", Duration::hours(3), 1),
+            at_limit("r_bbbbbbbb", Duration::hours(2), 2 * GB),
+            at_limit("r_cccccccc", Duration::hours(1), 3 * GB),
+        ];
+        assert_eq!(plan(&recs, now(), &cfg()), vec![screen("r_aaaaaaaa")]);
+    }
+
+    #[test]
     fn deleted_by_age_does_not_count_for_size() {
         let recs = [
             finished("r_aaaaaaaa", Duration::days(20), 6 * GB),
