@@ -38,42 +38,44 @@ pub struct Bridge {
     bound: std::sync::Mutex<String>,
     /// Tab switches before this are not reported (`CLOSE_QUIET`).
     quiet_until: std::sync::Mutex<Option<SystemTime>>,
+    /// The script URL of the worker first found answering as the bridge
+    /// (`chrome-extension://<id>/sw.js`): only a worker of exactly this URL is taken later
+    /// (another extension of the profile may have a `/sw.js` too).
+    script: String,
 }
 
-/// Finds the bridge worker of `context`, waiting up to `wait` for it to start.
-async fn find_worker(conn: &CdpConn, context: &str, wait: Duration) -> Result<Option<String>> {
-    let deadline = tokio::time::Instant::now() + wait;
-    loop {
-        let r = conn.send("Target.getTargets", json!({}), None).await?;
-        let found = r["targetInfos"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|t| is_worker_of(t, context));
-        if let Some(t) = found {
-            return Ok(t["targetId"].as_str().map(String::from));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+/// The service workers of `context` whose script is some extension's `/sw.js`: (target id,
+/// script URL).
+async fn workers(conn: &CdpConn, context: &str) -> Result<Vec<(String, String)>> {
+    let r = conn.send("Target.getTargets", json!({}), None).await?;
+    Ok(r["targetInfos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| is_worker_of(t, context))
+        .filter_map(|t| {
+            Some((
+                t["targetId"].as_str()?.to_string(),
+                t["url"].as_str()?.to_string(),
+            ))
+        })
+        .collect())
 }
 
 impl Bridge {
     /// Attaches to the bridge service worker that lives in `agent_context` and keeps that CDP session open.
     pub async fn attach(conn: &CdpConn, agent_context: &str) -> Result<Bridge> {
         let deadline = tokio::time::Instant::now() + WORKER_WAIT;
+        let mut seen = false;
         loop {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let target = find_worker(conn, agent_context, left)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!("bridge service worker for the agent profile did not appear within 10s")
-                })?;
             // A worker that is still starting (or being restarted) can accept a session
-            // yet never answer, so require one answered ping before trusting it.
-            if let Ok(session) = conn.attach(&target).await {
+            // yet never answer, and another extension's worker does not know `self.peg`: the
+            // bridge is the one that answers the ping.
+            for (target, script) in workers(conn, agent_context).await? {
+                seen = true;
+                let Ok(session) = conn.attach(&target).await else {
+                    continue;
+                };
                 if answers(conn, &session).await {
                     return Ok(Bridge {
                         conn: conn.clone(),
@@ -82,11 +84,22 @@ impl Bridge {
                         activity: std::sync::Mutex::new(None),
                         bound: std::sync::Mutex::new(String::new()),
                         quiet_until: std::sync::Mutex::new(None),
+                        script,
                     });
                 }
+                let _ = conn
+                    .send(
+                        "Target.detachFromTarget",
+                        json!({ "sessionId": session }),
+                        None,
+                    )
+                    .await;
             }
             if tokio::time::Instant::now() >= deadline {
-                bail!("bridge service worker did not answer within 10s");
+                if seen {
+                    bail!("bridge service worker did not answer within 10s");
+                }
+                bail!("bridge service worker for the agent profile did not appear within 10s");
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
@@ -139,7 +152,11 @@ impl Bridge {
     /// back by any means measured (spike-findings H9), and the call must not hang on it.
     /// Binds the new session when following.
     async fn revive(&self, session: &mut String) -> Result<()> {
-        if let Some(target) = find_worker(&self.conn, &self.agent_context, Duration::ZERO).await? {
+        let ours = workers(&self.conn, &self.agent_context)
+            .await?
+            .into_iter()
+            .find(|(_, script)| *script == self.script);
+        if let Some((target, _)) = ours {
             if let Ok(new) = self.conn.attach(&target).await {
                 if answers(&self.conn, &new).await {
                     let old = std::mem::replace(session, new);
@@ -318,6 +335,12 @@ impl Bridge {
         }
     }
 
+    /// A target that is this bridge's worker (its context, its exact script URL).
+    fn is_ours(&self, info: &Value) -> bool {
+        is_worker_of(info, &self.agent_context)
+            && info["url"].as_str() == Some(self.script.as_str())
+    }
+
     fn quiet(&self) {
         *lock(&self.quiet_until) = Some(SystemTime::now() + CLOSE_QUIET);
     }
@@ -344,14 +367,19 @@ impl Bridge {
             }
             // The worker restarted (it stops when idle): attach to the new one, add the
             // binding again and take the switches it kept.
-            "Target.targetCreated"
-                if is_worker_of(&e.params["targetInfo"], &self.agent_context) =>
-            {
+            "Target.targetCreated" if self.is_ours(&e.params["targetInfo"]) => {
                 let Some(target) = e.params["targetInfo"]["targetId"].as_str() else {
                     return;
                 };
                 let mut session = self.session.lock().await;
                 if let Ok(new) = self.conn.attach(target).await {
+                    if !answers(&self.conn, &new).await {
+                        let _ = self
+                            .conn
+                            .send("Target.detachFromTarget", json!({ "sessionId": new }), None)
+                            .await;
+                        return;
+                    }
                     let old = std::mem::replace(&mut *session, new);
                     self.bind_if_following(&session).await;
                     if crate::testenv::hooks() {
@@ -390,7 +418,7 @@ async fn follow(bridge: std::sync::Weak<Bridge>, mut events: broadcast::Receiver
                 };
                 if e.method == "Target.targetCreated" {
                     // Attaching waits for calls in flight: not on this loop.
-                    if is_worker_of(&e.params["targetInfo"], &b.agent_context) {
+                    if b.is_ours(&e.params["targetInfo"]) {
                         tokio::spawn(async move { b.on_event(e).await });
                     }
                 } else {
@@ -463,11 +491,14 @@ mod tests {
     /// `W<n+1>` and says so (`Target.targetCreated`); only a session on the current worker
     /// answers. The worker's `replayActivity` hands over one kept tab switch (of `T9`) through
     /// the binding of the session it is called on. Every method sent is in `seen`.
+    /// There is also always another extension's worker `X1` (`chrome-extension://y/sw.js`)
+    /// in the profile, which does not know `self.peg`. Events can be sent with `inject`.
     struct Fake {
         running: AtomicBool,
         worker: AtomicU32,
         seen: std::sync::Mutex<Vec<String>>,
-        restart: tokio::sync::Notify,
+        outbox: std::sync::Mutex<Vec<Value>>,
+        poke: tokio::sync::Notify,
     }
 
     impl Fake {
@@ -476,8 +507,41 @@ mod tests {
                 running: AtomicBool::new(true),
                 worker: AtomicU32::new(1),
                 seen: Default::default(),
-                restart: tokio::sync::Notify::new(),
+                outbox: Default::default(),
+                poke: tokio::sync::Notify::new(),
             })
+        }
+
+        fn inject(&self, event: Value) {
+            self.outbox.lock().unwrap().push(event);
+            self.poke.notify_one();
+        }
+
+        fn worker_created(&self, id: &str, url: &str) -> Value {
+            json!({ "method": "Target.targetCreated", "params": { "targetInfo": {
+                "targetId": id, "type": "service_worker", "browserContextId": "A", "url": url } } })
+        }
+
+        /// Chrome starts a new bridge worker.
+        fn restart(&self) {
+            let n = self.worker.fetch_add(1, Ordering::SeqCst) + 1;
+            self.running.store(true, Ordering::SeqCst);
+            self.inject(self.worker_created(&format!("W{n}"), "chrome-extension://x/sw.js"));
+        }
+
+        fn switch(session: &str, target: &str, at: u64) -> Value {
+            let payload = format!(r#"{{"event":"activated","targetId":"{target}","at":{at}}}"#);
+            json!({ "method": "Runtime.bindingCalled", "sessionId": session,
+                    "params": { "name": ACTIVITY_BINDING, "payload": payload } })
+        }
+
+        fn count(&self, what: &str) -> usize {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == what)
+                .count()
         }
 
         fn current(&self) -> String {
@@ -486,18 +550,30 @@ mod tests {
 
         fn reply(&self, v: &Value) -> Option<Vec<Value>> {
             let method = v["method"].as_str().unwrap_or("").to_string();
-            self.seen.lock().unwrap().push(method.clone());
+            let what = match v["params"]["targetId"].as_str() {
+                Some(t) => format!("{method} {t}"),
+                None => method.clone(),
+            };
+            self.seen.lock().unwrap().push(what);
             let on = v["sessionId"].as_str().unwrap_or("");
             let running = self.running.load(Ordering::SeqCst);
             let worker_session = on.starts_with("S-W");
             if worker_session && (!running || on != self.current()) {
                 return None;
             }
+            if on.starts_with("S-X") && method == "Runtime.evaluate" {
+                return Some(vec![
+                    json!({ "id": v["id"], "result": { "result": { "type": "undefined" } } }),
+                ]);
+            }
             let mut out = Vec::new();
             let result = match method.as_str() {
                 "Target.getTargets" => {
                     let mut infos = vec![json!({ "targetId": "P1", "type": "page",
                         "url": "about:blank", "browserContextId": "A" })];
+                    // Listed first: the bridge must not take it for its own.
+                    infos.push(json!({ "targetId": "X1", "type": "service_worker",
+                        "browserContextId": "A", "url": "chrome-extension://y/sw.js" }));
                     if running {
                         infos.push(
                             json!({ "targetId": format!("W{}", self.worker.load(Ordering::SeqCst)),
@@ -549,13 +625,11 @@ mod tests {
                             ws.send(Message::text(out.to_string())).await.unwrap();
                         }
                     }
-                    () = fake.restart.notified() => {
-                        let n = fake.worker.fetch_add(1, Ordering::SeqCst) + 1;
-                        fake.running.store(true, Ordering::SeqCst);
-                        let e = json!({ "method": "Target.targetCreated", "params": { "targetInfo": {
-                            "targetId": format!("W{n}"), "type": "service_worker",
-                            "browserContextId": "A", "url": "chrome-extension://x/sw.js" } } });
-                        ws.send(Message::text(e.to_string())).await.unwrap();
+                    () = fake.poke.notified() => {
+                        let out: Vec<Value> = fake.outbox.lock().unwrap().drain(..).collect();
+                        for e in out {
+                            ws.send(Message::text(e.to_string())).await.unwrap();
+                        }
                     }
                 }
             }
@@ -624,7 +698,7 @@ mod tests {
         assert_eq!((first.0.as_str(), first.1.as_str()), ("A", "T9"));
         // Chrome starts a new worker: the bridge attaches to it, binds it and takes what it
         // kept, without any call.
-        fake.restart.notify_one();
+        fake.restart();
         let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("no switch from the restarted worker")
@@ -637,9 +711,89 @@ mod tests {
                 UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)
             )
         );
+        assert_eq!(fake.count("Runtime.addBinding"), 2);
+    }
+
+    type Switches = tokio::sync::mpsc::UnboundedReceiver<(String, String, SystemTime)>;
+
+    /// A bridge following tab switches on the stand-in, and the switches it reports (the
+    /// first worker's replay already taken).
+    async fn followed(fake: &Arc<Fake>) -> (Arc<Bridge>, Switches) {
+        let conn = CdpConn::connect(&fake_browser(fake.clone()).await)
+            .await
+            .unwrap();
+        let bridge = Arc::new(Bridge::attach(&conn, "A").await.unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bridge
+            .follow_activity(Arc::new(move |ctx: &str, target: &str, at| {
+                let _ = tx.send((ctx.to_string(), target.to_string(), at));
+            }))
+            .await;
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.1, "T9");
+        (bridge, rx)
+    }
+
+    async fn next_switch(rx: &mut Switches) -> Option<String> {
+        tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, target, _)| target)
+    }
+
+    fn ms_now(plus: u64) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + plus
+    }
+
+    #[tokio::test]
+    async fn another_extensions_worker_is_never_taken_for_the_bridge() {
+        let fake = Fake::new();
+        let (_bridge, mut rx) = followed(&fake).await;
+        // Its worker is listed first and was refused (no `self.peg`): the bridge is on W1.
+        assert_eq!(fake.count("Runtime.addBinding"), 1);
+        fake.inject(fake.worker_created("X2", "chrome-extension://y/sw.js"));
+        // A worker of the bridge's own URL that does not answer (W7 is not the running one)
+        // is not taken either: the bridge stays bound to W1.
+        fake.inject(fake.worker_created("W7", "chrome-extension://x/sw.js"));
+        assert_eq!(next_switch(&mut rx).await, None);
+        fake.inject(Fake::switch("S-W1", "T1", ms_now(0)));
+        assert_eq!(next_switch(&mut rx).await.as_deref(), Some("T1"));
         let seen = fake.seen.lock().unwrap().clone();
-        let bindings = seen.iter().filter(|m| *m == "Runtime.addBinding").count();
-        assert_eq!(bindings, 2, "{seen:?}");
+        assert_eq!(fake.count("Target.attachToTarget X2"), 0, "{seen:?}");
+        assert_eq!(fake.count("Runtime.addBinding"), 1, "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn only_the_bound_session_reports_switches() {
+        let fake = Fake::new();
+        let (_bridge, mut rx) = followed(&fake).await;
+        // A call of the binding from another session (an old worker, another extension).
+        fake.inject(Fake::switch("S-X1", "T-FOREIGN", ms_now(0)));
+        fake.inject(Fake::switch("S-W1", "T1", ms_now(0)));
+        assert_eq!(next_switch(&mut rx).await.as_deref(), Some("T1"));
+        assert_eq!(next_switch(&mut rx).await, None);
+    }
+
+    #[tokio::test]
+    async fn switches_right_after_the_bridge_closed_tabs_are_chromes() {
+        let fake = Fake::new();
+        let (bridge, mut rx) = followed(&fake).await;
+        bridge.close_targets(&["T1".to_string()]).await.unwrap();
+        // Chrome activates a neighbour of the closed tab: not reported.
+        fake.inject(Fake::switch("S-W1", "T2", ms_now(500)));
+        // Later than the quiet time: reported.
+        let later = CLOSE_QUIET.as_millis() as u64 + 1000;
+        fake.inject(Fake::switch("S-W1", "T3", ms_now(later)));
+        assert_eq!(next_switch(&mut rx).await.as_deref(), Some("T3"));
+        assert_eq!(next_switch(&mut rx).await, None);
     }
 
     #[test]

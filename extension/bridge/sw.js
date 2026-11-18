@@ -48,7 +48,7 @@ function allowedUrl(url) {
 // person's). Each goes to `self.pegActivity`, a function the daemon adds over CDP
 // (`Runtime.addBinding`) to this worker. A restarted worker has lost it: switches are kept
 // here (the newest few, for a short while) until the daemon adds it again and asks for them
-// (`replayActivity`). Only tabs of this profile's own windows are reported. Nothing is kept
+// (`replayActivity`). An extension sees only its own profile's tabs. Nothing is kept
 // beyond that, and nothing here reads a page.
 const ACTIVITY_KEEP = 50;
 const ACTIVITY_MAX_AGE_MS = 60000;
@@ -67,11 +67,9 @@ function reportActivity(o) {
   if (keptActivity.length > ACTIVITY_KEEP) keptActivity.shift();
 }
 
-chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   const at = Date.now();
   try {
-    const windows = await chrome.windows.getAll();
-    if (!windows.some((w) => w.id === windowId)) return;
     const t = (await chrome.debugger.getTargets()).find((x) => x.type === 'page' && x.tabId === tabId);
     if (t) reportActivity({ event: 'activated', targetId: t.id, at });
   } catch (_) {
