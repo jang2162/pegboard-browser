@@ -38,7 +38,7 @@ use crate::recording::events::{
     classify, console_line, nav_line, CommandWindows, NavFollow, Requests, Signal,
 };
 use crate::recording::format::{
-    ConsoleLine, FrameKind, JsonlWriter, NavEvent, NavLine, NetworkLine,
+    Appended, CappedLog, ConsoleLine, FrameKind, NavEvent, NavLine, NetworkLine, LINE_LOG_LIMIT,
 };
 use crate::recording::screen::{
     frame_name, may_record, ScreenBudget, ScreenGate, ScreenWriter, Throttle, MIN_FRAME_GAP,
@@ -2036,8 +2036,9 @@ struct Writer {
     abandoned: Arc<AtomicBool>,
     last: LastFrames,
     writers: HashMap<String, ScreenWriter>,
-    /// navigation.jsonl, network.jsonl, console.jsonl: made on their first line.
-    logs: HashMap<&'static str, JsonlWriter>,
+    /// navigation.jsonl, network.jsonl, console.jsonl: made on their first line, each at
+    /// most `LINE_LOG_LIMIT`.
+    logs: HashMap<&'static str, CappedLog>,
     /// Errors already in daemon.log.
     told: HashSet<String>,
 }
@@ -2109,7 +2110,7 @@ impl Writer {
     fn line(&mut self, line: Line) {
         let name = line.file();
         if !self.logs.contains_key(name) {
-            match JsonlWriter::create(&self.manifest.dir().join(name)) {
+            match CappedLog::create(&self.manifest.dir().join(name), LINE_LOG_LIMIT) {
                 Ok(w) => {
                     self.logs.insert(name, w);
                 }
@@ -2119,13 +2120,19 @@ impl Writer {
         let Some(log) = self.logs.get_mut(name) else {
             return;
         };
+        let ts = now_ts();
         let written = match &line {
-            Line::Nav(l) => log.append(l),
-            Line::Network(l) => log.append(l),
-            Line::Console(l) => log.append(l),
+            Line::Nav(l) => log.append(l, &ts),
+            Line::Network(l) => log.append(l, &ts),
+            Line::Console(l) => log.append(l, &ts),
         };
-        if let Err(e) = written {
-            self.tell(&format!("a line of {name} was not written: {e}"));
+        match written {
+            Ok(Appended::Written | Appended::Dropped) => {}
+            Ok(Appended::Capped) => self.tell(&format!(
+                "{name} reached its limit of {} MB; no more lines are written to it",
+                LINE_LOG_LIMIT / (1024 * 1024)
+            )),
+            Err(e) => self.tell(&format!("a line of {name} was not written: {e}")),
         }
     }
 

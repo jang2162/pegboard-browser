@@ -89,6 +89,73 @@ pub struct ConsoleLine {
     pub text: String,
 }
 
+/// The last line of a navigation.jsonl, network.jsonl or console.jsonl that reached
+/// `LINE_LOG_LIMIT`: nothing more was written to it. (Readers of the other line types skip
+/// it: it has none of their fields.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CappedLine {
+    pub ts: String,
+    pub capped: bool,
+}
+
+/// Most bytes one of a recording's line logs (navigation, network, console) takes; past it
+/// the log ends with one `CappedLine`. Not counted in the screen's per-recording limit.
+pub const LINE_LOG_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// A line log with a size limit: lines are appended until the next one would pass the
+/// limit; then one `CappedLine` is written (the limit leaves room for it) and nothing after.
+pub struct CappedLog {
+    writer: JsonlWriter,
+    written: u64,
+    limit: u64,
+    capped: bool,
+}
+
+/// What became of a line given to `CappedLog::append`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Appended {
+    Written,
+    /// This line reached the limit: the log is capped now (said once).
+    Capped,
+    /// The log was capped before.
+    Dropped,
+}
+
+/// Room kept below the limit for the capped line.
+const CAPPED_ROOM: u64 = 256;
+
+impl CappedLog {
+    pub fn create(path: &Path, limit: u64) -> std::io::Result<CappedLog> {
+        Ok(CappedLog {
+            writer: JsonlWriter::create(path)?,
+            written: 0,
+            limit,
+            capped: false,
+        })
+    }
+
+    pub fn append<T: Serialize>(&mut self, line: &T, ts: &str) -> std::io::Result<Appended> {
+        if self.capped {
+            return Ok(Appended::Dropped);
+        }
+        let len = serde_json::to_vec(line)
+            .map_err(std::io::Error::other)?
+            .len() as u64
+            + 1;
+        if self.written + len + CAPPED_ROOM > self.limit {
+            self.capped = true;
+            self.written += self.writer.append(&CappedLine {
+                ts: ts.to_string(),
+                capped: true,
+            })?;
+            return Ok(Appended::Capped);
+        }
+        self.written += self.writer.append(line)?;
+        Ok(Appended::Written)
+    }
+}
+
 /// Creates the directory with mode 0700 (its parent must exist). An existing directory is
 /// made 0700; an existing symlink (even to a directory) or anything else is refused.
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
@@ -293,6 +360,36 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.join("nav.jsonl")).unwrap();
         assert!(JsonlWriter::create(&dir.join("nav.jsonl")).is_err());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_line_log_ends_with_one_capped_line_at_its_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("network.jsonl");
+        let line = NavLine {
+            ts: "t".into(),
+            target_id: "T1".into(),
+            event: NavEvent::Navigated,
+            url: Some("http://a.test/".into()),
+            opener: None,
+        };
+        let one = serde_json::to_vec(&line).unwrap().len() as u64 + 1;
+        let mut log = CappedLog::create(&path, 3 * one + CAPPED_ROOM).unwrap();
+        for _ in 0..3 {
+            assert_eq!(log.append(&line, "t").unwrap(), Appended::Written);
+        }
+        assert_eq!(log.append(&line, "t9").unwrap(), Appended::Capped);
+        assert_eq!(log.append(&line, "t").unwrap(), Appended::Dropped);
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size <= 3 * one + CAPPED_ROOM, "{size}");
+        assert_eq!(read_jsonl::<NavLine>(&path).unwrap().len(), 3);
+        assert_eq!(
+            read_jsonl::<CappedLine>(&path).unwrap(),
+            vec![CappedLine {
+                ts: "t9".into(),
+                capped: true
+            }]
+        );
     }
 
     #[test]
