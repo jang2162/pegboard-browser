@@ -977,6 +977,44 @@ fn commands_on_a_screen_off_domain_have_no_frames() {
     }
 }
 
+/// A click on a link that redirects into the screen-off domain (so only the commit tells the
+/// recorder where the tab went): the capture after it is answered while the
+/// recorder has not yet handled the navigation the browser sent before the answer (hooks: the
+/// capture waits 150 ms, so the page has committed; the navigation is handled 250 ms late).
+/// The capture is judged only after that navigation: nothing is kept.
+#[test]
+#[ignore]
+fn a_capture_answered_before_its_navigation_was_handled_is_not_kept() {
+    let origin = fixture();
+    let home = screen_home_with(
+        SCREEN_OFF_CONFIG,
+        &[
+            ("PEGBOARD_TEST_CAPTURE_DELAY_MS", "150"),
+            ("PEGBOARD_TEST_EVENT_DELAY_MS", "250"),
+        ],
+    );
+    let h = create(&home, &format!("{origin}/link-off"));
+    let a = targets(&home, &h)[0].clone();
+    std::thread::sleep(Duration::from_millis(1500));
+    let (code, e) = command(&home, &h, &["click", "#go"]);
+    assert_eq!(code, 0, "{e}");
+    std::thread::sleep(Duration::from_secs(1));
+    let (_, url) = command(&home, &h, &["get", "url"]);
+    assert_eq!(
+        host_of(url["url"].as_str().unwrap_or("")),
+        SCREEN_OFF_NAME,
+        "{url}"
+    );
+    close(&home, &h);
+    assert!(e.get("frameAfter").is_none(), "{e}");
+    let dir = recording_dir(&home, &h);
+    let after: Vec<_> = index(&dir, &a)
+        .into_iter()
+        .filter(|l| l["kind"] == "after")
+        .collect();
+    assert!(after.is_empty(), "a capture was kept: {after:?}");
+}
+
 fn duration_ms(entry: &Value) -> i64 {
     entry["durationMs"]
         .as_i64()
@@ -1029,10 +1067,13 @@ fn commands_run_while_the_recorder_is_disconnected() {
     let home = shared_home();
     let h = create(home, &format!("{origin}/counter"));
     std::thread::sleep(Duration::from_secs(1));
+    // What the command takes without the screen.
+    set_screen(home, &h, false);
     let base = (0..3)
         .map(|_| duration_ms(&command(home, &h, &["get", "url"]).1))
         .max()
         .unwrap();
+    set_screen(home, &h, true);
     let r = hook(
         home,
         "test.dropRecorder",
@@ -1048,7 +1089,7 @@ fn commands_run_while_the_recorder_is_disconnected() {
         assert!(has_no_frames(&e), "{e}");
         assert!(
             duration_ms(&e) < base + 100,
-            "{e}; with the recorder {base} ms"
+            "{e}; without the screen {base} ms"
         );
     }
     wait_out(held_until);

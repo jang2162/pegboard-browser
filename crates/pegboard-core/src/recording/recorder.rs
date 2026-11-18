@@ -65,6 +65,9 @@ pub const CAPTURE_LIMIT: Duration = Duration::from_millis(500);
 pub const FROZEN_BACKOFF: Duration = Duration::from_secs(30);
 /// Widest capture, as the stream's `maxWidth` (F3).
 const CAPTURE_MAX_WIDTH: f64 = 1280.0;
+/// A capture that ran out of the limit counts as a frozen screen only if it had at least
+/// this long itself (not when waiting for the tab used up the limit).
+const FROZEN_MIN_CAPTURE: Duration = Duration::from_millis(250);
 /// Between two looks at a tab that is being attached.
 const TICKET_POLL: Duration = Duration::from_millis(5);
 
@@ -98,7 +101,8 @@ impl CaptureHealth {
 }
 
 /// The device pixel ratio from `Page.getLayoutMetrics` (device over CSS content width, as
-/// the spike measured it); 1 when it cannot be read.
+/// the spike measured it); 1 when it cannot be read. Page zoom counts in it (a page zoomed to
+/// 200 % reads as 2), which only changes the scale of the capture.
 fn device_pixel_ratio(metrics: &Value) -> f64 {
     let device = metrics["contentSize"]["width"].as_f64();
     let css = metrics["cssContentSize"]["width"].as_f64();
@@ -108,22 +112,26 @@ fn device_pixel_ratio(metrics: &Value) -> f64 {
     }
 }
 
-/// `Page.captureScreenshot` parameters (F3): JPEG 60; at a ratio of 1 the screen as it is;
-/// above 1 the visual viewport, scaled to at most 1280 wide. `None` above 1 without the
-/// viewport (the picture would be too wide).
-fn capture_params(dpr: f64, metrics: Option<&Value>) -> Option<Value> {
+/// `Page.captureScreenshot` parameters (F3): JPEG 60. Without `metrics` (a tab known to
+/// need no clip) the screen as it is. With them: when the picture would be wider than 1280
+/// (a ratio above 1, or a window wider than 1280), the visual viewport scaled to 1280 wide,
+/// like the stream's `maxWidth`; otherwise as it is. `None` when the viewport cannot be read.
+fn capture_params(metrics: Option<&Value>) -> Option<Value> {
     let mut params = json!({ "format": "jpeg", "quality": 60 });
-    if dpr > 1.0 {
-        let vv = &metrics?["cssVisualViewport"];
-        let width = vv["clientWidth"].as_f64().filter(|w| *w > 0.0)?;
-        let height = vv["clientHeight"].as_f64().filter(|h| *h > 0.0)?;
-        let scale = (CAPTURE_MAX_WIDTH / (width * dpr)).min(1.0);
+    let Some(metrics) = metrics else {
+        return Some(params);
+    };
+    let dpr = device_pixel_ratio(metrics);
+    let vv = &metrics["cssVisualViewport"];
+    let width = vv["clientWidth"].as_f64().filter(|w| *w > 0.0)?;
+    let height = vv["clientHeight"].as_f64().filter(|h| *h > 0.0)?;
+    if width * dpr > CAPTURE_MAX_WIDTH {
         params["clip"] = json!({
             "x": vv["pageX"].as_f64().unwrap_or(0.0),
             "y": vv["pageY"].as_f64().unwrap_or(0.0),
             "width": width,
             "height": height,
-            "scale": scale,
+            "scale": CAPTURE_MAX_WIDTH / (width * dpr),
         });
     }
     Some(params)
@@ -305,8 +313,10 @@ struct Tab {
     /// The connection generation it was attached on.
     epoch: u64,
     streaming: bool,
-    /// Its device pixel ratio, once a capture read it.
-    dpr: Option<f64>,
+    /// Whether its captures need a clip (wider than 1280), once a capture found out. A tab
+    /// that needs one reads the viewport for every capture (its scroll position); one that
+    /// does not is captured without that round trip (a later resize is seen on a reattach).
+    clip: Option<bool>,
 }
 
 #[derive(Default)]
@@ -322,6 +332,9 @@ struct State {
     /// Test hook: no connection before this.
     held_until: Option<Instant>,
     health: CaptureHealth,
+    /// Events of the current connection handled so far, in the order the socket brought
+    /// them (`Recorder::event_handled`).
+    handled: u64,
 }
 
 impl State {
@@ -341,6 +354,8 @@ impl State {
 pub struct Recorder {
     opts: RecorderOptions,
     state: Mutex<State>,
+    /// Told whenever an event has been handled (a capture waits for the events before it).
+    progress: Notify,
     /// Wakes the connection task when a recording begins or a test hold ends.
     wake: Arc<Notify>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -364,6 +379,7 @@ impl Recorder {
         let recorder = Arc::new(Recorder {
             opts,
             state: Mutex::new(State::default()),
+            progress: Notify::new(),
             wake: Arc::new(Notify::new()),
             task: Mutex::new(None),
         });
@@ -678,18 +694,30 @@ impl Recorder {
         if !self.state().health.may_capture(target, started) {
             return None;
         }
-        let ticket = bounded(CAPTURE_LIMIT, self.ticket_when_ready(id, target)).await?;
+        let ticket =
+            match tokio::time::timeout(CAPTURE_LIMIT, self.ticket_when_ready(id, target)).await {
+                Ok(ticket) => ticket?,
+                Err(_) => {
+                    // The tab did not settle (attach, or what it shows) within the limit.
+                    self.state().health.timed_out(target, Instant::now());
+                    return None;
+                }
+            };
         let ready = Instant::now();
         let left = deadline.saturating_duration_since(ready);
-        let data = match tokio::time::timeout(left, self.capture(&ticket)).await {
+        let (data, before) = match tokio::time::timeout(left, self.capture(&ticket)).await {
             Ok(data) => data?,
             Err(_) => {
-                self.state().health.timed_out(target, Instant::now());
+                if left >= FROZEN_MIN_CAPTURE {
+                    self.state().health.timed_out(target, Instant::now());
+                }
                 return None;
             }
         };
         let captured = Instant::now();
-        let frame = self.keep_capture(&ticket.key, data);
+        let frame = self
+            .keep_capture_in_order(&ticket.key, data, before, deadline)
+            .await;
         if crate::testenv::hooks() {
             let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1000.0;
             let done = Instant::now();
@@ -701,6 +729,44 @@ impl Recorder {
             );
         }
         frame
+    }
+
+    /// One event of the connection has been handled.
+    fn event_handled(&self) {
+        self.state().handled += 1;
+        self.progress.notify_waiters();
+    }
+
+    /// `keep_capture` once every event the connection received before the capture's reply
+    /// (`before`, in socket order) has been handled, so that a navigation the browser sent
+    /// before answering is judged first (F5 is about the order the browser sends things in).
+    /// Dropped when that is not reached by `deadline`, or the connection changed.
+    async fn keep_capture_in_order(
+        &self,
+        key: &CaptureKey,
+        data: String,
+        before: u64,
+        deadline: Instant,
+    ) -> Option<AfterFrame> {
+        loop {
+            let progress = self.progress.notified();
+            tokio::pin!(progress);
+            progress.as_mut().enable();
+            {
+                let st = self.state();
+                if st.epoch != key.epoch {
+                    return None;
+                }
+                if st.handled >= before {
+                    drop(st);
+                    return self.keep_capture(key, data);
+                }
+            }
+            let until = tokio::time::Instant::from_std(deadline);
+            if tokio::time::timeout_at(until, progress).await.is_err() {
+                return None;
+            }
+        }
     }
 
     /// A ticket for a capture of `target` once the tab can be told: waits while it is being
@@ -773,54 +839,47 @@ impl Recorder {
     }
 
     /// Takes the capture (after the test delay, `PEGBOARD_TEST_CAPTURE_DELAY_MS`): its base64
-    /// JPEG. Reads the tab's device pixel ratio on its first capture (F3).
-    async fn capture(&self, t: &CaptureTicket) -> Option<String> {
+    /// JPEG and how many events the connection had received before the answer. Reads the
+    /// viewport on the first capture of an attach, and on every one that needs a clip (F3).
+    async fn capture(&self, t: &CaptureTicket) -> Option<(String, u64)> {
         if let Some(ms) = crate::testenv::var("PEGBOARD_TEST_CAPTURE_DELAY_MS")
             .and_then(|v| v.parse::<u64>().ok())
         {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
         let cdp = t.key.cdp_session.as_str();
-        let known = self
+        let clip = self
             .state()
             .tabs
             .get(&t.key.target)
             .filter(|tab| tab.cdp == cdp)
-            .and_then(|tab| tab.dpr);
-        let metrics = if known.is_none_or(|dpr| dpr > 1.0) {
-            t.conn
+            .and_then(|tab| tab.clip);
+        let params = if clip == Some(false) {
+            capture_params(None)?
+        } else {
+            let metrics = t
+                .conn
                 .send("Page.getLayoutMetrics", json!({}), Some(cdp))
                 .await
-                .ok()
-        } else {
-            None
-        };
-        let dpr = match (known, &metrics) {
-            (Some(dpr), _) => dpr,
-            (None, Some(m)) => {
-                let dpr = device_pixel_ratio(m);
-                if let Some(tab) = self
-                    .state()
-                    .tabs
-                    .get_mut(&t.key.target)
-                    .filter(|tab| tab.cdp == cdp)
-                {
-                    tab.dpr = Some(dpr);
-                }
-                dpr
+                .ok()?;
+            let params = capture_params(Some(&metrics))?;
+            if let Some(tab) = self
+                .state()
+                .tabs
+                .get_mut(&t.key.target)
+                .filter(|tab| tab.cdp == cdp)
+            {
+                tab.clip = Some(params.get("clip").is_some());
             }
-            (None, None) => return None,
+            params
         };
-        let params = capture_params(dpr, metrics.as_ref())?;
-        let r = t
+        let (r, before) = t
             .conn
-            .send("Page.captureScreenshot", params, Some(cdp))
+            .send_counted("Page.captureScreenshot", params, Some(cdp))
             .await
             .ok()?;
-        r["data"]
-            .as_str()
-            .filter(|d| !d.is_empty())
-            .map(String::from)
+        let data = r["data"].as_str().filter(|d| !d.is_empty())?;
+        Some((data.to_string(), before))
     }
 
     /// The capture's answer came: hands it to the writer if the tab is still on the document
@@ -836,7 +895,9 @@ impl Recorder {
             return None;
         }
         let gate = &sess.screens.get(&key.target)?.gate;
-        if !gate.capture_valid(&self.opts.config, key.navigation) || gate.held_at(Instant::now()) {
+        // No separate hold check: a hold begins only with a navigation (which `capture_valid`
+        // counts) or an attach (another CDP session, checked above).
+        if !gate.capture_valid(&self.opts.config, key.navigation) {
             return None;
         }
         let (reply, written) = oneshot::channel();
@@ -1052,7 +1113,7 @@ impl Recorder {
                 cdp: cdp.to_string(),
                 epoch,
                 streaming: false,
-                dpr: None,
+                clip: None,
             },
         );
         true
@@ -1191,9 +1252,6 @@ impl Recorder {
             let Some(session) = st.tabs.get(&target).map(|t| t.session.clone()) else {
                 return;
             };
-            if frame {
-                st.health.frame_seen(&target);
-            }
             let capped = st
                 .sessions
                 .get(&session)
@@ -1232,6 +1290,10 @@ impl Recorder {
         e: &CdpEvent,
         now: Instant,
     ) {
+        if e.method == "Page.screencastFrame" {
+            // The tab's screen is not frozen.
+            st.health.frame_seen(target);
+        }
         let Some(sess) = st.sessions.get_mut(session) else {
             return;
         };
@@ -1391,6 +1453,7 @@ impl Recorder {
             let mut st = self.state();
             st.conn = Some(conn);
             st.epoch += 1;
+            st.handled = 0;
             st.sessions
                 .values()
                 .filter(|s| s.rec.is_some())
@@ -1554,14 +1617,29 @@ async fn run_events(
         tokio::select! {
             event = queue.recv() => {
                 let Some(event) = event else { return };
+                test_event_delay(&event).await;
                 let Some(r) = recorder.upgrade() else { return };
                 r.on_event(conn, event);
+                r.event_handled();
             }
             () = timer => {
                 let Some(r) = recorder.upgrade() else { return };
                 r.on_tick(Instant::now());
             }
         }
+    }
+}
+
+/// Test hook `PEGBOARD_TEST_EVENT_DELAY_MS`: the recorder handles a main-frame
+/// `Page.frameNavigated` (and everything after it) that much later, as a busy event loop would.
+async fn test_event_delay(event: &CdpEvent) {
+    if event.method != "Page.frameNavigated" || event.params.pointer("/frame/parentId").is_some() {
+        return;
+    }
+    if let Some(ms) =
+        crate::testenv::var("PEGBOARD_TEST_EVENT_DELAY_MS").and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 }
 
@@ -2385,17 +2463,20 @@ mod tests {
     }
 
     #[test]
-    fn a_capture_follows_the_device_pixel_ratio() {
-        // F3: ratio 1 as it is (no clip); JPEG 60.
-        assert_eq!(device_pixel_ratio(&metrics(1440, 1440)), 1.0);
+    fn a_capture_is_at_most_1280_wide() {
+        let plain = json!({ "format": "jpeg", "quality": 60 });
+        // A tab known to need no clip: as it is, JPEG 60 (F3, ratio 1).
+        assert_eq!(capture_params(None), Some(plain.clone()));
+        // Ratio 1 in a window up to 1280 wide: as it is.
+        assert_eq!(device_pixel_ratio(&metrics(1200, 1200)), 1.0);
         assert_eq!(
-            capture_params(1.0, None),
-            Some(json!({ "format": "jpeg", "quality": 60 }))
+            capture_params(Some(&metrics(1200, 1200))),
+            Some(plain.clone())
         );
-        // Ratio 2: the viewport, scaled so that it is at most 1280 wide.
+        // Ratio 2: the viewport, scaled so that it is 1280 wide.
         let m = metrics(2880, 1440);
         assert_eq!(device_pixel_ratio(&m), 2.0);
-        let p = capture_params(2.0, Some(&m)).unwrap();
+        let p = capture_params(Some(&m)).unwrap();
         assert_eq!(
             (p["format"].as_str(), p["quality"].as_u64()),
             (Some("jpeg"), Some(60))
@@ -2407,12 +2488,15 @@ mod tests {
         assert_eq!(clip["height"].as_f64(), Some(900.0));
         let scale = clip["scale"].as_f64().unwrap();
         assert!((1440.0 * 2.0 * scale - 1280.0).abs() < 1e-6, "{scale}");
-        // A small window is never enlarged.
-        let small = capture_params(2.0, Some(&metrics(1000, 500))).unwrap();
-        assert_eq!(small["clip"]["scale"].as_f64(), Some(1.0));
-        // Ratio 2 without the viewport: no capture (it would be twice as wide).
-        assert_eq!(capture_params(2.0, None), None);
-        // Unreadable metrics count as ratio 1.
+        // Ratio 1 in a window wider than 1280: scaled down as well (the stream's width).
+        let wide = capture_params(Some(&metrics(1920, 1920))).unwrap();
+        let scale = wide["clip"]["scale"].as_f64().unwrap();
+        assert!((1920.0 * scale - 1280.0).abs() < 1e-6, "{scale}");
+        // Ratio 2 in a small window: 1000 wide as it is, never enlarged.
+        assert_eq!(capture_params(Some(&metrics(1000, 500))), Some(plain));
+        // The viewport cannot be read: no capture (it might be too wide).
+        assert_eq!(capture_params(Some(&json!({}))), None);
+        // Unreadable sizes count as ratio 1.
         assert_eq!(device_pixel_ratio(&json!({})), 1.0);
     }
 
@@ -2716,5 +2800,85 @@ mod tests {
             written: rx,
         };
         assert_eq!(gone.unless_failed(), None);
+    }
+
+    #[tokio::test]
+    async fn a_capture_is_judged_after_the_events_sent_before_its_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        let t0 = Instant::now();
+        let Ticket::Ready(key) = r.ticket_now(&id, T1) else {
+            panic!("an open tab can be captured");
+        };
+        // The reply came after one event that is still in the queue: the capture waits.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let waiting = r.keep_capture_in_order(&key, frame(1), 1, deadline);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), waiting.as_mut())
+                .await
+                .is_err(),
+            "judged before the event before it"
+        );
+        // That event: the tab went to a screen-off page before the browser answered.
+        feed(
+            &r,
+            &id,
+            navigated("http://screen-off.test/", "L1", "Navigation"),
+            t0,
+        );
+        r.event_handled();
+        assert!(waiting.await.is_none(), "an off page's capture was kept");
+        // Not reached in time: dropped.
+        feed(&r, &id, navigated("http://b.test/", "L2", "Navigation"), t0);
+        feed(&r, &id, fcp("L2"), t0);
+        r.event_handled();
+        let Ticket::Ready(on_b) = r.ticket_now(&id, T1) else {
+            panic!("b can be captured");
+        };
+        let soon = Instant::now() + Duration::from_millis(30);
+        assert!(r
+            .keep_capture_in_order(&on_b, frame(2), 3, soon)
+            .await
+            .is_none());
+        // Every event before the reply handled, nothing changed: kept.
+        let kept = r
+            .keep_capture_in_order(&on_b, frame(3), 2, deadline)
+            .await
+            .unwrap();
+        assert!(kept.written.await.unwrap());
+        // The connection changed meanwhile: dropped.
+        r.state().epoch += 1;
+        assert!(r
+            .keep_capture_in_order(&on_b, frame(4), 0, deadline)
+            .await
+            .is_none());
+        let files: Vec<_> = index(&manifest, T1)
+            .into_iter()
+            .filter_map(|l| l.file)
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_frame_ends_a_frozen_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, _manifest) = rig(tmp.path(), "http://a.test/");
+        let t0 = Instant::now();
+        r.state().health.timed_out(T1, t0);
+        assert!(!r.state().health.may_capture(T1, t0));
+        feed(&r, &id, shot_event(1), t0);
+        assert!(r.state().health.may_capture(T1, t0));
+    }
+
+    #[tokio::test]
+    async fn a_tab_of_an_earlier_connection_has_no_frame_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, _manifest) = rig(tmp.path(), "http://a.test/");
+        feed(&r, &id, shot_event(1), Instant::now());
+        eventually(|| r.before_command(&id, Some(T1))).await;
+        // A new connection whose attach has not come yet: the old attach says nothing.
+        r.state().epoch += 1;
+        assert_eq!(r.before_command(&id, Some(T1)), None);
     }
 }

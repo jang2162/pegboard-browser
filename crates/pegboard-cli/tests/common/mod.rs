@@ -249,6 +249,9 @@ paint(); setInterval(paint, 100);
             "replace-late",
             &format!("<script>location.replace('http://127.0.0.1:{port}/late')</script>"),
         )),
+        // A link into the screen-off domain through a redirect: the navigation starts on
+        // this address, and only its commit (`frameNavigated`) shows the off page.
+        "/link-off" => html(page("link-off", r#"<a id="go" href="/to-off">off</a>"#)),
         "/popup" => html(page(
             "popup",
             r#"<button id="pop" onclick="window.open('/animated')">Open</button>"#,

@@ -28,10 +28,13 @@ pub struct CdpEvent {
     pub session_id: Option<String>,
 }
 
+/// A reply, and how many events the connection had received before it.
+type Reply = (Result<Value>, u64);
+
 /// Outstanding requests, and whether the reader has finished (no reply can arrive any more).
 #[derive(Default)]
 struct PendingState {
-    waiters: HashMap<u64, oneshot::Sender<Result<Value>>>,
+    waiters: HashMap<u64, oneshot::Sender<Reply>>,
     closed: bool,
 }
 
@@ -45,6 +48,8 @@ struct Inner {
     /// Every event, unbounded and in order, for a reader that must not miss one (see
     /// `connect_queued`). Dropped when the connection ends, which ends the queue.
     queue: Mutex<Option<mpsc::UnboundedSender<CdpEvent>>>,
+    /// Events received so far (the reader counts them in socket order).
+    events_received: AtomicU64,
 }
 
 /// Cheap to clone; all clones share one websocket.
@@ -104,6 +109,7 @@ impl CdpConn {
             next_id: AtomicU64::new(1),
             events,
             queue: Mutex::new(queue),
+            events_received: AtomicU64::new(0),
         });
 
         tokio::spawn(async move {
@@ -128,7 +134,8 @@ impl CdpConn {
                             Some(e) => Err(anyhow!("CDP error: {e}")),
                             None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
                         };
-                        let _ = tx.send(result);
+                        let before = reader.events_received.load(Ordering::SeqCst);
+                        let _ = tx.send((result, before));
                     }
                 } else if let Some(method) = v.get("method").and_then(Value::as_str) {
                     let event = CdpEvent {
@@ -136,6 +143,7 @@ impl CdpConn {
                         params: v.get("params").cloned().unwrap_or(Value::Null),
                         session_id: v.get("sessionId").and_then(Value::as_str).map(String::from),
                     };
+                    reader.events_received.fetch_add(1, Ordering::SeqCst);
                     if let Some(queue) = reader.queue.lock().unwrap().as_ref() {
                         let _ = queue.send(event.clone());
                     }
@@ -152,8 +160,9 @@ impl CdpConn {
                 pending.closed = true;
                 pending.waiters.drain().collect()
             };
+            let before = reader.events_received.load(Ordering::SeqCst);
             for (_, tx) in waiters {
-                let _ = tx.send(Err(anyhow!("CDP connection closed")));
+                let _ = tx.send((Err(anyhow!("CDP connection closed")), before));
             }
         });
 
@@ -178,6 +187,19 @@ impl CdpConn {
         params: Value,
         session_id: Option<&str>,
     ) -> impl std::future::Future<Output = Result<Value>> + Send + 'static {
+        let reply = self.send_counted(method, params, session_id);
+        async move { reply.await.map(|(value, _)| value) }
+    }
+
+    /// `send_now`, also giving how many events the connection had received before the reply
+    /// (in socket order): a queued reader that has handled that many events has seen every
+    /// event the browser sent before answering.
+    pub fn send_counted(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<(Value, u64)>> + Send + 'static {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let mut msg = json!({ "id": id, "method": method, "params": params });
         if let Some(s) = session_id {
@@ -207,7 +229,9 @@ impl CdpConn {
                 bail!("CDP connection closed");
             }
             match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-                Ok(Ok(result)) => result.with_context(|| format!("{method} failed")),
+                Ok(Ok((result, before))) => result
+                    .map(|value| (value, before))
+                    .with_context(|| format!("{method} failed")),
                 Ok(Err(_)) => bail!("CDP connection closed during {method}"),
                 Err(_) => {
                     inner.pending.lock().unwrap().waiters.remove(&id);
@@ -314,4 +338,43 @@ pub async fn page_targets(conn: &CdpConn) -> Result<Vec<TargetInfo>> {
             opener_id: s(t, "openerId"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reply carries how many events came before it on the socket.
+    #[tokio::test]
+    async fn a_reply_counts_the_events_before_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut ids = Vec::new();
+            while ids.len() < 2 {
+                if let Some(Ok(Message::Text(t))) = ws.next().await {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    ids.push(v["id"].as_u64().unwrap());
+                }
+            }
+            let reply = |id: u64| Message::text(json!({ "id": id, "result": {} }).to_string());
+            let event = || Message::text(json!({ "method": "Page.x", "params": {} }).to_string());
+            ws.send(reply(ids[0])).await.unwrap();
+            ws.send(event()).await.unwrap();
+            ws.send(event()).await.unwrap();
+            ws.send(reply(ids[1])).await.unwrap();
+            let _ = ws.next().await;
+        });
+        let (conn, mut queue) = CdpConn::connect_queued(&format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let first = conn.send_counted("A", json!({}), None);
+        let second = conn.send_counted("B", json!({}), None);
+        assert_eq!(first.await.unwrap().1, 0);
+        assert_eq!(second.await.unwrap().1, 2);
+        assert_eq!(queue.recv().await.unwrap().method, "Page.x");
+        conn.close();
+    }
 }
