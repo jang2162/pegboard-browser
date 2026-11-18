@@ -356,37 +356,65 @@ pub fn console_line(method: &str, p: &Value, ts: &str, target: &str) -> Option<C
 /// Where a URL may start in page text.
 const URL_STARTS: &[&str] = &["https://", "http://", "wss://", "ws://", "blob:", "data:"];
 
-/// `text` with every URL in it (http, https, ws, wss, blob, data) as logged URLs are
-/// (`url_for_log`: no userinfo, query or fragment; `data:` only). A stack trace's
-/// `:line:column` after a URL stays.
+/// `text` with every URL in it that starts with `http://`, `https://`, `ws://`, `wss://`,
+/// `blob:` or `data:` as logged URLs are (`url_for_log`: no userinfo, query or fragment;
+/// `data:` only). Other forms (relative or schemeless addresses, `file:`,
+/// `chrome-extension:`) are left as they are.
+/// - A URL ends at whitespace or at a bracket or quote, except that once its query or
+///   fragment has begun (`?`, `#`) everything up to the next whitespace goes with it, and a
+///   `data:` URL always runs to the next whitespace: a secret there never stays behind.
+/// - A stack trace's `:line:column` stays when it follows the path (no query or fragment).
 pub fn scrub_urls(text: &str) -> String {
+    // ASCII lower-casing keeps every byte offset.
+    let lower = text.to_ascii_lowercase();
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    loop {
-        let lower = rest.to_ascii_lowercase();
-        let Some(at) = URL_STARTS.iter().filter_map(|s| lower.find(s)).min() else {
-            out.push_str(rest);
-            return out;
+    let mut i = 0;
+    while i < text.len() {
+        let next = URL_STARTS
+            .iter()
+            .filter_map(|s| lower[i..].find(s).map(|p| (i + p, *s)))
+            .min_by_key(|(p, _)| *p);
+        let Some((at, scheme)) = next else {
+            out.push_str(&text[i..]);
+            break;
         };
-        out.push_str(&rest[..at]);
-        let tail = &rest[at..];
-        let end = tail
-            .find(|c: char| c.is_whitespace() || "\"'<>()[]{}`".contains(c))
-            .unwrap_or(tail.len());
+        out.push_str(&text[i..at]);
+        let tail = &text[at..];
+        let to_space = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let end = if scheme == "data:" {
+            to_space
+        } else {
+            let delimiter = tail
+                .find(|c: char| c.is_whitespace() || URL_DELIMITERS.contains(c))
+                .unwrap_or(tail.len());
+            match tail[..to_space].find(['?', '#']) {
+                Some(q) if q < delimiter => to_space,
+                _ => delimiter,
+            }
+        };
         let token = &tail[..end];
-        let (url, position) = split_position(token);
+        let (url, position) = if token.contains(['?', '#']) {
+            (token, "")
+        } else {
+            split_position(token)
+        };
         out.push_str(&url_for_log(url));
         out.push_str(position);
-        rest = &tail[end..];
+        i = at + end;
     }
+    out
 }
 
-/// A token's `:line:column` suffix (stack traces), split off.
+/// What ends a URL before its query (a URL in brackets or quotes).
+const URL_DELIMITERS: &str = "\"'<>()[]{}`";
+
+/// A path's `:line:column` suffix (stack traces), split off: both numbers of at most 7
+/// digits, after a `scheme://host...` part.
 fn split_position(token: &str) -> (&str, &str) {
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let number = |s: &str| (1..=7).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
     let mut parts = token.rsplitn(3, ':');
     if let (Some(col), Some(line), Some(url)) = (parts.next(), parts.next(), parts.next()) {
-        if digits(col) && digits(line) && url.contains("://") {
+        if number(col) && number(line) && url.contains("://") {
             return (url, &token[url.len()..]);
         }
     }
@@ -460,8 +488,9 @@ mod tests {
         for secret in ["SECRET", "u:p@", "#x"] {
             assert!(!got.contains(secret), "{got}");
         }
-        assert!(got.contains("(https://a.test/app.js:10:5)"), "{got}");
-        assert!(got.contains("at https://a.test/b.js:3:1"), "{got}");
+        // A position after a query cannot be told from the query: it goes with it.
+        assert!(got.contains("at f (https://a.test/app.js\n"), "{got}");
+        assert!(got.contains("at https://a.test/b.js\n"), "{got}");
         // A comma does not end a URL (queries hold them): it goes with the query.
         assert!(
             got.contains("ws://a.test/s blob:https://a.test/id data:"),
@@ -472,6 +501,31 @@ mod tests {
         assert_eq!(
             scrub_urls("plain text, no address"),
             "plain text, no address"
+        );
+        // Brackets and quotes inside a query do not end it; a data URL runs to whitespace.
+        assert_eq!(
+            scrub_urls("x https://a.test/x?f=(SECRET6) y"),
+            "x https://a.test/x y"
+        );
+        assert_eq!(scrub_urls("x data:text/html,<p>SECRET7</p> y"), "x data: y");
+        // A number at the end of a query is not a position.
+        assert_eq!(
+            scrub_urls("https://a.test/x?otp=482913:1"),
+            "https://a.test/x"
+        );
+        // Brackets end a URL that has no query; a path position stays.
+        assert_eq!(
+            scrub_urls("(https://a.test/app.js:10:5)"),
+            "(https://a.test/app.js:10:5)"
+        );
+        assert_eq!(
+            scrub_urls("open WSS://u:p@a.test/s?t=SECRET8#f now"),
+            "open wss://a.test/s now"
+        );
+        // Forms that are not scrubbed.
+        assert_eq!(
+            scrub_urls("file:///x?q=1 /rel?q=2"),
+            "file:///x?q=1 /rel?q=2"
         );
         // Through console_line, for both kinds.
         let e = console_line(
