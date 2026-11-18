@@ -38,18 +38,10 @@ pub struct Bridge {
     bound: std::sync::Mutex<String>,
     /// Tab switches before this are not reported (`CLOSE_QUIET`).
     quiet_until: std::sync::Mutex<Option<SystemTime>>,
-    /// The worker's script URL (`chrome-extension://<id>/sw.js`): where to start it again.
-    script: std::sync::Mutex<String>,
 }
 
-/// How long `revive` waits for a worker it started.
-const WAKE_WAIT: Duration = Duration::from_secs(5);
-
-/// A worker target: (target id, script URL).
-type Worker = (String, String);
-
 /// Finds the bridge worker of `context`, waiting up to `wait` for it to start.
-async fn find_worker(conn: &CdpConn, context: &str, wait: Duration) -> Result<Option<Worker>> {
+async fn find_worker(conn: &CdpConn, context: &str, wait: Duration) -> Result<Option<String>> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         let r = conn.send("Target.getTargets", json!({}), None).await?;
@@ -59,9 +51,7 @@ async fn find_worker(conn: &CdpConn, context: &str, wait: Duration) -> Result<Op
             .flatten()
             .find(|t| is_worker_of(t, context));
         if let Some(t) = found {
-            return Ok(t["targetId"]
-                .as_str()
-                .map(|id| (id.to_string(), t["url"].as_str().unwrap_or("").to_string())));
+            return Ok(t["targetId"].as_str().map(String::from));
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);
@@ -76,14 +66,11 @@ impl Bridge {
         let deadline = tokio::time::Instant::now() + WORKER_WAIT;
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let (target, script) =
-                find_worker(conn, agent_context, left)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "bridge service worker for the agent profile did not appear within 10s"
-                        )
-                    })?;
+            let target = find_worker(conn, agent_context, left)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("bridge service worker for the agent profile did not appear within 10s")
+                })?;
             // A worker that is still starting (or being restarted) can accept a session
             // yet never answer, so require one answered ping before trusting it.
             if let Ok(session) = conn.attach(&target).await {
@@ -95,7 +82,6 @@ impl Bridge {
                         activity: std::sync::Mutex::new(None),
                         bound: std::sync::Mutex::new(String::new()),
                         quiet_until: std::sync::Mutex::new(None),
-                        script: std::sync::Mutex::new(script),
                     });
                 }
             }
@@ -148,89 +134,39 @@ impl Bridge {
             .is_ok()
     }
 
-    /// A new session on a worker that answers: the running worker, or one started again
-    /// (`wake`) when none runs or the one listed does not answer. Binds it when following.
+    /// A new session on the worker, if one runs and answers (a worker that restarted is a
+    /// new target). Otherwise `bridge_asleep` at once: a worker stopped by force does not come
+    /// back by any means measured (spike-findings H9), and the call must not hang on it.
+    /// Binds the new session when following.
     async fn revive(&self, session: &mut String) -> Result<()> {
-        let mut woken = false;
-        loop {
-            let wait = if woken { WAKE_WAIT } else { Duration::ZERO };
-            if let Some((target, script)) =
-                find_worker(&self.conn, &self.agent_context, wait).await?
-            {
-                if let Ok(new) = self.conn.attach(&target).await {
-                    if answers(&self.conn, &new).await {
-                        let old = std::mem::replace(session, new);
-                        *lock(&self.script) = script;
-                        let _ = tokio::time::timeout(
-                            PING_TIMEOUT,
-                            self.conn.send(
-                                "Target.detachFromTarget",
-                                json!({ "sessionId": old }),
-                                None,
-                            ),
-                        )
-                        .await;
-                        self.bind_if_following(session).await;
-                        if crate::testenv::hooks() {
-                            eprintln!(
-                                "pegboard: bridge: attached again to its worker{}",
-                                if woken { " (started by pegboard)" } else { "" }
-                            );
-                        }
-                        return Ok(());
-                    }
-                    let _ = self
-                        .conn
-                        .send("Target.detachFromTarget", json!({ "sessionId": new }), None)
-                        .await;
-                }
-            }
-            if woken {
-                bail!("bridge_asleep: the bridge service worker is not running");
-            }
-            self.wake().await;
-            woken = true;
-        }
-    }
-
-    /// Asks the browser to start the bridge's worker (`ServiceWorker.startWorker` on a page
-    /// of the profile, whose storage holds the extension's registration). Best effort.
-    async fn wake(&self) {
-        let script = lock(&self.script).clone();
-        let Some(scope) = script.strip_suffix("sw.js").map(String::from) else {
-            return;
-        };
-        let start = async {
-            let pages = crate::cdp::page_targets(&self.conn).await?;
-            let page = pages
-                .iter()
-                .find(|t| t.browser_context_id.as_deref() == Some(self.agent_context.as_str()))
-                .ok_or_else(|| anyhow!("the profile has no page"))?;
-            let s = self.conn.attach(&page.target_id).await?;
-            let started = async {
-                self.conn
-                    .send("ServiceWorker.enable", json!({}), Some(&s))
-                    .await?;
-                self.conn
-                    .send(
-                        "ServiceWorker.startWorker",
-                        json!({ "scopeURL": scope }),
-                        Some(&s),
+        if let Some(target) = find_worker(&self.conn, &self.agent_context, Duration::ZERO).await? {
+            if let Ok(new) = self.conn.attach(&target).await {
+                if answers(&self.conn, &new).await {
+                    let old = std::mem::replace(session, new);
+                    let _ = tokio::time::timeout(
+                        PING_TIMEOUT,
+                        self.conn.send(
+                            "Target.detachFromTarget",
+                            json!({ "sessionId": old }),
+                            None,
+                        ),
                     )
-                    .await
-            }
-            .await;
-            let _ = self
-                .conn
-                .send("Target.detachFromTarget", json!({ "sessionId": s }), None)
+                    .await;
+                    self.bind_if_following(session).await;
+                    if crate::testenv::hooks() {
+                        eprintln!("pegboard: bridge: attached again to its worker");
+                    }
+                    return Ok(());
+                }
+                let _ = tokio::time::timeout(
+                    PING_TIMEOUT,
+                    self.conn
+                        .send("Target.detachFromTarget", json!({ "sessionId": new }), None),
+                )
                 .await;
-            started
-        };
-        match tokio::time::timeout(WAKE_WAIT, start).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => eprintln!("pegboard: bridge: could not start its worker: {e:#}"),
-            Err(_) => eprintln!("pegboard: bridge: starting its worker timed out"),
+            }
         }
+        bail!("bridge_asleep: the bridge service worker is not running")
     }
 
     pub async fn create_group(&self, title: &str, color: &str) -> Result<(GroupId, String)> {
@@ -414,9 +350,6 @@ impl Bridge {
                 let Some(target) = e.params["targetInfo"]["targetId"].as_str() else {
                     return;
                 };
-                if let Some(url) = e.params["targetInfo"]["url"].as_str() {
-                    *lock(&self.script) = url.to_string();
-                }
                 let mut session = self.session.lock().await;
                 if let Ok(new) = self.conn.attach(target).await {
                     let old = std::mem::replace(&mut *session, new);
@@ -522,111 +455,191 @@ fn target_id(r: &Value) -> Result<String> {
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    /// A browser stand-in with one agent profile ("A", a page P1) and its bridge worker.
-    /// While `running` is false the worker is stopped: it is not listed, and a session on
-    /// the old worker takes requests and never answers them (what a session on a stopped
-    /// worker did on the second machine). `ServiceWorker.startWorker` starts a new one.
-    /// Returns the URL and the methods it was sent.
-    async fn fake_browser(
-        running: Arc<AtomicBool>,
-    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    /// A browser stand-in with one agent profile ("A", a page P1) and its bridge worker
+    /// `W<n>`. `running` false: the worker is stopped (not listed; a session on it takes
+    /// requests and never answers, as on the second machine). `restart` makes a new worker
+    /// `W<n+1>` and says so (`Target.targetCreated`); only a session on the current worker
+    /// answers. The worker's `replayActivity` hands over one kept tab switch (of `T9`) through
+    /// the binding of the session it is called on. Every method sent is in `seen`.
+    struct Fake {
+        running: AtomicBool,
+        worker: AtomicU32,
+        seen: std::sync::Mutex<Vec<String>>,
+        restart: tokio::sync::Notify,
+    }
+
+    impl Fake {
+        fn new() -> Arc<Fake> {
+            Arc::new(Fake {
+                running: AtomicBool::new(true),
+                worker: AtomicU32::new(1),
+                seen: Default::default(),
+                restart: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn current(&self) -> String {
+            format!("S-W{}", self.worker.load(Ordering::SeqCst))
+        }
+
+        fn reply(&self, v: &Value) -> Option<Vec<Value>> {
+            let method = v["method"].as_str().unwrap_or("").to_string();
+            self.seen.lock().unwrap().push(method.clone());
+            let on = v["sessionId"].as_str().unwrap_or("");
+            let running = self.running.load(Ordering::SeqCst);
+            let worker_session = on.starts_with("S-W");
+            if worker_session && (!running || on != self.current()) {
+                return None;
+            }
+            let mut out = Vec::new();
+            let result = match method.as_str() {
+                "Target.getTargets" => {
+                    let mut infos = vec![json!({ "targetId": "P1", "type": "page",
+                        "url": "about:blank", "browserContextId": "A" })];
+                    if running {
+                        infos.push(
+                            json!({ "targetId": format!("W{}", self.worker.load(Ordering::SeqCst)),
+                            "type": "service_worker", "browserContextId": "A",
+                            "url": "chrome-extension://x/sw.js" }),
+                        );
+                    }
+                    json!({ "targetInfos": infos })
+                }
+                "Target.attachToTarget" => {
+                    json!({ "sessionId": format!("S-{}", v["params"]["targetId"].as_str().unwrap_or("")) })
+                }
+                "Runtime.evaluate" => {
+                    let expr = v["params"]["expression"].as_str().unwrap_or("");
+                    let value = match expr {
+                        "typeof self.peg" => json!("object"),
+                        "self.peg.replayActivity()" => {
+                            let payload =
+                                r#"{"event":"activated","targetId":"T9","at":1700000000000}"#;
+                            out.push(json!({ "method": "Runtime.bindingCalled", "sessionId": on,
+                                "params": { "name": ACTIVITY_BINDING, "payload": payload } }));
+                            json!(1)
+                        }
+                        _ => json!(r#"{"targetIds":["T1"]}"#),
+                    };
+                    json!({ "result": { "value": value } })
+                }
+                _ => json!({}),
+            };
+            out.insert(0, json!({ "id": v["id"], "result": result }));
+            Some(out)
+        }
+    }
+
+    async fn fake_browser(fake: Arc<Fake>) -> String {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let log = seen.clone();
         tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            let mut worker = 1;
-            let mut live = String::from("S1");
-            while let Some(Ok(Message::Text(t))) = ws.next().await {
-                let v: Value = serde_json::from_str(&t).unwrap();
-                let method = v["method"].as_str().unwrap_or("").to_string();
-                log.lock().unwrap().push(method.clone());
-                let on = v["sessionId"].as_str().unwrap_or("").to_string();
-                let result = match method.as_str() {
-                    "Target.getTargets" => {
-                        let mut infos = vec![json!({ "targetId": "P1", "type": "page",
-                            "url": "about:blank", "browserContextId": "A" })];
-                        if running.load(Ordering::SeqCst) {
-                            infos.push(json!({ "targetId": format!("W{worker}"),
-                                "type": "service_worker", "browserContextId": "A",
-                                "url": "chrome-extension://x/sw.js" }));
+            loop {
+                tokio::select! {
+                    m = ws.next() => {
+                        let Some(Ok(Message::Text(t))) = m else { return };
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        for out in fake.reply(&v).unwrap_or_default() {
+                            ws.send(Message::text(out.to_string())).await.unwrap();
                         }
-                        json!({ "targetInfos": infos })
                     }
-                    "Target.attachToTarget" => {
-                        let target = v["params"]["targetId"].as_str().unwrap_or("");
-                        let session = format!("S-{target}");
-                        if target.starts_with('W') {
-                            live = session.clone();
-                        }
-                        json!({ "sessionId": session })
+                    () = fake.restart.notified() => {
+                        let n = fake.worker.fetch_add(1, Ordering::SeqCst) + 1;
+                        fake.running.store(true, Ordering::SeqCst);
+                        let e = json!({ "method": "Target.targetCreated", "params": { "targetInfo": {
+                            "targetId": format!("W{n}"), "type": "service_worker",
+                            "browserContextId": "A", "url": "chrome-extension://x/sw.js" } } });
+                        ws.send(Message::text(e.to_string())).await.unwrap();
                     }
-                    "ServiceWorker.startWorker" => {
-                        worker += 1;
-                        running.store(true, Ordering::SeqCst);
-                        json!({})
-                    }
-                    "Runtime.evaluate" if on.starts_with("S-W") && on != live => continue,
-                    "Runtime.evaluate"
-                        if on.starts_with("S-W") && !running.load(Ordering::SeqCst) =>
-                    {
-                        continue
-                    }
-                    "Runtime.evaluate" => {
-                        let expr = v["params"]["expression"].as_str().unwrap_or("");
-                        let value = if expr == "typeof self.peg" {
-                            json!("object")
-                        } else {
-                            json!(r#"{"targetIds":["T1"]}"#)
-                        };
-                        json!({ "result": { "value": value } })
-                    }
-                    _ => json!({}),
-                };
-                let reply = json!({ "id": v["id"], "result": result });
-                ws.send(Message::text(reply.to_string())).await.unwrap();
+                }
             }
         });
-        (format!("ws://{addr}"), seen)
+        format!("ws://{addr}")
     }
 
     #[tokio::test]
-    async fn a_call_after_the_worker_stopped_starts_it_again_without_waiting_out_the_limit() {
-        let running = Arc::new(AtomicBool::new(true));
-        let (url, seen) = fake_browser(running.clone()).await;
-        let conn = CdpConn::connect(&url).await.unwrap();
+    async fn a_call_on_a_stopped_worker_fails_at_once_instead_of_waiting_out_the_limit() {
+        let fake = Fake::new();
+        let conn = CdpConn::connect(&fake_browser(fake.clone()).await)
+            .await
+            .unwrap();
         let bridge = Bridge::attach(&conn, "A").await.unwrap();
         assert_eq!(
             bridge.members(&GroupId(1)).await.unwrap(),
             vec!["T1".to_string()]
         );
-        // The worker stops; its session stays and never answers again.
-        running.store(false, Ordering::SeqCst);
+        // Stopped by force: its session stays and never answers again; nothing restarts it.
+        fake.running.store(false, Ordering::SeqCst);
+        let t = std::time::Instant::now();
+        let e = bridge.members(&GroupId(1)).await.unwrap_err();
+        let took = t.elapsed();
+        assert!(format!("{e:#}").contains("bridge_asleep"), "{e:#}");
+        assert!(took < PING_TIMEOUT + Duration::from_secs(1), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_call_after_the_worker_restarted_goes_to_the_new_one() {
+        let fake = Fake::new();
+        let conn = CdpConn::connect(&fake_browser(fake.clone()).await)
+            .await
+            .unwrap();
+        let bridge = Bridge::attach(&conn, "A").await.unwrap();
+        // A new worker; the old session is dead. (Not followed: no rebind by event.)
+        fake.worker.fetch_add(1, Ordering::SeqCst);
         let t = std::time::Instant::now();
         assert_eq!(
             bridge.members(&GroupId(1)).await.unwrap(),
             vec!["T1".to_string()]
         );
-        let took = t.elapsed();
-        assert!(took < PING_TIMEOUT + Duration::from_secs(2), "{took:?}");
-        assert!(
-            seen.lock()
-                .unwrap()
-                .iter()
-                .any(|m| m == "ServiceWorker.startWorker"),
-            "{:?}",
-            seen.lock().unwrap()
-        );
-        // And the next call goes straight to the new worker.
+        assert!(t.elapsed() < PING_TIMEOUT + Duration::from_secs(1));
         let t = std::time::Instant::now();
         bridge.members(&GroupId(1)).await.unwrap();
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_restarted_worker_is_bound_again_and_hands_over_the_switches_it_kept() {
+        let fake = Fake::new();
+        let conn = CdpConn::connect(&fake_browser(fake.clone()).await)
+            .await
+            .unwrap();
+        let bridge = Arc::new(Bridge::attach(&conn, "A").await.unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bridge
+            .follow_activity(Arc::new(move |ctx: &str, target: &str, at| {
+                let _ = tx.send((ctx.to_string(), target.to_string(), at));
+            }))
+            .await;
+        // The first worker's replay (its binding is new too).
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((first.0.as_str(), first.1.as_str()), ("A", "T9"));
+        // Chrome starts a new worker: the bridge attaches to it, binds it and takes what it
+        // kept, without any call.
+        fake.restart.notify_one();
+        let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("no switch from the restarted worker")
+            .unwrap();
+        assert_eq!(
+            (got.0.as_str(), got.1.as_str(), got.2),
+            (
+                "A",
+                "T9",
+                UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)
+            )
+        );
+        let seen = fake.seen.lock().unwrap().clone();
+        let bindings = seen.iter().filter(|m| *m == "Runtime.addBinding").count();
+        assert_eq!(bindings, 2, "{seen:?}");
     }
 
     #[test]
