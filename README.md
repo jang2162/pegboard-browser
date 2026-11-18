@@ -44,8 +44,11 @@ pegboard eval "document.title"
 pegboard files list           # 세션 파일 디렉터리의 파일 (받은 파일, 스크린숏)
 pegboard session info "$PEGBOARD_SESSION"   # 세션과 정책
 pegboard session list         # 세션 목록 (토큰은 나오지 않는다)
-pegboard recording list       # 동작 기록 목록
+pegboard recording list       # 녹화 목록 (크기, 화면, keep, 실패 수; --session, --failed, --kept)
 pegboard recording show <기록 id>
+pegboard recording keep <기록 id>     # 보존 정리에서 빼기 (unkeep으로 되돌림)
+pegboard recording delete <기록 id>   # 진행 중인 녹화는 recording_running
+pegboard recording prune --dry-run    # 지금 정리하면 지울 것
 
 pegboard session close "$PEGBOARD_SESSION"   # 탭을 닫고 기록을 마감한다
 pegboard browser stop
@@ -223,6 +226,9 @@ pegboard profile delete work                            # 열린 세션이 있�
 - 화면 기록을 끈 도메인의 탭도 `--record`의 네트워크와 콘솔 기록은 남는다(화면만 끄는 설정이다).
 - 탭 전환은 브리지 확장의 서비스 워커가 알려 준다. 워커가 다시 뜨면 데몬이 다시 붙고 그동안 모아 둔 전환을 넘겨받게 되어 있지만, 실제 브라우저에서 브리지 워커가 다시 뜨는 것은 본 적이 없어 이 경로는 단위 시험으로만 확인했다.
 - Chrome이 브리지의 서비스 워커를 멈추면(강제로 멈추지 않고는 본 적이 없다) 새 탭 열기(`tab new`), 세션 만들기와 닫기가 `bridge_asleep`으로 곧바로 실패한다. 이미 있는 탭의 명령은 그대로 된다. 브라우저를 다시 시작하면(`pegboard browser stop`, `pegboard browser start`) 돌아온다.
+- 녹화는 저절로 지워진다: 끝난 지 14일(`config.toml`의 `[recording] max_age_days`)이 지난 녹화는 통째로, 그다음 전체 크기가 5 GB(`max_total_gb`)를 넘으면 끝난 녹화 중 오래된 것부터 화면(`screen/`)만 지운다("screen pruned"). 동작 기록은 크기 때문에 지우지 않고 14일까지 남는다. 진행 중인 녹화와 `recording keep`으로 표시한 녹화는 지우지 않고, keep한 것은 전체 크기에도 세지 않는다(쌓이면 `recording delete`로 지운다). 데몬이 시작할 때, 1시간마다, 세션이 끝날 때마다 정리한다. **2b 이전에 만든 동작 기록도 같은 14일 규칙을 따르므로, 2b를 처음 켜는 날 끝난 지 14일이 지난 기존 동작 기록이 지워진다.** 지우기 전에 남길 것은 `recording keep`으로 표시한다(데몬이 떠 있어야 한다).
+- 앞선 데몬이 끝을 적지 못하고 멈춘 녹화는 다음 시작 때 마지막으로 파일을 쓴 시각을 끝으로 적는다. `manifest.json`을 읽을 수 없는 녹화 디렉터리는 정리하지 않고 `daemon.log`에 한 줄 남긴다.
+- MCP 기본 모드에는 `pegboard_recording_keep`, `pegboard_recording_delete`가 없다(운영자 모드에만 있다). 보존과 삭제는 사람이 정한다.
 - `navigation.jsonl`, `network.jsonl`, `console.jsonl`은 녹화 하나에 파일마다 64 MiB까지다. 넘으면 `{"ts":…,"capped":true}` 한 줄로 끝나고 그 뒤로는 그 파일에 쓰지 않는다(화면의 녹화당 한도와 따로 센다).
 
 ## 시험
@@ -241,7 +247,7 @@ cargo test -p pegboard-core --test e2e_clipboard -- --ignored --test-threads=1  
 
 실제 브라우저를 띄우는 시험은 `#[ignore]`가 붙어 있고, 임시 `PEGBOARD_HOME`에서 돌며 끝나면 브라우저를 정리한다. 격리 시험 묶음 둘은 에이전트가 할 수 있는 일을 시도한다. CLI 묶음(`crates/pegboard-cli/tests/e2e_isolation.rs`)은 세션 핸들 하나로 agent-browser 명령만 쓰는 에이전트가 사람 프로필, 다른 세션, 세션 밖의 브라우저, 토큰에 닿지 못함을 확인한다(CLI 전체를 가진 에이전트는 사람의 권한이라 정책을 넓히는 시도는 다루지 않는다). MCP 묶음(`e2e_mcp_isolation.rs`)은 MCP 도구만으로 같은 것에 더해 더 넓은 정책과 세션 밖에 남는 탭에 닿지 못함을 확인한다. 시험마다 새 브라우저를 띄우며, 이후 모든 단계에서 유지한다. 손으로 하는 확인은 [docs/phase1-manual-checks.md](docs/phase1-manual-checks.md)와 [docs/phase2a-manual-checks.md](docs/phase2a-manual-checks.md).
 
-시험용 환경 변수는 모두 `PEGBOARD_TEST_HOOKS`를 함께 줄 때만 읽는다(실제 사용에서는 주지 않는다): `PEGBOARD_TEST_HOST_RULES`, `PEGBOARD_TEST_BROWSER_HOST_RULES`, `PEGBOARD_TEST_IP_SPACE_OVERRIDES`, `PEGBOARD_TEST_LAUNCH_LOG`, `PEGBOARD_TEST_IDLE_SECS`, `PEGBOARD_TEST_DOWNLOAD_LIMITS`, `PEGBOARD_TEST_NO_CLIPBOARD_SHIELD`. `PEGBOARD_TEST_HOOKS`는 데몬의 시험용 메서드와 진단 기록(daemon.log)도 켠다. `PEGBOARD_TEST_MCP_SLOW_CREATE`는 디버그 빌드의 MCP 서버에만 있다.
+시험용 환경 변수는 모두 `PEGBOARD_TEST_HOOKS`를 함께 줄 때만 읽는다(실제 사용에서는 주지 않는다): `PEGBOARD_TEST_HOST_RULES`, `PEGBOARD_TEST_BROWSER_HOST_RULES`, `PEGBOARD_TEST_IP_SPACE_OVERRIDES`, `PEGBOARD_TEST_LAUNCH_LOG`, `PEGBOARD_TEST_IDLE_SECS`, `PEGBOARD_TEST_PRUNE_SECS`, `PEGBOARD_TEST_DOWNLOAD_LIMITS`, `PEGBOARD_TEST_NO_CLIPBOARD_SHIELD`. `PEGBOARD_TEST_HOOKS`는 데몬의 시험용 메서드와 진단 기록(daemon.log)도 켠다. `PEGBOARD_TEST_MCP_SLOW_CREATE`는 디버그 빌드의 MCP 서버에만 있다.
 
 ## 라이선스
 
