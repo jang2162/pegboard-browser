@@ -675,7 +675,12 @@ struct Inner {
     /// Test hook: the shield without its `open`/`write`/`writeln` wrappers, so that an
     /// `open` gets past it and the guard's `documentOpened` check is what remains.
     no_wrappers: std::sync::atomic::AtomicBool,
+    /// Told the target just before the guard reloads a page itself (`on_reloading`).
+    reloading: Mutex<Option<Reloading>>,
 }
+
+/// See `Guard::on_reloading`.
+pub type Reloading = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct Guard {
     inner: Arc<Inner>,
@@ -727,6 +732,7 @@ impl Guard {
             nonce: random_hex(),
             key: random_hex(),
             no_wrappers: std::sync::atomic::AtomicBool::new(false),
+            reloading: Mutex::new(None),
         });
         let supervisor = tokio::spawn(supervise(Arc::downgrade(&inner)));
         Guard { inner, supervisor }
@@ -734,6 +740,12 @@ impl Guard {
 
     pub fn is_ready(&self) -> bool {
         *self.inner.ready.borrow()
+    }
+
+    /// `f` is told the target id of every page the guard reloads itself (to renew a page
+    /// that ran before it was judged, or to put the clipboard shield in place), just before.
+    pub fn on_reloading(&self, f: Reloading) {
+        *self.inner.reloading.lock().unwrap() = Some(f);
     }
 
     /// Waits up to `limit` for the guard to be up.
@@ -1059,6 +1071,13 @@ impl Inner {
     /// (a tab reloads, a frame inside it goes to `about:blank`, a frame target reloads itself),
     /// counted per frame like the other reloads; past that, or when anything fails, its tab
     /// is closed.
+    fn announce_reload(&self, target: &str) {
+        let f = self.reloading.lock().unwrap().clone();
+        if let Some(f) = f {
+            f(target);
+        }
+    }
+
     async fn check_opened(
         &self,
         conn: &CdpConn,
@@ -1101,6 +1120,7 @@ impl Inner {
             );
         }
         let renewed = if frame == attached.target && attached.kind == "page" {
+            self.announce_reload(&attached.target);
             conn.send("Page.reload", json!({}), s).await
         } else if frame == attached.target {
             conn.send(
@@ -1445,14 +1465,17 @@ impl Inner {
     ) -> String {
         let s = Some(a.session);
         match step {
-            ClipboardStep::ShieldAndReload => match conn.send("Page.reload", json!({}), s).await {
-                Ok(_) => " reload=ok".to_string(),
-                // Its document may not have the shield first: fail closed.
-                Err(e) => format!(
-                    " reload failed ({e:#}), {}",
-                    self.close_tab_of(conn, a.session).await
-                ),
-            },
+            ClipboardStep::ShieldAndReload => {
+                self.announce_reload(a.target);
+                match conn.send("Page.reload", json!({}), s).await {
+                    Ok(_) => " reload=ok".to_string(),
+                    // Its document may not have the shield first: fail closed.
+                    Err(e) => format!(
+                        " reload failed ({e:#}), {}",
+                        self.close_tab_of(conn, a.session).await
+                    ),
+                }
+            }
             ClipboardStep::ShieldAndReloadFrame => {
                 let allowed = self.count_reload(a.target, a.session) <= FRAME_RELOADS;
                 if !allowed {

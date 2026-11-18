@@ -438,6 +438,8 @@ struct State {
     handled: u64,
     /// Tabs pegboard is switching to itself, until when (`expect_activation`).
     expected: HashMap<String, Instant>,
+    /// Tabs pegboard is reloading itself (the guard), until when (`expect_navigation`).
+    expected_nav: HashMap<String, Instant>,
 }
 
 impl State {
@@ -795,6 +797,16 @@ impl Recorder {
             .insert(target_id.to_string(), Instant::now() + EXPECT_ACTIVATION);
     }
 
+    /// pegboard itself is about to reload `target` (the request guard renewing a page): its
+    /// next main-frame commit within 5 s is not a person's.
+    pub fn expect_navigation(&self, target_id: &str) {
+        let mut st = self.state();
+        let now = Instant::now();
+        st.expected_nav.retain(|_, until| *until > now);
+        st.expected_nav
+            .insert(target_id.to_string(), now + EXPECT_ACTIVATION);
+    }
+
     /// From the bridge of the profile whose context is `context`: `target` became the
     /// active tab of its window at `at` (the extension's clock; a switch the bridge kept
     /// while its worker restarted arrives late). A switch to a tab of a running recording,
@@ -833,7 +845,12 @@ impl Recorder {
         let Some(rec) = &sess.rec else {
             return;
         };
-        let in_command = sess.windows.covers(at_instant);
+        // A switch in a profile's window may come from any of its sessions' commands
+        // (closing a tab activates a neighbour, which may be another session's).
+        let in_command = st
+            .sessions
+            .values()
+            .any(|s| s.context == context && s.windows.covers(at_instant));
         if let Some((what, certain)) = classify(&Signal::Activated, in_command, expected) {
             let ts = time::OffsetDateTime::from(at)
                 .format(&time::format_description::well_known::Rfc3339)
@@ -1361,7 +1378,11 @@ impl Recorder {
             }
         };
         if network {
-            let _ = conn.send("Network.enable", json!({}), Some(cdp)).await;
+            // No buffering of bodies for `Network.getResponseBody` (never asked for).
+            let small = json!({ "maxTotalBufferSize": 0, "maxResourceBufferSize": 0 });
+            if conn.send("Network.enable", small, Some(cdp)).await.is_err() {
+                let _ = conn.send("Network.enable", json!({}), Some(cdp)).await;
+            }
         }
         if console {
             let _ = conn.send("Runtime.enable", json!({}), Some(cdp)).await;
@@ -1550,6 +1571,13 @@ impl Recorder {
             // The tab's screen is not frozen.
             st.health.frame_seen(target);
         }
+        // A commit of a reload pegboard announced (the guard renewing a page).
+        let announced = e.method == "Page.frameNavigated"
+            && e.params.pointer("/frame/parentId").is_none()
+            && st
+                .expected_nav
+                .remove(target)
+                .is_some_and(|until| until >= now);
         let Some(sess) = st.sessions.get_mut(session) else {
             return;
         };
@@ -1596,7 +1624,9 @@ impl Recorder {
                 let signal = follow.committed(url);
                 if let Some(rec) = &sess.rec {
                     rec.nav(target, NavEvent::Navigated, Some(url), None);
-                    let mark = signal.and_then(|s| classify(&s, sess.windows.covers(now), false));
+                    let mark = signal
+                        .filter(|_| !announced)
+                        .and_then(|s| classify(&s, sess.windows.covers(now), false));
                     if let Some((what, certain)) = mark {
                         rec.human(session, &now_ts(), target, Some(url), &what, certain);
                     }
@@ -3666,5 +3696,92 @@ mod tests {
             ("error", "hello")
         );
         assert_eq!(mode(&manifest.dir().join("console.jsonl")), 0o600);
+    }
+
+    #[tokio::test]
+    async fn a_switch_during_another_sessions_command_in_the_profile_is_not_marked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        let other = SessionId("s_bbbbbbbb".into());
+        let foreign = SessionId("s_cccccccc".into());
+        r.state().sessions.insert(other.clone(), Sess::new("AGENT"));
+        r.state()
+            .sessions
+            .insert(foreign.clone(), Sess::new("ELSEWHERE"));
+        // Another session of the same profile runs a command (it closes a tab, say).
+        let window = r.command_window(&other);
+        r.activated("AGENT", T1, SystemTime::now());
+        drop(window);
+        // A command of a session in another profile is no cover.
+        let window = r.command_window(&foreign);
+        let later = (
+            SystemTime::now() + Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(2),
+        );
+        r.activated_as_of("AGENT", T1, later.0, later);
+        drop(window);
+        settle().await;
+        r.end_session(&id).await;
+        assert_eq!(humans(&manifest).len(), 1, "{:?}", humans(&manifest));
+    }
+
+    #[tokio::test]
+    async fn a_reload_pegboard_announced_is_not_marked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
+        let later = Instant::now() + Duration::from_secs(2);
+        // The guard renews the page: announced, so not a person's.
+        r.expect_navigation(T1);
+        feed(&r, &id, navigated("http://a.test/", "L1", "Reload"), later);
+        // The next commit is not covered by that announcement any more.
+        feed(
+            &r,
+            &id,
+            navigated("http://a.test/2", "L2", "Navigation"),
+            later,
+        );
+        // An announcement past its 5 s covers nothing.
+        r.expect_navigation(T1);
+        feed(
+            &r,
+            &id,
+            navigated("http://a.test/3", "L3", "Navigation"),
+            Instant::now() + Duration::from_secs(6),
+        );
+        settle().await;
+        r.end_session(&id).await;
+        let urls: Vec<Option<String>> = humans(&manifest).into_iter().map(|e| e.url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                Some("http://a.test/2".to_string()),
+                Some("http://a.test/3".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_create_counts_as_a_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = Recorder::start(RecorderOptions {
+            ws_url: "ws://127.0.0.1:9/none".into(),
+            human_context: "HUMAN".into(),
+            config: off_config(),
+        });
+        let (log, manifest) = open_log(tmp.path());
+        let id = SessionId("s_abcdefgh".into());
+        r.add_target(&id, T1, "AGENT");
+        r.begin_session(&id, "AGENT", log, manifest.clone(), Vec::new())
+            .await;
+        // Within a second of the session's creation: its start page's doing.
+        r.activated("AGENT", T1, SystemTime::now());
+        let later = (
+            SystemTime::now() + Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(2),
+        );
+        r.activated_as_of("AGENT", T1, later.0, later);
+        settle().await;
+        r.end_session(&id).await;
+        assert_eq!(humans(&manifest).len(), 1, "{:?}", humans(&manifest));
     }
 }

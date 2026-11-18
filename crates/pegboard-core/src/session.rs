@@ -326,6 +326,11 @@ impl SessionManager {
             .on_activating(Arc::new(move |target: &str| {
                 recorder.expect_activation(target)
             }));
+        // Nor is a reload the guard makes itself.
+        let recorder = inner.recorder.clone();
+        inner.guard.on_reloading(Arc::new(move |target: &str| {
+            recorder.expect_navigation(target)
+        }));
         let watcher = tokio::spawn(watch(Arc::downgrade(&inner), events));
         SessionManager { inner, watcher }
     }
