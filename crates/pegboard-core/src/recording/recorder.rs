@@ -3375,6 +3375,44 @@ mod tests {
         )
     }
 
+    /// One reading of the wall clock with the monotonic one, and wall times derived from it
+    /// only: `activated_as_of` turns a wall time into an instant by the pair it is given, so
+    /// a test that reads the two clocks apart (with the wall clock's microsecond steps and
+    /// its own rate) may land a switch made in a command a hair before the command began.
+    struct Clock {
+        wall: SystemTime,
+        start: Instant,
+    }
+
+    impl Clock {
+        /// Read after the command window it is used with began.
+        fn now() -> Clock {
+            Clock {
+                wall: SystemTime::now(),
+                start: Instant::now(),
+            }
+        }
+
+        /// The (wall, monotonic) pair of the instant `at`.
+        fn at(&self, at: Instant) -> (SystemTime, Instant) {
+            (self.wall + at.duration_since(self.start), at)
+        }
+
+        /// The pair of `ahead` after now (read after the windows it is judged against ended).
+        fn after_now(&self, ahead: Duration) -> (SystemTime, Instant) {
+            self.at(Instant::now() + ahead)
+        }
+    }
+
+    /// Lets the tasks already spawned (the marks appended to the action log) run to the end:
+    /// the test runtime has one thread, and such a task needs one poll (the log is not
+    /// locked by anything else here).
+    async fn run_spawned() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Lets the tasks that append to the action log run.
     async fn settle() {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3575,14 +3613,12 @@ mod tests {
         let (r, id, manifest) = rig(tmp.path(), "http://a.test/");
         // In a command, and a late report of a switch made during one (a replay, 2 s on).
         let window = r.command_window(&id);
-        let during = SystemTime::now();
-        r.activated("AGENT", T1, during);
+        let clock = Clock::now();
+        let during = clock.at(clock.start);
+        r.activated_as_of("AGENT", T1, during.0, during);
         drop(window);
-        let later = (
-            SystemTime::now() + Duration::from_secs(2),
-            Instant::now() + Duration::from_secs(2),
-        );
-        r.activated_as_of("AGENT", T1, during, later);
+        let later = clock.after_now(Duration::from_secs(2));
+        r.activated_as_of("AGENT", T1, during.0, later);
         // Announced by pegboard.
         r.expect_activation(T1);
         r.activated_as_of("AGENT", T1, later.0, later);
@@ -3591,7 +3627,7 @@ mod tests {
         r.activated_as_of("AGENT", T2, later.0, later);
         // A person.
         r.activated_as_of("AGENT", T1, later.0, later);
-        settle().await;
+        run_spawned().await;
         r.end_session(&id).await;
         let marks = humans(&manifest);
         assert_eq!(marks.len(), 1, "{marks:?}");
@@ -3710,17 +3746,16 @@ mod tests {
             .insert(foreign.clone(), Sess::new("ELSEWHERE"));
         // Another session of the same profile runs a command (it closes a tab, say).
         let window = r.command_window(&other);
-        r.activated("AGENT", T1, SystemTime::now());
+        let clock = Clock::now();
+        let during = clock.at(clock.start);
+        r.activated_as_of("AGENT", T1, during.0, during);
         drop(window);
         // A command of a session in another profile is no cover.
         let window = r.command_window(&foreign);
-        let later = (
-            SystemTime::now() + Duration::from_secs(2),
-            Instant::now() + Duration::from_secs(2),
-        );
+        let later = clock.after_now(Duration::from_secs(2));
         r.activated_as_of("AGENT", T1, later.0, later);
         drop(window);
-        settle().await;
+        run_spawned().await;
         r.end_session(&id).await;
         assert_eq!(humans(&manifest).len(), 1, "{:?}", humans(&manifest));
     }
