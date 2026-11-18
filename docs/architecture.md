@@ -501,7 +501,7 @@ pegboard browser status [--browser B]
 # 세션
 pegboard session create [--name N] [--browser B] [--url U]
                         [--profile P | --temp-profile [--from P]]
-                        [--record on|off] [--policy FILE]
+                        [--record network,console] [--policy FILE]
 pegboard session list [--browser B]
 pegboard session info  <id>
 pegboard session close <id> [--keep-tabs]
@@ -524,10 +524,11 @@ pegboard [--session S] <그 밖의 agent-browser 명령>
 # 녹화
 pegboard recording list [--session S] [--failed] [--kept]
 pegboard recording show <id>          요약과 동작 로그
-pegboard recording open <id>          재생 화면 열기
-pegboard recording export <id> --format webm|zip
-pegboard recording delete <id>
-pegboard recording prune [--older-than 14d]
+pegboard recording open <id>          재생 화면 열기 (2b)
+pegboard recording keep|unkeep <id>   보존 정리에서 빼기 (2b)
+pegboard recording delete <id>        진행 중이면 거부 (2b)
+pegboard recording prune [--dry-run]  지금 정리 (2b. 기준은 config.toml)
+pegboard recording export <id> --format webm|zip   (2b에서 뺐다)
 
 # 원격
 pegboard login | logout | whoami
@@ -541,7 +542,7 @@ pegboard mcp [--operator] [--tools core,...] [정책 옵션]
 pegboard doctor
 ```
 
-**동작 명령 통과 규칙**: `pegboard`는 agent-browser의 동작 명령을 그대로 넘기되, 접속 대상과 실행 환경을 바꾸는 전역 플래그는 거부한다. 거부 대상: `--cdp`, `--auto-connect`, `--provider`, `--profile`, `--executable-path`, `--args`, `--extension`, `--state`, `--config`, `--engine`. 에이전트가 이 플래그로 세션 밖 브라우저에 붙는 것을 막기 위해서다. `session`, `close`, `record`, `install`, `upgrade`, `connect`처럼 Pegboard가 맡는 명령은 가로채서 Pegboard 쪽 동작으로 바꾼다.
+**동작 명령 통과 규칙**: `pegboard`는 agent-browser의 동작 명령을 그대로 넘기되, 접속 대상과 실행 환경을 바꾸는 전역 플래그는 거부한다. 거부 대상: `--cdp`, `--auto-connect`, `--provider`, `--profile`, `--executable-path`, `--args`, `--extension`, `--state`, `--config`, `--engine`. 에이전트가 이 플래그로 세션 밖 브라우저에 붙는 것을 막기 위해서다. `session`, `close`, `record`, `stream`, `install`, `upgrade`, `connect`처럼 Pegboard가 맡는 일의 명령은 처음 초안에서는 가로채 Pegboard 쪽 동작으로 바꾸려 했으나, 만든 것은 허용목록 밖이라 거부한다(종료 코드 2). 세션과 녹화는 `pegboard session`, `pegboard recording`으로 하고, 화면은 데몬이 스스로 녹화한다(2b).
 
 ### MCP 도구 (2a)
 
@@ -561,7 +562,8 @@ pegboard doctor
 | `pegboard_session_list` | 없음 | 자기 세션만 | 전부 |
 | `pegboard_session_info` | `sessionId` | 자기 세션만 | 전부(`session.info_any`) |
 | `pegboard_session_close` | `sessionId`, `keepTabs?` | 자기 세션만, `keepTabs: true`는 `invalid_params`로 거부 | 전부(`session.close_any`), `keepTabs`도 된다 |
-| `pegboard_recording_list`, `pegboard_recording_get` | 없음 / `recordingId` | 자기 세션의 기록만 | 전부 |
+| `pegboard_recording_list`, `pegboard_recording_get` | 없음 / `recordingId` | 자기 세션의 기록만(텍스트, 프레임은 이름만) | 전부 |
+| `pegboard_recording_keep`, `pegboard_recording_delete` (2b) | `recordingId`, `keep` / `recordingId` | 없음 | 있음 |
 | `pegboard_files_list` | `sessionId` | 자기 세션만 | 자기 세션만(토큰이 필요하다) |
 | `pegboard_browser_status` | 없음 | 있음 | 있음(세션 수 포함) |
 | `pegboard_profile_list`, `_create`, `_delete`, `pegboard_browser_stop` | CLI와 같음 | 없음 | 있음 |
@@ -600,7 +602,7 @@ JSON-RPC 2.0, 한 줄에 메시지 하나.
 | `command.exec` | agent-browser 명령 실행 |
 | `session.info_any`, `session.close_any` | 운영자용, 토큰 없이 세션 보기와 닫기(2a) |
 | `files.list` | 세션 파일 디렉터리의 파일(2a) |
-| `recording.list`, `recording.get`, `recording.read`, `recording.delete` | 녹화 |
+| `recording.list`, `recording.get`, `recording.open`, `recording.keep`, `recording.delete`, `recording.prune` | 녹화(2b. 토큰 없이 소켓 소유자 검사만) |
 | `confirm.respond` | 확인이 필요한 동작에 대한 승인·거부 |
 | 알림: `session.changed`, `confirm.required` | 서버에서 클라이언트로 |
 
@@ -608,79 +610,105 @@ JSON-RPC 2.0, 한 줄에 메시지 하나.
 
 ## 8. 녹화
 
+2b단계에서 만들었다(자동 시험 완료 2026-11-18). 설계와 바꾼 값의 이유는 [2b 설계](./plans/2026-11-17-phase2b-recording-design.md), 측정은 [spike-findings.md](./spike-findings.md) "2b단계 측정".
+
 ### 무엇을 기록하는가
 
 | 종류 | 내용 | 기본값 | 수집 지점 |
 |---|---|---|---|
-| **동작 로그** | 명령, 인자(민감 값 가림), 결과 요약, 시각, 소요 시간, 대상 탭과 주소 | 켜짐 | `pegboardd` (모든 명령이 지나간다) |
-| **화면** | 세션 탭의 화면 프레임 | 켜짐 | 프록시와 별개의 CDP 세션에서 화면 캡처 |
-| **탐색 기록** | 탭별 주소 변화, 탭 열림·닫힘 | 켜짐 | CDP 이벤트 |
-| **네트워크** | 요청·응답의 메타데이터(주소, 상태, 크기, 시간) | 꺼짐 | CDP 네트워크 이벤트 |
-| **네트워크 본문** | 요청·응답 본문 | 꺼짐. 명시적으로 켜야 함 | 같음 |
-| **콘솔** | 콘솔 메시지와 페이지 오류 | 꺼짐 | CDP 이벤트 |
-| **사람 개입** | 사람이 세션 탭을 조작한 시점 | 켜짐 | 입력 이벤트 감지 |
+| **동작 로그** | 명령, 인자(민감 값 가림), 결과 요약, 시각, 소요 시간, 대상 탭과 주소, 직전·직후 프레임 이름 | 켜짐 | `pegboardd` (모든 명령이 지나간다) |
+| **화면** | 세션 탭의 화면 프레임(바뀔 때 초당 최대 2장, 명령마다 직후 한 장) | 켜짐. 도메인 단위로 끈다 | 녹화기의 자기 CDP 연결 |
+| **탐색 기록** | 탭 열림(팝업이면 연 탭), 주 프레임 주소 변화, 닫힘 | 켜짐 | 녹화기 세션의 CDP 이벤트 |
+| **네트워크** | 요청의 방법, 주소(쿼리 없이), 상태, 크기, 시간, 오류. 헤더와 본문은 남기지 않는다 | 꺼짐 (`--record network`) | 녹화기 세션의 CDP 네트워크 이벤트 |
+| **콘솔** | 콘솔 메시지와 페이지 오류(한 줄 1000자) | 꺼짐 (`--record console`) | 녹화기 세션의 CDP 이벤트 |
+| **사람 개입** | 명령 구간 밖의 탐색과 탭 전환. 모두 "가능성" | 켜짐 | 녹화기 세션의 탐색 이벤트, 브리지 확장의 탭 전환 |
 
-동작 로그가 중심이다. 화면은 동작 로그의 시각에 맞춰 붙는 보조 자료다.
+동작 로그가 중심이다. 화면은 동작 로그의 시각에 맞춰 붙는 보조 자료다. 네트워크 본문은 만들지 않았다(2b 범위 밖).
 
 ### 화면 기록 방식
 
-**결정**: `pegboardd`가 세션 탭마다 CDP 화면 캡처를 직접 받아, 화면이 바뀐 프레임만 JPEG로 저장하고 시각 색인을 남긴다. 영상 파일(WebM)은 내보낼 때 만든다.
+**결정**: `pegboardd`의 녹화기가 브라우저에 자기 CDP 연결을 하나 더 열어 세션 탭마다 `Page.startScreencast {jpeg, quality 60, maxWidth 1280}`을 걸고, 받은 프레임을 초당 2장으로 묶어 JPEG 그대로 저장하고 시각 색인을 남긴다. 명령이 끝나면 그 탭을 `Page.captureScreenshot`으로 한 장 찍는다. 영상 파일은 만들지 않는다.
 
 **이유**
 - agent-browser의 `record`는 외부 ffmpeg가 `PATH`에 있어야 하고 활성 페이지 하나만 녹화한다 [확인]. 세션에 탭이 여러 개일 수 있고, 사용자에게 ffmpeg 설치를 요구할 수 없다.
 - 에이전트 작업은 화면이 멈춰 있는 시간이 길다. 변화 프레임만 저장하면 작다.
 - 프레임 단위 저장이라 특정 동작 직전·직후 화면을 바로 찾을 수 있다.
+- **자기 연결 (F1)**: 데몬의 주 연결(포커스 유지 세션이 있는 곳)에 걸어도 프레임은 똑같이 왔다. 그래도 따로 연 것은 프레임이 주 연결의 이벤트 방송(1024칸)을 채워 세션 관리자의 이벤트 처리를 밀어내지 않게 하려는 것이다. 연결이 끊기면 250ms부터 5초까지 늘려 가며 다시 붙고 녹화 중인 탭에 모두 다시 붙는다.
+
+**규칙**
+- 묶기: 받은 프레임은 곧바로 확인(ack)하고(F2), 500ms 안에 온 다음 프레임은 버리되 화면이 멈추면 마지막 프레임을 남긴다.
+- 직후 캡처: 명령 하나에 500ms까지. 배율 1이고 창이 1280 이하면 그대로, 그 밖에는 `clip`과 `scale`로 가로 1280에 맞춘다. 캡처가 오래 걸려 제한에 닿은 탭은 30초 동안(또는 그 탭의 스트림 프레임이 올 때까지) 찍지 않는다. 답은 브라우저가 그보다 먼저 보낸 이벤트를 다 처리한 뒤 판정해, 그 사이에 다른 문서로 넘어갔으면 버린다.
+- 직전 화면: 찍지 않는다. `frameBefore`는 그 탭에 마지막으로 저장된 프레임(스트림 프레임이나 앞 명령의 직후 캡처)이다. 앞뒤를 다 찍으면 명령이 중앙값 50ms 넘게 느려졌다(F7).
+- 화면 기록 끄기(F5): 주 프레임이 끈 도메인으로 가면(탐색 시작, 302는 `frameNavigated`) 닫고 `off` 표시를 남긴다. 나올 때는 새 문서의 `firstContentfulPaint`까지(back/forward 캐시 복원은 250ms) 스트림 프레임과 캡처를 버린다. 녹화기가 탭이 무엇을 보이는지 모를 때(다시 붙는 동안 등)도 닫혀 있다.
+- 녹화 하나의 화면이 1 GB(설정)에 닿으면 그 녹화의 화면만 멈추고 `capped` 표시를 남긴다.
+
+**측정 결과** [확인: 2b 작업 1, 4]
+- 가려진 탭: 같은 창의 뒤쪽 탭, 최소화한 창, 다른 창에 가려진 창에서도 스트림 프레임(뒤쪽 탭과 최소화는 초당 약 4장)과 직접 캡처가 모두 왔다(F4). 다른 Space, 화면 잠금, 디스플레이 절전은 재지 못했다(수동 확인 [phase2b-manual-checks.md](./phase2b-manual-checks.md) P3, P4).
+- 명령에 더하는 시간: 배포용 빌드에서 명령별 중앙값 26~51ms, 최대 87ms(배율 1 화면). 기준은 중앙값 60ms, 최악 1초(소유자 결정 2026-11-18).
+- 디스크: 화면이 계속 바뀌는 30분 세션이 197MB(상한). 5 GB에 화면 약 12.7시간 분량이다(F8).
+- 레티나 화면(배율 2)에서의 캡처 시간과 크기는 재지 않았다.
 
 **버린 대안**
 - *agent-browser `record` 사용*: 위 이유.
 - *DOM 변화 기록(rrweb 방식)*: 용량이 가장 작고 텍스트 검색이 되지만, 페이지에 스크립트를 주입해야 해서 사이트의 보안 정책과 충돌할 수 있고, 페이지의 모든 텍스트가 기록에 남아 민감 정보 처리가 더 어렵다.
 - *OS 화면 캡처*: 사람의 탭과 다른 앱까지 찍힌다.
-
-**위험**: 가려진 탭에서는 화면 캡처 프레임이 오지 않을 수 있다 [미확인]. 5절의 백그라운드 탭 위험과 같은 문제다.
+- *명령 직전 캡처*: 위 F7.
+- *페이지에 입력 감지 스크립트를 넣어 사람 개입 알기*: 사이트 동작에 영향이 없는지 재야 하고, 탐색 신호로도 사람과 에이전트를 가를 수 없었다(F6). 사람 개입은 시간으로만 가리고 모두 "가능성"으로 남긴다.
 
 ### 저장 형식과 위치
 
 ```
-<사용자 데이터 디렉터리>/recordings/<recordingId>/
-  manifest.json        세션 정보, 형식 버전, 시작·종료 시각, 정책, 가림 규칙
-  actions.jsonl        동작 로그. 한 줄에 동작 하나
-  navigation.jsonl     탐색 기록
+<PEGBOARD_HOME>/recordings/<recordingId>/
+  manifest.json        형식 버전(2), 세션 정보, 시작·종료 시각, keep, screen, record, sizes
+  actions.jsonl        동작 로그. 한 줄에 동작 하나(kind: command | human)
+  navigation.jsonl     탐색 기록 {ts, targetId, event: created|navigated|closed, url, opener}
   screen/<targetId>/
-    index.jsonl        { ts, file, url, width, height }
+    index.jsonl        프레임 {ts, file, url, width, height, kind: change|after}, 표시 {ts, kind: off|capped}
     000001.jpg ...
-  network.har          켰을 때만
-  console.jsonl        켰을 때만
+  network.jsonl        --record network 일 때만
+  console.jsonl        --record console 일 때만
 ```
+
+- `screen`은 `none`(형식 1, 또는 화면이 없음), `recorded`, `capped`(녹화 하나의 한도), `pruned`(용량 한도로 화면을 지움)다. `sizes`는 끝날 때 잰 전체·화면 바이트.
+- 프레임 이름은 `screen/` 기준 `<targetId>/<file>`이다(타깃 ID는 32자 대문자 16진수). 쓰는 쪽과 읽는 쪽 모두 이 꼴만 받는다.
+- `navigation.jsonl`, `network.jsonl`, `console.jsonl`은 파일마다 64 MiB까지이고 넘으면 `capped` 한 줄로 끝난다.
 
 `actions.jsonl` 한 줄의 예:
 
 ```json
-{"seq":14,"ts":"2026-11-10T05:12:03.412Z","sessionId":"s_8fk2","targetId":"A1B2",
- "url":"https://example.com/login","command":"fill",
- "args":{"selector":"@e3","text":"[가림: password]"},
- "ok":true,"durationMs":182,"frameBefore":"000031.jpg","frameAfter":"000032.jpg"}
+{"seq":14,"ts":"2026-11-10T05:12:03.412Z","sessionId":"s_8fk2abcd","targetId":"9A1F…",
+ "url":"https://example.com/login","command":"fill","args":["fill","@e3","[redacted]"],
+ "ok":true,"durationMs":182,"redacted":true,
+ "frameBefore":"9A1F…/000031.jpg","frameAfter":"9A1F…/000032.jpg"}
+{"seq":15,"ts":"2026-11-10T05:12:09.020Z","sessionId":"s_8fk2abcd","targetId":"9A1F…",
+ "url":"https://example.com/home","command":"human","args":[],"ok":true,"kind":"human",
+ "what":"followed a link or form outside a command","certain":false}
 ```
 
+- `frameBefore`, `frameAfter`가 가리키는 파일은 없을 수 있다(쓰기 실패, 한도, 보존 정리). 읽는 쪽은 "화면 없음"으로 다룬다.
+- `seq`는 쓴 순서, `ts`는 일이 일어난 때다. 시간 순서로 읽을 때는 `ts`로 정렬한다.
 - 위치는 브라우저가 있는 머신의 로컬 디스크다. 원격 세션의 녹화는 원격 머신에 남는다.
 - 녹화는 호스팅 서버로 올라가지 않는다. 원격 녹화를 보려면 터널을 통해 필요할 때 가져온다.
-- 디렉터리 권한은 소유자 전용. 저장 시 암호화는 선택 사항으로 둔다.
+- 디렉터리 권한은 소유자 전용(0700, 파일 0600). 저장 시 암호화는 하지 않았다(선택 사항).
 
 ### 재생
 
-- `pegboard recording open <id>`가 재생 화면을 연다. 동작 목록과 화면이 시간축으로 맞물리고, 동작을 누르면 그 시점 화면으로 이동한다.
-- 재생 화면은 정적 웹 페이지로 만들어 `pegboardd`가 루프백에서 일회용 토큰과 함께 제공한다. 포크 이후에는 브라우저 내부 페이지로 옮길 수 있다.
-- `recording export --format webm`은 프레임을 영상으로 묶는다. 이때만 인코더가 필요하다.
-- `recording show`는 화면 없이 동작 로그만 텍스트로 보여 준다. 에이전트가 자기 작업을 되짚을 때 쓴다.
+- `pegboard recording open <id>`가 재생 화면을 사람의 기본 브라우저로 연다(링크를 확인하고 `open`을 부르는 것은 CLI다. 에이전트 프로필 창에서 열지 않는다). 동작 목록과 화면이 시간축으로 맞물리고, 열면 첫 사고(실패, 거부, 사람 개입)의 직전 화면에서 시작하며, 시간축의 사고 표시를 누르면 직전, 한 번 더 누르면 직후 화면으로 간다. 좌우 화살표로 동작을 옮기고, 탭 단추로 탭을 고른다.
+- 재생 화면은 바이너리에 넣은 정적 페이지 하나다(외부 자원 없음). `pegboardd`가 시작할 때 루프백 임시 포트에 재생 서버를 띄우고, 열 때마다 그 녹화 하나에만 유효한 일회용 토큰(30분, 데몬 종료 시 사라짐)을 만든다. 동작마다 탭별로 무엇을 보일지(프레임, 화면 기록 꺼짐, 화면 기록 멈춤, 화면 지워짐, 화면 없음)는 서버가 정하고, 페이지는 그리기만 한다. 페이지에서 온 글은 텍스트로만 넣는다. 포크 이후에는 브라우저 내부 페이지로 옮길 수 있다.
+- 동영상 내보내기(`recording export --format webm`)는 2b에서 뺐다(ffmpeg가 필요하고 블랙박스 용도에는 재생 화면으로 충분하다). 필요해지면 따로 넣는다.
+- `recording show`는 화면 없이 동작 로그만 텍스트로 보여 준다(프레임은 이름만). 에이전트가 자기 작업을 되짚을 때 쓴다(`pegboard_recording_get`).
 
 ### 보존 기간
 
 **사용자 결정 (2026-11-10)**: 녹화의 주된 용도는 디버깅이다.
 
-14일이 지났거나 전체 용량이 5GB를 넘으면 오래된 것부터 지운다. 둘 다 설정으로 바꿀 수 있다. 특정 녹화를 "보관"으로 표시하면 자동 삭제에서 빠진다. 숫자는 작성자가 고른 출발점이다.
+데몬이 시작할 때, 1시간마다, 세션이 끝날 때마다 정리한다. 끝난 지 14일(`max_age_days`)이 지난 녹화는 통째로 지운다. 그다음 전체가 5 GB(`max_total_gb`, GB는 10^9바이트)를 넘으면 끝난 녹화 중 오래된 것부터 **화면만** 지운다. 동작 기록은 작고 에이전트가 되읽으므로 크기 때문에 지우지 않는다. 진행 중인 녹화는 지우지 않고(크기에는 센다), `recording keep`으로 표시한 녹화는 지우지도 크기에 세지도 않는다(사람이 `recording delete`로 지운다). 녹화 하나의 화면은 1 GB(`max_per_recording_gb`)까지이고 넘으면 그 녹화의 화면 기록만 멈춘다. 2b 이전의 녹화도 같은 14일 규칙이라, 2b를 처음 켜는 날 14일이 지난 기존 동작 기록이 지워진다. 앞선 데몬이 끝을 적지 못한 녹화(고아)는 다음 시작 때 마지막으로 파일을 쓴 시각을 끝으로 적는다. 설정은 `<PEGBOARD_HOME>/config.toml`의 `[recording]`이고, 데몬이 시작할 때 한 번 읽는다(잘못 쓰면 `browser start`가 종료 코드 2로 끝난다).
+
+화면 기록의 실제 보존 기간은 용량 한도가 정한다: 화면이 계속 바뀌는 상한에서 5 GB는 약 12.7시간 분량이다.
 
 디버깅 용도이므로 하지 않는 것: 변조 방지(서명, 해시 사슬), 장기 보존, 고화질 영상 우선. 화면은 무슨 일이 있었는지 알아볼 수 있는 화질이면 충분하고, 저장 용량을 줄이는 쪽을 택한다.
 
-디버깅 용도이므로 챙기는 것: 실패한 동작의 직전과 직후 화면, 그 시점의 오류 메시지와 스냅샷 요약을 동작 로그에서 바로 찾을 수 있게 한다. 실패한 세션의 녹화는 `recording list --failed`로 골라 볼 수 있게 한다.
+디버깅 용도이므로 챙기는 것: 실패한 동작의 직전과 직후 화면, 그 시점의 오류 메시지를 동작 로그에서 바로 찾을 수 있게 한다. 실패한 세션의 녹화는 `recording list --failed`로 골라 본다.
 
 ### 민감 정보 처리
 
@@ -688,14 +716,16 @@ JSON-RPC 2.0, 한 줄에 메시지 하나.
 |---|---|
 | 비밀번호 입력란에 넣는 값 | 동작 로그에서 가린다. 입력란 종류는 명령 실행 전에 프록시가 확인한다 |
 | 자격증명 금고로 하는 로그인 | 비밀번호가 명령 인자에 아예 나타나지 않는다 [확인: agent-browser 금고]. 로그인은 이 경로를 권장한다 |
-| 카드 번호, 일회용 코드 입력란 | `autocomplete` 속성으로 판별해 로그에서 가린다 |
-| 화면 속 비밀번호 | 입력란이 원래 가려져 표시된다. "비밀번호 보기"를 누른 경우는 막지 못한다 |
-| 화면 속 그 밖의 민감 정보 | 도메인 단위 규칙으로 화면 기록을 끈다. 예: 은행 사이트에서는 동작 로그만 남긴다 |
-| 네트워크 헤더 | `Authorization`, `Cookie`, `Set-Cookie`는 항상 가린다 |
-| 네트워크 본문 | 기본으로 기록하지 않는다 |
-| `eval` 결과, 스냅샷 본문 | 동작 로그에는 요약과 크기만 남긴다. 전문 저장은 선택 사항 |
+| 카드 번호, 일회용 코드 입력란 | `autocomplete` 속성으로 판별해 동작 로그에서 가린다. **화면에는 그대로 찍힌다**(사용자 결정 R10 B안, 2026-11-17) |
+| 화면 속 비밀번호 | 입력란이 원래 가려져 표시된다. "비밀번호 보기"를 누른 화면, 사람이 에이전트 창에서 직접 로그인하는 과정은 그대로 찍힌다(R10) |
+| 화면 속 그 밖의 민감 정보 | 도메인 단위 규칙(`screen_off_domains`)으로 화면 기록을 끈다. 예: 은행 사이트에서는 동작 로그만 남긴다. 판정은 탭의 주 프레임 주소로만 하므로, 다른 페이지 안의 iframe으로 뜬 그 도메인은 찍힌다. 화면을 끈 도메인에서도 동작 로그, 탐색 기록, (켰다면) 네트워크·콘솔 기록은 남는다 |
+| 주소 | 동작 로그, 탐색 기록, 네트워크 기록, 화면 색인의 주소는 쿼리, 조각, 계정 정보를 지운다 |
+| 네트워크 헤더 | 기록하지 않는다(`Authorization`, `Cookie`, `Set-Cookie` 포함) |
+| 네트워크 본문 | 기록하지 않는다 |
+| 콘솔 | 페이지가 찍은 글이 그대로 남는다(글 속 http(s)·ws(s)·blob·data 주소만 쿼리 등을 지운다). 비밀이 들어갈 수 있어 기본은 꺼짐 |
+| `eval` 결과, 스냅샷 본문 | 동작 로그에는 요약과 크기만 남긴다 |
 
-한계: 화면에 보이는 정보를 완전히 가리는 방법은 없다. 그래서 녹화는 로컬에만 두고, 접근을 통제하고, 보존 기간을 짧게 잡는 것을 기본으로 한다.
+한계: 화면에 보이는 정보를 완전히 가리는 방법은 없다. 그래서 녹화는 로컬에만 두고, 접근을 통제하고(11절), 보존 기간을 짧게 잡는 것을 기본으로 한다.
 
 ---
 
@@ -921,7 +951,7 @@ WSS  /v1/tunnel/client?relay={id}   클라이언트 스트림
 | 같은 머신의 다른 프로세스가 브라우저를 제어한다 | TCP 디버깅 포트는 3단계부터 열지 않는다(1~2단계는 루프백 포트를 쓴다. 아래 "남는 위험"). 코어 API는 소유자 전용 소켓. 세션 CDP 엔드포인트는 루프백에 무작위 토큰. agent-browser의 스트림 서버는 세션 시작 직후 끈다 |
 | 호스팅 서버가 뚫린다 | 서버는 정책을 풀 수 없다. 릴레이가 로컬 허용목록으로 다시 확인한다. 종단 간 암호화(선택) |
 | 릴레이 자격이 유출된다 | 개인 키는 OS 키 저장소에. 서버에서 릴레이를 폐기할 수 있다 |
-| 녹화가 유출된다 | 로컬 저장, 소유자 전용 권한, 민감 값 가림, 짧은 보존, 선택적 암호화 |
+| 녹화가 유출된다 | 로컬 저장, 소유자 전용 권한(0700/0600), 민감 값 가림(화면은 가리지 못한다: 아래 "남는 위험"), 짧은 보존(14일, 화면은 5 GB), 도메인 단위 화면 끄기. 재생 서버는 루프백의 자기 포트에만 뜨고, 녹화 하나에 30분짜리 일회용 토큰(32바이트 난수)이 있어야 열리며, `Host`가 `127.0.0.1:<포트>`가 아닌 요청은 거부한다. 그 포트는 에이전트 세션에서 어떤 정책으로도 닿지 않는다(2b). 저장 시 암호화는 하지 않았다 |
 | 동봉한 agent-browser가 변조된다 | 버전과 체크섬 고정, 브라우저 패키지와 함께 서명 |
 
 ### 에이전트 권한 범위
@@ -966,11 +996,12 @@ WSS  /v1/tunnel/client?relay={id}   클라이언트 스트림
 
 ### 녹화 데이터 접근 통제
 
-- 로컬: 파일 권한으로 소유자만. 코어 API의 `recording.*`은 소켓 소유자 검사를 통과해야 한다.
-- 에이전트: 자기 세션의 녹화만 읽을 수 있다. 다른 세션의 녹화는 사용자 권한이 필요하다.
+- 로컬: 파일 권한으로 소유자만. 코어 API의 `recording.*`은 소켓 소유자 검사를 통과해야 한다(토큰은 필요 없다. 2a의 운영자 메서드와 같은 수준이다: 소켓에 닿는 로컬 프로세스는 아무 녹화나 읽고, 표시하고, 지우고, 재생 링크를 만들 수 있다).
+- 에이전트: MCP 기본 모드에서는 자기 세션의 녹화를 텍스트로만 읽을 수 있다(`pegboard_recording_get`, 프레임은 이름만). 화면을 받을 길이 없다: 재생 화면을 여는 도구가 없고, 재생 서버의 포트는 주소 규칙의 "pegboard 자신의 포트"라 막히며, 세션 프록시는 화면 스트림 메서드(`Page.startScreencast`, `stopScreencast`, `screencastFrameAck`)를 거부한다. 보존 표시와 삭제(`keep`, `delete`)는 운영자 모드에만 있다. 다른 세션의 녹화는 사용자 권한이 필요하다.
+- 재생 링크(2b): `pegboard recording open`이 만드는 `http://127.0.0.1:<포트>/r/<토큰>/`는 녹화 하나에만, 30분 동안(또는 데몬이 끝날 때까지) 유효하다. 서버는 `GET`/`HEAD`만 받고, 그 녹화 디렉터리 안의 일반 파일만 내주며(링크를 따라가지 않는다), 모든 응답에 `default-src 'none'` CSP와 `no-store`, `no-referrer`를 붙인다. 링크를 아는 같은 머신의 다른 프로세스는 그 30분 동안 그 녹화를 볼 수 있다.
 - 원격: `recording.read`는 릴레이의 로컬 허용목록에서 별도 권한이다. 세션을 제어할 수 있다고 해서 녹화를 볼 수 있는 것은 아니다.
 - 서버: 녹화를 저장하지도 중간에 보관하지도 않는다.
-- 삭제: 녹화 삭제는 프레임 파일까지 지운다. 보존 기간이 지난 것은 `pegboardd`가 시작할 때와 주기적으로 지운다.
+- 삭제: 녹화 삭제는 프레임 파일까지 지운다(먼저 `.deleting-` 이름으로 바꾸고 지우므로, 끊기면 다음 정리가 끝낸다). 보존 기간이 지난 것은 `pegboardd`가 시작할 때, 1시간마다, 세션이 끝날 때 지운다.
 
 ### 남는 위험
 
@@ -996,6 +1027,8 @@ WSS  /v1/tunnel/client?relay={id}   클라이언트 스트림
 - 주소 정책은 프로필 단위다(사용자 결정 D8). 세션이 프로필을 고정하는 동안만 그 값이고, 세션을 닫을 때는 탭을 닫거나 그룹에서 뺀 뒤에 고정을 푼다(최종 검토 I1. 시험 `mcp_session_closed_under_allow_domain_leaves_no_tab_outside_it`은 데몬이 고정을 풀 때 남은 탭 수를 시험 훅으로 남긴 것을 읽는다). CLI와 운영자 모드의 `--keep-tabs`로 남긴 탭, 닫기가 실패해 남은 탭은 고정이 풀린 뒤 프로필의 기본 주소 정책을 따른다(허용목록 밖에 닿을 수 있다). MCP 기본 모드는 `keepTabs`를 거부한다.
 - 세션 정책(`SessionPolicy`)은 모르는 필드를 거부하므로 CLI·MCP 서버와 데몬은 같은 버전이어야 한다.
 - MCP(2a 작업 9, 10): 권한 구분은 MCP 서버 프로세스가 한다. 데몬의 코어 API에는 호출자 구분이 없어, 소켓에 닿는 로컬 프로세스는 운영자용 `session.info_any`/`session.close_any`, `session.list`(모든 세션의 정책 포함), 기록 조회, `browser.stop`을 토큰 없이 부를 수 있다(1단계의 `browser stop`과 같은 수준). 셸 없는 에이전트는 MCP 도구 말고는 닿을 길이 없다는 것이 전제다. 서버는 자기가 쥔 토큰과 핸들 꼴의 글을 결과에서 지운다(페이지의 글이라도 핸들 꼴이면 지워진다). 강제로 죽은 서버의 세션은 쉬는 세션 닫기(1시간)로만 닫힌다. 에이전트가 `eval`에 직접 쓴 글은 가림 규칙(`/`나 템플릿 치환이 없으면 그대로)대로 기록되므로, 에이전트가 어디선가 본 핸들을 `eval`에 넣으면 기록에 남는다.
+- 녹화(2b): 화면은 가리지 못한다. 카드 번호와 일회용 코드 입력란의 숫자(동작 로그에서는 가린다), 사람이 에이전트 창에서 직접 로그인하는 과정, "비밀번호 보기"를 누른 화면은 그대로 찍힌다(사용자 결정 R10 B안, 2026-11-17: 녹화는 로컬에만 있고 14일 뒤 지워지는 것에 기댄다). 화면 끄기는 탭의 주 프레임 주소로만 판정하므로 다른 페이지 안의 iframe으로 뜬 끈 도메인은 찍히고(계획 사전 검토 C7), 끈 도메인에서도 동작 로그, 탐색 기록, (켰다면) 네트워크·콘솔 기록은 남는다. 콘솔 기록(`--record console`)은 페이지가 찍은 글을 그대로 남겨 토큰이나 입력값이 들어갈 수 있다(글 속의 http(s)·ws(s)·blob·data 주소만 쿼리, 조각, 계정 정보를 지운다). 네트워크 기록은 헤더와 본문을 남기지 않는다. 코어 API의 `recording.keep`, `recording.delete`, `recording.open`은 토큰 없이 소켓 소유자 검사만 한다(위 MCP 항목과 같은 수준).
+- 브리지 확장(2b): 탭 전환을 알리려고 브리지의 서비스 워커가 `chrome.tabs.onActivated`를 듣는다. 확장이 명령줄로 로드되므로 사람 프로필에서도 듣고, 그 프로필에서는 아무도 바인딩을 걸지 않아 최근 탭 전환 50개(타깃 ID와 시각)를 메모리에만 쥐고 있다(누구에게도 넘기지 않는다). Chrome이 브리지 워커를 멈추면 데몬은 되살리지 못하고 새 탭, 세션 만들기와 닫기가 `bridge_asleep`으로 실패한다(H9. 브라우저를 다시 시작하면 돌아온다).
 
 ---
 
@@ -1005,7 +1038,7 @@ WSS  /v1/tunnel/client?relay={id}   클라이언트 스트림
 
 | # | 가정 | 틀리면 | 판정 (2026-11-10) |
 |---|---|---|---|
-| A1 | 가려진 탭에서도 CDP 자동화와 화면 캡처가 쓸 만하게 동작한다(또는 플래그나 패치로 그렇게 만들 수 있다) | 세션 모델을 다시 생각해야 한다. 가장 큰 위험 | 조건부. CDP 호출 2개로 해결 |
+| A1 | 가려진 탭에서도 CDP 자동화와 화면 캡처가 쓸 만하게 동작한다(또는 플래그나 패치로 그렇게 만들 수 있다) | 세션 모델을 다시 생각해야 한다. 가장 큰 위험 | 조건부. CDP 호출 2개로 해결. 화면 캡처(2b 작업 1 F4): 같은 창의 뒤쪽 탭, 최소화한 창, 가려진 창에서 스트림 프레임과 직접 캡처가 모두 온다. 다른 Space, 화면 잠금, 디스플레이 절전에서의 화면은 미확인(2b 수동 확인 P3, P4) |
 | A2 | CDP 프록시로 타깃을 걸러도 agent-browser가 정상 동작한다 | agent-browser에 패치를 얹거나 프록시 방식을 바꾼다 | 맞다 |
 | A3 | agent-browser가 전체 ws URL과 `--cdp-headers`만으로 우리 엔드포인트에 붙는다 | 프록시가 HTTP 탐색 경로도 구현한다 | 맞다 |
 | A4 | 최신 CDP에도 탭그룹 제어가 없다 | 있으면 `Pegboard` 도메인이 작아진다 (좋은 쪽) | 맞다 (Chrome 157) |

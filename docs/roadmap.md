@@ -18,7 +18,7 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 |---|---|---|
 | 0 | 검증 스파이크 | 제품 없음. 미확인 가정 13개의 답 |
 | 1 | 로컬 MVP | 순정 Chromium에서 세션 생성, 탭그룹 격리, CLI로 제어, 동작 로그 |
-| 2 | MCP와 녹화 | 2a: MCP 서버와 세션 정책(완료). 2b: 화면 녹화와 재생 |
+| 2 | MCP와 녹화 | 2a: MCP 서버와 세션 정책(완료). 2b: 화면 녹화와 재생(자동 시험 완료, 수동 확인 대기) |
 | 3 | Chromium 포크 v1 | 설치 가능한 Pegboard 브라우저 (macOS), 자동 업데이트 |
 | 3-2 | 북마크 프로필 | 북마크바 왼쪽 선택기로 북마크 묶음 전환 |
 | 4 | 릴레이와 호스팅 서버 | 원격 머신의 브라우저에 세션을 만들고 제어 |
@@ -101,7 +101,7 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 2. CLI와 MCP 동등성 시험: 같은 코어 API를 거치는지, 결과가 같은지. (2a)
 3. 화면 녹화: 탭별 화면 캡처, 변화 프레임 저장, 색인. (2b)
 4. 탐색 기록, 사람 개입 감지. (2b)
-5. 재생 화면: 동작 목록과 화면의 시간축 연결. `recording open`, `recording export`. (2b)
+5. 재생 화면: 동작 목록과 화면의 시간축 연결. `recording open`. (2b. `recording export`는 뺐다: 아래 "2b가 남긴 것")
 6. 보존 정책과 자동 삭제. 도메인 단위 화면 기록 끄기. (2b)
 7. 정책: 동작 분류별 허용·거부, 도메인 허용목록(프록시 구현). (2a. 확인 요청과 실시간 승인은 하지 않았다: 아래 "2a가 남긴 것")
 8. 페이지 출력 경계 표식을 기본으로 켠다. (2a)
@@ -141,7 +141,27 @@ Chromium 포크가 3단계에 오는 것은 포크를 미루려는 것이 아니
 
 ### 2b. 녹화와 재생
 
-할 일 3, 4, 5, 6, 9. 설계: [2026-11-17-phase2b-recording-design.md](./plans/2026-11-17-phase2b-recording-design.md) (승인, 2026-11-17).
+**자동 시험 완료 (2026-11-18), 수동 확인 대기.** 할 일 3, 4, 5, 6, 9. 설계: [2026-11-17-phase2b-recording-design.md](./plans/2026-11-17-phase2b-recording-design.md) (승인 2026-11-17, 만든 그대로 고침 2026-11-18). 실행 계획: [2026-11-17-phase2b-recording.md](./plans/2026-11-17-phase2b-recording.md). 측정: [spike-findings.md](./spike-findings.md) "2b단계 측정". 손으로 하는 확인 P1~P8([phase2b-manual-checks.md](./phase2b-manual-checks.md))은 아직 하지 않았다.
+
+**동작하는 것** (각 줄 끝: 자동 시험. 실제 브라우저 시험은 `e2e_recording`, `e2e_replay`)
+- 세션을 만들면 설정 없이 세션 탭의 화면이 녹화된다(바뀔 때 초당 최대 2장). 사람 프로필의 탭은 찍히지 않는다. → `screen_frames_are_recorded_by_default`, `the_settled_screen_is_the_last_frame`, `hidden_tab_follows_the_measured_rule`, `human_profile_tab_is_never_recorded`, `session_create_does_not_wait_for_the_recorder`, `a_session_created_during_a_recorder_outage_is_recorded_once_it_ends`.
+- 명령마다 직전·직후 화면이 동작 기록에 붙는다(직후는 한 장 찍고, 직전은 그 탭의 마지막 그림). 녹화가 명령에 더하는 시간은 중앙값 60ms 이하, 최악 1초 이하. → `every_command_has_frames_before_and_after`, `a_failed_command_still_has_both_frames`, `refused_commands_have_no_frames`, `recording_overhead_meets_the_targets`, `a_slow_capture_never_delays_a_command_beyond_the_cap`, `commands_run_while_the_recorder_is_disconnected`, `a_capture_answered_before_its_navigation_was_handled_is_not_kept`.
+- 화면 기록을 끈 도메인(`config.toml`의 `screen_off_domains`)의 화면은 남지 않는다. → `screen_off_domain_frames_are_never_written`, `commands_on_a_screen_off_domain_have_no_frames`, `a_tab_reattached_after_leaving_an_off_page_writes_nothing_before_the_paint`, `a_screen_off_start_page_is_known_to_the_recording`, `a_page_cannot_fake_its_first_paint`.
+- 탐색 기록, 사람 개입 가능성 표시, 선택 기록(`--record network,console`). → `navigation_log_follows_tabs_and_popups`, `agent_commands_are_never_taken_for_human_ones`, `a_human_navigation_outside_a_command_is_recorded`, `a_human_like_click_outside_a_command_is_marked_possible`, `page_script_navigation_is_not_human`, `a_tab_switch_outside_a_command_is_marked_possible`, `network_and_console_are_off_by_default_and_on_with_record`, `network_log_keeps_no_secrets`, e2e_mcp의 `mcp_record_option_reaches_every_session`, `mcp_default_mode_cannot_turn_recording_extras_on`.
+- 보존: 14일, 전체 5 GB(화면부터), 녹화 하나 1 GB. `keep`한 것은 지우지 않는다. → `old_recordings_are_pruned_at_start_and_kept_ones_stay`, `the_size_limit_deletes_finished_screens_first`, `per_recording_cap_stops_only_the_screen`, `list_shows_sizes_screen_keep_and_filters`, `delete_refuses_a_running_recording_and_removes_a_finished_one`, e2e_mcp의 `mcp_default_mode_cannot_keep_or_delete`.
+- `pegboard recording open`이 재생 화면을 사람의 기본 브라우저로 연다. 첫 사고에서 시작하고, 페이지의 글은 글로만 보인다. 에이전트 세션은 재생 서버에 닿지 못한다. → e2e_replay의 `replay_page_starts_at_the_first_incident`, `replay_page_shows_page_text_as_text`, `replay_page_marks_screen_off_missing_and_pruned`, `replay_page_follows_tabs_keys_extras_and_same_time_rules`, e2e_recording의 `recording_open_gives_a_loopback_link_for_that_recording`, `agent_session_cannot_reach_the_replay_server`, `tokens_end_with_the_daemon`.
+- 에이전트는 화면 스트림을 시작하거나 멈출 수 없다. → e2e_proxy의 `agent_cannot_start_or_stop_the_screencast`.
+- 브리지 워커가 멈추면 브리지 호출이 30초 기다리지 않고 곧바로 `bridge_asleep`으로 실패한다. → `a_bridge_call_after_its_worker_stopped_fails_at_once`.
+
+**2b가 남긴 것**
+- 동영상 내보내기(`recording export --format webm`): ffmpeg가 필요하다. 블랙박스 용도에는 재생 화면으로 충분하다고 보고 뺐다.
+- 네트워크 본문 기록: 민감 정보가 가장 많다. 메타데이터만 만들었다.
+- 화면 기록 전체를 끄는 사용자 설정: 설계에 없다(블랙박스는 늘 켜짐. 시험은 시험 훅 `test.setScreen`으로 끈다). 필요한지는 쓰면서 정한다.
+- 재지 못한 것: 다른 Space, 화면 잠금, 디스플레이 절전에서의 화면(수동 확인 P3, P4), 사람이 직접 한 입력의 사람 개입 표시(P5), 레티나 화면의 캡처 시간과 크기(P7), 무거운 페이지와 실제 사이트에서의 화면 끄기 규칙(back/forward 캐시 250ms), 실제 브라우저에서 브리지 워커가 다시 뜨는 경로(H9).
+- 2a 클립보드 시험 15개를 두 번째 기계의 클립보드에 텍스트가 아닌 내용이 있어 2b 동안 돌리지 못했다(2b는 클립보드 코드를 바꾸지 않았다). 수동 확인 P8에서 다시 돌린다.
+- 사람 개입은 시간으로만 가린다(모두 "가능성"). 확실히 가르려면 포크(3단계)에서 브라우저가 입력의 출처를 알려 줘야 한다.
+- 브리지 워커를 되살리는 방법: 강제로 멈춘 워커는 어떤 방법으로도 다시 뜨지 않았다(H9). 3단계의 내장 브리지로 바꾸면 사라지는 문제다.
+- 화면 끄기의 iframe: 주 프레임 주소로만 판정한다. 다른 페이지 안의 iframe까지 끄려면 프레임별 판정이 필요하다.
 
 **동작하는 것** (2단계 전체를 마친 뒤)
 - MCP 클라이언트 설정에 `pegboard mcp`를 넣으면 에이전트가 세션을 만들고 브라우저를 제어한다. (2a)
@@ -336,7 +356,7 @@ flowchart LR
 
 기간은 1단계 계획을 세울 때 작업 단위로 추정한다.
 
-### 진행 현황과 예상 기간 (2026-11-17)
+### 진행 현황과 예상 기간 (2026-11-18)
 
 **실제로 걸린 기간** (에이전트가 구현과 검토를 하고 두 번째 맥에서 실제 브라우저 시험을 돌리는 방식)
 
@@ -345,11 +365,12 @@ flowchart LR
 | 0. 스파이크 | 2026-11-10, 하루 | |
 | 1. 로컬 MVP | 2026-11-11 ~ 11-13, 3일 | 작업 10개, 수동 확인 9개 |
 | 2a. MCP와 정책 | 2026-11-13 ~ 11-16, 4일 | 작업 11개, 측정 4회 |
+| 2b. 녹화와 재생 | 2026-11-17 ~ 11-18, 2일 | 작업 8개(자동 시험까지). 수동 확인 남음 |
 
 **제품 MVP의 정의 (작성자 제안)**: 1단계의 "로컬 MVP"는 끝났다. 사람이 설치해서 평소 브라우저로 쓰고, 에이전트가 MCP로 붙고, 그 작업이 블랙박스처럼 남는 상태를 제품 MVP로 본다. 곧 **2b와 3단계까지**다.
 
-- 진행도: 작업량 기준 약 **30%** (0, 1, 2a 완료. 남은 것은 2b와 3단계).
-- 남은 기간: 약 **4~6주**. 2b 3~5일, 3단계 3~5주.
+- 진행도: 작업량 기준 약 **35%** (0, 1, 2a 완료. 2b는 자동 시험까지 완료하고 수동 확인이 남았다. 남은 것은 2b 수동 확인과 3단계).
+- 남은 기간: 약 **3~5주**. 3단계 3~5주(2b 수동 확인은 사용자 일정에 달렸다).
 
 **MVP 이후 (단계별 대략)**
 

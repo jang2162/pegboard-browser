@@ -8,6 +8,8 @@ AI 에이전트가 브라우저를 쓰되, 사람이 쓰는 브라우저 데이�
 
 **2a단계(MCP와 세션 정책).** 1단계(로컬 MVP) 위에 `pegboard mcp`(MCP 서버), 세션 정책(동작 분류, 주소 규칙), 세션별 다운로드 폴더, 업로드, 클립보드 차단, 쉬는 세션 닫기를 더했다. 자동 시험은 끝났다(2026-11-14). 순정 Chrome for Testing 위에서 동작한다. 설치해서 쓰는 브라우저가 아니고, Chromium 포크는 3단계 계획이다. macOS(arm64)에서만 동작한다. 1단계의 손으로 하는 확인 9개(M1~M7, M8, M8b)는 2026-11-13에 수행했다([docs/phase1-manual-checks.md](docs/phase1-manual-checks.md)). 그때 다운로드 경로(M5) 하나가 기대와 달랐고(에이전트가 받은 파일이 `~/Downloads`에 저장됨) 2a에서 세션 폴더로 받게 고쳤다. 2a의 손으로 하는 확인은 [docs/phase2a-manual-checks.md](docs/phase2a-manual-checks.md)에 있다(아직 수행하지 않았다).
 
+**2b단계(녹화와 재생).** 세션 탭의 화면, 탐색 기록, 사람 개입 가능성, 선택 기록(네트워크, 콘솔)을 남기고, 보존 정리와 `pegboard recording open`(재생 화면)을 더했다(아래 "녹화"). 자동 시험은 끝났다(2026-11-18). 손으로 하는 확인은 [docs/phase2b-manual-checks.md](docs/phase2b-manual-checks.md)에 있다(아직 수행하지 않았다).
+
 ## 준비
 
 - Rust (stable). `cargo build --release`로 `target/release/pegboard`를 만든다.
@@ -45,7 +47,8 @@ pegboard files list           # 세션 파일 디렉터리의 파일 (받은 파
 pegboard session info "$PEGBOARD_SESSION"   # 세션과 정책
 pegboard session list         # 세션 목록 (토큰은 나오지 않는다)
 pegboard recording list       # 녹화 목록 (크기, 화면, keep, 실패 수; --session, --failed, --kept)
-pegboard recording show <기록 id>
+pegboard recording show <기록 id>     # 동작 기록 (텍스트)
+pegboard recording open <기록 id>     # 재생 화면을 기본 브라우저로 (링크는 30분)
 pegboard recording keep <기록 id>     # 보존 정리에서 빼기 (unkeep으로 되돌림)
 pegboard recording delete <기록 id>   # 진행 중인 녹화는 recording_running
 pegboard recording prune --dry-run    # 지금 정리하면 지울 것
@@ -116,7 +119,7 @@ pegboard profile delete work                            # 열린 세션이 있�
 | `--no-localhost` | localhost와 루프백 주소를 닫는다(허용목록에 있어도) | 열림 |
 | `--upload-dir <폴더>` | 업로드할 파일이 있는 폴더(절대 경로, `--allow upload`와 함께만. pegboard 데이터 디렉터리와 겹치면 거부) | 없음 |
 | `--no-expire` | 쉬어도 1시간 뒤에 닫지 않는다 | 닫음 |
-| `--record <network,console>` | 녹화에 네트워크 요청(`network.jsonl`: 방법, 주소, 상태, 크기, 시간, 오류만. 헤더와 본문은 남기지 않는다)과 콘솔 메시지·페이지 오류(`console.jsonl`, 한 줄 1000자까지)를 더한다. **콘솔 기록은 페이지가 찍은 글을 그대로 남기므로 토큰, 입력값 같은 비밀이 들어갈 수 있다**(글 속에서 `http://`, `https://`, `ws://`, `wss://`, `blob:`, `data:`로 시작하는 주소만 쿼리, 조각, 계정 정보를 지우고 `data:` 주소는 내용을 지운다. 상대 주소, 스킴 없는 주소, `file:`, `chrome-extension:` 주소는 그대로 남는다). 세션마다 정하며 프로필에 고정되지 않는다 | 끔 |
+| `--record <network,console>` | 녹화에 네트워크 요청(`network.jsonl`: 방법, 주소, 상태, 크기, 시간, 오류만. 헤더와 본문은 남기지 않는다)과 콘솔 메시지·페이지 오류(`console.jsonl`)를 더한다. **콘솔 기록에는 비밀이 들어갈 수 있다**(아래 "알려진 한계"의 녹화). 세션마다 정하며 프로필에 고정되지 않는다 | 끔 |
 
 | 동작 분류 | 기본 | 예 |
 |---|---|---|
@@ -135,9 +138,76 @@ pegboard profile delete work                            # 열린 세션이 있�
 - 업로드는 `--allow upload`와 `--upload-dir`이 둘 다 있어야 열린다(하나만 주면 세션을 만들 때 거부된다). 파일은 맨 파일 이름으로만 고르며, `--upload-dir` 폴더에서 먼저 찾고 거기 없으면 세션 파일 디렉터리(받은 파일, 스크린샷)에서 찾는다. 경로, 심볼릭 링크, 폴더 밖의 파일은 거부한다. 프록시도 `DOM.setFileInputFiles`의 경로가 그 두 폴더 바로 안의 파일인지 다시 검사한다.
 - 받은 파일은 `<PEGBOARD_HOME>/sessions/<id>/files`에 생기고(파일 하나 200 MiB, 세션 합계 1 GiB까지) `pegboard files list`나 `pegboard_files_list`로 본다. 세션을 닫으면 지워진다.
 
+## 녹화
+
+세션마다 녹화 하나가 자동차 블랙박스처럼 늘 남는다. 설정하지 않아도 켜져 있고, 오래된 것부터 저절로 지워지고, 무슨 일이 있었을 때 사람이 꺼내 본다(`pegboard recording open`). 설계는 [docs/plans/2026-11-17-phase2b-recording-design.md](docs/plans/2026-11-17-phase2b-recording-design.md).
+
+### 무엇을 남기나
+
+| 종류 | 기본 | 파일 | 내용 |
+|---|---|---|---|
+| 동작 기록 | 켜짐 | `actions.jsonl` | 명령, 인자(비밀은 가림), 결과, 시각, 소요 시간, 탭과 주소, 직전·직후 화면 이름. 사람 개입 가능성 항목(`kind: human`)도 여기 들어간다 |
+| 화면 | 켜짐 | `screen/<탭>/index.jsonl`, `000001.jpg` … | 세션 탭의 화면. 바뀔 때 초당 최대 2장(멈추면 마지막 그림), 명령이 끝날 때마다 한 장. JPEG 품질 60, 가로 최대 1280 |
+| 탐색 기록 | 켜짐 | `navigation.jsonl` | 세션 탭의 열림(팝업이면 연 탭), 주 프레임 주소 변화, 닫힘 |
+| 네트워크 | 꺼짐 | `network.jsonl` | `--record network`: 요청의 방법, 주소, 상태, 크기, 시간, 오류. 헤더와 본문은 남기지 않는다 |
+| 콘솔 | 꺼짐 | `console.jsonl` | `--record console`: 콘솔 메시지와 페이지 오류(한 줄 1000자) |
+
+- 녹화는 `<PEGBOARD_HOME>/recordings/<기록 id>/`에 있다. 디렉터리는 소유자 전용(0700), 파일은 0600이다. 이 머신 밖으로 나가지 않는다.
+- 기록에 남는 주소는 모두 쿼리, 조각(`#…`), 계정 정보를 지운 꼴이다.
+- 명령의 "직전" 화면은 따로 찍지 않는다. 명령이 시작할 때 그 탭에 마지막으로 저장된 그림(화면이 바뀔 때 받은 것이거나 앞 명령의 직후 화면)이다. "직후" 화면은 명령이 끝날 때 그 탭을 찍은 것이고, 500ms 안에 못 찍으면 없이 간다. 녹화 때문에 명령이 실패하지는 않는다. 거부된 명령에는 화면이 없다.
+- 사람 개입: 세션의 명령이 실행되는 동안과 끝난 뒤 1초 밖에서 세션 탭이 다른 주소로 가거나(주소창 입력, 뒤로·앞으로, 링크 클릭, 폼 제출) 앞 탭으로 바뀌면 `human` 항목으로 남는다. 사람과 에이전트, 페이지 스크립트를 확실히 가를 신호가 없어 모든 항목은 "사람 개입 가능성"(`certain: false`)이다. 스크립트가 직접 주소를 바꾼 것(`location=`), 새로 고침 태그, 같은 문서 안의 이동(`pushState`, `#`)은 남지 않는다. `seq`는 쓴 순서이고 `ts`는 일이 일어난 때다(탭 전환은 늦게 전해질 수 있다). 시간 순서로 읽을 때는 `ts`로 정렬한다.
+- `navigation.jsonl`, `network.jsonl`, `console.jsonl`은 녹화 하나에 파일마다 64 MiB까지다. 넘으면 `{"ts":…,"capped":true}` 한 줄로 끝난다.
+
+### 설정 (`config.toml`)
+
+`<PEGBOARD_HOME>/config.toml`(기본 위치면 `~/Library/Application Support/Pegboard/config.toml`). 파일이 없으면 아래 기본값이다.
+
+```toml
+[recording]
+max_age_days = 14            # 끝난 지 이만큼 지난 녹화는 통째로 지운다 (1~3650)
+max_total_gb = 5             # 전체가 넘으면 오래된 녹화의 화면부터 지운다
+max_per_recording_gb = 1     # 녹화 하나의 화면이 닿으면 그 녹화의 화면 기록만 멈춘다
+screen_off_domains = ["bank.example", "mail.example"]   # 화면을 찍지 않는 도메인 (기본은 빈 목록)
+```
+
+- GB는 10^9바이트다. 크기는 0.001(1 MB) 이상.
+- `screen_off_domains`는 그 도메인과 하위 도메인이다(IP 주소도 된다. 한글 도메인은 `xn--` 꼴로 쓴다). 탭의 주 프레임이 그 주소에 있는 동안 화면을 찍지 않고, 재생 화면에는 "화면 기록 꺼짐"으로 보인다(화면만 끈다: 아래 "알려진 한계"의 녹화). 그 주소에서 나온 뒤에는 새 페이지가 처음 그려질 때까지 찍지 않는다(그 사이 몇 장은 잃는다).
+- 데몬이 시작할 때 한 번 읽는다. 바꾸면 `pegboard browser stop`, `pegboard browser start`로 데몬을 다시 띄운다.
+- 잘못 쓰면 `pegboard browser start`가 `invalid_params`와 종료 코드 2로 끝나고(파일 경로와 키를 알려 준다) 데몬이 뜨지 않는다.
+
+### 선택 기록 (`--record network,console`)
+
+`session create`나 `pegboard mcp`의 정책 옵션이다(위 "세션 정책" 표). 세션마다 정하며 프로필에 고정되지 않는다. MCP 기본 모드의 도구로는 켤 수 없다. `session info`의 정책 끝에 `record network,console`(또는 `record -`)로 보인다.
+
+### 보존, `keep`, `delete`, `prune`
+
+- 데몬이 시작할 때, 1시간마다, 세션이 끝날 때마다 정리한다. 끝난 지 14일이 지난 녹화는 통째로 지운다. 그다음 전체가 5 GB를 넘으면 끝난 녹화 중 오래된 것부터 **화면만** 지운다(`recording list`에 "screen pruned", 재생 화면에 "화면 지워짐"). 동작 기록은 크기 때문에 지우지 않고 14일까지 남는다.
+- 진행 중인 녹화는 지우지 않는다(전체 크기에는 센다). `pegboard recording keep <id>`로 표시한 녹화는 지우지 않고 전체 크기에도 세지 않는다. `unkeep`으로 되돌린다. keep한 녹화는 쌓이면 사람이 `pegboard recording delete <id>`로 지운다(진행 중인 녹화는 `recording_running`으로 거부).
+- `pegboard recording prune`은 지금 정리한다. `--dry-run`은 지울 것만 보여 준다.
+- `recording list`는 녹화마다 끝 시각(또는 running), 크기, 화면 상태(screen, no screen, screen capped, screen pruned), kept, 실패·거부 수를 보이고, 마지막 줄에 전체와 keep 용량을 보인다. `--failed`, `--kept`, `--session`으로 거른다.
+- 앞선 데몬이 끝을 적지 못하고 멈춘 녹화는 다음 시작 때 마지막으로 파일을 쓴 시각을 끝으로 적는다. `manifest.json`을 읽을 수 없는 녹화 디렉터리는 건드리지 않고 `daemon.log`에 한 줄 남긴다(데몬이 뜰 때마다 녹화 하나에 한 번). 녹화를 통째로 지울 때는 먼저 `recordings/.deleting-<id>-…`로 이름을 바꾼 뒤 지우므로, 지우다 끊기면 그 디렉터리만 남고 다음 정리(데몬 시작 포함) 때 지워진다.
+
+### 재생 (`recording open`)
+
+```bash
+pegboard recording list --failed      # 실패가 있는 녹화
+pegboard recording open <기록 id>      # 사람의 기본 브라우저에서 재생 화면을 연다
+```
+
+- 데몬이 루프백(`127.0.0.1`)의 자기 포트에 그 녹화 하나에만 쓰는 일회용 링크를 만들고, CLI가 macOS `open`으로 기본 브라우저에서 연다(에이전트 창에서 열지 않는다). 링크는 30분 동안, 또는 데몬이 끝날 때까지 쓸 수 있다. 끝나면 다시 `recording open`을 한다. `open`에 실패하면 링크를 찍고 종료 코드 1로 끝난다.
+- 머리글에 세션 이름, 시간, 명령·실패·거부·사람 개입 수. 가운데에 그 시점의 탭 화면, 오른쪽에 동작 목록, 아래에 시간축이 있다.
+- 열면 첫 사고(실패, 거부, 사람 개입) 직전 화면에서 시작한다. 시간축의 사고 표시(✗ 실패, ⛔ 거부, 👤 사람 개입)를 누르면 그 동작의 직전 화면, 한 번 더 누르면 직후 화면이다. "◀ 직전", "직후 ▶" 단추와 좌우 화살표 키(앞·다음 동작)로도 옮긴다. 탭이 여럿이면 화면 아래의 탭 단추로 고른다. 선택 기록이 있으면 "네트워크 · 콘솔" 칸에 그 동작 앞뒤의 줄이 나온다.
+- 화면 대신 나오는 말: "화면 기록 꺼짐"(끈 도메인), "화면 없음"(그 시각의 그림이 없다), "화면 기록 멈춤(녹화 하나 1GB)", "화면 지워짐"(보존 정리). 동작 목록의 값은 동작 기록 그대로 가려진 채 보이고(가린 항목 끝에 🔒), 페이지에서 온 글은 글로만 보인다.
+
+### 에이전트가 보는 것과 보지 못하는 것
+
+- MCP 기본 모드의 에이전트는 자기 세션의 녹화를 텍스트로만 읽는다(`pegboard_recording_list`, `pegboard_recording_get`. 사람 개입 항목과 프레임 이름까지). 화면 그림은 받을 길이 없다: 재생 화면을 여는 도구가 없고, 재생 서버의 포트는 "pegboard 자신의 포트"라 세션에서 어떤 정책으로도 닿지 않으며, 세션은 화면 스트림(`Page.startScreencast` 등)을 시작하거나 멈출 수 없다.
+- `pegboard_recording_keep`, `pegboard_recording_delete`는 운영자 모드에만 있다. 보존과 삭제는 사람이 정한다. `recording prune`과 `recording open`은 MCP에 없다.
+
 ## 아직 안 되는 것
 
-- 화면 녹화(지금 기록은 동작 목록뿐이다), 확인 요청(동작을 실시간으로 승인하기), 원격 제어, 프로필 복사(`profile create --from`, 임시 프로필).
+- 확인 요청(동작을 실시간으로 승인하기), 원격 제어, 프로필 복사(`profile create --from`, 임시 프로필).
+- 녹화의 동영상 내보내기(`recording export`), 네트워크 본문 기록, 화면 기록 전체를 끄는 설정(도메인 단위로만 끈다).
 - 허용목록에서 뺀 명령. 허용목록(`crates/pegboard-core/src/argv.rs`)에 없는 것은 모두 거부되며, 아래는 그중 알려 둘 만한 것이다.
   - `cookies clear`, `set media`, `set geo`, `set offline`: 필요한 CDP 메서드(`Network.clearBrowserCookies`, 에뮬레이션·네트워크 조건 계열)를 프록시가 허용하지 않는다.
   - `network route`: 요청 가로채기는 데몬의 요청 가드가 쓰므로, 에이전트용 규칙을 따로 설계해야 한다.
@@ -154,7 +224,7 @@ pegboard profile delete work                            # 열린 세션이 있�
 - 세션 정책(`SessionPolicy`)은 모르는 필드를 거부한다. CLI(또는 MCP 서버)와 데몬은 같은 버전이어야 하고, 버전이 다르면 세션 만들기가 `invalid_params`로 거부될 수 있다. 바꾼 뒤에는 `pegboard browser stop`으로 옛 데몬을 끈다.
 - 1~2단계는 루프백 디버깅 포트를 쓴다. 같은 사용자로 도는 로컬 프로세스는 브라우저 전체에 붙을 수 있다. 격리가 막는 것은 제공된 도구(CLI, MCP)를 통해 조종당한 에이전트이고, 셸을 가진 악의적 프로세스가 아니다. 이 브라우저의 데이터 디렉터리에는 실제 계정을 넣지 않는다.
 - `--session`으로 넘긴 핸들은 프로세스 목록에 보인다. `PEGBOARD_SESSION`을 쓴다.
-- `session list`, 기록 조회(가려진 로그), `profile delete`, `browser stop`, 운영자용 `session.info_any`/`session.close_any`는 토큰이 필요 없다. 소켓에 닿는 로컬 클라이언트는 누구나 다른 세션을 닫거나 그 (가려진) 기록과 정책(업로드 폴더, 허용 도메인 포함)을 읽거나 브라우저를 끌 수 있다. MCP 기본 모드는 이 메서드들을 자기 세션에만 쓴다.
+- `session list`, 기록 조회(가려진 로그), 녹화의 `recording.keep`/`delete`/`prune`/`open`(재생 링크 만들기), `profile delete`, `browser stop`, 운영자용 `session.info_any`/`session.close_any`는 토큰이 필요 없다. 소켓에 닿는 로컬 클라이언트는 누구나 다른 세션을 닫거나, 그 (가려진) 기록과 정책(업로드 폴더, 허용 도메인 포함)을 읽거나, 녹화를 지우거나 화면을 열어 보거나, 브라우저를 끌 수 있다. MCP 기본 모드는 이 메서드들을 자기 세션에만 쓰고, keep·delete·prune·open은 쓰지 않는다.
 - Chrome을 `--remote-allow-origins`로 띄우지 않는다. 열면 웹 페이지가 브라우저의 디버깅 포트에 붙을 수 있다.
 - 데몬이 강제로 죽으면(`kill -9` 등) 브라우저는 그대로 떠 있을 것으로 보인다(코드를 읽고 한 판단이다). 같은 데이터 디렉터리로 다시 `browser start`를 하기 전에 그 Chrome을 직접 닫아야 한다.
 - `pegboard browser start`가 `pegboard browser stop`과 겹치면 브라우저가 다시 살아날 수 있다.
@@ -220,18 +290,30 @@ pegboard profile delete work                            # 열린 세션이 있�
 - `screenshot`과 `pdf`가 쓴 파일과 받은 파일은 세션을 닫을 때 지워진다. 필요하면 닫기 전에 가져간다.
 - 동작 기록은 공격적으로 가린다. 실패한 입력 명령, 거부된 명령, `/`나 템플릿 치환이 든 `eval`은 내용 없이 기록된다. 반대로 그 밖의 `eval`, `wait --url`, `wait --text`, `network requests --filter`의 인자는 준 그대로 기록되므로 비밀을 넣지 않는다.
 - 크기 상한(인자 하나 64 KiB, 전체 256 KiB, 단어 256개)을 넘어 거부된 명령(`limit_exceeded`)은 동작 기록에 전혀 남지 않는다.
-- 녹화의 `navigation.jsonl`은 세션 탭의 열림(팝업이면 연 탭), 주 프레임 주소 변화, 닫힘을 남긴다(주소는 쿼리와 계정 정보 없이). 같은 문서 안의 이동(`pushState`, `#` 이동)은 남지 않는다.
-- 사람 개입은 시간으로만 가린다: 세션의 명령이 실행되는 동안과 끝난 뒤 1초 밖에서 세션 탭이 다른 주소로 가거나(주소창 입력, 뒤로·앞으로, 링크 클릭, 폼 제출) 앞 탭으로 바뀌면 동작 기록에 `human` 항목으로 남는다. 페이지 스크립트의 `history.back()`이나 `a.click()`, 다른 탭의 팝업이 닫힐 때 돌아오는 탭 전환도 사람의 것과 구별되지 않아 같이 남는다. 그래서 모든 항목은 "사람 개입 가능성"(`certain: false`)이다. 스크립트가 직접 주소를 바꾸거나(`location=`) 새로 고침 태그로 넘어간 것은 남지 않는다. 명령이 끝나고 1초 뒤에 끝난 느린 탐색은 사람 개입 가능성으로 남을 수 있다.
-  - 같은 프로필의 다른 세션이 명령을 실행하는 동안의 탭 전환, 요청 가드가 페이지를 스스로 다시 불러온 것, pegboard가 다운로드 정책을 걸려고 탭을 앞으로 가져온 것은 남지 않는다.
-  - 남지 않는 사람의 동작도 있다: 새로 연 빈 탭에 처음 주소를 친 것(탭의 첫 페이지는 탭이 열린 것으로 본다), Ctrl·가운데 클릭으로 세션 탭에서 새 탭을 연 것(탐색 기록에 `created`로만 남는다), 사람이 세션 탭을 닫은 것(`closed`로만 남는다), 브리지가 탭을 닫은 뒤 2초 안의 탭 전환, pegboard가 앞으로 가져오겠다고 알린 탭(5초 안)으로의 전환, 같은 문서 안의 이동.
-  - 사람 개입 항목의 `seq`는 기록에 쓴 순서이고 `ts`는 일이 일어난 때다. 탭 전환은 늦게 전해질 수 있어(브리지 워커가 다시 뜬 뒤) 나중 명령보다 큰 `seq`에 이른 `ts`가 붙을 수 있다. 시간 순서로 읽을 때는 `ts`로 정렬한다.
-- 화면 기록을 끈 도메인의 탭도 `--record`의 네트워크와 콘솔 기록은 남는다(화면만 끄는 설정이다).
-- 탭 전환은 브리지 확장의 서비스 워커가 알려 준다. 워커가 다시 뜨면 데몬이 다시 붙고 그동안 모아 둔 전환을 넘겨받게 되어 있지만, 실제 브라우저에서 브리지 워커가 다시 뜨는 것은 본 적이 없어 이 경로는 단위 시험으로만 확인했다.
+
+### 녹화 (2b)
+
+- **화면은 가리지 못한다.** 카드 번호와 일회용 코드 입력란의 숫자(동작 기록에서는 가린다), 사람이 에이전트 창에서 직접 로그인하는 과정, "비밀번호 보기"를 누른 화면은 그대로 찍힌다(사용자 결정). 녹화는 로컬에만 있고 14일 뒤 지워진다. 피하려면 그 사이트를 `screen_off_domains`에 넣는다.
+- 화면 끄기는 탭의 주 프레임 주소로만 판정한다. 다른 페이지 안의 iframe으로 뜬 끈 도메인은 찍힌다.
+- 화면을 끈 도메인에서도 동작 기록, 탐색 기록, (켰다면) 네트워크·콘솔 기록은 남는다.
+- 끈 도메인에서 나온 뒤 새 페이지가 내용을 그리지 않으면(그림 없는 페이지, 처음 그림 신호가 오지 않는 뒤쪽 탭) 그 탭은 다음 탐색까지 찍히지 않는다(찍지 않는 쪽으로 실패한다).
+- **콘솔 기록은 페이지가 찍은 글을 그대로 남겨 토큰, 입력값 같은 비밀이 들어갈 수 있다.** 글 속에서 `http://`, `https://`, `ws://`, `wss://`, `blob:`, `data:`로 시작하는 주소만 쿼리, 조각, 계정 정보를 지우고 `data:` 주소는 내용을 지운다. 상대 주소, 스킴 없는 주소, `file:`, `chrome-extension:` 주소는 그대로 남는다.
+- 사람 개입은 시간으로만 가린 추정이다. 잘못 남는 것: 페이지 스크립트의 `history.back()`·`a.click()`, 페이지가 연 팝업이 닫힐 때 돌아오는 탭 전환, 명령이 끝나고 1초 넘게 걸려 끝난 느린 탐색.
+- 남지 않는 사람의 동작: 새로 연 빈 탭에 처음 주소를 친 것(탭의 첫 페이지는 탭이 열린 것으로 본다), Ctrl·가운데 클릭으로 세션 탭에서 새 탭을 연 것(탐색 기록에 `created`로만), 사람이 세션 탭을 닫은 것(`closed`로만), 브리지가 탭을 닫은 뒤 2초 안의 탭 전환, pegboard가 앞으로 가져오겠다고 알린 탭(5초 안)으로의 전환, 요청 가드가 페이지를 스스로 다시 불러온 것, 같은 문서 안의 이동.
+- 같은 프로필의 한 세션이 명령을 실행하는 동안(과 끝난 뒤 1초)에는 그 프로필의 다른 세션 탭에서 일어난 탭 전환도 남지 않는다(어느 세션의 것인지 가를 수 없다).
+- 탭 전환은 브리지 확장의 서비스 워커가 알려 준다. 워커가 다시 뜨면 데몬이 다시 붙어 그동안 모아 둔 전환을 넘겨받게 되어 있지만, 실제 브라우저에서 브리지 워커가 다시 뜨는 것은 본 적이 없어 이 경로는 단위 시험으로만 확인했다.
 - Chrome이 브리지의 서비스 워커를 멈추면(강제로 멈추지 않고는 본 적이 없다) 새 탭 열기(`tab new`), 세션 만들기와 닫기가 `bridge_asleep`으로 곧바로 실패한다. 이미 있는 탭의 명령은 그대로 된다. 브라우저를 다시 시작하면(`pegboard browser stop`, `pegboard browser start`) 돌아온다.
-- 녹화는 저절로 지워진다: 끝난 지 14일(`config.toml`의 `[recording] max_age_days`)이 지난 녹화는 통째로, 그다음 전체 크기가 5 GB(`max_total_gb`)를 넘으면 끝난 녹화 중 오래된 것부터 화면(`screen/`)만 지운다("screen pruned"). 동작 기록은 크기 때문에 지우지 않고 14일까지 남는다. 진행 중인 녹화와 `recording keep`으로 표시한 녹화는 지우지 않고, keep한 것은 전체 크기에도 세지 않는다(쌓이면 `recording delete`로 지운다). 데몬이 시작할 때, 1시간마다, 세션이 끝날 때마다 정리한다. **2b 이전에 만든 동작 기록도 같은 14일 규칙을 따르므로, 2b를 처음 켜는 날 끝난 지 14일이 지난 기존 동작 기록이 지워진다.** 지우기 전에 남길 것은 `recording keep`으로 표시한다(데몬이 떠 있어야 한다).
-- 앞선 데몬이 끝을 적지 못하고 멈춘 녹화는 다음 시작 때 마지막으로 파일을 쓴 시각을 끝으로 적는다. `manifest.json`을 읽을 수 없는 녹화 디렉터리는 정리하지 않고 `daemon.log`에 한 줄 남긴다(데몬이 뜰 때마다 녹화 하나에 한 번). 녹화를 통째로 지울 때는 먼저 `recordings/.deleting-<id>-…`로 이름을 바꾼 뒤 지우므로, 지우다 끊기면(데몬이 죽거나 디스크 오류) 그 디렉터리만 남고 다음 정리(데몬 시작 포함) 때 지워진다.
-- MCP 기본 모드에는 `pegboard_recording_keep`, `pegboard_recording_delete`가 없다(운영자 모드에만 있다). 보존과 삭제는 사람이 정한다.
-- `navigation.jsonl`, `network.jsonl`, `console.jsonl`은 녹화 하나에 파일마다 64 MiB까지다. 넘으면 `{"ts":…,"capped":true}` 한 줄로 끝나고 그 뒤로는 그 파일에 쓰지 않는다(화면의 녹화당 한도와 따로 센다).
+- agent-browser의 `record`, `stream` 명령은 쓸 수 없다(허용목록 밖, 세션 프록시도 화면 스트림 메서드를 거부한다).
+- **2b를 처음 켜는 날, 끝난 지 14일이 지난 기존(2b 이전) 동작 기록이 지워진다.** 같은 14일 규칙을 따르기 때문이다. 남길 것은 지워지기 전에 `recording keep`으로 표시해야 하는데, 표시하려면 데몬이 떠 있어야 하고 데몬은 뜨자마자 정리한다. 남기려면 2b를 켜기 전에 `recordings/` 디렉터리를 따로 복사해 둔다.
+- 화면이 계속 바뀌는 최악의 경우 30분에 약 200MB라, 5 GB에는 화면 약 12.7시간 분량만 남는다. 화면의 실제 보존 기간은 14일보다 짧을 수 있다(그 뒤로는 동작 기록만 남는다).
+- 레티나 화면(배율 2)에서의 캡처 시간, 그림 크기, 디스크 사용량은 재지 않았다(배율 1 화면에서만 쟀다). 배율은 녹화기가 탭에 붙을 때 한 번 읽으므로, 배율이 다른 화면으로 창을 옮기면 다음에 다시 붙을 때까지 옛 배율로 찍는다.
+- 다른 Space, 화면 잠금, 디스플레이 절전 중에 화면이 찍히는지는 재지 않았다(수동 확인 P3, P4). 찍히지 않은 구간은 재생 화면에 "화면 없음"으로 보인다.
+- "직전" 화면은 명령 시작 때의 화면보다 최대 약 0.5초 늦은 그림일 수 있다. 끈 도메인에서 정지한 페이지로 나온 뒤에는 화면이 바뀔 때까지 "직전" 화면이 없다.
+- 직후 화면을 찍는 데 오래 걸려 제한(500ms)에 닿은 탭은 30초 동안(또는 그 탭의 화면이 바뀔 때까지) 직후 화면을 찍지 않는다.
+- 동작 기록의 `frameBefore`, `frameAfter`가 가리키는 파일은 없을 수 있다(디스크 쓰기 실패, 녹화 하나의 한도, 세션 끝의 쓰기 제한, 보존 정리). 재생 화면은 "화면 없음"으로 보인다.
+- 끈 도메인과 상관없는 탐색에서, 새 주소의 첫 그림 전에 받은 한두 장은 이전 페이지의 그림인데 `index.jsonl`에는 새 주소로 적힐 수 있다.
+- 재생 화면에서 직후 화면이 따로 없는 동작(사람 개입, 거부된 명령, 다른 탭)의 "직후"는 다음 동작 시각(마지막이면 녹화 끝)의 그 탭 화면이다.
+- 재생 링크는 루프백에 열리므로 30분 동안 링크를 아는 같은 머신의 다른 프로세스도 그 녹화를 볼 수 있다.
 
 ## 시험
 
@@ -241,15 +323,20 @@ cargo test -p pegboard-cli --test e2e_isolation -- --ignored --test-threads=1   
 cargo test -p pegboard-cli --test e2e_mcp_isolation -- --ignored --test-threads=1   # 격리 시험 묶음 (MCP)
 cargo test --workspace -- --ignored --test-threads=1                 # 실제 브라우저를 띄우는 전체 시험 (몇 분, 창이 뜬다)
 cargo test -p pegboard-core --test e2e_clipboard -- --ignored --test-threads=1  # 클립보드 시험
+cargo test -p pegboard-cli --test e2e_recording -- --ignored --test-threads=1 --skip diag_   # 녹화 시험 (2b)
+cargo test -p pegboard-core --test e2e_replay -- --ignored --test-threads=1     # 재생 화면 시험 (2b)
+cargo test -p pegboard-cli --release --test e2e_recording recording_overhead_meets_the_targets -- --ignored --nocapture   # 녹화가 명령에 더하는 시간 (배포용 빌드)
 ```
 
-클립보드 시험과 MCP 격리 시험 묶음의 `mcp_agent_cannot_write_the_clipboard`는 시스템 클립보드를 저장하고 표식을 넣었다가 되돌린다(비어 있었으면 다시 비운다). 텍스트가 아닌 내용이 있으면 돌지 않는다.
+클립보드 시험과 MCP 격리 시험 묶음의 `mcp_agent_cannot_write_the_clipboard`는 시스템 클립보드를 저장하고 표식을 넣었다가 되돌린다(비어 있었으면 다시 비운다). 텍스트가 아닌 내용(그림, 서식 있는 글)이 있으면 돌지 않는다. 돌리기 전에 `printf x | pbcopy`처럼 클립보드를 일반 텍스트로 바꿔 둔다.
+
+녹화 시험의 `diag_bridge_worker_stop_and_wake`는 측정용 진단이다(약 15분, 판정하지 않는다). 위처럼 `--skip diag_`로 뺀다(전체 시험 `cargo test --workspace -- --ignored`에도 들어 있으니 거기에도 `--skip diag_`를 붙인다). `recording_overhead_meets_the_targets`는 디버그 빌드로도 돌지만 기준(중앙값 60ms)은 배포용 빌드에 대한 것이다.
 
 격리 시험 묶음의 `agent_actions_do_not_change_the_humans_active_tab`은 시험용 브라우저 창이 완전히 가려지거나, 최소화되거나, 다른 Space에 있거나, 화면이 잠긴 상태면 "cannot determine"으로 실패한다(활성 탭을 `visibilityState`로 판정하기 때문이다). 시험 중에는 그 창을 가리지 않는다. `mcp_agent_cannot_reach_pegboards_own_ports_or_the_private_network`는 기본 경로의 네트워크 인터페이스에 사설(RFC 1918) IPv4 주소가 있어야 돈다.
 
-실제 브라우저를 띄우는 시험은 `#[ignore]`가 붙어 있고, 임시 `PEGBOARD_HOME`에서 돌며 끝나면 브라우저를 정리한다. 격리 시험 묶음 둘은 에이전트가 할 수 있는 일을 시도한다. CLI 묶음(`crates/pegboard-cli/tests/e2e_isolation.rs`)은 세션 핸들 하나로 agent-browser 명령만 쓰는 에이전트가 사람 프로필, 다른 세션, 세션 밖의 브라우저, 토큰에 닿지 못함을 확인한다(CLI 전체를 가진 에이전트는 사람의 권한이라 정책을 넓히는 시도는 다루지 않는다). MCP 묶음(`e2e_mcp_isolation.rs`)은 MCP 도구만으로 같은 것에 더해 더 넓은 정책과 세션 밖에 남는 탭에 닿지 못함을 확인한다. 시험마다 새 브라우저를 띄우며, 이후 모든 단계에서 유지한다. 손으로 하는 확인은 [docs/phase1-manual-checks.md](docs/phase1-manual-checks.md)와 [docs/phase2a-manual-checks.md](docs/phase2a-manual-checks.md).
+실제 브라우저를 띄우는 시험은 `#[ignore]`가 붙어 있고, 임시 `PEGBOARD_HOME`에서 돌며 끝나면 브라우저를 정리한다. 격리 시험 묶음 둘은 에이전트가 할 수 있는 일을 시도한다. CLI 묶음(`crates/pegboard-cli/tests/e2e_isolation.rs`)은 세션 핸들 하나로 agent-browser 명령만 쓰는 에이전트가 사람 프로필, 다른 세션, 세션 밖의 브라우저, 토큰에 닿지 못함을 확인한다(CLI 전체를 가진 에이전트는 사람의 권한이라 정책을 넓히는 시도는 다루지 않는다). MCP 묶음(`e2e_mcp_isolation.rs`)은 MCP 도구만으로 같은 것에 더해 더 넓은 정책과 세션 밖에 남는 탭에 닿지 못함을 확인한다. 시험마다 새 브라우저를 띄우며, 이후 모든 단계에서 유지한다. 손으로 하는 확인은 [docs/phase1-manual-checks.md](docs/phase1-manual-checks.md), [docs/phase2a-manual-checks.md](docs/phase2a-manual-checks.md), [docs/phase2b-manual-checks.md](docs/phase2b-manual-checks.md).
 
-시험용 환경 변수는 모두 `PEGBOARD_TEST_HOOKS`를 함께 줄 때만 읽는다(실제 사용에서는 주지 않는다): `PEGBOARD_TEST_HOST_RULES`, `PEGBOARD_TEST_BROWSER_HOST_RULES`, `PEGBOARD_TEST_IP_SPACE_OVERRIDES`, `PEGBOARD_TEST_LAUNCH_LOG`, `PEGBOARD_TEST_IDLE_SECS`, `PEGBOARD_TEST_PRUNE_SECS`, `PEGBOARD_TEST_DOWNLOAD_LIMITS`, `PEGBOARD_TEST_NO_CLIPBOARD_SHIELD`. `PEGBOARD_TEST_HOOKS`는 데몬의 시험용 메서드와 진단 기록(daemon.log)도 켠다. `PEGBOARD_TEST_MCP_SLOW_CREATE`는 디버그 빌드의 MCP 서버에만 있다.
+시험용 환경 변수는 모두 `PEGBOARD_TEST_HOOKS`를 함께 줄 때만 읽는다(실제 사용에서는 주지 않는다): `PEGBOARD_TEST_HOST_RULES`, `PEGBOARD_TEST_BROWSER_HOST_RULES`, `PEGBOARD_TEST_IP_SPACE_OVERRIDES`, `PEGBOARD_TEST_LAUNCH_LOG`, `PEGBOARD_TEST_IDLE_SECS`, `PEGBOARD_TEST_DOWNLOAD_LIMITS`, `PEGBOARD_TEST_NO_CLIPBOARD_SHIELD`, 그리고 2b의 `PEGBOARD_TEST_CAPTURE_DELAY_MS`(직후 캡처를 늦춘다), `PEGBOARD_TEST_EVENT_DELAY_MS`(녹화기가 주 프레임 탐색 이벤트를 늦게 처리한다), `PEGBOARD_TEST_PRUNE_SECS`(정리 주기), `PEGBOARD_TEST_REPLAY_TTL_SECS`(재생 링크의 수명), `PEGBOARD_TEST_OPEN_LOG`(CLI가 `recording open`에서 `open`을 부르지 않고 링크를 그 파일에 적는다). `PEGBOARD_TEST_HOOKS`는 데몬의 시험용 메서드와 진단 기록(daemon.log)도 켠다. 2b의 시험용 메서드는 모두 세션 토큰이 필요하다: `test.recordTarget`(탭이 녹화되는지), `test.setScreen`(세션의 화면 기록을 끄고 켠다), `test.dropRecorder`(녹화기 연결을 끊어 둔다), `test.detachBridge`(브리지가 워커에서 떨어진다). `PEGBOARD_TEST_MCP_SLOW_CREATE`는 디버그 빌드의 MCP 서버에만 있다.
 
 ## 라이선스
 

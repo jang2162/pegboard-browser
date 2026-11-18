@@ -837,12 +837,12 @@ base에서 명령별 더해진 시간 중앙값(ms): `open` 52, `snapshot -i` 52
 
 - F1: 스트림은 녹화기의 자기 연결에 건다(구성 B) (근거: V1, V2, V5. 잰 네 상태에서 A와 B의 프레임 수와 캡처가 같고, 에이전트 세션의 시작·중지가 B의 스트림에 영향이 없다. B를 고른 이유는 프레임이 포커스 유지 연결의 이벤트 방송을 채우지 않는다는 것이다. 다른 Space와 잠금에서의 A와 B 비교는 미측정)
 - F2: 받자마자 확인한다 (근거: V4. 두 방식 모두 마지막 상태의 프레임이 남는다. 늦춘 확인은 브라우저 CPU를 한 코어의 약 4%만큼 줄이지만, 초당 2장으로 묶으므로 받자마자 확인해도 저장량은 같다)
-- F3: `devicePixelRatio`가 1이면 직접 캡처는 그대로(`clip` 없이) 찍는다. **1보다 크면 `Page.getLayoutMetrics`로 구한 화면 영역을 `clip`으로 주고 `scale`을 가로가 1280 이하(스트림의 `maxWidth`와 같다)가 되게 준다.** 작업 4는 이 규칙을 따른다 (근거: V3. 배율 1 화면에서 `clip`은 크기를 줄이지 않고 15ms 느리다. 배율 2 화면에서는 그대로 찍으면 가로 2560이 된다. 레티나 화면에서의 캡처 시간과 크기는 미측정이다. 쓸 수 있는 두 번째 레티나 기기가 없어 지금 재지 않는다)
+- F3: `devicePixelRatio`가 1이면 직접 캡처는 그대로(`clip` 없이) 찍는다. **1보다 크면 `Page.getLayoutMetrics`로 구한 화면 영역을 `clip`으로 주고 `scale`을 가로가 1280 이하(스트림의 `maxWidth`와 같다)가 되게 준다.** 작업 4는 이 규칙을 넓혀 만들었다: 그대로 찍으면 가로가 1280을 넘을 때(배율이 1보다 크거나, 배율 1이어도 창이 1280보다 넓을 때) `clip`과 `scale`을 쓰고, 배율 2라도 창이 640 이하면 그대로 찍는다(위 "작업 4". 넓은 창의 `clip` 비용은 미측정) (근거: V3. 배율 1 화면에서 `clip`은 크기를 줄이지 않고 15ms 느리다. 배율 2 화면에서는 그대로 찍으면 가로 2560이 된다. 레티나 화면에서의 캡처 시간과 크기는 미측정이다. 쓸 수 있는 두 번째 레티나 기기가 없어 지금 재지 않는다)
 - F4: 보이는 탭, 같은 창의 뒤쪽 탭, 최소화한 창, 다른 창에 가려진 창에서는 스트림과 직접 캡처가 모두 온다(뒤쪽 탭과 최소화는 초당 약 4장). 뒤쪽 탭 상태는 화면에서 확인하지 않았다. 다른 Space, 화면 잠금, 디스플레이 절전은 **보류(미측정)**. 재생 화면의 "화면 없음"은 기록된 프레임이 없는 구간에 보인다(어느 상태에서 생기는지는 보류한 상태의 측정 뒤에 정한다) (근거: V1, V2)
 - F5: **들어갈 때**의 기준은 주 프레임의 `Page.frameNavigated`다. 그 주소가 끈 도메인이면 그때부터 스트림 프레임과 직접 캡처를 버린다. `frameStartedNavigating`도 늘 먼저 오지만, 302로 넘어간 곳의 주소는 `frameNavigated`에서야 안다. 탐색 시작부터 `frameNavigated`까지 온 프레임은 이전 문서의 것이었으므로 시작부터 버릴 필요가 없다(S6 두 실행, 새 문서가 먼저 온 적 0). **끈 도메인에서 나갈 때**는 다음을 따른다.
   - 직접 캡처: 새 주 프레임의 `frameNavigated`가 도착한 **뒤에 보낸** 캡처만 쓴다. 그 전에 보낸 캡처는 응답이 늦게 와도 버린다. 근거: 그 뒤에 보낸 캡처 1,437번 중 이전 문서 0(S6b 여섯 종류).
   - 스트림 프레임: 새 문서(`frameNavigated`의 `loaderId`)의 `Page.lifecycleEvent` `firstContentfulPaint`까지 버린다. 그 전에 온 새 문서 프레임은 잃고(탐색 하나에 약 1장, 첫 그림이 늦는 페이지에서는 그림이 나올 때까지), 그 구간은 재생 화면에 "화면 기록 꺼짐"으로 보인다. 근거: 그 뒤의 이전 문서 프레임 0(다섯 종류, 150번). `networkAlmostIdle`은 쓰지 않는다: 긴 폴링 페이지에서 30번 모두 오지 않았고 back/forward 캐시 복원에서도 오지 않는다. `firstContentfulPaint`가 오지 않는 문서(내용을 그리지 않는 페이지)는 기록되지 않은 채로 남는다(닫힌 쪽으로 실패).
-  - back/forward 캐시 복원(`frameNavigated.type`이 `BackForwardCacheRestore`, lifecycle 이벤트가 오지 않는다): 스트림 프레임을 `frameNavigated`부터 **250ms** 동안 버리고, `frameNavigated` 뒤에 보낸 직접 캡처 한 장으로 그 구간의 그림을 남긴다. 250ms는 "잰 가장 긴 지연의 두 배와 250ms 중 큰 쪽"이다: 뒤로 가기만 30번 돌린 따로 한 실행(f80a503, `--only=s6b --kinds=history-back`. 위 표의 84eec45 실행과 다르다)에서 `frameNavigated` 뒤에 이전 문서의 스트림 프레임이 온 것은 3번, 마지막 것은 `frameNavigated` 뒤 최대 14ms, 중앙값 5ms였다(두 배 28ms). 가벼운 페이지에서만 쟀으므로 아래 한도를 250ms로 두었다. 같은 실행에서 `frameNavigated` 뒤에 보낸 캡처 236번 중 이전 문서 0, 실패한 캡처 22번은 모두 `frameNavigated` 전에 보낸 것이었다.
+  - back/forward 캐시 복원(`frameNavigated.type`이 `BackForwardCacheRestore`, lifecycle 이벤트가 오지 않는다): 스트림 프레임을 `frameNavigated`부터 **250ms** 동안 버리고, `frameNavigated` 뒤에 보낸 직접 캡처 한 장으로 그 구간의 그림을 남긴다(만든 것은 이 250ms 동안 직접 캡처도 하지 않는다: 닫힌 쪽. 작업 4). 250ms는 "잰 가장 긴 지연의 두 배와 250ms 중 큰 쪽"이다: 뒤로 가기만 30번 돌린 따로 한 실행(f80a503, `--only=s6b --kinds=history-back`. 위 표의 84eec45 실행과 다르다)에서 `frameNavigated` 뒤에 이전 문서의 스트림 프레임이 온 것은 3번, 마지막 것은 `frameNavigated` 뒤 최대 14ms, 중앙값 5ms였다(두 배 28ms). 가벼운 페이지에서만 쟀으므로 아래 한도를 250ms로 두었다. 같은 실행에서 `frameNavigated` 뒤에 보낸 캡처 236번 중 이전 문서 0, 실패한 캡처 22번은 모두 `frameNavigated` 전에 보낸 것이었다.
   - 모두 가벼운 시험 페이지에서 잰 것이다(종류마다 30번) (근거: S6, S6b)
 - F6: 탐색 이벤트나 확장 신호에는 사람과 에이전트(또는 페이지 스크립트)를 확실히 가르는 신호가 없다. 판정은 시간으로 한다: 명령 실행 구간 밖에서 일어난 것만 사람 개입 후보다. 그리고 **어느 것도 확실한 것으로 보지 않는다. 모두 "사람 개입 가능성"이다.** 이유:
   - `frameRequestedNavigation` 없이 시작한 탐색(주소창, 뒤로·앞으로): 페이지 스크립트의 `history.back()`, `history.go(-1)`도 같은 모양이다(`frameStartedNavigating(historyDifferentDocument)`, `BackForwardCacheRestore`, `frameRequestedNavigation` 없음).
@@ -865,7 +865,7 @@ base에서 명령별 더해진 시간 중앙값(ms): `open` 52, `snapshot -i` 52
 
 ### 작업 8의 수동 확인으로 넘기는 것
 
-소유자의 기계 시간이 필요한 아래 항목은 작업 8의 수동 확인에서 한다. 그동안 작업 3은 위의 판정 줄대로 진행한다.
+소유자의 기계 시간이 필요한 아래 항목은 작업 8의 수동 확인에서 한다. 그동안 작업 3은 위의 판정 줄대로 진행한다. 작업 8이 [phase2b-manual-checks.md](./phase2b-manual-checks.md)의 P3, P4, P5로 옮겼다.
 
 - 화면 잠금과 디스플레이 절전(사람이 잠금을 푼다): `cd spikes && node 40-screencast.mjs --auto --with-lock --with-sleep --only=locked,display-sleep`.
 - 다른 Space(Space 두 개 이상, Control+←/→ 단축키 켬): `cd spikes && node 40-screencast.mjs --auto --only=other-space`.
