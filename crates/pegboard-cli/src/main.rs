@@ -11,17 +11,19 @@ use std::time::{Duration, Instant};
 mod mcp;
 
 use clap::{Parser, Subcommand};
-use pegboard_core::actionlog::{valid_recording_id, ActionEntry, EntryKind, Manifest};
+use pegboard_core::actionlog::{valid_recording_id, ActionEntry, EntryKind};
 use pegboard_core::api::{serve, Client};
 use pegboard_core::daemon::Daemon;
 use pegboard_core::lock::DaemonLock;
 use pegboard_core::paths::{ensure_home, paths, socket_path_fits, Paths};
 use pegboard_core::policy;
 use pegboard_core::recording::config::RecordingConfig;
+use pegboard_core::recording::screen::valid_frame_name;
 use pegboard_core::runner::succeeded;
 use pegboard_protocol::{
     codes, ActionClass, BrowserStatus, CommandExecParams, CommandExecResult, FileInfo, ProfileInfo,
-    RecordExtra, RpcError, SessionCreateParams, SessionId, SessionInfo, SessionPolicy,
+    RecordExtra, RecordingList, RecordingSummary, RpcError, SessionCreateParams, SessionId,
+    SessionInfo, SessionPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -72,7 +74,7 @@ enum Cmd {
         #[command(subcommand)]
         command: SessionCmd,
     },
-    /// Read action recordings.
+    /// Read, keep and delete recordings.
     Recording {
         #[command(subcommand)]
         command: RecordingCmd,
@@ -223,8 +225,32 @@ enum FilesCmd {
 
 #[derive(Subcommand)]
 enum RecordingCmd {
-    List,
+    /// List the recordings, oldest first, with their size, screen and failures.
+    List {
+        /// Only the recordings of this session (its id, or its handle).
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+        /// Only recordings with a failed or refused command.
+        #[arg(long)]
+        failed: bool,
+        /// Only kept recordings.
+        #[arg(long)]
+        kept: bool,
+    },
+    /// Show the actions of a recording.
     Show { recording_id: String },
+    /// Keep a recording: the retention rules never delete it.
+    Keep { recording_id: String },
+    /// Let the retention rules delete a kept recording again.
+    Unkeep { recording_id: String },
+    /// Delete a recording (not one still being written).
+    Delete { recording_id: String },
+    /// Apply the retention rules now (14 days, then screens over the total size).
+    Prune {
+        /// Only tell what would be deleted.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() {
@@ -518,18 +544,135 @@ fn describe_policy(p: &SessionPolicy) -> String {
 /// A line of `recording show` for something a person may have done in a session tab.
 fn describe_human(a: &ActionEntry) -> String {
     format!(
-        "{}  {}  human  {}{}  tab {}  {}",
+        "{}  {}  human: {}{}  tab {}  {}",
         a.seq,
         a.ts,
+        a.what.as_deref().unwrap_or("-"),
         if a.certain == Some(true) {
             ""
         } else {
-            "possible: "
+            " (possibly)"
         },
-        a.what.as_deref().unwrap_or("-"),
         a.target_id.as_deref().unwrap_or("-"),
         a.url.as_deref().unwrap_or("-"),
     )
+}
+
+/// A frame name as `recording show` prints it: only a well-formed `<targetId>/<file>`.
+fn frame_shown(name: Option<&str>) -> &str {
+    name.filter(|n| valid_frame_name(n)).unwrap_or("-")
+}
+
+/// A line of `recording show` for a command, with its frames when it has any.
+fn describe_command(a: &ActionEntry) -> String {
+    let words = std::iter::once(a.command.as_str())
+        .chain(a.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let result = match (a.ok, &a.error) {
+        (true, _) => "ok".to_string(),
+        (false, Some(e)) => format!("failed: {e}"),
+        (false, None) => "failed".to_string(),
+    };
+    let mut line = format!(
+        "{}  {}  {}  {}  {}ms",
+        a.seq, a.ts, words, result, a.duration_ms
+    );
+    if a.frame_before.is_some() || a.frame_after.is_some() {
+        line.push_str(&format!(
+            "  frames {} / {}",
+            frame_shown(a.frame_before.as_deref()),
+            frame_shown(a.frame_after.as_deref())
+        ));
+    }
+    line
+}
+
+/// Bytes as `recording list` shows them (decimal units, as config.toml counts GB).
+pub(crate) fn human_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if bytes < 1000 {
+        format!("{bytes} B")
+    } else if b < 1e6 {
+        format!("{:.1} KB", b / 1e3)
+    } else if b < 1e9 {
+        format!("{:.1} MB", b / 1e6)
+    } else {
+        format!("{:.2} GB", b / 1e9)
+    }
+}
+
+/// What became of a recording's screen, in words.
+pub(crate) fn screen_words(screen: &str) -> &'static str {
+    match screen {
+        "recorded" => "screen",
+        "capped" => "screen capped",
+        "pruned" => "screen pruned",
+        _ => "no screen",
+    }
+}
+
+/// A line of `recording list`.
+fn describe_recording(r: &RecordingSummary) -> String {
+    format!(
+        "{}  {}  {}  {}  {}  {}  {}  {}  {} failed  {} denied",
+        r.recording_id,
+        r.session_id,
+        r.started_at,
+        if r.running {
+            "running"
+        } else {
+            r.ended_at.as_deref().unwrap_or("-")
+        },
+        r.session_name,
+        human_size(r.total_bytes),
+        screen_words(&r.screen),
+        if r.keep { "kept" } else { "-" },
+        r.failed,
+        r.denied
+    )
+}
+
+/// The filters of `recording list`.
+#[derive(Default)]
+struct ListFilter {
+    session: Option<String>,
+    failed: bool,
+    kept: bool,
+}
+
+impl ListFilter {
+    fn admits(&self, r: &RecordingSummary) -> bool {
+        // A handle (`<id>.<token>`) names its session too; the token is not needed here.
+        let session = self
+            .session
+            .as_deref()
+            .map(|s| s.split_once('.').map_or(s, |(id, _)| id));
+        session.is_none_or(|s| r.session_id == s)
+            && (!self.failed || r.failed + r.denied > 0)
+            && (!self.kept || r.keep)
+    }
+}
+
+/// The lines of `recording list`: the recordings the filter admits, then the totals.
+fn list_lines(list: &RecordingList, filter: &ListFilter) -> Vec<String> {
+    list.recordings
+        .iter()
+        .filter(|r| filter.admits(r))
+        .map(describe_recording)
+        .chain(std::iter::once(format!(
+            "total {}, kept {}",
+            human_size(list.total_bytes),
+            human_size(list.kept_bytes)
+        )))
+        .collect()
+}
+
+/// A recording id of a `recording` subcommand, checked before it is sent.
+fn checked_recording_id(id: &str) {
+    if !valid_recording_id(id) {
+        usage(&format!("{id:?} is not a recording id"));
+    }
 }
 
 fn describe(s: &SessionInfo) -> String {
@@ -619,26 +762,28 @@ fn session(paths: &Paths, command: SessionCmd, json: bool) -> Result<(), RpcErro
 
 fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), RpcError> {
     match command {
-        RecordingCmd::List => {
-            let list: Vec<Manifest> = call(paths, "recording.list", json!({}))?;
+        RecordingCmd::List {
+            session,
+            failed,
+            kept,
+        } => {
+            let filter = ListFilter {
+                session,
+                failed,
+                kept,
+            };
+            let mut list: RecordingList = call(paths, "recording.list", json!({}))?;
             if json {
+                list.recordings.retain(|r| filter.admits(r));
                 print_json(&list);
-            }
-            for m in list.iter().filter(|_| !json) {
-                println!(
-                    "{}  {}  {}  {}  {}",
-                    m.recording_id,
-                    m.session_id,
-                    m.started_at,
-                    m.ended_at.as_deref().unwrap_or("-"),
-                    m.session_name
-                );
+            } else {
+                for line in list_lines(&list, &filter) {
+                    println!("{line}");
+                }
             }
         }
         RecordingCmd::Show { recording_id } => {
-            if !valid_recording_id(&recording_id) {
-                usage(&format!("{recording_id:?} is not a recording id"));
-            }
+            checked_recording_id(&recording_id);
             let v: Value = call(
                 paths,
                 "recording.get",
@@ -654,25 +799,79 @@ fn recording(paths: &Paths, command: RecordingCmd, json: bool) -> Result<(), Rpc
             for a in &actions {
                 if a.kind == EntryKind::Human {
                     println!("{}", describe_human(a));
-                    continue;
+                } else {
+                    println!("{}", describe_command(a));
                 }
-                let words = std::iter::once(a.command.as_str())
-                    .chain(a.args.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let result = match (a.ok, &a.error) {
-                    (true, _) => "ok".to_string(),
-                    (false, Some(e)) => format!("failed: {e}"),
-                    (false, None) => "failed".to_string(),
-                };
-                println!(
-                    "{}  {}  {}  {}  {}ms",
-                    a.seq, a.ts, words, result, a.duration_ms
-                );
+            }
+        }
+        RecordingCmd::Keep { recording_id } => set_keep(paths, &recording_id, true, json)?,
+        RecordingCmd::Unkeep { recording_id } => set_keep(paths, &recording_id, false, json)?,
+        RecordingCmd::Delete { recording_id } => {
+            checked_recording_id(&recording_id);
+            let _: Value = call(
+                paths,
+                "recording.delete",
+                json!({ "recordingId": recording_id }),
+            )?;
+            if json {
+                print_json(&json!({ "deleted": recording_id }));
+            } else {
+                println!("deleted {recording_id}");
+            }
+        }
+        RecordingCmd::Prune { dry_run } => {
+            let v: Value = call(paths, "recording.prune", json!({ "dryRun": dry_run }))?;
+            if json {
+                print_json(&v);
+                return Ok(());
+            }
+            let lines = prune_lines(&v, dry_run);
+            if lines.is_empty() {
+                println!("nothing to prune");
+            }
+            for line in lines {
+                println!("{line}");
             }
         }
     }
     Ok(())
+}
+
+fn set_keep(paths: &Paths, recording_id: &str, keep: bool, json: bool) -> Result<(), RpcError> {
+    checked_recording_id(recording_id);
+    let r: RecordingSummary = call(
+        paths,
+        "recording.keep",
+        json!({ "recordingId": recording_id, "keep": keep }),
+    )?;
+    if json {
+        print_json(&r);
+    } else {
+        println!(
+            "{} {}",
+            if r.keep { "kept" } else { "unkept" },
+            r.recording_id
+        );
+    }
+    Ok(())
+}
+
+/// One line per action of a `recording.prune` answer.
+fn prune_lines(answer: &Value, dry_run: bool) -> Vec<String> {
+    let verb = if dry_run { "would delete" } else { "deleted" };
+    answer["actions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|a| {
+            let id = a["id"].as_str().unwrap_or("?");
+            match a["action"].as_str() {
+                Some("deleteScreen") => format!("{verb} the screen of {id}"),
+                _ => format!("{verb} {id}"),
+            }
+        })
+        .collect()
 }
 
 /// The fields of agent-browser's `data` that are the answer of a command (eval's `result`,
@@ -1014,8 +1213,193 @@ mod tests {
         a.seq = 7;
         assert_eq!(
             describe_human(&a),
-            "7  2026-01-01T00:00:00Z  human  possible: switched to this tab  tab T1  https://a.test/x"
+            "7  2026-01-01T00:00:00Z  human: switched to this tab (possibly)  tab T1  https://a.test/x"
         );
+    }
+
+    fn summary(id: &str, session: &str) -> RecordingSummary {
+        RecordingSummary {
+            recording_id: id.into(),
+            session_id: session.into(),
+            session_name: "demo".into(),
+            profile: "default".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: Some("2026-01-01T00:10:00Z".into()),
+            running: false,
+            keep: false,
+            screen: "recorded".into(),
+            screen_bytes: 1_500_000,
+            total_bytes: 1_600_000,
+            commands: 4,
+            failed: 0,
+            denied: 0,
+            human: 0,
+        }
+    }
+
+    #[test]
+    fn sizes_are_decimal() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(999), "999 B");
+        assert_eq!(human_size(1500), "1.5 KB");
+        assert_eq!(human_size(2_340_000), "2.3 MB");
+        assert_eq!(human_size(5_000_000_000), "5.00 GB");
+    }
+
+    #[test]
+    fn recording_list_lines_and_filters() {
+        let a = summary("r_aaaaaaaa", "s_aaaaaaaa");
+        let b = RecordingSummary {
+            keep: true,
+            screen: "pruned".into(),
+            failed: 1,
+            ..summary("r_bbbbbbbb", "s_bbbbbbbb")
+        };
+        let c = RecordingSummary {
+            running: true,
+            ended_at: None,
+            screen: "none".into(),
+            denied: 2,
+            ..summary("r_cccccccc", "s_cccccccc")
+        };
+        let d = RecordingSummary {
+            screen: "capped".into(),
+            ..summary("r_dddddddd", "s_dddddddd")
+        };
+        let list = RecordingList {
+            recordings: vec![a, b, c, d],
+            total_bytes: 6_400_000,
+            kept_bytes: 1_600_000,
+        };
+        let all = list_lines(&list, &ListFilter::default());
+        assert_eq!(
+            all,
+            vec![
+                "r_aaaaaaaa  s_aaaaaaaa  2026-01-01T00:00:00Z  2026-01-01T00:10:00Z  demo  1.6 MB  screen  -  0 failed  0 denied",
+                "r_bbbbbbbb  s_bbbbbbbb  2026-01-01T00:00:00Z  2026-01-01T00:10:00Z  demo  1.6 MB  screen pruned  kept  1 failed  0 denied",
+                "r_cccccccc  s_cccccccc  2026-01-01T00:00:00Z  running  demo  1.6 MB  no screen  -  0 failed  2 denied",
+                "r_dddddddd  s_dddddddd  2026-01-01T00:00:00Z  2026-01-01T00:10:00Z  demo  1.6 MB  screen capped  -  0 failed  0 denied",
+                "total 6.4 MB, kept 1.6 MB",
+            ]
+        );
+        let ids = |f: ListFilter| -> Vec<String> {
+            list_lines(&list, &f)
+                .iter()
+                .filter_map(|l| l.split_whitespace().next().filter(|w| w.starts_with("r_")))
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(
+            ids(ListFilter {
+                failed: true,
+                ..ListFilter::default()
+            }),
+            ["r_bbbbbbbb", "r_cccccccc"]
+        );
+        assert_eq!(
+            ids(ListFilter {
+                kept: true,
+                ..ListFilter::default()
+            }),
+            ["r_bbbbbbbb"]
+        );
+        for session in ["s_cccccccc", "s_cccccccc.sometoken"] {
+            assert_eq!(
+                ids(ListFilter {
+                    session: Some(session.into()),
+                    ..ListFilter::default()
+                }),
+                ["r_cccccccc"]
+            );
+        }
+        assert!(ids(ListFilter {
+            session: Some("s_cccccccc".into()),
+            kept: true,
+            ..ListFilter::default()
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn recording_show_names_the_frames() {
+        let target = "A".repeat(32);
+        let mut a = ActionEntry {
+            seq: 3,
+            ts: "t".into(),
+            command: "click".into(),
+            args: vec!["click".into(), "#a".into()],
+            ok: true,
+            duration_ms: 12,
+            frame_before: Some(format!("{target}/000001.jpg")),
+            frame_after: Some(format!("{target}/000002.jpg")),
+            ..ActionEntry::default()
+        };
+        assert_eq!(
+            describe_command(&a),
+            format!(
+                "3  t  click click #a  ok  12ms  frames {target}/000001.jpg / {target}/000002.jpg"
+            )
+        );
+        // Only well-formed names are shown.
+        a.frame_before = Some("../../etc/passwd".into());
+        a.frame_after = None;
+        assert_eq!(
+            describe_command(&a),
+            "3  t  click click #a  ok  12ms  frames - / -"
+        );
+        a.frame_before = None;
+        assert_eq!(describe_command(&a), "3  t  click click #a  ok  12ms");
+    }
+
+    #[test]
+    fn prune_lines_tell_each_action() {
+        let answer = json!({ "actions": [
+            { "action": "delete", "id": "r_aaaaaaaa" },
+            { "action": "deleteScreen", "id": "r_bbbbbbbb" },
+        ]});
+        assert_eq!(
+            prune_lines(&answer, false),
+            ["deleted r_aaaaaaaa", "deleted the screen of r_bbbbbbbb"]
+        );
+        assert_eq!(
+            prune_lines(&answer, true),
+            [
+                "would delete r_aaaaaaaa",
+                "would delete the screen of r_bbbbbbbb"
+            ]
+        );
+        assert!(prune_lines(&json!({ "actions": [] }), true).is_empty());
+    }
+
+    #[test]
+    fn recording_subcommands_parse() {
+        use clap::Parser;
+        let rec = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Cmd::Recording { command } => command,
+            _ => panic!("{args:?}"),
+        };
+        assert!(matches!(
+            rec(&["pegboard", "recording", "list", "--session", "s_aaaaaaaa", "--failed", "--kept"]),
+            RecordingCmd::List { session: Some(s), failed: true, kept: true } if s == "s_aaaaaaaa"
+        ));
+        assert!(matches!(
+            rec(&["pegboard", "recording", "prune", "--dry-run"]),
+            RecordingCmd::Prune { dry_run: true }
+        ));
+        for (word, id) in [
+            ("keep", "r_aaaaaaaa"),
+            ("unkeep", "r_aaaaaaaa"),
+            ("delete", "r_aaaaaaaa"),
+        ] {
+            let parsed = rec(&["pegboard", "recording", word, id]);
+            let got = match parsed {
+                RecordingCmd::Keep { recording_id } => ("keep", recording_id),
+                RecordingCmd::Unkeep { recording_id } => ("unkeep", recording_id),
+                RecordingCmd::Delete { recording_id } => ("delete", recording_id),
+                _ => panic!(),
+            };
+            assert_eq!(got, (word, id.to_string()));
+        }
     }
 
     #[test]

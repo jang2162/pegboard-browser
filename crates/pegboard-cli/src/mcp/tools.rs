@@ -9,13 +9,15 @@
 
 use std::sync::Mutex;
 
-use pegboard_core::actionlog::{valid_recording_id, ActionEntry, Manifest};
+use pegboard_core::actionlog::{valid_recording_id, ActionEntry, EntryKind, Manifest};
 use pegboard_core::argv::{self, ArgKind, ArgSpec, FormSpec};
 use pegboard_core::policy;
+use pegboard_core::recording::screen::valid_frame_name;
 use pegboard_core::runner::succeeded;
 use pegboard_protocol::{
-    codes, BrowserStatus, CommandExecParams, CommandExecResult, FileInfo, ProfileInfo, RpcError,
-    SessionCreateParams, SessionId, SessionInfo, SessionPolicy,
+    codes, BrowserStatus, CommandExecParams, CommandExecResult, FileInfo, ProfileInfo,
+    RecordingList, RecordingSummary, RpcError, SessionCreateParams, SessionId, SessionInfo,
+    SessionPolicy,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
@@ -42,6 +44,8 @@ enum Kind {
     SessionClose,
     RecordingList,
     RecordingGet,
+    RecordingKeep,
+    RecordingDelete,
     FilesList,
     BrowserStatus,
     ProfileList,
@@ -207,13 +211,21 @@ fn management_tools(operator: bool) -> Vec<Tool> {
         (
             Kind::RecordingList,
             "pegboard_recording_list",
-            format!("List the action recordings of {scope}."),
+            format!(
+                "List the recordings of {scope}: when, how large, whether the screen was \
+                 recorded (or capped, or pruned for space), whether a person kept it, and how \
+                 many commands failed or were refused."
+            ),
             none(),
         ),
         (
             Kind::RecordingGet,
             "pegboard_recording_get",
-            format!("Show the actions of a recording ({scope}). Secrets in it are already hidden."),
+            format!(
+                "Show the actions of a recording ({scope}), what a person may have done in its \
+                 tabs, and the names of the frames around each command. Secrets in it are \
+                 already hidden."
+            ),
             schema(
                 json!({ "recordingId": { "type": "string", "description": "r_ and 8 characters." } }),
                 &["recordingId"],
@@ -261,6 +273,31 @@ fn management_tools(operator: bool) -> Vec<Tool> {
                 "pegboard_browser_stop",
                 "Close every session and stop the browser.".to_string(),
                 none(),
+            ),
+            (
+                Kind::RecordingKeep,
+                "pegboard_recording_keep",
+                "Keep a recording (keep: true), so the retention rules (14 days, total size) \
+                 never delete it, or let them again (keep: false)."
+                    .to_string(),
+                schema(
+                    json!({
+                        "recordingId": { "type": "string", "description": "r_ and 8 characters." },
+                        "keep": { "type": "boolean" },
+                    }),
+                    &["recordingId", "keep"],
+                ),
+            ),
+            (
+                Kind::RecordingDelete,
+                "pegboard_recording_delete",
+                "Delete a recording. One whose session is still open is refused \
+                 (recording_running)."
+                    .to_string(),
+                schema(
+                    json!({ "recordingId": { "type": "string", "description": "r_ and 8 characters." } }),
+                    &["recordingId"],
+                ),
             ),
         ]);
     }
@@ -844,6 +881,17 @@ pub fn no_session(id: &SessionId) -> RpcError {
 }
 
 /// The answer for a recording that does not exist, word for word the daemon's.
+/// A recording id of a tool call, checked before it reaches the daemon.
+fn checked_recording_id(id: &str) -> Result<(), RpcError> {
+    if valid_recording_id(id) {
+        Ok(())
+    } else {
+        Err(invalid(
+            "recordingId is not a recording id (r_ and 8 characters)",
+        ))
+    }
+}
+
 fn no_recording(id: &str) -> RpcError {
     error(codes::RECORDING_NOT_FOUND, format!("no recording {id}"))
 }
@@ -977,6 +1025,32 @@ impl Registry {
             Kind::RecordingGet => {
                 let id = plain(&["recordingId"])?.required("recordingId")?;
                 self.recording_get(ctx, &id)
+            }
+            // Listed in operator mode only; a person's decisions about recordings.
+            Kind::RecordingKeep => {
+                let a = plain(&["recordingId", "keep"])?;
+                let id = a.required("recordingId")?;
+                if !matches!(args.get("keep"), Some(Value::Bool(_))) {
+                    return Err(invalid("keep is required: true or false"));
+                }
+                let keep = a.flag("keep")?;
+                checked_recording_id(&id)?;
+                let r: RecordingSummary = call(
+                    ctx.core,
+                    "recording.keep",
+                    json!({ "recordingId": id, "keep": keep }),
+                )?;
+                Ok(format!(
+                    "{} {}",
+                    if r.keep { "kept" } else { "no longer kept" },
+                    r.recording_id
+                ))
+            }
+            Kind::RecordingDelete => {
+                let id = plain(&["recordingId"])?.required("recordingId")?;
+                checked_recording_id(&id)?;
+                let _: Value = call(ctx.core, "recording.delete", json!({ "recordingId": id }))?;
+                Ok(format!("deleted {id}"))
             }
             Kind::FilesList => {
                 let id = plain(&["sessionId"])?.session_id()?;
@@ -1182,29 +1256,47 @@ impl Registry {
     }
 
     fn recording_list(&self, ctx: &mut Ctx) -> Result<String, RpcError> {
-        let list: Vec<Manifest> = call(ctx.core, "recording.list", json!({}))?;
+        let list: RecordingList = call(ctx.core, "recording.list", json!({}))?;
         let owned = lock(ctx.owned);
-        let lines: Vec<String> = list
+        let mut lines: Vec<String> = list
+            .recordings
             .iter()
-            .filter(|m| {
-                self.operator || SessionId::parse(&m.session_id).is_some_and(|id| owned.knows(&id))
+            .filter(|r| {
+                self.operator || SessionId::parse(&r.session_id).is_some_and(|id| owned.knows(&id))
             })
-            .map(|m| {
+            .map(|r| {
                 format!(
-                    "{}  {}  {}  {}  {}",
-                    m.recording_id,
-                    m.session_id,
-                    m.started_at,
-                    m.ended_at.as_deref().unwrap_or("-"),
-                    m.session_name
+                    "{}  {}  {}  {}  {}  {}  {}{}  {} commands, {} failed, {} denied",
+                    r.recording_id,
+                    r.session_id,
+                    r.started_at,
+                    if r.running {
+                        "running"
+                    } else {
+                        r.ended_at.as_deref().unwrap_or("-")
+                    },
+                    r.session_name,
+                    crate::human_size(r.total_bytes),
+                    crate::screen_words(&r.screen),
+                    if r.keep { "  kept" } else { "" },
+                    r.commands,
+                    r.failed,
+                    r.denied
                 )
             })
             .collect();
-        Ok(if lines.is_empty() {
-            "no recordings".to_string()
-        } else {
-            lines.join("\n")
-        })
+        if lines.is_empty() {
+            return Ok("no recordings".to_string());
+        }
+        // The bytes of all recordings tell of other sessions' work: operator mode only.
+        if self.operator {
+            lines.push(format!(
+                "total {}, kept {}",
+                crate::human_size(list.total_bytes),
+                crate::human_size(list.kept_bytes)
+            ));
+        }
+        Ok(lines.join("\n"))
     }
 
     fn recording_get(&self, ctx: &mut Ctx, id: &str) -> Result<String, RpcError> {
@@ -1235,10 +1327,34 @@ impl Registry {
             ),
             "seq  time  command  result  duration".to_string(),
         ];
-        // A failure's text may be agent-browser's, quoting the page: all of them go
-        // together between page-content markers after the table.
-        let mut failures = Vec::new();
+        // A failure's text may be agent-browser's, quoting the page, and what a person did
+        // names the page's address: all of them go together between page-content markers
+        // after the table.
+        let (mut failures, mut humans) = (Vec::new(), Vec::new());
         for a in &actions {
+            if a.kind == EntryKind::Human {
+                humans.push(format!(
+                    "seq {}: {}{}",
+                    a.seq,
+                    a.what.as_deref().unwrap_or("-"),
+                    a.url
+                        .as_deref()
+                        .map(|u| format!("  {u}"))
+                        .unwrap_or_default()
+                ));
+                out.push(format!(
+                    "{}  {}  human{} (what: below)  tab {}",
+                    a.seq,
+                    a.ts,
+                    if a.certain == Some(true) {
+                        ""
+                    } else {
+                        " (possibly)"
+                    },
+                    a.target_id.as_deref().unwrap_or("-")
+                ));
+                continue;
+            }
             let words = std::iter::once(a.command.as_str())
                 .chain(a.args.iter().map(String::as_str))
                 .collect::<Vec<_>>()
@@ -1251,13 +1367,37 @@ impl Registry {
                 }
                 (false, None) => "failed",
             };
-            out.push(format!(
+            let mut line = format!(
                 "{}  {}  {}  {}  {}ms",
                 a.seq, a.ts, words, result, a.duration_ms
-            ));
+            );
+            if a.frame_before.is_some() || a.frame_after.is_some() {
+                // Names pegboard gave; only well-formed ones are shown.
+                let frame = |n: &Option<String>| {
+                    n.as_deref()
+                        .filter(|n| valid_frame_name(n))
+                        .unwrap_or("-")
+                        .to_string()
+                };
+                line.push_str(&format!(
+                    "  frames {} / {}",
+                    frame(&a.frame_before),
+                    frame(&a.frame_after)
+                ));
+            }
+            out.push(line);
         }
-        if !failures.is_empty() {
-            out.push("why the failed actions failed:".to_string());
+        let header = match (failures.is_empty(), humans.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some("why the failed actions failed:"),
+            (true, false) => Some("what a person may have done:"),
+            (false, false) => {
+                Some("why the failed actions failed, then what a person may have done:")
+            }
+        };
+        if let Some(header) = header {
+            out.push(header.to_string());
+            failures.extend(humans);
             out.push(wrap_page_content(&failures.join("\n"), None));
         }
         Ok(out.join("\n"))

@@ -27,6 +27,8 @@ struct StubState {
     file_name: Option<String>,
     /// When set, the error of the failed action recording.get gives.
     recorded_error: Option<String>,
+    /// When set, recording.get also gives a human entry with this `what`, and frames.
+    human_what: Option<String>,
 }
 
 /// A core API that answers like the daemon, and puts tokens everywhere it can: a `token`
@@ -194,15 +196,39 @@ impl Core for Stub {
                     .map(|s| (s.0.clone(), s.1.clone()))
                     .chain(st.ended.iter().map(|id| (id.clone(), token_of(id))))
                     .map(|(id, token)| {
+                        let kept = id == FOREIGN;
                         json!({
-                            "format": 1, "recordingId": format!("r_{}", &id[2..]),
+                            "recordingId": format!("r_{}", &id[2..]),
                             "sessionId": id, "sessionName": "n", "profile": "default",
-                            "startedAt": "t0", "endedAt": null, "chromeVersion": "157",
-                            "agentBrowserVersion": "0.42.0", "token": token,
+                            "startedAt": "t0", "endedAt": "t1", "running": false,
+                            "keep": kept, "screen": if kept { "pruned" } else { "recorded" },
+                            "screenBytes": 2_000_000, "totalBytes": 2_500_000,
+                            "commands": 3, "failed": 1, "denied": 2, "human": 0,
+                            "token": token,
                         })
                     })
                     .collect();
-                Ok(Value::Array(all))
+                let n = all.len() as u64;
+                Ok(json!({
+                    "recordings": all, "totalBytes": n * 2_500_000, "keptBytes": 2_500_000,
+                    "token": FOREIGN_TOKEN,
+                }))
+            }
+            "recording.keep" => Ok(json!({
+                "recordingId": p["recordingId"], "sessionId": "s_x", "sessionName": "n",
+                "profile": "default", "startedAt": "t0", "endedAt": "t1", "running": false,
+                "keep": p["keep"], "screen": "recorded", "screenBytes": 1, "totalBytes": 2,
+                "commands": 0, "failed": 0, "denied": 0, "human": 0,
+            })),
+            "recording.delete" => {
+                if p["recordingId"] == "r_runnnnnn" {
+                    return Err(RpcError {
+                        code: codes::RECORDING_RUNNING.into(),
+                        message: "recording r_runnnnnn is still being written".into(),
+                        data: None,
+                    });
+                }
+                Ok(json!({}))
             }
             "recording.get" => {
                 let rid = p["recordingId"].as_str().unwrap_or("").to_string();
@@ -228,20 +254,37 @@ impl Core for Stub {
                 } else {
                     token.clone()
                 };
+                let mut actions = vec![json!({
+                    "seq": 1, "ts": "t1", "sessionId": sid, "targetId": null, "url": null,
+                    "command": "fill", "args": ["fill", "@e1", free], "ok": false,
+                    "error": st.recorded_error.clone()
+                        .unwrap_or_else(|| format!("failed near {free}")),
+                    "durationMs": 5,
+                    "redacted": false, "token": token,
+                })];
+                if let Some(what) = &st.human_what {
+                    let target = "A".repeat(32);
+                    actions.push(json!({
+                        "seq": 2, "ts": "t2", "sessionId": sid, "targetId": target,
+                        "url": "https://a.test/x", "command": "human", "args": [], "ok": true,
+                        "error": null, "durationMs": 0, "redacted": false, "kind": "human",
+                        "what": what, "certain": false,
+                    }));
+                    actions.push(json!({
+                        "seq": 3, "ts": "t3", "sessionId": sid, "targetId": target,
+                        "url": null, "command": "click", "args": ["click", "#a"], "ok": true,
+                        "error": null, "durationMs": 7, "redacted": false,
+                        "frameBefore": format!("{target}/000001.jpg"),
+                        "frameAfter": "../../../etc/passwd",
+                    }));
+                }
                 Ok(json!({
                     "manifest": {
                         "format": 1, "recordingId": rid, "sessionId": sid, "sessionName": "n",
                         "profile": "default", "startedAt": "t0", "endedAt": null,
                         "chromeVersion": "157", "agentBrowserVersion": "0.42.0", "token": token,
                     },
-                    "actions": [{
-                        "seq": 1, "ts": "t1", "sessionId": sid, "targetId": null, "url": null,
-                        "command": "fill", "args": ["fill", "@e1", free], "ok": false,
-                        "error": st.recorded_error.clone()
-                            .unwrap_or_else(|| format!("failed near {free}")),
-                        "durationMs": 5,
-                        "redacted": false, "token": token,
-                    }],
+                    "actions": actions,
                     "token": token,
                 }))
             }
@@ -396,11 +439,13 @@ const DEFAULT_TOOLS: [&str; 8] = [
     "pegboard_browser_status",
 ];
 
-const OPERATOR_ONLY: [&str; 4] = [
+const OPERATOR_ONLY: [&str; 6] = [
     "pegboard_profile_list",
     "pegboard_profile_create",
     "pegboard_profile_delete",
     "pegboard_browser_stop",
+    "pegboard_recording_keep",
+    "pegboard_recording_delete",
 ];
 
 #[test]
@@ -473,6 +518,160 @@ fn default_mode_has_no_profile_or_stop_tools() {
         assert_eq!(r["error"]["code"], INVALID_PARAMS, "{r}");
     }
     assert!(h.stub.methods().is_empty(), "{:?}", h.stub.methods());
+}
+
+#[test]
+fn default_mode_has_no_keep_or_delete_tools() {
+    let mut h = Harness::new(false);
+    let names = h.tool_names();
+    assert!(
+        !names
+            .iter()
+            .any(|n| n == "pegboard_recording_keep" || n == "pegboard_recording_delete"),
+        "{names:?}"
+    );
+    for (tool, args) in [
+        (
+            "pegboard_recording_delete",
+            json!({ "recordingId": "r_foreignn" }),
+        ),
+        (
+            "pegboard_recording_keep",
+            json!({ "recordingId": "r_foreignn", "keep": true }),
+        ),
+    ] {
+        // A made-up name of the same length (a long name is not repeated in the error).
+        let made_up = format!("pegboard_{}", "x".repeat(tool.len() - 9));
+        let unknown = h.request("tools/call", json!({ "name": made_up, "arguments": {} }));
+        assert_eq!(unknown["error"]["code"], INVALID_PARAMS, "{unknown}");
+        let r = h.request("tools/call", json!({ "name": tool, "arguments": args }));
+        // Exactly what a tool that does not exist gets.
+        assert_eq!(
+            r["error"].to_string().replace(tool, "?"),
+            unknown["error"].to_string().replace(&made_up, "?"),
+            "{r}"
+        );
+    }
+    assert!(h.stub.methods().is_empty(), "{:?}", h.stub.methods());
+}
+
+#[test]
+fn operator_mode_keeps_and_deletes() {
+    let mut h = Harness::new(true);
+    let (err, text) = h.call(
+        "pegboard_recording_keep",
+        json!({ "recordingId": "r_foreignn", "keep": true }),
+    );
+    assert!(!err && text == "kept r_foreignn", "{text}");
+    let (err, text) = h.call(
+        "pegboard_recording_keep",
+        json!({ "recordingId": "r_foreignn", "keep": false }),
+    );
+    assert!(!err && text == "no longer kept r_foreignn", "{text}");
+    assert_eq!(
+        h.stub.calls_of("recording.keep"),
+        vec![
+            json!({ "recordingId": "r_foreignn", "keep": true }),
+            json!({ "recordingId": "r_foreignn", "keep": false }),
+        ]
+    );
+    let (err, text) = h.call(
+        "pegboard_recording_delete",
+        json!({ "recordingId": "r_foreignn" }),
+    );
+    assert!(!err && text == "deleted r_foreignn", "{text}");
+    assert_eq!(
+        h.stub.calls_of("recording.delete"),
+        vec![json!({ "recordingId": "r_foreignn" })]
+    );
+    let (err, text) = h.call(
+        "pegboard_recording_delete",
+        json!({ "recordingId": "r_runnnnnn" }),
+    );
+    assert!(err && text.starts_with("recording_running:"), "{text}");
+    // Bad arguments never reach the daemon.
+    for args in [
+        json!({ "recordingId": "../x", "keep": true }),
+        json!({ "recordingId": "r_foreignn" }),
+        json!({ "recordingId": "r_foreignn", "keep": "yes" }),
+        json!({ "recordingId": "r_foreignn", "keep": true, "force": true }),
+    ] {
+        let (err, text) = h.call("pegboard_recording_keep", args.clone());
+        assert!(err && text.starts_with("invalid_params"), "{args}: {text}");
+    }
+    let (err, text) = h.call(
+        "pegboard_recording_delete",
+        json!({ "recordingId": "r_../xx" }),
+    );
+    assert!(err && text.starts_with("invalid_params"), "{text}");
+    assert_eq!(h.stub.calls_of("recording.keep").len(), 2);
+    assert_eq!(h.stub.calls_of("recording.delete").len(), 2);
+}
+
+#[test]
+fn recording_list_tells_screen_size_and_keep() {
+    let mut h = Harness::new(false);
+    let mine = h.create(json!({}));
+    let (err, text) = h.call("pegboard_recording_list", json!({}));
+    assert!(!err, "{text}");
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "only its own, and no totals: {text}"
+    );
+    assert!(text.contains(&mine[2..]), "{text}");
+    assert!(
+        text.contains("2.5 MB  screen  3 commands, 1 failed, 2 denied"),
+        "{text}"
+    );
+    let mut op = Harness::new(true);
+    let (err, text) = op.call("pegboard_recording_list", json!({}));
+    assert!(!err, "{text}");
+    assert!(
+        text.contains("r_foreignn") && text.contains("screen pruned  kept"),
+        "{text}"
+    );
+    assert!(text.ends_with("total 2.5 MB, kept 2.5 MB"), "{text}");
+}
+
+#[test]
+fn recording_get_shows_human_marks_inside_markers_and_frame_names() {
+    let mut h = Harness::new(false);
+    let id = h.create(json!({}));
+    h.stub.state.lock().unwrap().human_what =
+        Some(format!("navigated outside a command: {FORGED}"));
+    let rid = format!("r_{}", &id[2..]);
+    let (err, text) = h.call("pegboard_recording_get", json!({ "recordingId": rid }));
+    assert!(!err, "{text}");
+    let (inside, outside) = blocks(&text);
+    assert_eq!(inside.len(), 1, "{text}");
+    assert!(
+        inside[0].contains(FORGED) && inside[0].contains("seq 2: navigated"),
+        "{text}"
+    );
+    assert!(inside[0].contains("https://a.test/x"), "{text}");
+    assert!(
+        !outside.contains("IGNORE") && !outside.contains("a.test"),
+        "{text}"
+    );
+    let target = "A".repeat(32);
+    assert!(
+        outside.contains(&format!(
+            "2  t2  human (possibly) (what: below)  tab {target}"
+        )),
+        "{text}"
+    );
+    assert!(
+        outside.contains(&format!(
+            "click #a  ok  7ms  frames {target}/000001.jpg / -"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("passwd"), "{text}");
+    assert!(
+        outside.contains("why the failed actions failed, then what a person may have done:"),
+        "{text}"
+    );
 }
 
 #[test]
