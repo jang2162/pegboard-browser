@@ -1313,3 +1313,504 @@ fn recording_overhead_meets_the_targets() {
         rows.join("\n")
     );
 }
+
+// ---- navigation log, human interventions, network and console (task 5) ----
+
+/// Plays the person at the browser: a connection of the test's own, made straight to the
+/// browser (test-only knowledge of its port, from the home's `DevToolsActivePort`), not
+/// through a session endpoint. What it does to a session tab happens outside any command.
+struct Person {
+    rt: tokio::runtime::Runtime,
+    conn: pegboard_core::cdp::CdpConn,
+}
+
+impl Person {
+    fn connect(home: &Home) -> Person {
+        let text = std::fs::read_to_string(home.path().join("chrome/DevToolsActivePort")).unwrap();
+        let mut lines = text.lines();
+        let (port, path) = (lines.next().unwrap(), lines.next().unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let conn = rt
+            .block_on(pegboard_core::cdp::CdpConn::connect(&format!(
+                "ws://127.0.0.1:{port}{path}"
+            )))
+            .unwrap();
+        Person { rt, conn }
+    }
+
+    fn send(&self, method: &str, params: Value, session: Option<&str>) -> Value {
+        self.rt
+            .block_on(self.conn.send(method, params, session))
+            .unwrap_or_else(|e| panic!("{method}: {e:#}"))
+    }
+
+    /// Runs `f` on a CDP session of the test's own on `target`.
+    fn on<T>(&self, target: &str, f: impl FnOnce(&Person, &str) -> T) -> T {
+        let session = self.rt.block_on(self.conn.attach(target)).unwrap();
+        let out = f(self, &session);
+        let _ = self.rt.block_on(self.conn.send(
+            "Target.detachFromTarget",
+            json!({ "sessionId": session }),
+            None,
+        ));
+        out
+    }
+
+    /// Types an address into the tab (a navigation the browser starts).
+    fn navigate(&self, target: &str, url: &str) {
+        self.on(target, |p, s| {
+            p.send("Page.navigate", json!({ "url": url }), Some(s));
+        });
+    }
+
+    /// Clicks the middle of the element with the mouse.
+    fn click(&self, target: &str, selector: &str) {
+        self.on(target, |p, s| {
+            let expr = format!(
+                "JSON.stringify((r => [r.x + r.width / 2, r.y + r.height / 2])\
+                 (document.querySelector({selector:?}).getBoundingClientRect()))"
+            );
+            let r = p.send(
+                "Runtime.evaluate",
+                json!({ "expression": expr, "returnByValue": true }),
+                Some(s),
+            );
+            let xy: Vec<f64> = serde_json::from_str(r["result"]["value"].as_str().unwrap()).unwrap();
+            for kind in ["mouseMoved", "mousePressed", "mouseReleased"] {
+                p.send(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": kind, "x": xy[0], "y": xy[1], "button": "left", "clickCount": 1 }),
+                    Some(s),
+                );
+            }
+        });
+    }
+
+    /// Clicks the tab (makes it the active tab of its window).
+    fn activate(&self, target: &str) {
+        self.send("Target.activateTarget", json!({ "targetId": target }), None);
+    }
+
+    /// The bridge worker of the profile `target` is in: its target id.
+    fn bridge_worker(&self, target: &str) -> Option<String> {
+        let info = self.send("Target.getTargetInfo", json!({ "targetId": target }), None);
+        let context = info["targetInfo"]["browserContextId"].clone();
+        let all = self.send("Target.getTargets", json!({}), None);
+        all["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| {
+                t["type"] == "service_worker"
+                    && t["browserContextId"] == context
+                    && t["url"].as_str().is_some_and(|u| u.ends_with("/sw.js"))
+            })
+            .map(|t| t["targetId"].as_str().unwrap().to_string())
+    }
+}
+
+/// Opens a second tab and makes it the front one with a command (agent-browser's `tab`
+/// switches tabs in the browser, spike H6), so that `first` is behind it; waits out the
+/// command's grace.
+fn in_front_of(home: &Home, handle: &str, first: &str, url: &str) {
+    ok(home, handle, &["tab", "new", url]);
+    let second = tabs(home, handle)
+        .into_iter()
+        .find(|(t, _)| t != first)
+        .unwrap()
+        .0;
+    ok(home, handle, &["tab", &second]);
+}
+
+fn nav_lines(dir: &Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("navigation.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(json)
+        .collect()
+}
+
+fn human_entries(dir: &Path) -> Vec<Value> {
+    actions(dir)
+        .into_iter()
+        .filter(|a| a["kind"] == "human")
+        .collect()
+}
+
+/// The handle of a session made with these options.
+fn create_with(home: &Home, url: &str, options: &[&str]) -> String {
+    let mut args = vec!["session", "create", "--url", url];
+    args.extend_from_slice(options);
+    let (code, out, err) = home.run(&args);
+    assert_eq!(code, 0, "{err}");
+    session_handle(&out)
+}
+
+#[test]
+#[ignore]
+fn navigation_log_follows_tabs_and_popups() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/counter?start=SECRET0"));
+    let a = targets(home, &h)[0].clone();
+    ok(home, &h, &["open", &format!("{origin}/marker?q=SECRET1")]);
+    ok(
+        home,
+        &h,
+        &["tab", "new", &format!("{origin}/popup?q=SECRET2")],
+    );
+    let b = tabs(home, &h)
+        .into_iter()
+        .find(|(_, url)| url.contains("/popup"))
+        .unwrap()
+        .0;
+    ok(home, &h, &["click", "#pop"]);
+    std::thread::sleep(Duration::from_secs(1));
+    let popup = tabs(home, &h)
+        .into_iter()
+        .find(|(_, url)| url.ends_with("/animated"))
+        .unwrap_or_else(|| panic!("no popup: {:?}", tabs(home, &h)))
+        .0;
+    ok(home, &h, &["tab", &popup]);
+    ok(home, &h, &["tab", "close"]);
+    std::thread::sleep(Duration::from_secs(1));
+    close(home, &h);
+
+    let dir = recording_dir(home, &h);
+    let lines = nav_lines(&dir);
+    let text = std::fs::read_to_string(dir.join("navigation.jsonl")).unwrap();
+    assert!(!text.contains('?') && !text.contains("SECRET"), "{text}");
+    assert_eq!(mode(&dir.join("navigation.jsonl")), 0o600);
+    let of = |t: &str| -> Vec<(String, String)> {
+        lines
+            .iter()
+            .filter(|l| l["targetId"] == t)
+            .map(|l| {
+                (
+                    l["event"].as_str().unwrap().to_string(),
+                    l["url"].as_str().unwrap_or("-").to_string(),
+                )
+            })
+            .collect()
+    };
+    let path = |u: &str| u.strip_prefix(&origin).unwrap_or(u).to_string();
+    let events = |t: &str| -> Vec<(String, String)> {
+        of(t).into_iter().map(|(e, u)| (e, path(&u))).collect()
+    };
+    // The first tab: created on its start page, then its navigation.
+    let first = events(&a);
+    assert_eq!(
+        first[0],
+        ("created".to_string(), "/counter".to_string()),
+        "{lines:?}"
+    );
+    assert!(
+        first.contains(&("navigated".to_string(), "/marker".to_string())),
+        "{lines:?}"
+    );
+    // The second tab: created, then its page.
+    let second = events(&b);
+    assert_eq!(second[0].0, "created", "{lines:?}");
+    assert!(
+        second.contains(&("navigated".to_string(), "/popup".to_string())),
+        "{lines:?}"
+    );
+    // The popup: created with its opener, its page, closed, in that order.
+    let p = events(&popup);
+    let at = |e: &str| p.iter().position(|(x, _)| x == e);
+    let (created, navigated, closed) = (at("created"), at("navigated"), at("closed"));
+    assert!(
+        created.is_some() && created < navigated && navigated < closed,
+        "{lines:?}"
+    );
+    assert!(
+        p.contains(&("navigated".to_string(), "/animated".to_string())),
+        "{lines:?}"
+    );
+    let created_line = lines
+        .iter()
+        .find(|l| l["targetId"] == popup.as_str() && l["event"] == "created")
+        .unwrap();
+    assert_eq!(created_line["opener"], b.as_str(), "{created_line}");
+    // The person did nothing.
+    assert!(human_entries(&dir).is_empty(), "{:?}", human_entries(&dir));
+}
+
+#[test]
+#[ignore]
+fn agent_commands_are_never_taken_for_human_ones() {
+    let origin = fixture();
+    let home = shared_home();
+    let search = format!("{origin}/search");
+    let h = create(home, &search);
+    let first = targets(home, &h)[0].clone();
+    let lines: Vec<Vec<&str>> = vec![
+        vec!["open", &search],
+        vec!["click", "#go"],
+        vec!["back"],
+        vec!["forward"],
+        vec!["reload"],
+        vec!["back"],
+        vec!["click", "#go"],
+        vec!["back"],
+        vec!["fill", "#q", "hello"],
+        vec!["press", "Enter"],
+        vec!["back"],
+        vec!["tab", "new", &search],
+        vec!["click", "#go"],
+        vec!["tab", &first],
+        vec!["reload"],
+        vec!["forward"],
+        vec!["open", &search],
+        vec!["fill", "#q", "again"],
+        vec!["press", "Enter"],
+        vec!["get", "url"],
+    ];
+    assert_eq!(lines.len(), 20);
+    for args in &lines {
+        ok(home, &h, args);
+    }
+    // Late commits and switches of the last commands come within the grace.
+    std::thread::sleep(Duration::from_secs(2));
+    close(home, &h);
+    let dir = recording_dir(home, &h);
+    assert!(human_entries(&dir).is_empty(), "{:?}", human_entries(&dir));
+    // The commands did navigate (the log saw them).
+    let navigated = nav_lines(&dir)
+        .iter()
+        .filter(|l| l["event"] == "navigated")
+        .count();
+    assert!(navigated >= 10, "{:?}", nav_lines(&dir));
+}
+
+#[test]
+#[ignore]
+fn a_human_navigation_outside_a_command_is_recorded() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/counter"));
+    let first = targets(home, &h)[0].clone();
+    ok(home, &h, &["get", "url"]);
+    std::thread::sleep(Duration::from_secs(2));
+    let person = Person::connect(home);
+    person.navigate(&first, &format!("{origin}/marker?secret=SECRET1"));
+    std::thread::sleep(Duration::from_millis(1500));
+    close(home, &h);
+
+    let dir = recording_dir(home, &h);
+    let marks = human_entries(&dir);
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    let m = &marks[0];
+    assert_eq!(m["targetId"], first.as_str(), "{m}");
+    // Spike F6: nothing tells a person from a script's history navigation: never certain.
+    assert_eq!(m["certain"], false, "{m}");
+    assert_eq!(m["command"], "human", "{m}");
+    assert_eq!(
+        m["what"],
+        format!("navigated outside a command: {origin}/marker").as_str(),
+        "{m}"
+    );
+    assert!(!m.to_string().contains("SECRET"), "{m}");
+    let rid = format!("r_{}", &id_of(&h)[2..]);
+    let (code, out, err) = home.run(&["recording", "show", &rid]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("human  possible: navigated outside a command") && out.contains(&first),
+        "{out}"
+    );
+}
+
+#[test]
+#[ignore]
+fn a_human_like_click_outside_a_command_is_marked_possible() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/search"));
+    let first = targets(home, &h)[0].clone();
+    ok(home, &h, &["get", "url"]);
+    std::thread::sleep(Duration::from_secs(2));
+    let person = Person::connect(home);
+    person.click(&first, "#go");
+    std::thread::sleep(Duration::from_millis(1500));
+    let url = eval(home, &h, "location.pathname");
+    close(home, &h);
+    assert_eq!(url, "/counter", "the click did not follow the link");
+
+    let dir = recording_dir(home, &h);
+    let marks = human_entries(&dir);
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert_eq!(
+        marks[0]["what"],
+        "followed a link or form outside a command"
+    );
+    assert_eq!(marks[0]["certain"], false);
+    assert_eq!(marks[0]["targetId"], first.as_str());
+}
+
+#[test]
+#[ignore]
+fn page_script_navigation_is_not_human() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/script-nav"));
+    // The page moves on by itself 2.5 s after it loaded: no command is running then.
+    std::thread::sleep(Duration::from_secs(4));
+    close(home, &h);
+    let dir = recording_dir(home, &h);
+    assert!(
+        nav_lines(&dir)
+            .iter()
+            .any(|l| l["event"] == "navigated" && l["url"] == format!("{origin}/counter").as_str()),
+        "{:?}",
+        nav_lines(&dir)
+    );
+    assert!(human_entries(&dir).is_empty(), "{:?}", human_entries(&dir));
+}
+
+#[test]
+#[ignore]
+fn a_tab_switch_outside_a_command_is_marked_possible() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/counter"));
+    let first = targets(home, &h)[0].clone();
+    in_front_of(home, &h, &first, &format!("{origin}/marker"));
+    std::thread::sleep(Duration::from_secs(2));
+    let person = Person::connect(home);
+    person.activate(&first);
+    std::thread::sleep(Duration::from_millis(1500));
+    close(home, &h);
+    let dir = recording_dir(home, &h);
+    let marks = human_entries(&dir);
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert_eq!(marks[0]["what"], "switched to this tab");
+    assert_eq!(marks[0]["certain"], false);
+    assert_eq!(marks[0]["targetId"], first.as_str());
+}
+
+#[test]
+#[ignore]
+fn a_tab_switch_after_the_bridge_worker_restarted_is_marked() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create(home, &format!("{origin}/counter"));
+    let first = targets(home, &h)[0].clone();
+    in_front_of(home, &h, &first, &format!("{origin}/marker"));
+    let person = Person::connect(home);
+    let old = person.bridge_worker(&first).expect("no bridge worker");
+    // The worker starts again (as after Chrome stopped it): the binding is gone with it.
+    // The switch below may be what wakes the new worker (then it keeps the switch until the
+    // daemon binds it again, spike H8) or come after the daemon bound it.
+    person.on(&old, |p, s| {
+        // The worker goes away with the call: its answer may never come.
+        let _ = p.rt.block_on(tokio::time::timeout(
+            Duration::from_secs(3),
+            p.conn.send(
+                "Runtime.evaluate",
+                json!({ "expression": "chrome.runtime.reload()" }),
+                Some(s),
+            ),
+        ));
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    person.activate(&first);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let new = loop {
+        match person.bridge_worker(&first) {
+            Some(w) if w != old => break w,
+            _ if Instant::now() > deadline => panic!("premise: the bridge worker did not restart"),
+            _ => std::thread::sleep(Duration::from_millis(200)),
+        }
+    };
+    std::thread::sleep(Duration::from_secs(2));
+    // The bridge still works after its worker restarted.
+    ok(home, &h, &["tab", "new", &format!("{origin}/counter")]);
+    close(home, &h);
+    let dir = recording_dir(home, &h);
+    let marks = human_entries(&dir);
+    assert_eq!(marks.len(), 1, "worker {old} -> {new}: {marks:?}");
+    assert_eq!(marks[0]["what"], "switched to this tab");
+    assert_eq!(marks[0]["targetId"], first.as_str());
+}
+
+#[test]
+#[ignore]
+fn network_and_console_are_off_by_default_and_on_with_record() {
+    let origin = fixture();
+    let home = shared_home();
+    let talk = format!("{origin}/talk");
+    let plain = create(home, &talk);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(eval(home, &plain, "window.fetched"), r#"{"ok":true}"#);
+    close(home, &plain);
+    let dir = recording_dir(home, &plain);
+    assert_eq!(manifest(&dir)["record"], json!([]));
+    assert!(!dir.join("network.jsonl").exists());
+    assert!(!dir.join("console.jsonl").exists());
+
+    let h = create_with(home, &talk, &["--record", "network,console"]);
+    let (code, out, err) = home.run(&["session", "info", &h]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("record network,console"), "{out}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(eval(home, &h, "window.fetched"), r#"{"ok":true}"#);
+    close(home, &h);
+    let dir = recording_dir(home, &h);
+    assert_eq!(manifest(&dir)["record"], json!(["network", "console"]));
+    let read = |f: &str| -> Vec<Value> {
+        std::fs::read_to_string(dir.join(f))
+            .unwrap_or_else(|e| panic!("{f}: {e}"))
+            .lines()
+            .map(json)
+            .collect()
+    };
+    let api = format!("{origin}/api");
+    let net = read("network.jsonl");
+    assert!(
+        net.iter()
+            .any(|l| l["url"] == api.as_str() && l["status"] == 200 && l["method"] == "GET"),
+        "{net:?}"
+    );
+    let console = read("console.jsonl");
+    assert!(
+        console
+            .iter()
+            .any(|l| l["level"] == "log" && l["text"] == "hello console"),
+        "{console:?}"
+    );
+    for f in ["network.jsonl", "console.jsonl"] {
+        assert_eq!(mode(&dir.join(f)), 0o600, "{f}");
+    }
+}
+
+#[test]
+#[ignore]
+fn network_log_keeps_no_secrets() {
+    let origin = fixture();
+    let home = shared_home();
+    let h = create_with(home, &format!("{origin}/talk"), &["--record", "network"]);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(eval(home, &h, "window.fetched"), r#"{"ok":true}"#);
+    // The request did carry them (the page's own view).
+    assert!(eval(home, &h, "document.cookie")
+        .as_str()
+        .unwrap()
+        .contains("SECRET3"));
+    close(home, &h);
+    let dir = recording_dir(home, &h);
+    let text = std::fs::read_to_string(dir.join("network.jsonl")).unwrap();
+    assert!(text.contains("/api"), "{text}");
+    for secret in [
+        "SECRET1",
+        "SECRET2",
+        "SECRET3",
+        "SECRET5",
+        "Authorization",
+        "authorization",
+        "Cookie",
+        "cookie",
+    ] {
+        assert!(!text.contains(secret), "{secret} in {text}");
+    }
+    assert!(!dir.join("console.jsonl").exists());
+}

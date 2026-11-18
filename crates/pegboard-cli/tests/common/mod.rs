@@ -256,6 +256,34 @@ paint(); setInterval(paint, 100);
             "popup",
             r#"<button id="pop" onclick="window.open('/animated')">Open</button>"#,
         )),
+        // A link and a search form (Enter submits it) to `/counter`.
+        "/search" => html(page(
+            "search",
+            r#"<a id="go" href="/counter">go</a> <form action="/counter" method="get"><input id="q" name="q"></form>"#,
+        )),
+        // The page moves itself on 2.5 s after it loads (a script, no command).
+        "/script-nav" => html(page(
+            "script-nav",
+            "<p>script</p><script>setTimeout(() => { location.href = '/counter?from=script'; }, 2500);</script>",
+        )),
+        // 1.5 s after it loads: a fetch of `/api` carrying a token in its query, an
+        // Authorization header and a cookie, then a console line.
+        "/talk" => html(page(
+            "talk",
+            r#"<p>talk</p><script>
+document.cookie = 'k=SECRET3; path=/';
+setTimeout(() => {
+  fetch('/api?token=SECRET1', { headers: { Authorization: 'Bearer SECRET2' } })
+    .then(r => r.text())
+    .then(t => { window.fetched = t; console.log('hello console'); });
+}, 1500);
+</script>"#,
+        )),
+        "/api" => (
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nset-cookie: s=SECRET5; Path=/\r\n"
+                .to_string(),
+            r#"{"ok":true}"#.to_string(),
+        ),
         // Five changes of the background within 300 ms once `start()` is called, then
         // still; `settledAt` is the time of the last change. Nothing on it is contentful (no
         // text, image or canvas), so it never has a first contentful paint: it is recorded

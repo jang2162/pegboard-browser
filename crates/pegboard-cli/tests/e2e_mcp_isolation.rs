@@ -524,7 +524,7 @@ fn mcp_agent_cannot_reach_another_servers_session() {
 }
 
 /// Keys that look like they could widen a session's policy.
-const POLICY_KEYS: [(&str, &str); 8] = [
+const POLICY_KEYS: [(&str, &str); 9] = [
     (
         "policy",
         r#"{"allow":["state","clipboard","upload"],"deny":[]}"#,
@@ -536,6 +536,7 @@ const POLICY_KEYS: [(&str, &str); 8] = [
     ("noLocalhost", "false"),
     ("uploadDir", r#""/""#),
     ("noExpire", "true"),
+    ("record", r#"["network","console"]"#),
 ];
 
 #[test]
@@ -556,7 +557,7 @@ fn mcp_agent_cannot_widen_its_policy() {
     let made = mcp.create(json!({ "url": counter }));
     let the_policy = json!({
         "allow": [], "deny": ["eval"], "allowDomains": [], "allowPrivateNetwork": false,
-        "noLocalhost": false, "uploadDir": null, "noExpire": false,
+        "noLocalhost": false, "uploadDir": null, "noExpire": false, "record": [],
     });
     let open_before = cli_sessions(&home).len();
 

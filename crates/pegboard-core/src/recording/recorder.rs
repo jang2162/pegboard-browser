@@ -394,6 +394,13 @@ impl Sess {
         if let Some(rec) = &self.rec {
             if self.created.insert(target.to_string()) {
                 rec.nav(target, NavEvent::Created, url, opener);
+                if let Some(url) = url {
+                    // The page it is created on is named; an attach does not name it again.
+                    self.follow
+                        .entry(target.to_string())
+                        .or_default()
+                        .unlogged(url);
+                }
             }
         }
     }
@@ -1382,10 +1389,13 @@ impl Recorder {
             .clone();
         let sess = st.sessions.get_mut(&session)?;
         let capped = sess.paused || sess.rec.as_ref().is_none_or(|r| r.budget.capped());
-        sess.follow
-            .entry(target.to_string())
-            .or_default()
-            .seen_on(url);
+        let follow = sess.follow.entry(target.to_string()).or_default();
+        follow.seen_on(url);
+        // A page the tab went to while the recorder was not attached (a popup that
+        // committed before the attach, a navigation during a reconnect).
+        if let (true, Some(rec)) = (follow.unlogged(url), &sess.rec) {
+            rec.nav(target, NavEvent::Navigated, Some(url), None);
+        }
         let gate = &mut sess.screens.get_mut(target)?.gate;
         let neighbours: Vec<&str> = neighbours.iter().map(String::as_str).collect();
         gate.attached(&self.opts.config, url, loader, painted, &neighbours);
@@ -3426,6 +3436,8 @@ mod tests {
         assert_eq!(
             urls,
             [
+                // The page the attach found the tab on (the rig's attach).
+                "http://a.test/",
                 "http://a.test/1",
                 "http://a.test/2",
                 "http://b.test/x",
@@ -3489,6 +3501,7 @@ mod tests {
         let nav: Vec<NavLine> = lines(&manifest, "navigation.jsonl");
         let got: Vec<(String, NavEvent, Option<String>, Option<String>)> = nav
             .iter()
+            .filter(|l| l.target_id == T2)
             .map(|l| {
                 (
                     l.target_id.clone(),

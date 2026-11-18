@@ -288,6 +288,68 @@ fn server_policy_is_attached_to_every_session() {
     assert_eq!(op.wait_exit(20), 0);
 }
 
+/// The policy of an open session, as `session list` shows it.
+fn cli_policy_of(home: &Home, id: &str) -> Value {
+    let (code, out, err) = home.run(&["session", "list", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    json(&out)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("{id} not listed: {out}"))["policy"]
+        .clone()
+}
+
+#[test]
+#[ignore]
+fn mcp_record_option_reaches_every_session() {
+    let home = shared_home();
+    let mut mcp = Mcp::start(home, &["--record", "console"]);
+    let (err, text) = mcp.call("pegboard_session_create", json!({}));
+    assert!(!err && text.contains("record console"), "{text}");
+    let id = text
+        .split_whitespace()
+        .find(|w| w.starts_with("s_"))
+        .unwrap()
+        .to_string();
+    assert_eq!(cli_policy_of(home, &id)["record"], json!(["console"]));
+    let manifest = std::fs::read_to_string(
+        home.path()
+            .join("recordings")
+            .join(format!("r_{}", &id[2..]))
+            .join("manifest.json"),
+    )
+    .unwrap();
+    assert_eq!(json(&manifest)["record"], json!(["console"]), "{manifest}");
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+}
+
+#[test]
+#[ignore]
+fn mcp_default_mode_cannot_turn_recording_extras_on() {
+    let home = shared_home();
+    let mut mcp = Mcp::start(home, &[]);
+    let before = cli_session_ids(home).len();
+    for args in [
+        json!({ "record": ["network"] }),
+        json!({ "policy": { "record": ["network"] } }),
+    ] {
+        let (err, text) = mcp.call("pegboard_session_create", args.clone());
+        assert!(
+            err && text.starts_with("invalid_params: "),
+            "{args}: {text}"
+        );
+    }
+    assert_eq!(cli_session_ids(home).len(), before);
+    // A session it may create records nothing extra.
+    let (err, text) = mcp.call("pegboard_session_create", json!({}));
+    assert!(!err && text.contains("record -"), "{text}");
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+}
+
 #[test]
 #[ignore]
 fn adopted_session_keeps_its_own_wider_policy() {

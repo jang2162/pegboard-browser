@@ -139,6 +139,8 @@ pub struct NavFollow {
     /// The tab joined the recording before its first page committed: that commit is its
     /// opening, not a navigation (a popup's first page, `tab new`'s page).
     fresh: bool,
+    /// The page the navigation log last named for the tab.
+    logged: Option<String>,
 }
 
 impl NavFollow {
@@ -178,8 +180,19 @@ impl NavFollow {
         }
     }
 
+    /// Whether the navigation log has yet to name `url` as the tab's page (an attach found
+    /// the tab on a page whose commit it did not see); from now on it has.
+    pub fn unlogged(&mut self, url: &str) -> bool {
+        if is_blank(url) || self.logged.as_deref() == Some(url) {
+            return false;
+        }
+        self.logged = Some(url.to_string());
+        true
+    }
+
     /// A main-frame commit of `url`: the signal, or None for the tab's first page.
     pub fn committed(&mut self, url: &str) -> Option<Signal> {
+        self.logged = Some(url.to_string());
         let requested = self.underway.take().or_else(|| {
             self.requested
                 .take()
@@ -497,6 +510,17 @@ mod tests {
         let mut h = NavFollow::new(true);
         h.seen_on("http://a.test/");
         assert!(h.committed("http://a.test/2").is_some());
+    }
+
+    #[test]
+    fn a_page_found_on_attach_is_logged_once() {
+        let mut f = NavFollow::new(true);
+        assert!(!f.unlogged("about:blank"));
+        assert!(f.unlogged("http://a.test/"));
+        assert!(!f.unlogged("http://a.test/"));
+        f.committed("http://b.test/");
+        assert!(!f.unlogged("http://b.test/"));
+        assert!(f.unlogged("http://c.test/"));
     }
 
     #[test]
