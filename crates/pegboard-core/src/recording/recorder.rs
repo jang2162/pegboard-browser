@@ -2015,6 +2015,19 @@ fn spawn_writer(
             told: HashSet::new(),
         };
         for job in rx {
+            // Given up on at session end: what is still queued for the screen is dropped,
+            // so nothing recreates `screen/<target>/` after the session (a prune may be
+            // deleting it).
+            if w.abandoned.load(Ordering::SeqCst) {
+                match job {
+                    Job::Frame { .. } | Job::Mark { .. } => continue,
+                    Job::Capture { reply, .. } => {
+                        let _ = reply.send(false);
+                        continue;
+                    }
+                    Job::Line(_) | Job::End(_) => {}
+                }
+            }
             match job {
                 Job::Frame {
                     target,
@@ -2262,6 +2275,45 @@ mod tests {
             url: Some("http://a.test/".into()),
             data: frame(fill),
         }
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_writer_drops_what_is_queued_for_the_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_log, manifest) = open_log(tmp.path());
+        let abandoned = Arc::new(AtomicBool::new(true));
+        let jobs = spawn_writer(
+            manifest.clone(),
+            ScreenBudget::new(1_000_000),
+            abandoned,
+            Default::default(),
+        );
+        jobs.send(Job::Frame {
+            target: T1.into(),
+            shot: shot(1),
+            kind: FrameKind::Change,
+            number: None,
+        })
+        .unwrap();
+        jobs.send(Job::Mark {
+            target: T2.into(),
+            ts: now_ts(),
+            kind: FrameKind::Off,
+            url: None,
+        })
+        .unwrap();
+        let (reply, written) = oneshot::channel();
+        jobs.send(Job::Capture {
+            target: T1.into(),
+            shot: shot(2),
+            number: 7,
+            reply,
+        })
+        .unwrap();
+        assert!(!written.await.unwrap());
+        end(&jobs).await;
+        assert!(!manifest.dir().join("screen").exists());
+        assert_eq!(manifest.get().screen, ScreenStatus::None);
     }
 
     #[tokio::test]

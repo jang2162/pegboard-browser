@@ -208,20 +208,25 @@ async fn human_tab(conn: &CdpConn) -> String {
     conn.attach(&target).await.unwrap()
 }
 
-/// A real JPEG: a capture of the human tab.
+/// A real JPEG (64x40), made once and kept with the tests: a capture of the human tab right
+/// after the shared browser started could fail with "Not attached to an active page" (the
+/// first test of the binary), and the frames' content does not matter here.
+const JPEG: &[u8] = include_bytes!("shared/replay-frame.jpg");
+
+/// Puts the human tab on about:blank, ready to be scripted, and gives the frame bytes.
 async fn a_jpeg(conn: &CdpConn, session: &str) -> Vec<u8> {
     conn.navigate(session, "about:blank").await.unwrap();
-    let shot = conn
-        .send(
-            "Page.captureScreenshot",
-            json!({ "format": "jpeg", "quality": 60 }),
-            Some(session),
+    assert_eq!(
+        until(
+            conn,
+            session,
+            "document.readyState === 'complete' ? true : null"
         )
-        .await
-        .unwrap();
-    data_encoding::BASE64
-        .decode(shot["data"].as_str().unwrap().as_bytes())
-        .unwrap()
+        .await,
+        json!(true)
+    );
+    assert_eq!(&JPEG[..3], &[0xFF, 0xD8, 0xFF], "not a JPEG");
+    JPEG.to_vec()
 }
 
 /// Opens the replay page of `id` in the human tab and waits until it has drawn itself.
