@@ -136,6 +136,18 @@ impl Bridge {
         serde_json::from_str(text).with_context(|| format!("parsing bridge reply of {func}"))
     }
 
+    /// Test hook (`test.detachBridge`): lets go of the worker (detaches the session), so
+    /// nothing of pegboard keeps it running. The next call attaches again (`revive`).
+    pub async fn detach_for_test(&self) -> bool {
+        let mut session = self.session.lock().await;
+        let old = std::mem::take(&mut *session);
+        *lock(&self.bound) = String::new();
+        self.conn
+            .send("Target.detachFromTarget", json!({ "sessionId": old }), None)
+            .await
+            .is_ok()
+    }
+
     /// A new session on a worker that answers: the running worker, or one started again
     /// (`wake`) when none runs or the one listed does not answer. Binds it when following.
     async fn revive(&self, session: &mut String) -> Result<()> {

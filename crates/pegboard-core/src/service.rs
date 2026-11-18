@@ -616,6 +616,14 @@ impl Daemon {
                 let set = self.recorder.set_screen_for_test(&id, p.on).await;
                 Ok(json!({ "set": set }))
             }
+            // Test hook: the bridge of the session's profile detaches from its worker (a
+            // diagnostic of how the worker stops and starts without pegboard holding it).
+            "test.detachBridge" if crate::testenv::hooks() => {
+                let p: SessionIdParams = params(p)?;
+                let id = checked_session(&p.session_id)?;
+                self.authorize(&id, p.token.as_deref())?;
+                Ok(json!({ "detached": self.sessions.detach_bridge_for_test(&id).await }))
+            }
             "files.list" => {
                 let p: SessionIdParams = params(p)?;
                 let id = checked_session(&p.session_id)?;

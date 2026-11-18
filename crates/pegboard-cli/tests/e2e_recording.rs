@@ -1948,3 +1948,258 @@ fn network_log_keeps_no_secrets() {
     }
     assert!(!dir.join("console.jsonl").exists());
 }
+
+// ---- diagnostic: how the bridge's worker stops and what starts it again ----
+
+/// The bridge worker's registration as a page of its profile sees it (ServiceWorker
+/// domain): (version id, registration id, scope URL, running status), if it is visible.
+type SwSeen = Option<(String, String, String, String)>;
+
+fn sw_seen(
+    person: &Person,
+    page_session: &str,
+    events: &mut tokio::sync::broadcast::Receiver<pegboard_core::cdp::CdpEvent>,
+) -> SwSeen {
+    let mut regs: std::collections::HashMap<String, String> = Default::default();
+    let mut version: Option<(String, String, String)> = None;
+    person.rt.block_on(async {
+        let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+            loop {
+                let e = match events.recv().await {
+                    Ok(e) => e,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                if e.session_id.as_deref() != Some(page_session) {
+                    continue;
+                }
+                match e.method.as_str() {
+                    "ServiceWorker.workerRegistrationUpdated" => {
+                        for r in e.params["registrations"].as_array().into_iter().flatten() {
+                            regs.insert(
+                                r["registrationId"].as_str().unwrap_or("").into(),
+                                r["scopeURL"].as_str().unwrap_or("").into(),
+                            );
+                        }
+                    }
+                    "ServiceWorker.workerVersionUpdated" => {
+                        for v in e.params["versions"].as_array().into_iter().flatten() {
+                            let url = v["scriptURL"].as_str().unwrap_or("");
+                            if url.starts_with("chrome-extension://") && url.ends_with("/sw.js") {
+                                version = Some((
+                                    v["versionId"].as_str().unwrap_or("").into(),
+                                    v["registrationId"].as_str().unwrap_or("").into(),
+                                    v["runningStatus"].as_str().unwrap_or("").into(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+    });
+    let (v, r, status) = version?;
+    let scope = regs.get(&r).cloned().unwrap_or_default();
+    Some((v, r, scope, status))
+}
+
+/// Waits up to `limit` for `f` to give something; with the time it took.
+fn within<T>(limit: Duration, mut f: impl FnMut() -> Option<T>) -> Option<(T, u128)> {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = f() {
+            return Some((v, start.elapsed().as_millis()));
+        }
+        if start.elapsed() > limit {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// One stop × wake case in a browser of its own; a table row.
+fn worker_case(origin: &str, stop: &str, wake: &str, attached: bool) -> String {
+    let home = screen_home(SCREEN_OFF_CONFIG);
+    let h = create(&home, &format!("{origin}/counter"));
+    let first = targets(&home, &h)[0].clone();
+    in_front_of(&home, &h, &first, &format!("{origin}/marker"));
+    let person = Person::connect(&home);
+    let ctx = person.send("Target.getTargetInfo", json!({ "targetId": first }), None)["targetInfo"]
+        ["browserContextId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let Some(old) = person.bridge_worker(&first) else {
+        return format!("| {stop} | {attached} | {wake} | no worker at the start | | | | | |");
+    };
+    // A page session of the profile with the ServiceWorker domain on, kept for the case.
+    let mut events = person.conn.events();
+    let page = person.rt.block_on(person.conn.attach(&first)).unwrap();
+    let _ = person.rt.block_on(
+        person
+            .conn
+            .send("ServiceWorker.enable", json!({}), Some(&page)),
+    );
+    let seen = sw_seen(&person, &page, &mut events);
+    if !attached {
+        let r = hook(
+            &home,
+            "test.detachBridge",
+            json!({ "sessionId": id_of(&h), "token": token_of(&h) }),
+        );
+        assert_eq!(r["detached"], true, "{r}");
+    }
+    let send = |method: &str, params: Value, session: Option<&str>| -> String {
+        match person.rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                person.conn.send(method, params, session),
+            )
+            .await
+        }) {
+            Ok(Ok(v)) => format!("ok {v}"),
+            Ok(Err(e)) => format!("error {e:#}"),
+            Err(_) => "no answer in 5 s".into(),
+        }
+    };
+    let stop_result = match stop {
+        "closeTarget" => send("Target.closeTarget", json!({ "targetId": old }), None),
+        "stopWorker" => match &seen {
+            Some((v, ..)) => send(
+                "ServiceWorker.stopWorker",
+                json!({ "versionId": v }),
+                Some(&page),
+            ),
+            None => "no version seen".into(),
+        },
+        "stopAllWorkers" => send("ServiceWorker.stopAllWorkers", json!({}), Some(&page)),
+        _ => "waited (idle)".into(),
+    };
+    let stop_limit = if stop == "idle" { 90 } else { 5 };
+    let gone = within(Duration::from_secs(stop_limit), || {
+        (person.bridge_worker(&first).as_deref() != Some(old.as_str())).then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let by_itself = person.bridge_worker(&first).filter(|w| *w != old);
+    let after_stop = sw_seen(&person, &page, &mut events);
+    let wake_result = match wake {
+        "startWorker" => match &seen {
+            Some((_, _, scope, _)) => send(
+                "ServiceWorker.startWorker",
+                json!({ "scopeURL": scope }),
+                Some(&page),
+            ),
+            None => "no scope seen".into(),
+        },
+        "dispatchSyncEvent" => match &seen {
+            Some((_, r, scope, _)) => send(
+                "ServiceWorker.dispatchSyncEvent",
+                json!({ "origin": scope.trim_end_matches('/'), "registrationId": r,
+                        "tag": "pegboard-diag", "lastChance": false }),
+                Some(&page),
+            ),
+            None => "no registration seen".into(),
+        },
+        "activation" => send("Target.activateTarget", json!({ "targetId": first }), None),
+        "tabFromPage" => send(
+            "Runtime.evaluate",
+            json!({ "expression": "window.open('about:blank'); 1", "userGesture": true }),
+            Some(&page),
+        ),
+        "createTarget" => send(
+            "Target.createTarget",
+            json!({ "url": "about:blank", "browserContextId": ctx, "background": true }),
+            None,
+        ),
+        other => panic!("{other}"),
+    };
+    let woke = within(Duration::from_secs(10), || {
+        person.bridge_worker(&first).filter(|w| *w != old)
+    });
+    let answers = woke.as_ref().map(|(w, _)| {
+        person.on(w, |p, s| {
+            match p.rt.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    p.conn.evaluate(s, "typeof self.peg"),
+                )
+                .await
+            }) {
+                Ok(Ok(v)) => v.to_string(),
+                Ok(Err(e)) => format!("error {e:#}"),
+                Err(_) => "no answer".into(),
+            }
+        })
+    });
+    let short = |t: &str| t.chars().take(90).collect::<String>().replace('|', "/");
+    format!(
+        "| {stop} | {attached} | {wake} | {} ({}) | {} | {} | {} | {} | {} | {} |",
+        gone.map_or("no".to_string(), |(_, ms)| format!("{ms} ms")),
+        short(&stop_result),
+        by_itself.map_or("no".to_string(), |w| format!("yes {w}")),
+        after_stop.map_or("-".to_string(), |s| s.3),
+        short(&wake_result),
+        woke.as_ref()
+            .map_or("no".to_string(), |(_, ms)| format!("{ms} ms")),
+        answers.unwrap_or_else(|| "-".into()),
+        seen.as_ref()
+            .map_or("not seen".to_string(), |s| format!("{} {}", s.2, s.3)),
+    )
+}
+
+/// Diagnostic, not a check: stops the bridge worker each way and tries each way to start it
+/// again, each pair in a fresh browser, and prints a table (run with `--nocapture`). Cases can
+/// be narrowed with `PEGBOARD_DIAG_STOPS`, `PEGBOARD_DIAG_WAKES` (comma lists) and
+/// `PEGBOARD_DIAG_ATTACHED` (`yes`, `no`). The idle cases wait up to 90 s each with no
+/// debugger on the worker (the daemon's bridge detached by `test.detachBridge`).
+#[test]
+#[ignore]
+fn diag_bridge_worker_stop_and_wake() {
+    let origin = fixture();
+    let list = |var: &str, all: &[&'static str]| -> Vec<&'static str> {
+        match std::env::var(var) {
+            Ok(v) => all
+                .iter()
+                .copied()
+                .filter(|x| v.split(',').any(|y| y == *x))
+                .collect(),
+            Err(_) => all.to_vec(),
+        }
+    };
+    let stops = list(
+        "PEGBOARD_DIAG_STOPS",
+        &["closeTarget", "stopWorker", "stopAllWorkers", "idle"],
+    );
+    let wakes = list(
+        "PEGBOARD_DIAG_WAKES",
+        &[
+            "startWorker",
+            "dispatchSyncEvent",
+            "activation",
+            "tabFromPage",
+            "createTarget",
+        ],
+    );
+    let attached: Vec<bool> = match std::env::var("PEGBOARD_DIAG_ATTACHED").as_deref() {
+        Ok("yes") => vec![true],
+        Ok("no") => vec![false],
+        _ => vec![true, false],
+    };
+    println!(
+        "| stop | daemon attached to the worker | wake | worker target gone (stop call) | new worker before the wake | page's view of the version after the stop | wake call | new worker target after the wake | new worker answers | registration seen from the page (scope, status) |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for stop in &stops {
+        for at in &attached {
+            // Chrome stops an idle worker only when no debugger holds it.
+            if *stop == "idle" && *at {
+                continue;
+            }
+            for wake in &wakes {
+                println!("{}", worker_case(&origin, stop, wake, *at));
+            }
+        }
+    }
+}

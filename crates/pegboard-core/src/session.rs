@@ -878,6 +878,16 @@ impl SessionManager {
         true
     }
 
+    /// Test hook: the bridge of the session's profile lets go of its worker.
+    #[doc(hidden)]
+    pub async fn detach_bridge_for_test(&self, id: &SessionId) -> bool {
+        let bridge = match self.inner.table.lock().unwrap().records.get(id) {
+            Some(r) => r.bridge.clone(),
+            None => return false,
+        };
+        bridge.detach_for_test().await
+    }
+
     /// Opens a window of the profile (and its bridge) if it has none.
     pub async fn open_profile(&self, name: &str) -> Result<(), RpcError> {
         check_profile(&*self.inner.profiles.lock().await, name)?;
