@@ -8,6 +8,7 @@ pub mod cdp;
 pub mod daemon;
 pub mod downloads;
 pub mod guard;
+pub mod link;
 pub mod lock;
 pub mod paths;
 pub mod policy;

@@ -19,7 +19,7 @@ const NAVIGATE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Largest message and frame a queued connection takes (Chrome sends a CDP message as one
 /// frame). The request guard reads response bodies in pieces well below this; the limit is
 /// there so that no other message (a long URL in an event) can end the guard's connection.
-const QUEUED_MAX_MESSAGE: usize = 256 << 20;
+pub(crate) const QUEUED_MAX_MESSAGE: usize = 256 << 20;
 
 #[derive(Debug, Clone)]
 pub struct CdpEvent {
