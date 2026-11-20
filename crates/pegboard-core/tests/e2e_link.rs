@@ -284,7 +284,10 @@ async fn rig() -> Rig {
 #[ignore]
 async fn discover_targets_on_one_session_stays_there() {
     let Rig {
-        fixture, mut link, ..
+        fixture,
+        mut link,
+        _env,
+        _browser,
     } = rig().await;
     let s1 = link.browser_session().await;
     let s2 = link.browser_session().await;
@@ -309,7 +312,10 @@ async fn discover_targets_on_one_session_stays_there() {
 #[ignore]
 async fn auto_attach_on_one_session_stays_there() {
     let Rig {
-        fixture, mut link, ..
+        fixture,
+        mut link,
+        _env,
+        _browser,
     } = rig().await;
     let s1 = link.browser_session().await;
     let s2 = link.browser_session().await;
@@ -336,8 +342,11 @@ async fn auto_attach_on_one_session_stays_there() {
         .await;
     link.next_for(Some(&child), console("auto")).await;
     link.settle(QUIET).await;
-    let attach_elsewhere = link.seen(Some(&s2), event("Target.attachedToTarget"))
-        || link.seen(None, event("Target.attachedToTarget"));
+    let attach_elsewhere = link.seen(
+        Some(&s2),
+        about_target("Target.attachedToTarget", tid.clone()),
+    ) || link
+        .seen(None, about_target("Target.attachedToTarget", tid.clone()));
     let console_elsewhere = link.seen_anywhere(|m| {
         m["method"] == json!("Runtime.consoleAPICalled") && session_of(m) != Some(child.as_str())
     });
@@ -356,7 +365,10 @@ async fn auto_attach_on_one_session_stays_there() {
 #[ignore]
 async fn page_session_events_go_only_to_that_session() {
     let Rig {
-        fixture, mut link, ..
+        fixture,
+        mut link,
+        _env,
+        _browser,
     } = rig().await;
     let s1 = link.browser_session().await;
     let s2 = link.browser_session().await;
@@ -395,7 +407,10 @@ async fn page_session_events_go_only_to_that_session() {
 #[ignore]
 async fn download_behavior_fetch_and_screencast_are_per_session() {
     let Rig {
-        fixture, mut link, ..
+        fixture,
+        mut link,
+        _env,
+        _browser,
     } = rig().await;
     let s1 = link.browser_session().await;
     let s2 = link.browser_session().await;
@@ -549,7 +564,10 @@ async fn download_behavior_fetch_and_screencast_are_per_session() {
 async fn detaching_a_browser_session_detaches_its_children() {
     // A measurement: passes either way, the outcome is the printed line.
     let Rig {
-        fixture, mut link, ..
+        fixture,
+        mut link,
+        _env,
+        _browser,
     } = rig().await;
     let s1 = link.browser_session().await;
     let tid = link.new_tab(&format!("{}/counter", fixture.origin)).await;
@@ -582,7 +600,10 @@ async fn detaching_a_browser_session_detaches_its_children() {
 #[ignore]
 async fn proxy_allowlist_behaves_the_same_on_a_browser_session() {
     let Rig {
-        fixture, mut link, ..
+        fixture,
+        mut link,
+        _env,
+        _browser,
     } = rig().await;
     let s1 = link.browser_session().await;
     let tid = link.new_tab(&format!("{}/counter", fixture.origin)).await;
