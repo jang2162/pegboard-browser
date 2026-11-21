@@ -263,13 +263,7 @@ fn the_human_profile_is_untouched() {
             }
         });
         let conn = &h.browser.conn;
-        let human = page_targets(conn)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|t| t.browser_context_id.as_deref() == Some(h.browser.human_context.as_str()))
-            .expect("a human page")
-            .target_id;
+        let human = human_page(&h.browser).await;
         let s = conn.attach(&human).await.unwrap();
         conn.navigate(&s, &format!("{}/counter", h.fixture.origin))
             .await
@@ -348,11 +342,12 @@ fn the_human_profile_is_untouched() {
 
 /// The first page of the browser's human profile.
 async fn human_page(b: &pegboard_core::browser::Browser) -> String {
+    let human = common::human_context(b).await;
     page_targets(&b.conn)
         .await
         .unwrap()
         .into_iter()
-        .find(|t| t.browser_context_id.as_deref() == Some(b.human_context.as_str()))
+        .find(|t| t.browser_context_id.as_deref() == Some(human.as_str()))
         .expect("a human page")
         .target_id
 }
@@ -926,13 +921,14 @@ fn a_limit_cancel_works_when_the_agent_profile_is_not_the_default() {
         let tab = h.manager.info(&info.id).unwrap().targets[0].clone();
         let conn = &h.browser.conn;
         let human = human_page(&h.browser).await;
+        let human_context = common::human_context(&h.browser).await;
         assert!(
-            common::establish_human_premise(&h.env, conn, &h.browser.human_context, &human).await,
+            common::establish_human_premise(&h.env, conn, &human_context, &human).await,
             "premise: the human's profile could not be made the default context"
         );
         assert_eq!(
             default_context(conn).await,
-            json!(h.browser.human_context).to_string(),
+            json!(human_context).to_string(),
             "premise"
         );
         let front = frontmost();
@@ -977,6 +973,7 @@ fn measure_making_the_agent_profile_default_without_focus() {
         let h = Harness::start();
         let conn = &h.browser.conn;
         let human = human_page(&h.browser).await;
+        let human_context = common::human_context(&h.browser).await;
         for method in ["background-tab", "activate"] {
             let probe = common::DownloadProbe::new();
             let name = format!("{}-{method}", probe.token);
@@ -986,8 +983,7 @@ fn measure_making_the_agent_profile_default_without_focus() {
             let tab = h.manager.info(&info.id).unwrap().targets[0].clone();
             let agent = common::context_of(conn, &tab).await;
             assert!(
-                common::establish_human_premise(&h.env, conn, &h.browser.human_context, &human)
-                    .await,
+                common::establish_human_premise(&h.env, conn, &human_context, &human).await,
                 "premise: human default"
             );
             let front0 = frontmost();

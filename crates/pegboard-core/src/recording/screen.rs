@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::actionlog::url_for_log;
+use crate::contexts::AgentContexts;
 use crate::recording::config::RecordingConfig;
 use crate::recording::format::{
     create_private_dir, write_private_file, FrameKind, IndexLine, JsonlWriter,
@@ -122,11 +123,12 @@ pub fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
-/// The daemon records a target only in the session's own context, never in the human's.
-pub fn may_record(target_context: &str, session_context: &str, human_context: &str) -> bool {
+/// The daemon records a target only in the session's own context, and only when that is an
+/// agent profile's: never in a person's profile, nor in a context nobody knows.
+pub fn may_record(target_context: &str, session_context: &str, agents: &AgentContexts) -> bool {
     !target_context.is_empty()
         && target_context == session_context
-        && target_context != human_context
+        && agents.is_agent(target_context)
 }
 
 /// Why stream frames stay out although the main frame's URL is not screen-off (spike F5):
@@ -711,13 +713,32 @@ mod tests {
         assert_eq!(jpeg_size(&jpeg(0xC0, 0, 717)), None);
     }
 
+    fn agents() -> AgentContexts {
+        let a = AgentContexts::default();
+        a.set("PegboardAgent", "ctxA");
+        a.set("PegboardAgent-work", "ctxB");
+        a
+    }
+
     #[test]
     fn may_record_only_in_the_session_context() {
-        assert!(may_record("ctxA", "ctxA", "human"));
-        assert!(!may_record("human", "human", "human"));
-        assert!(!may_record("ctxB", "ctxA", "human"));
-        assert!(!may_record("", "ctxA", "human"));
-        assert!(!may_record("", "", "human"));
+        let a = agents();
+        assert!(may_record("ctxA", "ctxA", &a));
+        assert!(!may_record("ctxB", "ctxA", &a));
+        assert!(!may_record("", "ctxA", &a));
+        assert!(!may_record("", "", &a));
+    }
+
+    #[test]
+    fn may_record_needs_an_agent_context() {
+        let a = agents();
+        // A person's profiles (two of them) and an id nobody knows: never, even when the
+        // session's context says so.
+        for human in ["H1", "H2", "unknown"] {
+            assert!(!may_record(human, human, &a), "{human}");
+        }
+        a.forget_context("ctxA");
+        assert!(!may_record("ctxA", "ctxA", &a));
     }
 
     fn off_list() -> RecordingConfig {

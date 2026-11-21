@@ -11,11 +11,14 @@ use serde_json::json;
 use tokio::process::{Child, Command};
 
 use crate::cdp::{page_targets, CdpConn};
+use crate::contexts::{is_agent_profile_dir, AgentContexts};
 use crate::downloads::Downloads;
 use crate::link::BrowserLink;
 use crate::paths::{ensure, Paths};
 
-pub const HUMAN_PROFILE_DIR: &str = "Default";
+/// The profile stock mode launches Chrome with (a person's). Only the launch uses it:
+/// whether a context is a person's is never decided by comparing to it (`AgentContexts`).
+const HUMAN_PROFILE_DIR: &str = "Default";
 
 #[derive(Debug, Clone)]
 pub struct BrowserConfig {
@@ -71,9 +74,13 @@ pub struct Browser {
     /// The daemon's one connection to the browser; every connection it makes rides it.
     pub link: BrowserLink,
     pub conn: CdpConn,
-    pub human_context: String,
+    /// The agent profiles' contexts. Every other context is a person's.
+    pub agents: AgentContexts,
     child: Mutex<Child>,
-    /// profile directory -> browserContextId, for profiles whose window we opened.
+    /// The context of the profile Chrome was launched with: never taken for an agent
+    /// profile's window (only that; it does not decide what is a person's).
+    launch_context: String,
+    /// Agent profile directory -> browserContextId, for profiles whose window we opened.
     profiles: Mutex<HashMap<String, String>>,
     /// The agent profiles' download policies and their downloads (`downloads`).
     pub downloads: Downloads,
@@ -112,14 +119,15 @@ impl Browser {
                 return Err(e);
             }
         };
+        let agents = AgentContexts::default();
         let setup = async {
             let link = BrowserLink::websocket(&ws_url).await?;
             let conn = CdpConn::over(&link).await?;
-            let human_context = wait_for_first_context(&conn).await?;
-            let downloads = Downloads::new(&link, &human_context, conn.clone(), paths)?;
-            anyhow::Ok((link, conn, human_context, downloads))
+            let launch_context = wait_for_first_context(&conn).await?;
+            let downloads = Downloads::new(&link, agents.clone(), conn.clone(), paths)?;
+            anyhow::Ok((link, conn, launch_context, downloads))
         };
-        let (link, conn, human_context, downloads) = match setup.await {
+        let (link, conn, launch_context, downloads) = match setup.await {
             Ok(v) => v,
             Err(e) => {
                 let _ = child.kill().await;
@@ -131,25 +139,25 @@ impl Browser {
             ws_url: Some(ws_url),
             link,
             conn,
-            human_context,
+            agents,
             child: Mutex::new(child),
-            profiles: Mutex::new(HashMap::from([(
-                HUMAN_PROFILE_DIR.to_string(),
-                String::new(),
-            )])),
+            launch_context,
+            profiles: Mutex::new(HashMap::new()),
             downloads,
         })
     }
 
-    /// Opens (or focuses) a window of `profile_dir` and returns that profile's browserContextId.
+    /// Opens (or focuses) a window of the agent profile `profile_dir` and returns that
+    /// profile's browserContextId, which it records in `agents` (dropping the profile's old
+    /// one when Chrome unloaded it).
     pub async fn open_profile_window(
         &self,
         paths: &Paths,
         cfg: &BrowserConfig,
         profile_dir: &str,
     ) -> Result<String> {
-        if profile_dir == HUMAN_PROFILE_DIR {
-            return Ok(self.human_context.clone());
+        if !is_agent_profile_dir(profile_dir) {
+            bail!("{profile_dir} is not an agent profile");
         }
         let known = self.profiles.lock().unwrap().get(profile_dir).cloned();
         if let Some(ctx) = known {
@@ -159,10 +167,13 @@ impl Browser {
                 .any(|t| t.browser_context_id.as_deref() == Some(&ctx))
             {
                 // Normally in place already; set when an earlier attempt failed.
+                self.agents.set(profile_dir, &ctx);
                 self.downloads.apply(&ctx, profile_dir).await?;
                 return Ok(ctx);
             }
-            // The context is gone (Chrome unloaded the profile): its policy went with it.
+            // The context is gone (Chrome unloaded the profile): its policy went with it,
+            // and it is no agent's any more.
+            self.agents.forget_context(&ctx);
             self.downloads.forget_context(&ctx);
         }
         let before: Vec<String> = page_targets(&self.conn)
@@ -192,8 +203,8 @@ impl Browser {
         for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let now = page_targets(&self.conn).await?;
-            // Accept only a context that is neither the human profile nor another known
-            // profile, so a tab the human opens meanwhile cannot be mistaken for this one.
+            // Accept only a context that is neither the launch profile's nor another known
+            // profile's, so a tab the person opens meanwhile cannot be mistaken for this one.
             let taken: Vec<String> = {
                 let map = self.profiles.lock().unwrap();
                 map.iter()
@@ -204,7 +215,7 @@ impl Browser {
             let fresh = now.iter().find(|t| {
                 !before.contains(&t.target_id)
                     && t.browser_context_id.as_ref().is_some_and(|c| {
-                        !c.is_empty() && *c != self.human_context && !taken.contains(c)
+                        !c.is_empty() && *c != self.launch_context && !taken.contains(c)
                     })
             });
             if let Some(t) = fresh {
@@ -213,6 +224,8 @@ impl Browser {
                     .lock()
                     .unwrap()
                     .insert(profile_dir.to_string(), ctx.clone());
+                // Before the policy: `apply` takes only an agent profile's context.
+                self.agents.set(profile_dir, &ctx);
                 self.downloads.forget_context(&ctx);
                 self.downloads.apply(&ctx, profile_dir).await?;
                 return Ok(ctx);
@@ -275,7 +288,7 @@ async fn wait_for_ws_url(port_file: &std::path::Path, child: &mut Child) -> Resu
     bail!("DevToolsActivePort was not written within 15s")
 }
 
-/// The first page target present after launch belongs to the human profile.
+/// The first page target present after launch belongs to the launch profile (a person's).
 async fn wait_for_first_context(conn: &CdpConn) -> Result<String> {
     for _ in 0..100 {
         let pages = page_targets(conn).await?;

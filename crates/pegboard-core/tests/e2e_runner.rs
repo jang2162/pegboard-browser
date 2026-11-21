@@ -197,11 +197,12 @@ fn tab_list_shows_only_session_tabs() {
     common::run(async {
         let h = Harness::start();
         // The browser's first window is the human profile and has a tab.
+        let human_ctx = common::human_context(&h.browser).await;
         let human: Vec<String> = page_targets(&h.browser.conn)
             .await
             .unwrap()
             .into_iter()
-            .filter(|t| t.browser_context_id.as_deref() == Some(h.browser.human_context.as_str()))
+            .filter(|t| t.browser_context_id.as_deref() == Some(human_ctx.as_str()))
             .map(|t| t.target_id)
             .collect();
         assert!(!human.is_empty());
@@ -323,11 +324,12 @@ fn human_tab_loads_while_agent_browser_is_attached() {
         let (info, ep) = h.session("/counter").await;
         h.exec(&info, &ep, &["snapshot", "-i"]).await;
         let conn = &h.browser.conn;
+        let human_ctx = common::human_context(&h.browser).await;
         let human_pages: Vec<_> = page_targets(conn)
             .await
             .unwrap()
             .into_iter()
-            .filter(|t| t.browser_context_id.as_deref() == Some(h.browser.human_context.as_str()))
+            .filter(|t| t.browser_context_id.as_deref() == Some(human_ctx.as_str()))
             .map(|t| t.target_id)
             .collect();
         let human = human_pages[0].clone();
@@ -348,7 +350,6 @@ fn human_tab_loads_while_agent_browser_is_attached() {
     );
         let ((), opened) = tokio::join!(busy, open);
         opened.unwrap();
-        let human_ctx = h.browser.human_context.clone();
         let loaded = eventually(5, || async {
             for t in page_targets(conn).await.unwrap() {
                 if t.browser_context_id.as_deref() == Some(human_ctx.as_str())
@@ -555,11 +556,12 @@ fn cookies_set_stays_in_the_agent_profile() {
             "{agent_cookies}"
         );
         let conn = &h.browser.conn;
+        let human_ctx = common::human_context(&h.browser).await;
         let human = page_targets(conn)
             .await
             .unwrap()
             .into_iter()
-            .find(|t| t.browser_context_id.as_deref() == Some(h.browser.human_context.as_str()))
+            .find(|t| t.browser_context_id.as_deref() == Some(human_ctx.as_str()))
             .unwrap()
             .target_id;
         let s = conn.attach(&human).await.unwrap();
@@ -639,11 +641,12 @@ fn wrong_tab_id_is_a_plain_failure_not_tab_gone() {
     common::run(async {
         let h = Harness::start();
         let (info, ep) = h.session("/counter").await;
+        let human_ctx = common::human_context(&h.browser).await;
         let human = page_targets(&h.browser.conn)
             .await
             .unwrap()
             .into_iter()
-            .find(|t| t.browser_context_id.as_deref() == Some(h.browser.human_context.as_str()))
+            .find(|t| t.browser_context_id.as_deref() == Some(human_ctx.as_str()))
             .unwrap()
             .target_id;
         for tab in ["t9", human.as_str()] {

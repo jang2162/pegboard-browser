@@ -201,7 +201,9 @@ mod tests {
     fn profile_dirs_never_collide_with_the_human_profile() {
         assert_eq!(profile_dir("default"), "PegboardAgent");
         assert_eq!(profile_dir("work"), "PegboardAgent-work");
-        assert_ne!(profile_dir("default"), crate::browser::HUMAN_PROFILE_DIR);
+        for name in ["default", "work"] {
+            assert!(crate::contexts::is_agent_profile_dir(&profile_dir(name)));
+        }
     }
 
     #[test]

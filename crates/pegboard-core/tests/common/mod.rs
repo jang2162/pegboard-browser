@@ -528,6 +528,28 @@ pub async fn establish_human_premise(
     establish_human_active(conn, human_context, &window).await == human_context
 }
 
+/// The browserContextId of the human profile (`Default`, the profile stock mode launches
+/// with): the one context of the open pages that is not an agent profile's. Panics when there
+/// is none or more than one (the tests run one human profile), so an agent window landing in
+/// the human profile is caught here too.
+pub async fn human_context(browser: &Browser) -> String {
+    let mut contexts: Vec<String> = page_targets(&browser.conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|t| t.browser_context_id)
+        .filter(|c| !c.is_empty() && !browser.agents.is_agent(c))
+        .collect();
+    contexts.sort();
+    contexts.dedup();
+    assert_eq!(
+        contexts.len(),
+        1,
+        "expected the pages of exactly one human profile: {contexts:?}"
+    );
+    contexts.remove(0)
+}
+
 /// The browserContextId of a page target.
 pub async fn context_of(conn: &CdpConn, target_id: &str) -> String {
     page_targets(conn)
@@ -571,11 +593,12 @@ pub async fn session_fixture() -> SessionFixture {
     use std::sync::Arc;
 
     let (env, fixture, browser) = launched().await;
+    let human_context = human_context(&browser).await;
     let human_target = page_targets(&browser.conn)
         .await
         .unwrap()
         .into_iter()
-        .find(|t| t.browser_context_id.as_deref() == Some(browser.human_context.as_str()))
+        .find(|t| t.browser_context_id.as_deref() == Some(human_context.as_str()))
         .expect("no human page")
         .target_id;
     let human_session = browser.conn.attach(&human_target).await.unwrap();
@@ -771,7 +794,7 @@ impl Shared {
         let profiles = Profiles::load(&env.paths).unwrap();
         let recorder = Recorder::start(RecorderOptions {
             link: browser.link.clone(),
-            human_context: browser.human_context.clone(),
+            agents: browser.agents.clone(),
             config: Default::default(),
         });
         // The replay server of this home; its port is one of pegboard's own, as in the daemon.
@@ -1222,11 +1245,12 @@ pub async fn shared_session_fixture() -> SharedSessionFixture {
     let (agent_context, bridge) = sh.agent().await;
     let browser = sh.browser.clone();
     let scope = PageScope::begin(&browser.conn).await;
+    let human_context = human_context(&browser).await;
     let human_target = page_targets(&browser.conn)
         .await
         .unwrap()
         .into_iter()
-        .find(|t| t.browser_context_id.as_deref() == Some(browser.human_context.as_str()))
+        .find(|t| t.browser_context_id.as_deref() == Some(human_context.as_str()))
         .expect("no human page")
         .target_id;
     // An http page in the human profile (a cookie-free one), as a person would have open.

@@ -4,7 +4,7 @@
 //! - Every frame is acknowledged as soon as it arrives (F2) and goes through the target's
 //!   `ScreenGate` (F5) and `Throttle` (at most 2 a second, the settled screen last).
 //! - A tab is attached only after the browser confirms, on this connection, that it is in
-//!   the session's own context (`may_record`): never a tab of the human's profile.
+//!   the session's own context, an agent profile's (`may_record`): never a tab of a person's profile.
 //! - What the recorder knows of a target's screen (gate, held frame, Off marker) belongs to
 //!   the session's recording and outlives an attach: a reattach or reconnect continues it
 //!   and assumes nothing about a document it did not see (`ScreenGate::attached`).
@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::actionlog::{url_for_log, ActionEntry, ManifestHandle, ScreenStatus, SessionLog};
 use crate::cdp::{CdpConn, CdpEvent};
+use crate::contexts::AgentContexts;
 use crate::link::BrowserLink;
 use crate::recording::config::RecordingConfig;
 use crate::recording::events::{
@@ -171,7 +172,8 @@ fn now_ts() -> String {
 pub struct RecorderOptions {
     /// The daemon's connection to the browser; the recorder's is a virtual connection of it.
     pub link: BrowserLink,
-    pub human_context: String,
+    /// The agent profiles' contexts: only their tabs are recorded.
+    pub agents: AgentContexts,
     pub config: RecordingConfig,
 }
 
@@ -1288,8 +1290,7 @@ impl Recorder {
         };
         let info = &r["targetInfo"];
         let context = info["browserContextId"].as_str().unwrap_or("");
-        if info["type"] != "page" || !may_record(context, session_context, &self.opts.human_context)
-        {
+        if info["type"] != "page" || !may_record(context, session_context, &self.opts.agents) {
             if crate::testenv::hooks() {
                 eprintln!(
                     "pegboard: recorder: not attaching {target}: not a page of the session's context"
@@ -2441,7 +2442,7 @@ mod tests {
     ) -> (Arc<Recorder>, SessionId, ManifestHandle) {
         let recorder = Recorder::start(RecorderOptions {
             link: BrowserLink::ended_for_test(),
-            human_context: "HUMAN".into(),
+            agents: AgentContexts::default(),
             config: off_config(),
         });
         let (log, manifest) = open_log(dir);
@@ -2772,7 +2773,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let r = Recorder::start(RecorderOptions {
             link: BrowserLink::ended_for_test(),
-            human_context: "HUMAN".into(),
+            agents: AgentContexts::default(),
             config: off_config(),
         });
         let id = SessionId("s_abcdefgh".into());
@@ -3854,7 +3855,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let r = Recorder::start(RecorderOptions {
             link: BrowserLink::ended_for_test(),
-            human_context: "HUMAN".into(),
+            agents: AgentContexts::default(),
             config: off_config(),
         });
         let (log, manifest) = open_log(tmp.path());

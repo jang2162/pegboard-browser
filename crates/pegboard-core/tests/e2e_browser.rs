@@ -23,16 +23,42 @@ async fn launches_and_reports_version() {
 async fn agent_profile_window_has_its_own_context() {
     let e = common::env();
     let b = Browser::launch(&e.paths, &e.cfg).await.unwrap();
+    let human = common::human_context(&b).await;
     let agent = b
         .open_profile_window(&e.paths, &e.cfg, "PegboardAgent")
         .await
         .unwrap();
-    assert_ne!(agent, b.human_context);
+    assert_ne!(agent, human);
     let again = b
         .open_profile_window(&e.paths, &e.cfg, "PegboardAgent")
         .await
         .unwrap();
     assert_eq!(again, agent); // same profile, same context
+    b.shutdown().await.unwrap();
+}
+
+/// Opening an agent profile's window makes its context an agent context; the human
+/// profile's stays a person's, and a non-agent profile directory is refused.
+#[tokio::test]
+#[ignore]
+async fn opened_agent_profiles_are_agent_contexts() {
+    let e = common::env();
+    let b = Browser::launch(&e.paths, &e.cfg).await.unwrap();
+    let human = common::human_context(&b).await;
+    assert!(!b.agents.is_agent(&human));
+    let agent = b
+        .open_profile_window(&e.paths, &e.cfg, "PegboardAgent")
+        .await
+        .unwrap();
+    assert!(b.agents.is_agent(&agent));
+    assert_eq!(b.agents.context_of("PegboardAgent"), Some(agent.clone()));
+    assert!(b.downloads.is_ready(&agent));
+    assert!(!b.agents.is_agent(&human));
+    assert!(b
+        .open_profile_window(&e.paths, &e.cfg, "Default")
+        .await
+        .is_err());
+    assert!(!b.agents.is_agent(&human));
     b.shutdown().await.unwrap();
 }
 
@@ -60,6 +86,8 @@ async fn navigate_waits_for_load() {
 async fn human_tab_opened_meanwhile_is_not_mistaken_for_the_agent_profile() {
     let e = common::env();
     let b = Browser::launch(&e.paths, &e.cfg).await.unwrap();
+    // Before any agent window: the launch profile's pages are the only ones.
+    let human = common::human_context(&b).await;
     let human_tab = async {
         let r = b
             .conn
@@ -73,20 +101,17 @@ async fn human_tab_opened_meanwhile_is_not_mistaken_for_the_agent_profile() {
             .into_iter()
             .find(|t| t.target_id == id)
             .unwrap();
-        assert_eq!(
-            t.browser_context_id.as_deref(),
-            Some(b.human_context.as_str())
-        );
+        assert_eq!(t.browser_context_id.as_deref(), Some(human.as_str()));
     };
     let agent = b.open_profile_window(&e.paths, &e.cfg, "PegboardAgent");
     let (_, agent) = tokio::join!(human_tab, agent);
     let agent = agent.unwrap();
-    assert_ne!(agent, b.human_context);
+    assert_ne!(agent, human);
     let work = b
         .open_profile_window(&e.paths, &e.cfg, "PegboardAgent-work")
         .await
         .unwrap();
-    assert_ne!(work, b.human_context);
+    assert_ne!(work, human);
     assert_ne!(work, agent);
     b.shutdown().await.unwrap();
 }

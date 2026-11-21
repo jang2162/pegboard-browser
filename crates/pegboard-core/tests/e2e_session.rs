@@ -95,7 +95,7 @@ impl OwnHarness {
         let recorder = pegboard_core::recording::recorder::Recorder::start(
             pegboard_core::recording::recorder::RecorderOptions {
                 link: browser.link.clone(),
-                human_context: browser.human_context.clone(),
+                agents: browser.agents.clone(),
                 config: Default::default(),
             },
         );
@@ -191,7 +191,7 @@ fn create_opens_group_in_agent_window() {
         assert_eq!(info.recording_id, format!("r_{}", &info.id.0[2..]));
         let t = &info.targets[0];
         let ctx = common::context_of(&h.browser.conn, t).await;
-        assert_ne!(ctx, h.browser.human_context);
+        assert_ne!(ctx, common::human_context(&h.browser).await);
         let mut members = bridge.members(&GroupId(info.tab_group_id)).await.unwrap();
         members.sort();
         assert_eq!(members, info.targets);
@@ -314,7 +314,7 @@ fn named_profile_is_isolated_from_default() {
         let ctx_a = common::context_of(&h.browser.conn, &a.targets[0]).await;
         let ctx_b = common::context_of(&h.browser.conn, &b.targets[0]).await;
         assert_ne!(ctx_a, ctx_b);
-        assert_ne!(ctx_b, h.browser.human_context);
+        assert_ne!(ctx_b, common::human_context(&h.browser).await);
         // The work profile's directory is its own, never the human one.
         assert!(h
             .env
@@ -787,11 +787,12 @@ fn popup_in_the_human_profile_is_never_adopted() {
     common::run(async {
         let h = T::start().await;
         let session = h.make(params(None, Some(h.url("/opener")), None)).await;
+        let human_ctx = common::human_context(&h.browser).await;
         let human = page_targets(&h.browser.conn)
             .await
             .unwrap()
             .into_iter()
-            .find(|t| t.browser_context_id.as_deref() == Some(h.browser.human_context.as_str()))
+            .find(|t| t.browser_context_id.as_deref() == Some(human_ctx.as_str()))
             .expect("no human page")
             .target_id;
         let s = h.browser.conn.attach(&human).await.unwrap();
@@ -817,10 +818,7 @@ fn popup_in_the_human_profile_is_never_adopted() {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
-        assert_eq!(
-            common::context_of(&h.browser.conn, &popup).await,
-            h.browser.human_context
-        );
+        assert_eq!(common::context_of(&h.browser.conn, &popup).await, human_ctx);
         tokio::time::sleep(Duration::from_secs(2)).await;
         for info in h.manager.list() {
             assert!(!info.targets.contains(&popup), "{info:?}");

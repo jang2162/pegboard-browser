@@ -418,7 +418,7 @@ impl Daemon {
         let store = RecordingStore::new(paths.clone(), recording.clone());
         let recorder = Recorder::start(RecorderOptions {
             link: browser.link.clone(),
-            human_context: browser.human_context.clone(),
+            agents: browser.agents.clone(),
             config: recording,
         });
         // Before the sessions: its port is one of pegboard's own, which they never reach.

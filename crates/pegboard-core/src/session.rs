@@ -241,7 +241,7 @@ impl SessionManager {
             });
             Guard::start(
                 &browser.link,
-                &browser.human_context,
+                browser.agents.clone(),
                 policy_of,
                 clipboard_of,
                 before_ready,

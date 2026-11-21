@@ -119,13 +119,10 @@ fn cannot_attach_to_human_target() {
 async fn created_tab_lands_in_agent_profile_even_when_human_window_is_active() {
     let s = common::session_fixture().await;
     let c = common::client(&s.endpoint).await;
-    let held = common::establish_human_premise(
-        &s.env,
-        &s.browser.conn,
-        &s.browser.human_context,
-        &s.human_target,
-    )
-    .await;
+    let human_context = common::human_context(&s.browser).await;
+    let held =
+        common::establish_human_premise(&s.env, &s.browser.conn, &human_context, &s.human_target)
+            .await;
     if !held {
         eprintln!(
             "PREMISE NOT ESTABLISHED: even after re-invoking Chrome for a new human window a \
@@ -157,9 +154,10 @@ fn tab_created_in_another_context_is_refused() {
     common::run(async {
         let s = common::shared_session_fixture().await;
         let wrong = pegboard_protocol::SessionId::generate();
+        let human_context = common::human_context(&s.browser).await;
         let endpoint = s.proxy.register(
             &wrong,
-            &s.browser.human_context, // not the agent context the bridge creates tabs in
+            &human_context, // not the agent context the bridge creates tabs in
             s.group.clone(),
             s.bridge.clone(),
             vec![],
@@ -571,7 +569,10 @@ fn human_tab_opened_during_session_loads_normally() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let t = t.expect("the human page did not open a tab");
-        assert_eq!(common::context_of(b, &t).await, s.browser.human_context);
+        assert_eq!(
+            common::context_of(b, &t).await,
+            common::human_context(&s.browser).await
+        );
         let sid = b.attach(&t).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {

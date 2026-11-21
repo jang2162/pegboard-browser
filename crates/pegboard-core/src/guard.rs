@@ -7,8 +7,9 @@
 //!   request interception (`Fetch.enable`) on for it and resumes it. On every attached page
 //!   and frame the guard asks for the same auto-attach again, so cross-site frames (OOPIF)
 //!   and workers are caught too, before their first request.
-//! - Targets of the human profile are resumed and let go at once: their requests are never
-//!   paused, failed or changed. The extension's own targets are let go the same way.
+//! - Targets of every context that is not an agent profile's (a person's profiles, and a
+//!   context not known to be an agent's) are resumed and let go at once: their requests are
+//!   never paused, failed or changed. The extension's own targets are let go the same way.
 //! - Each paused request is judged by `judge_request`: the URL first, then every address the
 //!   daemon resolves its host name to (2 s limit; no answer fails the request).
 //! - WebSocket handshakes never reach `Fetch` (spike B1). Documents from public addresses
@@ -49,6 +50,7 @@ use url::Url;
 
 use crate::address::{self, judge_resolved, judge_url, Target, Verdict};
 use crate::cdp::{CdpConn, CdpEvent};
+use crate::contexts::AgentContexts;
 use crate::link::BrowserLink;
 
 /// The address policy that applies in a browser context (an agent profile).
@@ -634,7 +636,7 @@ struct State {
 
 struct Inner {
     link: BrowserLink,
-    human_context: String,
+    agents: AgentContexts,
     policy_of: PolicyOf,
     clipboard_of: ClipboardOf,
     before_ready: BeforeReady,
@@ -680,6 +682,15 @@ struct Inner {
     reloading: Mutex<Option<Reloading>>,
 }
 
+/// Whether the guard lets an attached target go untouched: every target outside the agent
+/// profiles (a person's, or of a context not known to be an agent's), and the bridge
+/// extension's service worker, which runs in every profile. Any other extension target in an
+/// agent profile is judged.
+fn is_foreign(agents: &AgentContexts, context: &str, kind: &str, url: &str) -> bool {
+    let bridge_worker = kind == "service_worker" && url.starts_with("chrome-extension://");
+    !agents.is_agent(context) || bridge_worker
+}
+
 /// See `Guard::on_reloading`.
 pub type Reloading = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -702,7 +713,7 @@ impl Guard {
     /// connected (reconnecting after a loss). Must be called inside a tokio runtime.
     pub fn start(
         link: &BrowserLink,
-        human_context: &str,
+        agents: AgentContexts,
         policy_of: PolicyOf,
         clipboard_of: ClipboardOf,
         before_ready: BeforeReady,
@@ -711,7 +722,7 @@ impl Guard {
     ) -> Guard {
         let inner = Arc::new(Inner {
             link: link.clone(),
-            human_context: human_context.to_string(),
+            agents,
             policy_of,
             clipboard_of,
             before_ready,
@@ -1268,10 +1279,7 @@ impl Inner {
         let waiting = p["waitingForDebugger"].as_bool().unwrap_or(false);
         // The session the event came on owns the new one (`None`: the browser's).
         let parent = event.session_id.clone();
-        // The bridge extension's service worker runs in every profile; it is let go like the
-        // human's targets. Any other extension target in an agent profile is judged.
-        let bridge_worker = kind == "service_worker" && url.starts_with("chrome-extension://");
-        let foreign = context == self.human_context || bridge_worker;
+        let foreign = is_foreign(&self.agents, &context, &kind, &url);
         if !foreign && !session.is_empty() {
             let mut state = self.state.lock().unwrap();
             state.sessions.insert(
@@ -1293,12 +1301,12 @@ impl Inner {
         }
         let me = self.clone();
         let conn = conn.clone();
-        let whose = if context == me.human_context {
-            "human"
-        } else if context.is_empty() {
+        let whose = if context.is_empty() {
             "no-context"
-        } else {
+        } else if me.agents.is_agent(&context) {
             "agent"
+        } else {
+            "human"
         };
         tokio::spawn(async move {
             let outcome = if foreign {
@@ -1962,6 +1970,28 @@ mod tests {
             allow_domains: domains.iter().map(|d| d.to_string()).collect(),
             ..SessionPolicy::default()
         }
+    }
+
+    #[test]
+    fn guard_treats_a_second_human_profile_as_foreign() {
+        let agents = AgentContexts::default();
+        agents.set("PegboardAgent", "A1");
+        // The person's two profiles, an empty and an unknown context: let go.
+        for context in ["H1", "H2", "", "X"] {
+            assert!(
+                is_foreign(&agents, context, "page", "https://a.test/"),
+                "{context:?}"
+            );
+        }
+        // The agent profile's pages are judged; the bridge's worker there is let go.
+        assert!(!is_foreign(&agents, "A1", "page", "https://a.test/"));
+        assert!(!is_foreign(&agents, "A1", "iframe", "https://a.test/"));
+        assert!(is_foreign(
+            &agents,
+            "A1",
+            "service_worker",
+            "chrome-extension://abc/sw.js"
+        ));
     }
 
     #[test]

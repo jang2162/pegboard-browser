@@ -198,11 +198,12 @@ fn plant_more(
 /// The human profile's tab and a CDP session on it.
 async fn human_tab(conn: &CdpConn) -> String {
     let sh = common::shared();
+    let human = common::human_context(&sh.browser).await;
     let target = page_targets(conn)
         .await
         .unwrap()
         .into_iter()
-        .find(|t| t.browser_context_id.as_deref() == Some(sh.browser.human_context.as_str()))
+        .find(|t| t.browser_context_id.as_deref() == Some(human.as_str()))
         .expect("no human page")
         .target_id;
     conn.attach(&target).await.unwrap()

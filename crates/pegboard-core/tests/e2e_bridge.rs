@@ -52,7 +52,8 @@ fn create_tab_ignores_which_window_was_last_active() {
         let agent = a.agent.clone();
         let br = a.bridge.clone();
         let (g, _) = br.create_group("a", "red").await.unwrap();
-        common::activate_any_target_in(&b.conn, &b.human_context).await;
+        let human = common::human_context(b).await;
+        common::activate_any_target_in(&b.conn, &human).await;
         let (t, moved) = br.create_tab(&g, "about:blank", "a", "red").await.unwrap();
         assert_eq!(moved, None);
         assert_eq!(common::context_of(&b.conn, &t).await, agent);
@@ -104,11 +105,12 @@ fn bridge_refuses_targets_of_the_human_profile() {
         let b = &sh.browser;
         let br = a.bridge.clone();
         let (g, _) = br.create_group("iso", "blue").await.unwrap();
+        let human_context = common::human_context(b).await;
         let human = page_targets(&b.conn)
             .await
             .unwrap()
             .into_iter()
-            .find(|t| t.browser_context_id.as_deref() == Some(b.human_context.as_str()))
+            .find(|t| t.browser_context_id.as_deref() == Some(human_context.as_str()))
             .expect("no human page")
             .target_id;
         let closed = br.close_targets(std::slice::from_ref(&human)).await;
@@ -124,7 +126,7 @@ fn bridge_refuses_targets_of_the_human_profile() {
             .expect("human target vanished");
         assert_eq!(
             t.browser_context_id.as_deref(),
-            Some(b.human_context.as_str())
+            Some(human_context.as_str())
         );
         assert!(!br.members(&g).await.unwrap().contains(&human));
         a.finish().await;

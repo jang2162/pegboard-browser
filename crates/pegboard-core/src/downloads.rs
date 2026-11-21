@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::actionlog::{url_for_log, ActionEntry};
 use crate::cdp::{page_targets, CdpConn, CdpEvent};
+use crate::contexts::AgentContexts;
 use crate::link::BrowserLink;
 use crate::paths::{ensure_owned_private_dir, ensure_session_files, Paths};
 
@@ -556,7 +557,8 @@ struct Inner {
     /// The daemon's connection to the browser: each policy connection is a virtual
     /// connection of it.
     link: BrowserLink,
-    human_context: String,
+    /// The agent profiles' contexts: every other context is a person's and gets no policy.
+    agents: AgentContexts,
     /// The daemon's browser connection, for looking at targets and cancelling downloads.
     conn: CdpConn,
     paths: Paths,
@@ -586,7 +588,9 @@ struct Inner {
 /// - Chrome takes a `browserContextId` only for the profile that is the default context at
 ///   that moment (E); opening or activating a tab of the profile makes it the default (E3).
 ///   A policy set then stays when the human's profile becomes the default (E2, E3). The
-///   human's context is never given a policy, and no call goes without a context id.
+///   only contexts given a policy are the agent profiles' (`AgentContexts`): a person's
+///   (any of their profiles) and an unknown one never are, and no call goes without a
+///   context id.
 /// - Every policy connection gets the download events of every profile (L1): a download is
 ///   handled once, by its guid, and one no session's tab started is deleted. The human's
 ///   downloads never land in a staging directory, so deleting touches nothing of theirs.
@@ -631,7 +635,7 @@ impl Downloads {
     /// sweeper. Must be called inside a tokio runtime.
     pub fn new(
         link: &BrowserLink,
-        human_context: &str,
+        agents: AgentContexts,
         conn: CdpConn,
         paths: &Paths,
     ) -> Result<Downloads> {
@@ -645,7 +649,7 @@ impl Downloads {
         ensure_owned_private_dir(&root)?;
         let inner = Arc::new(Inner {
             link: link.clone(),
-            human_context: human_context.to_string(),
+            agents,
             conn,
             paths: paths.clone(),
             root,
@@ -665,8 +669,11 @@ impl Downloads {
     /// policy, unless it is already. Call it right after opening the profile's window. An
     /// error leaves the profile unprotected: the caller must not use it.
     pub async fn apply(&self, context: &str, profile_dir: &str) -> Result<()> {
-        if context.is_empty() || context == self.inner.human_context {
-            bail!("refusing to set a download policy on the human or an unknown context");
+        // Only the context the agent profile `profile_dir` has now (`AgentContexts::set`).
+        if !self.inner.agents.is_agent(context)
+            || self.inner.agents.profile_of(context).as_deref() != Some(profile_dir)
+        {
+            bail!("refusing to set a download policy outside the agent profile's context");
         }
         if !valid_dir_name(profile_dir) {
             bail!("not a profile directory name");
@@ -689,8 +696,8 @@ impl Downloads {
     /// this from a path a page can trigger). Allowed: that connection is closed, which lifts
     /// the denial. An error leaves the profile not ready: the caller must not use it.
     pub async fn apply_clipboard(&self, context: &str, denied: bool) -> Result<()> {
-        if context.is_empty() || context == self.inner.human_context {
-            bail!("refusing to set a clipboard policy on the human or an unknown context");
+        if !self.inner.agents.is_agent(context) {
+            bail!("refusing to set a clipboard policy outside an agent profile");
         }
         let _one = self.inner.applying.lock().await;
         // What lifting needs: the connection that holds the denial, or (when that was lost
@@ -1038,8 +1045,8 @@ impl Inner {
 
     /// Activates a tab of the agent `context`, which makes it the default context (E3).
     async fn activate(&self, context: &str) -> Result<()> {
-        if context == self.human_context {
-            bail!("refusing to activate the human's tabs");
+        if !self.agents.is_agent(context) {
+            bail!("refusing to activate a tab outside an agent profile");
         }
         let pages = page_targets(&self.conn).await?;
         let page = pages
@@ -1290,7 +1297,7 @@ impl Inner {
     /// into staging, within the profile's running cap, and is deleted when it ends (or by
     /// the sweeper). Each outcome is counted (`cancel_counts`) and logged.
     async fn cancel(&self, guid: &str, context: &str) {
-        if context.is_empty() || context == self.human_context {
+        if !self.agents.is_agent(context) {
             return;
         }
         let send = || {
@@ -1499,7 +1506,7 @@ impl Inner {
             .await
             .ok()?;
         let context = r["targetInfo"]["browserContextId"].as_str()?;
-        (!context.is_empty() && context != self.human_context).then(|| context.to_string())
+        self.agents.is_agent(context).then(|| context.to_string())
     }
 
     /// A dropped download whose profile is not known yet (its frame is no target): its
@@ -1552,13 +1559,20 @@ impl Inner {
         None
     }
 
-    /// Whether `frame` is (the main frame of) a target of the human's profile.
+    /// Whether `frame` is (the main frame of) a target outside the agent profiles: a
+    /// person's profile, or a context not known to be an agent's. A frame that is no target
+    /// is not decided here (it is looked for in the agent tabs).
     async fn in_human_tab(&self, frame: &str) -> bool {
         self.conn
             .send("Target.getTargetInfo", json!({ "targetId": frame }), None)
             .await
             .ok()
-            .is_some_and(|r| r["targetInfo"]["browserContextId"] == self.human_context.as_str())
+            .and_then(|r| {
+                r["targetInfo"]["browserContextId"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .is_some_and(|c| !self.agents.is_agent(&c))
     }
 
     async fn parent_of_frame_target(&self, frame: &str) -> Option<String> {
@@ -1569,7 +1583,7 @@ impl Inner {
             .ok()?;
         let info = &r["targetInfo"];
         let context = info["browserContextId"].as_str().unwrap_or_default();
-        if info["type"] != "iframe" || context.is_empty() || context == self.human_context {
+        if info["type"] != "iframe" || !self.agents.is_agent(context) {
             return None;
         }
         info["parentFrameId"].as_str().map(String::from)
@@ -1588,7 +1602,7 @@ impl Inner {
             .filter(|t| matches!(t["type"].as_str(), Some("page" | "iframe")))
             .filter(|t| {
                 let c = t["browserContextId"].as_str().unwrap_or_default();
-                !c.is_empty() && c != self.human_context
+                self.agents.is_agent(c)
             })
             .filter_map(|t| t["targetId"].as_str().map(String::from))
             .filter(|t| t != frame)
@@ -1885,6 +1899,50 @@ async fn sweep(weak: Weak<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A browser connection that never answers.
+    async fn silent_conn() -> CdpConn {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        CdpConn::connect(&format!("ws://{addr}")).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn policy_is_not_applied_to_a_second_human_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(tmp.path());
+        let agents = AgentContexts::default();
+        agents.set("PegboardAgent", "A1");
+        let d = Downloads::new(
+            &BrowserLink::ended_for_test(),
+            agents.clone(),
+            silent_conn().await,
+            &paths,
+        )
+        .unwrap();
+        // The person's two profiles, an unknown and an empty context, and an agent context
+        // named under another profile's directory: refused before anything is sent.
+        for (context, dir) in [
+            ("H1", "Default"),
+            ("H2", "Profile 1"),
+            ("X", "PegboardAgent-x"),
+            ("", "PegboardAgent"),
+            ("A1", "PegboardAgent-work"),
+        ] {
+            let e = d.apply(context, dir).await.unwrap_err();
+            assert!(e.to_string().starts_with("refusing"), "{context}: {e}");
+            assert!(!d.is_ready(context));
+            if context != "A1" {
+                let e = d.apply_clipboard(context, true).await.unwrap_err();
+                assert!(e.to_string().starts_with("refusing"), "{context}: {e}");
+            }
+        }
+    }
 
     #[test]
     fn a_profile_first_seen_may_carry_a_clipboard_denial() {
