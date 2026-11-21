@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+use crate::cdp::QUEUED_MAX_MESSAGE;
 use mux::{Handle, Inner};
 
 /// A physical connection to the browser. Cheap to clone; all clones share it.
@@ -27,15 +28,23 @@ pub struct BrowserLink {
 }
 
 impl BrowserLink {
-    /// Connects to the browser's DevTools websocket (messages up to 256 MiB).
+    /// Connects to the browser's DevTools websocket. A message over 256 MiB ends only the
+    /// virtual connection it belongs to, never the link.
     pub async fn websocket(url: &str) -> Result<BrowserLink> {
-        Ok(Self::start(transport::websocket(url).await?))
+        Ok(Self::start(
+            transport::websocket(url, QUEUED_MAX_MESSAGE).await?,
+        ))
     }
 
     /// The daemon's end of a DevTools pipe: reads `read`, writes `write` (fork mode: fds 3
-    /// and 4). Messages are JSON, each ended by a NUL. Needs a tokio runtime.
+    /// and 4). Messages are JSON, each ended by a NUL; one over 256 MiB is skipped and ends
+    /// only the virtual connection it belongs to. Needs a tokio runtime.
     pub fn pipe(read: OwnedFd, write: OwnedFd) -> Result<BrowserLink> {
-        Ok(Self::start(transport::pipe(read, write)?))
+        Ok(Self::start(transport::pipe(
+            read,
+            write,
+            QUEUED_MAX_MESSAGE,
+        )?))
     }
 
     fn start(transport: transport::Transport) -> BrowserLink {

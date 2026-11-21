@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::transport::Transport;
+use super::transport::{Incoming, Transport};
 
 pub(crate) type VconnId = u64;
 
@@ -102,9 +102,12 @@ impl Inner {
         });
         let weak: Weak<Inner> = Arc::downgrade(&inner);
         tokio::spawn(async move {
-            while let Some(text) = incoming.recv().await {
+            while let Some(message) = incoming.recv().await {
                 let Some(inner) = weak.upgrade() else { return };
-                Inner::dispatch(&inner, &text);
+                match message {
+                    Incoming::Text(text) => Inner::dispatch(&inner, &text),
+                    Incoming::Oversized { head, tail } => inner.oversized(&head, &tail),
+                }
             }
             if let Some(inner) = weak.upgrade() {
                 inner.end();
@@ -319,6 +322,40 @@ impl Inner {
         }
     }
 
+    /// A message over the limit, of which only its ends are known. It is delivered to no
+    /// one; the one virtual connection it belongs to ends (a request it answers gets an error
+    /// first). Found by its id (an answer: Chrome writes `{"id":N` first) or else by its
+    /// session (Chrome writes `,"sessionId":"…"}` last). With no owner it is only dropped:
+    /// the link and every other virtual connection go on.
+    fn oversized(&self, head: &[u8], tail: &[u8]) {
+        let mut st = self.state.lock().unwrap();
+        let st = &mut *st;
+        if let Some(link_id) = leading_id(head) {
+            match st.pending.remove(&link_id) {
+                Some(Pending::Virtual { vconn, id, .. }) => {
+                    if let Some(vc) = st.vconns.get(&vconn) {
+                        let error = json!({"id": id, "error": {"code": -32000,
+                            "message": "The message is too large."}});
+                        let _ = vc.tx.send(error.to_string());
+                    }
+                    self.close_locked(st, vconn);
+                }
+                Some(Pending::Open(tx)) => {
+                    let _ = tx.send(Err(anyhow!(
+                        "Target.attachToBrowserTarget answered too large a message"
+                    )));
+                }
+                Some(Pending::Ignore) => {}
+                None => dropped("an oversized answer to no request", None),
+            }
+            return;
+        }
+        match trailing_session(tail).and_then(|s| st.owners.get(s).copied()) {
+            Some(owner) => self.close_locked(st, owner),
+            None => dropped("an oversized message nobody owns", None),
+        }
+    }
+
     /// The answer to `Target.attachToBrowserTarget`: a new virtual connection. Returns it when
     /// nobody waits for it any more; the caller drops it once the state is unlocked.
     fn opened(
@@ -403,6 +440,30 @@ fn params_session(msg: &Map<String, Value>) -> Option<&str> {
     msg.get("params").and_then(session_of)
 }
 
+/// The id of a message that starts `{"id":N` (an answer, as Chrome writes it).
+fn leading_id(head: &[u8]) -> Option<u64> {
+    let rest = head.trim_ascii_start().strip_prefix(b"{\"id\":")?;
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    // A number cut off by the end of `head` is not known.
+    if digits == 0 || digits == rest.len() {
+        return None;
+    }
+    std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()
+}
+
+/// The session of a message that ends `,"sessionId":"…"}` (as Chrome writes it). A message
+/// whose last member is not that ends `}}` or so and has none.
+fn trailing_session(tail: &[u8]) -> Option<&str> {
+    const KEY: &[u8] = b",\"sessionId\":\"";
+    let body = tail.trim_ascii_end().strip_suffix(b"\"}")?;
+    let at = body.windows(KEY.len()).rposition(|w| w == KEY)?;
+    let value = &body[at + KEY.len()..];
+    if value.is_empty() || value.iter().any(|&b| b == b'"' || b == b'\\') {
+        return None;
+    }
+    std::str::from_utf8(value).ok()
+}
+
 /// `params.sessionId`, whatever its type.
 fn params_session_value(msg: &Map<String, Value>) -> Option<&Value> {
     msg.get("params").and_then(|p| p.get("sessionId"))
@@ -431,7 +492,7 @@ mod tests {
     use serde_json::{json, Value};
     use tokio::sync::mpsc;
 
-    use super::super::transport::Transport;
+    use super::super::transport::{Incoming, Transport};
     use super::super::{BrowserLink, VirtualReceiver, VirtualSender};
 
     const WAIT: Duration = Duration::from_secs(3);
@@ -441,15 +502,15 @@ mod tests {
     /// `B1`, `B2`, … (after the root `Target.attachedToTarget` Chrome sends first) and hands
     /// every other message it receives to the test.
     struct FakeBrowser {
-        inject: Option<mpsc::UnboundedSender<Value>>,
+        inject: Option<mpsc::UnboundedSender<Incoming>>,
         seen: mpsc::UnboundedReceiver<Value>,
     }
 
     impl FakeBrowser {
         fn start() -> (BrowserLink, FakeBrowser) {
-            let (in_tx, in_rx) = mpsc::unbounded_channel::<String>();
+            let (in_tx, in_rx) = mpsc::unbounded_channel::<Incoming>();
             let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-            let (inject_tx, mut inject_rx) = mpsc::unbounded_channel::<Value>();
+            let (inject_tx, mut inject_rx) = mpsc::unbounded_channel::<Incoming>();
             let (seen_tx, seen_rx) = mpsc::unbounded_channel::<Value>();
             tokio::spawn(async move {
                 let mut sessions = 0;
@@ -467,15 +528,15 @@ mod tests {
                                     "params": {"sessionId": s, "waitingForDebugger": false,
                                         "targetInfo": {"targetId": format!("T{s}"), "type": "browser"}}});
                                 let reply = json!({"id": v["id"], "result": {"sessionId": s}});
-                                let _ = in_tx.send(event.to_string());
-                                let _ = in_tx.send(reply.to_string());
+                                let _ = in_tx.send(Incoming::Text(event.to_string()));
+                                let _ = in_tx.send(Incoming::Text(reply.to_string()));
                             } else if seen_tx.send(v).is_err() {
                                 break;
                             }
                         }
                         msg = inject_rx.recv() => {
                             let Some(msg) = msg else { break };
-                            let _ = in_tx.send(msg.to_string());
+                            let _ = in_tx.send(msg);
                         }
                     }
                 }
@@ -492,7 +553,16 @@ mod tests {
         }
 
         fn send(&self, v: Value) {
-            self.inject.as_ref().unwrap().send(v).unwrap();
+            self.send_incoming(Incoming::Text(v.to_string()));
+        }
+
+        /// Sends `v` as the transport hands it on under a limit of `max` bytes.
+        fn send_limited(&self, v: Value, max: usize) {
+            self.send_incoming(Incoming::limited(v.to_string(), max));
+        }
+
+        fn send_incoming(&self, m: Incoming) {
+            self.inject.as_ref().unwrap().send(m).unwrap();
         }
 
         async fn next(&mut self) -> Value {
@@ -1071,8 +1141,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_oversized_answer_ends_only_its_connection() {
+        const MAX: usize = 1024;
+        let big = "x".repeat(MAX);
+        let (link, mut fake) = FakeBrowser::start();
+        let (s1, mut r1) = open(&link).await;
+        let (s2, mut r2) = open(&link).await;
+
+        // V1's request answered with too large a message, on its browser session (Chrome
+        // writes the session last).
+        send(&s1, json!({"id": 1, "method": "Runtime.evaluate"}));
+        let m = fake.next().await;
+        let mut answer = json!({"id": m["id"], "result": {"value": big}});
+        answer["sessionId"] = m["sessionId"].clone();
+        fake.send_limited(answer, MAX);
+        let error = recv(&mut r1).await;
+        assert_eq!(error["id"], 1);
+        assert_eq!(error["error"]["code"], -32000);
+        assert!(tokio::time::timeout(WAIT, r1.recv())
+            .await
+            .unwrap()
+            .is_none());
+        let detach = fake.next().await;
+        assert_eq!(detach["method"], "Target.detachFromTarget");
+        assert_eq!(detach["params"]["sessionId"], "B1");
+        assert!(s1
+            .send(json!({"id": 2, "method": "Browser.getVersion"}).to_string())
+            .is_err());
+
+        // An oversized event on a child of V2's ends V2 alone; one nobody owns, nobody.
+        let (s3, mut r3) = open(&link).await;
+        fake.send(attached("B2", "C2"));
+        recv(&mut r2).await;
+        fake.send_limited(
+            json!({"method": "Runtime.consoleAPICalled", "params": {"v": big}, "sessionId": "C2"}),
+            MAX,
+        );
+        let mut detached = Vec::new();
+        for _ in 0..2 {
+            let m = fake.next().await;
+            assert_eq!(m["method"], "Target.detachFromTarget");
+            detached.push(m["params"]["sessionId"].as_str().unwrap().to_string());
+        }
+        assert_eq!(detached, ["C2", "B2"]);
+        assert!(tokio::time::timeout(WAIT, r2.recv())
+            .await
+            .unwrap()
+            .is_none());
+        fake.send_limited(
+            json!({"method": "Page.x", "params": {"v": big}, "sessionId": "NOPE"}),
+            MAX,
+        );
+        fake.send_limited(json!({"method": "Page.x", "params": {"v": big}}), MAX);
+        fake.send_limited(json!({"id": 999_999, "result": {"v": big}}), MAX);
+        fake.quiet().await;
+        assert!(!s2
+            .send(json!({"id": 3, "method": "Browser.getVersion"}).to_string())
+            .is_ok());
+
+        // The link and V3 go on.
+        assert!(!link.is_closed());
+        send(&s3, json!({"id": 1, "method": "Browser.getVersion"}));
+        let m = fake.next().await;
+        assert_eq!(m["sessionId"], "B3");
+        fake.answer(&m, json!({}));
+        assert_eq!(recv(&mut r3).await, json!({"id": 1, "result": {}}));
+    }
+
+    #[test]
+    fn the_ends_of_a_message_name_its_owner() {
+        use super::{leading_id, trailing_session};
+        assert_eq!(leading_id(b"{\"id\":42,\"result\":{"), Some(42));
+        assert_eq!(leading_id(b" {\"id\":7,"), Some(7));
+        // Cut off, or not first: not known.
+        assert_eq!(leading_id(b"{\"id\":42"), None);
+        assert_eq!(leading_id(b"{\"method\":\"x\",\"params\":{\"id\":4,"), None);
+        assert_eq!(
+            trailing_session(b"xx\"},\"sessionId\":\"AB12\"}"),
+            Some("AB12")
+        );
+        assert_eq!(trailing_session(b",\"sessionId\":\"AB12\"}}"), None);
+        assert_eq!(trailing_session(b"\"v\":\"a\"}}"), None);
+        assert_eq!(trailing_session(b",\"sessionId\":\"\"}"), None);
+    }
+
+    #[tokio::test]
     async fn opening_fails_when_the_browser_refuses() {
-        let (in_tx, in_rx) = mpsc::unbounded_channel::<String>();
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<Incoming>();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let link = BrowserLink::start(Transport {
             incoming: in_rx,
@@ -1085,7 +1240,9 @@ mod tests {
         let m: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
         assert_eq!(m["method"], "Target.attachToBrowserTarget");
         in_tx
-            .send(json!({"id": m["id"], "error": {"code": -32000, "message": "no"}}).to_string())
+            .send(Incoming::Text(
+                json!({"id": m["id"], "error": {"code": -32000, "message": "no"}}).to_string(),
+            ))
             .unwrap();
         assert!(opening.await.unwrap().is_err());
         assert!(!link.is_closed());

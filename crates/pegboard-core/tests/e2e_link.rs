@@ -759,6 +759,30 @@ impl Virtual {
     }
 }
 
+/// An environment variable set until this is dropped (also when the test fails), then put
+/// back as it was.
+struct EnvVar {
+    name: &'static str,
+    before: Option<std::ffi::OsString>,
+}
+
+impl EnvVar {
+    fn set(name: &'static str, value: &str) -> EnvVar {
+        let before = std::env::var_os(name);
+        std::env::set_var(name, value);
+        EnvVar { name, before }
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        match &self.before {
+            Some(v) => std::env::set_var(self.name, v),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 /// ESTABLISHED TCP connections of process `pid` on `port` (either end), by `lsof`.
 fn established(pid: u32, port: u16) -> usize {
     let out = std::process::Command::new("lsof")
@@ -777,7 +801,8 @@ fn established(pid: u32, port: u16) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn the_daemon_opens_one_browser_connection() {
-    std::env::set_var("PEGBOARD_TEST_HOOKS", "1");
+    // The daemon's test hooks, for this test only: put back as they were when it ends.
+    let _hooks = EnvVar::set("PEGBOARD_TEST_HOOKS", "1");
     let env = common::env();
     let fixture = common::fixture().await;
     let daemon = pegboard_core::service::Daemon::start(env.paths.clone())
@@ -938,6 +963,10 @@ fn sessions_stay_isolated_over_one_connection() {
         println!(
             "OBSERVED sessions_isolated: a_about_b={about_theirs:?} b_discovery={discovery_b:?}"
         );
+        // `a_about_b` is kept from A by the proxy's own filter too (B's tab is not in A's
+        // scope), so it would pass even if the link leaked. `b_discovery` is the assertion
+        // that catches a leak between virtual connections: B never turned discovery on, so
+        // any target event it gets came from A's browser session.
         assert!(
             about_theirs.is_empty(),
             "A heard of B's tab: {about_theirs:?}"
@@ -1019,4 +1048,75 @@ async fn another_connections_child_cannot_be_detached_by_params() {
         "{:?}",
         v2.seen
     );
+}
+
+/// Session A's client evaluates a string over 256 MiB by value. That answer is too large for
+/// the link: it ends A's virtual connection only. Session B, the daemon's own connection and
+/// the one physical connection go on.
+#[test]
+#[ignore]
+fn an_oversized_eval_does_not_cut_other_sessions() {
+    common::run(async {
+        let s = common::shared_session_fixture().await;
+        let (g2, t2) = s.bridge.create_group("second", "red").await.unwrap();
+        let id2 = pegboard_protocol::SessionId::generate();
+        let ep2 = s.proxy.register(
+            &id2,
+            &s.agent_context,
+            g2,
+            s.bridge.clone(),
+            vec![t2.clone()],
+        );
+        let a = common::client(&s.endpoint).await;
+        let b = common::client(&ep2).await;
+        let sa = a.attach(&s.first_target).await.unwrap();
+        let sb = b.attach(&t2).await.unwrap();
+        let link = &s.browser.link;
+        let before = link.virtual_connections();
+
+        // 3e8 characters: over 256 MiB as JSON.
+        let big = a
+            .send(
+                "Runtime.evaluate",
+                json!({ "expression": "'x'.repeat(3e8)", "returnByValue": true }),
+                Some(&sa),
+            )
+            .await;
+        let outcome = match &big {
+            Ok(v) => format!("ok({} bytes)", v.to_string().len()),
+            Err(e) => format!("err({e:#})"),
+        };
+
+        let b_works = b.evaluate(&sb, "1 + 1").await;
+        let main_works = s
+            .browser
+            .conn
+            .send("Browser.getVersion", json!({}), None)
+            .await;
+        let after = link.virtual_connections();
+        let port = s.browser.debugging_port().unwrap();
+        let physical = established(s.browser.pid, port);
+        println!(
+            "OBSERVED oversized_eval: a={outcome} b={b_works:?} main_ok={} link_closed={} \
+             virtual_before={before} virtual_after={after} physical={physical}",
+            main_works.is_ok(),
+            link.is_closed()
+        );
+        // A's answer never arrived: refused by the link (too large) and its connection closed,
+        // not refused by Chrome on its own (which would make this test say nothing).
+        let a_err = format!("{:#}", big.as_ref().expect_err("A got its huge answer"));
+        assert!(
+            a_err.contains("too large") || a_err.contains("closed"),
+            "A failed otherwise: {a_err}"
+        );
+        assert_eq!(b_works.unwrap(), json!(2));
+        main_works.unwrap();
+        assert!(!link.is_closed());
+        assert_eq!(
+            physical, 1,
+            "the browser has {physical} DevTools connections"
+        );
+        drop((a, b));
+        s.shutdown().await;
+    });
 }
