@@ -20,7 +20,7 @@ use tokio::sync::{broadcast, OnceCell};
 use tokio::task::JoinHandle;
 
 use crate::address::Verdict;
-use crate::bridge::{Bridge, GroupId};
+use crate::bridge::{ExtensionBridge, GroupId, TabBridge};
 use crate::browser::{Browser, BrowserConfig};
 use crate::cdp::{page_targets, CdpConn, CdpEvent};
 use crate::downloads::{PolicyLost, Report, SessionView};
@@ -65,7 +65,7 @@ pub fn group_color(index: usize) -> &'static str {
 /// An open agent profile: its browser context and the bridge that makes its tabs.
 pub struct ProfileRuntime {
     pub context: String,
-    pub bridge: Arc<Bridge>,
+    pub bridge: Arc<dyn TabBridge>,
 }
 
 fn now() -> String {
@@ -114,7 +114,7 @@ struct SessionRecord {
     info: SessionInfo,
     context: String,
     group: GroupId,
-    bridge: Arc<Bridge>,
+    bridge: Arc<dyn TabBridge>,
     endpoint: Endpoint,
     /// The session's hold on its profile's pinned settings: dropping the record (however
     /// the session ends) releases it.
@@ -394,7 +394,7 @@ impl SessionManager {
         };
         if let Err(e) = checked.await {
             if let Ok(members) = runtime.bridge.members(&group).await {
-                let _ = close_tabs(conn, &runtime.bridge, &members.into_iter().collect()).await;
+                let _ = close_tabs(conn, &*runtime.bridge, &members.into_iter().collect()).await;
             }
             return Err(e);
         }
@@ -471,7 +471,7 @@ impl SessionManager {
             Ok::<(), RpcError>(())
         };
         if let Err(e) = setup.await {
-            inner.discard(&id, &runtime.bridge, &group, &first).await;
+            inner.discard(&id, &*runtime.bridge, &group, &first).await;
             return Err(e);
         }
         let mut table = inner.table.lock().unwrap();
@@ -562,7 +562,7 @@ impl SessionManager {
                 Err(e) => Err(e),
             }
         } else {
-            close_tabs(&inner.browser.conn, &record.bridge, &targets).await
+            close_tabs(&inner.browser.conn, &*record.bridge, &targets).await
         };
         // Tabs that stay open (kept, or not closed after all) leave focus emulation.
         for t in &targets {
@@ -578,7 +578,7 @@ impl SessionManager {
             _pin: pin,
             ..
         } = record;
-        inner.release_pin(id, pin, &bridge, &group, &targets).await;
+        inner.release_pin(id, pin, &*bridge, &group, &targets).await;
         result.map_err(|e| {
             rpc_error(
                 codes::BROWSER_FAILED,
@@ -654,7 +654,7 @@ impl SessionManager {
             inner.release_focus(&target).await;
             // Through the bridge, which refuses a tab outside its profile.
             let tabs = BTreeSet::from([target]);
-            let _ = close_tabs(&inner.browser.conn, &bridge, &tabs).await;
+            let _ = close_tabs(&inner.browser.conn, &*bridge, &tabs).await;
             return Err(e);
         }
         Ok(target)
@@ -977,7 +977,7 @@ impl SessionManager {
         };
         let blank = blank_to_close(&pages, &own, keep);
         if !blank.is_empty() {
-            let _ = close_tabs(&inner.browser.conn, &bridge, &blank).await;
+            let _ = close_tabs(&inner.browser.conn, &*bridge, &blank).await;
         }
     }
 
@@ -1178,14 +1178,15 @@ impl Inner {
                 return Ok(rt.clone());
             }
         }
-        let bridge = Arc::new(
-            Bridge::attach(&self.browser.conn, &context)
+        let bridge: Arc<dyn TabBridge> = Arc::new(
+            ExtensionBridge::attach(&self.browser.conn, &context)
                 .await
                 .map_err(browser_failed)?,
         );
         // Tab switches in the profile, for the recordings (a person's possible intervention).
         let recorder = self.recorder.clone();
         bridge
+            .clone()
             .follow_activity(Arc::new(move |context: &str, target: &str, at| {
                 recorder.activated(context, target, at)
             }))
@@ -1298,7 +1299,7 @@ impl Inner {
     }
 
     /// Takes back what a failed `create` made.
-    async fn discard(&self, id: &SessionId, bridge: &Bridge, group: &GroupId, first: &str) {
+    async fn discard(&self, id: &SessionId, bridge: &dyn TabBridge, group: &GroupId, first: &str) {
         let mut targets: BTreeSet<String> = self.proxy.targets(id).into_iter().collect();
         targets.insert(first.to_string());
         self.proxy.unregister(id);
@@ -1331,7 +1332,7 @@ impl Inner {
         &self,
         id: &SessionId,
         pin: PinGuard,
-        bridge: &Bridge,
+        bridge: &dyn TabBridge,
         group: &GroupId,
         targets: &BTreeSet<String>,
     ) {
@@ -1621,7 +1622,7 @@ where
 /// `CLOSE_BUDGET`. A tab that still cannot be closed is named (id only) on stderr.
 async fn close_tabs(
     conn: &CdpConn,
-    bridge: &Bridge,
+    bridge: &dyn TabBridge,
     targets: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
     let result = retry_within(CLOSE_BUDGET, CLOSE_INTERVAL, || async {

@@ -30,7 +30,7 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::bridge::{Bridge, GroupId};
+use crate::bridge::{GroupId, TabBridge};
 use crate::link::{BrowserLink, VirtualReceiver, VirtualSender};
 use crate::proxy::filter::{self, BrowserDecision, ClientDecision, Scope};
 
@@ -120,10 +120,10 @@ struct SessionEntry {
     token: String,
     /// Chrome deletes a group with its last tab; the session can then move to a new one.
     group: Mutex<GroupId>,
-    /// Title and colour a new group gets when the old one is gone (see `Bridge::create_tab`).
+    /// Title and colour a new group gets when the old one is gone (see `TabBridge::create_tab`).
     style: Mutex<(String, String)>,
     /// Bridge of the profile the session lives in; it creates the session's tabs.
-    bridge: Arc<Bridge>,
+    bridge: Arc<dyn TabBridge>,
     scope: Mutex<Scope>,
     /// Set to true when the session is unregistered; client connections then close.
     closed: watch::Sender<bool>,
@@ -139,7 +139,7 @@ impl SessionEntry {
         token: String,
         context: &str,
         group: GroupId,
-        bridge: Arc<Bridge>,
+        bridge: Arc<dyn TabBridge>,
         targets: Vec<String>,
     ) -> SessionEntry {
         SessionEntry {
@@ -246,7 +246,7 @@ impl ProxyServer {
         id: &SessionId,
         context: &str,
         group: GroupId,
-        bridge: Arc<Bridge>,
+        bridge: Arc<dyn TabBridge>,
         initial_targets: Vec<String>,
     ) -> Endpoint {
         let token = new_token();

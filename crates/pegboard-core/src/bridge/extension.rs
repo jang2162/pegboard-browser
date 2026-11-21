@@ -1,12 +1,15 @@
-//! Client for the bridge extension's service worker (tab groups, tabs in the agent profile).
+//! The bridge on stock Chrome: a client for the bridge extension's service worker (tab groups,
+//! tabs in the agent profile).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 
+use super::{lock, ActivityFn, GroupId, TabBridge, CLOSE_QUIET};
 use crate::cdp::{CdpConn, CdpEvent};
 
 const WORKER_WAIT: Duration = Duration::from_secs(10);
@@ -16,18 +19,8 @@ const DATA_LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The worker's function for tab switches (see sw.js).
 const ACTIVITY_BINDING: &str = "pegActivity";
-/// Tab switches until this long after the bridge closed tabs are Chrome's doing (it
-/// activates a neighbour of a closed tab), not a person's.
-const CLOSE_QUIET: Duration = Duration::from_secs(2);
 
-/// Told of every tab switch in the profile: (the profile's browser context, the target that
-/// became active, when).
-pub type ActivityFn = Arc<dyn Fn(&str, &str, SystemTime) + Send + Sync>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GroupId(pub i64);
-
-pub struct Bridge {
+pub struct ExtensionBridge {
     conn: CdpConn,
     agent_context: String,
     /// Flat-mode session attached to the worker; kept open for the bridge's lifetime.
@@ -62,9 +55,9 @@ async fn workers(conn: &CdpConn, context: &str) -> Result<Vec<(String, String)>>
         .collect())
 }
 
-impl Bridge {
+impl ExtensionBridge {
     /// Attaches to the bridge service worker that lives in `agent_context` and keeps that CDP session open.
-    pub async fn attach(conn: &CdpConn, agent_context: &str) -> Result<Bridge> {
+    pub async fn attach(conn: &CdpConn, agent_context: &str) -> Result<ExtensionBridge> {
         let deadline = tokio::time::Instant::now() + WORKER_WAIT;
         let mut seen = false;
         loop {
@@ -77,7 +70,7 @@ impl Bridge {
                     continue;
                 };
                 if answers(conn, &session).await {
-                    return Ok(Bridge {
+                    return Ok(ExtensionBridge {
                         conn: conn.clone(),
                         agent_context: agent_context.to_string(),
                         session: Mutex::new(session),
@@ -135,18 +128,6 @@ impl Bridge {
         serde_json::from_str(text).with_context(|| format!("parsing bridge reply of {func}"))
     }
 
-    /// Test hook (`test.detachBridge`): lets go of the worker (detaches the session), so
-    /// nothing of pegboard keeps it running. The next call attaches again (`revive`).
-    pub async fn detach_for_test(&self) -> bool {
-        let mut session = self.session.lock().await;
-        let old = std::mem::take(&mut *session);
-        *lock(&self.bound) = String::new();
-        self.conn
-            .send("Target.detachFromTarget", json!({ "sessionId": old }), None)
-            .await
-            .is_ok()
-    }
-
     /// A new session on the worker, if one runs and answers (a worker that restarted is a
     /// new target). Otherwise `bridge_asleep` at once: a worker stopped by force does not come
     /// back by any means measured (spike-findings H9), and the call must not hang on it.
@@ -184,52 +165,6 @@ impl Bridge {
             }
         }
         bail!("bridge_asleep: the bridge service worker is not running")
-    }
-
-    pub async fn create_group(&self, title: &str, color: &str) -> Result<(GroupId, String)> {
-        let r = self
-            .call("createGroup", &[json!(title), json!(color)])
-            .await?;
-        Ok((GroupId(group_id(&r)?), target_id(&r)?))
-    }
-
-    /// Makes a tab in `group`. When Chrome already deleted the group (it goes with its last
-    /// tab) the worker starts a new one with `title` and `color` and the group id is returned
-    /// with the target.
-    pub async fn create_tab(
-        &self,
-        group: &GroupId,
-        url: &str,
-        title: &str,
-        color: &str,
-    ) -> Result<(String, Option<GroupId>)> {
-        // `chrome.tabs.update` navigates as if the extension's page asked for it, and Chrome
-        // does not let that kind of navigation take a tab to a data: URL: the call succeeds
-        // and the tab stays at about:blank. A data: URL is opened through CDP instead, the
-        // way `open` does it.
-        let via_cdp = url.starts_with("data:");
-        let for_worker = if via_cdp { "about:blank" } else { url };
-        let r = self
-            .call(
-                "createTab",
-                &[
-                    json!(group.0),
-                    json!(for_worker),
-                    json!(title),
-                    json!(color),
-                ],
-            )
-            .await?;
-        let moved = r["newGroupId"].as_i64().map(GroupId);
-        let target = target_id(&r)?;
-        if via_cdp {
-            if let Err(e) = self.open_in_tab(&target, url).await {
-                // The tab was made for this URL: it does not stay behind without it.
-                let _ = self.close_targets(std::slice::from_ref(&target)).await;
-                return Err(e);
-            }
-        }
-        Ok((target, moved))
     }
 
     /// Navigates the tab on a CDP session of its own and waits for the load (a page that
@@ -270,44 +205,6 @@ impl Bridge {
             )
             .await;
         result
-    }
-
-    pub async fn add_to_group(&self, group: &GroupId, target_id: &str) -> Result<()> {
-        self.call("addToGroup", &[json!(group.0), json!(target_id)])
-            .await?;
-        Ok(())
-    }
-
-    pub async fn members(&self, group: &GroupId) -> Result<Vec<String>> {
-        let r = self.call("members", &[json!(group.0)]).await?;
-        Ok(r["targetIds"]
-            .as_array()
-            .ok_or_else(|| anyhow!("members reply has no targetIds"))?
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect())
-    }
-
-    pub async fn close_targets(&self, target_ids: &[String]) -> Result<()> {
-        self.quiet();
-        let closed = self.call("closeTargets", &[json!(target_ids)]).await;
-        self.quiet();
-        closed?;
-        Ok(())
-    }
-
-    /// Reports every tab switch in the profile to `on` from now on, also across restarts
-    /// of the worker (spike H8: a restarted worker has lost the binding; the switches it
-    /// kept meanwhile are asked for when it is added again).
-    pub async fn follow_activity(self: &Arc<Self>, on: ActivityFn) {
-        *lock(&self.activity) = Some(on);
-        // Subscribed before the binding exists, so no call of it is missed.
-        let events = self.conn.events();
-        {
-            let session = self.session.lock().await;
-            self.bind_if_following(&session).await;
-        }
-        tokio::spawn(follow(Arc::downgrade(self), events));
     }
 
     async fn bind_if_following(&self, session: &str) {
@@ -395,21 +292,123 @@ impl Bridge {
             _ => {}
         }
     }
+}
+
+#[async_trait]
+impl TabBridge for ExtensionBridge {
+    async fn create_group(&self, title: &str, color: &str) -> Result<(GroupId, String)> {
+        let r = self
+            .call("createGroup", &[json!(title), json!(color)])
+            .await?;
+        Ok((GroupId(group_id(&r)?), target_id(&r)?))
+    }
+
+    /// Makes a tab in `group`. When Chrome already deleted the group (it goes with its last
+    /// tab) the worker starts a new one with `title` and `color` and the group id is returned
+    /// with the target.
+    async fn create_tab(
+        &self,
+        group: &GroupId,
+        url: &str,
+        title: &str,
+        color: &str,
+    ) -> Result<(String, Option<GroupId>)> {
+        // `chrome.tabs.update` navigates as if the extension's page asked for it, and Chrome
+        // does not let that kind of navigation take a tab to a data: URL: the call succeeds
+        // and the tab stays at about:blank. A data: URL is opened through CDP instead, the
+        // way `open` does it.
+        let via_cdp = url.starts_with("data:");
+        let for_worker = if via_cdp { "about:blank" } else { url };
+        let r = self
+            .call(
+                "createTab",
+                &[
+                    json!(group.0),
+                    json!(for_worker),
+                    json!(title),
+                    json!(color),
+                ],
+            )
+            .await?;
+        let moved = r["newGroupId"].as_i64().map(GroupId);
+        let target = target_id(&r)?;
+        if via_cdp {
+            if let Err(e) = self.open_in_tab(&target, url).await {
+                // The tab was made for this URL: it does not stay behind without it.
+                let _ = self.close_targets(std::slice::from_ref(&target)).await;
+                return Err(e);
+            }
+        }
+        Ok((target, moved))
+    }
+
+    async fn add_to_group(&self, group: &GroupId, target_id: &str) -> Result<()> {
+        self.call("addToGroup", &[json!(group.0), json!(target_id)])
+            .await?;
+        Ok(())
+    }
+
+    async fn members(&self, group: &GroupId) -> Result<Vec<String>> {
+        let r = self.call("members", &[json!(group.0)]).await?;
+        Ok(r["targetIds"]
+            .as_array()
+            .ok_or_else(|| anyhow!("members reply has no targetIds"))?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect())
+    }
+
+    async fn close_targets(&self, target_ids: &[String]) -> Result<()> {
+        self.quiet();
+        let closed = self.call("closeTargets", &[json!(target_ids)]).await;
+        self.quiet();
+        closed?;
+        Ok(())
+    }
+
+    /// Reports every tab switch in the profile to `on` from now on, also across restarts
+    /// of the worker (spike H8: a restarted worker has lost the binding; the switches it
+    /// kept meanwhile are asked for when it is added again).
+    async fn follow_activity(self: Arc<Self>, on: ActivityFn) {
+        *lock(&self.activity) = Some(on);
+        // Subscribed before the binding exists, so no call of it is missed.
+        let events = self.conn.events();
+        {
+            let session = self.session.lock().await;
+            self.bind_if_following(&session).await;
+        }
+        tokio::spawn(follow(Arc::downgrade(&self), events));
+    }
 
     /// Takes the tabs out of their groups; no other tab is touched.
-    pub async fn ungroup_targets(&self, target_ids: &[String]) -> Result<()> {
+    async fn ungroup_targets(&self, target_ids: &[String]) -> Result<()> {
         self.call("ungroupTargets", &[json!(target_ids)]).await?;
         Ok(())
     }
 
-    pub async fn ungroup(&self, group: &GroupId) -> Result<()> {
+    async fn ungroup(&self, group: &GroupId) -> Result<()> {
         self.call("ungroup", &[json!(group.0)]).await?;
         Ok(())
+    }
+
+    /// Test hook (`test.detachBridge`): lets go of the worker (detaches the session), so
+    /// nothing of pegboard keeps it running. The next call attaches again (`revive`).
+    async fn detach_for_test(&self) -> bool {
+        let mut session = self.session.lock().await;
+        let old = std::mem::take(&mut *session);
+        *lock(&self.bound) = String::new();
+        self.conn
+            .send("Target.detachFromTarget", json!({ "sessionId": old }), None)
+            .await
+            .is_ok()
     }
 }
 
 /// Follows the daemon's connection for the bridge's tab switches while the bridge lives.
-async fn follow(bridge: std::sync::Weak<Bridge>, mut events: broadcast::Receiver<CdpEvent>) {
+async fn follow(
+    bridge: std::sync::Weak<ExtensionBridge>,
+    mut events: broadcast::Receiver<CdpEvent>,
+) {
     loop {
         match events.recv().await {
             Ok(e) => {
@@ -429,10 +428,6 @@ async fn follow(bridge: std::sync::Weak<Bridge>, mut events: broadcast::Receiver
             Err(broadcast::error::RecvError::Closed) => return,
         }
     }
-}
-
-fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// (target, when) of a tab switch the worker reported.
@@ -643,7 +638,7 @@ mod tests {
         let conn = CdpConn::connect(&fake_browser(fake.clone()).await)
             .await
             .unwrap();
-        let bridge = Bridge::attach(&conn, "A").await.unwrap();
+        let bridge = ExtensionBridge::attach(&conn, "A").await.unwrap();
         assert_eq!(
             bridge.members(&GroupId(1)).await.unwrap(),
             vec!["T1".to_string()]
@@ -663,7 +658,7 @@ mod tests {
         let conn = CdpConn::connect(&fake_browser(fake.clone()).await)
             .await
             .unwrap();
-        let bridge = Bridge::attach(&conn, "A").await.unwrap();
+        let bridge = ExtensionBridge::attach(&conn, "A").await.unwrap();
         // A new worker; the old session is dead. (Not followed: no rebind by event.)
         fake.worker.fetch_add(1, Ordering::SeqCst);
         let t = std::time::Instant::now();
@@ -683,9 +678,10 @@ mod tests {
         let conn = CdpConn::connect(&fake_browser(fake.clone()).await)
             .await
             .unwrap();
-        let bridge = Arc::new(Bridge::attach(&conn, "A").await.unwrap());
+        let bridge = Arc::new(ExtensionBridge::attach(&conn, "A").await.unwrap());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bridge
+            .clone()
             .follow_activity(Arc::new(move |ctx: &str, target: &str, at| {
                 let _ = tx.send((ctx.to_string(), target.to_string(), at));
             }))
@@ -718,13 +714,14 @@ mod tests {
 
     /// A bridge following tab switches on the stand-in, and the switches it reports (the
     /// first worker's replay already taken).
-    async fn followed(fake: &Arc<Fake>) -> (Arc<Bridge>, Switches) {
+    async fn followed(fake: &Arc<Fake>) -> (Arc<ExtensionBridge>, Switches) {
         let conn = CdpConn::connect(&fake_browser(fake.clone()).await)
             .await
             .unwrap();
-        let bridge = Arc::new(Bridge::attach(&conn, "A").await.unwrap());
+        let bridge = Arc::new(ExtensionBridge::attach(&conn, "A").await.unwrap());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bridge
+            .clone()
             .follow_activity(Arc::new(move |ctx: &str, target: &str, at| {
                 let _ = tx.send((ctx.to_string(), target.to_string(), at));
             }))

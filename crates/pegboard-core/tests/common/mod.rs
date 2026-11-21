@@ -571,7 +571,7 @@ pub async fn context_of(conn: &CdpConn, target_id: &str) -> String {
 /// Fields drop in declaration order: the proxy and the browser go before the temp dir.
 pub struct SessionFixture {
     pub proxy: pegboard_core::proxy::server::ProxyServer,
-    pub bridge: std::sync::Arc<pegboard_core::bridge::Bridge>,
+    pub bridge: std::sync::Arc<dyn pegboard_core::bridge::TabBridge>,
     pub browser: Browser,
     pub fixture: Fixture,
     pub env: Env,
@@ -592,7 +592,7 @@ impl SessionFixture {
 }
 
 pub async fn session_fixture() -> SessionFixture {
-    use pegboard_core::bridge::Bridge;
+    use pegboard_core::bridge::{ExtensionBridge, TabBridge};
     use pegboard_core::proxy::server::{LinkUpstream, ProxyServer};
     use std::sync::Arc;
 
@@ -615,7 +615,11 @@ pub async fn session_fixture() -> SessionFixture {
         .open_profile_window(&env.paths, &env.cfg, "PegboardAgent")
         .await
         .unwrap();
-    let bridge = Arc::new(Bridge::attach(&browser.conn, &agent_context).await.unwrap());
+    let bridge: Arc<dyn TabBridge> = Arc::new(
+        ExtensionBridge::attach(&browser.conn, &agent_context)
+            .await
+            .unwrap(),
+    );
     let (group, first_target) = bridge.create_group("proxy", "blue").await.unwrap();
     let upstream = Arc::new(LinkUpstream {
         link: browser.link.clone(),
@@ -744,7 +748,7 @@ pub struct Shared {
     pub recorder: Arc<Recorder>,
     /// Serves replay pages of recordings under `env.paths` (`grant` gives a link).
     pub replay: Arc<ReplayServer>,
-    agent: tokio::sync::OnceCell<(String, Arc<pegboard_core::bridge::Bridge>)>,
+    agent: tokio::sync::OnceCell<(String, Arc<dyn pegboard_core::bridge::TabBridge>)>,
 }
 
 /// The binary's browser, started on first use. Call it from inside `run` or a plain test.
@@ -832,7 +836,7 @@ impl Shared {
     /// The `PegboardAgent` profile's context and a bridge to its extension, opened on first
     /// use and kept for the binary's life (for suites that talk to the bridge and the proxy
     /// directly instead of through the session manager).
-    pub async fn agent(&self) -> (String, Arc<pegboard_core::bridge::Bridge>) {
+    pub async fn agent(&self) -> (String, Arc<dyn pegboard_core::bridge::TabBridge>) {
         self.agent
             .get_or_init(|| async {
                 let ctx = self
@@ -840,10 +844,12 @@ impl Shared {
                     .open_profile_window(&self.env.paths, &self.env.cfg, "PegboardAgent")
                     .await
                     .unwrap();
-                let bridge = pegboard_core::bridge::Bridge::attach(&self.browser.conn, &ctx)
-                    .await
-                    .unwrap();
-                (ctx, Arc::new(bridge))
+                let bridge =
+                    pegboard_core::bridge::ExtensionBridge::attach(&self.browser.conn, &ctx)
+                        .await
+                        .unwrap();
+                let bridge: Arc<dyn pegboard_core::bridge::TabBridge> = Arc::new(bridge);
+                (ctx, bridge)
             })
             .await
             .clone()
@@ -1186,7 +1192,7 @@ impl PageScope {
 pub struct AgentScope {
     pub sh: &'static Shared,
     pub agent: String,
-    pub bridge: Arc<pegboard_core::bridge::Bridge>,
+    pub bridge: Arc<dyn pegboard_core::bridge::TabBridge>,
     scope: PageScope,
 }
 
@@ -1214,7 +1220,7 @@ impl AgentScope {
 /// every tab the test made and sends the human tab back to `about:blank`.
 pub struct SharedSessionFixture {
     pub proxy: pegboard_core::proxy::server::ProxyServer,
-    pub bridge: Arc<pegboard_core::bridge::Bridge>,
+    pub bridge: Arc<dyn pegboard_core::bridge::TabBridge>,
     pub browser: Arc<Browser>,
     pub fixture: &'static Fixture,
     pub env: &'static Env,

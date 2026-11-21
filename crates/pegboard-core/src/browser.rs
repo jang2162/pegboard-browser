@@ -220,18 +220,49 @@ impl Browser {
             });
             if let Some(t) = fresh {
                 let ctx = t.browser_context_id.clone().unwrap();
-                self.profiles
-                    .lock()
-                    .unwrap()
-                    .insert(profile_dir.to_string(), ctx.clone());
-                // Before the policy: `apply` takes only an agent profile's context.
-                self.agents.set(profile_dir, &ctx);
-                self.downloads.forget_context(&ctx);
-                self.downloads.apply(&ctx, profile_dir).await?;
+                self.adopt(profile_dir, &ctx).await?;
                 return Ok(ctx);
             }
         }
         bail!("no window appeared for profile {profile_dir}")
+    }
+
+    /// `open_profile_window` on the Pegboard fork: one `Pegboard.openProfileWindow` on the
+    /// control connection, which loads the profile or finds it loaded. Its context is
+    /// recorded as in stock mode (a new context replaces the profile's old one).
+    pub async fn open_profile_window_by_domain(&self, profile_dir: &str) -> Result<String> {
+        if !is_agent_profile_dir(profile_dir) {
+            bail!("{profile_dir} is not an agent profile");
+        }
+        let ctx = crate::bridge::domain::open_profile_window(&self.conn, profile_dir).await?;
+        let known = self.profiles.lock().unwrap().get(profile_dir).cloned();
+        match known {
+            Some(old) if old == ctx => {
+                self.agents.set(profile_dir, &ctx);
+                self.downloads.apply(&ctx, profile_dir).await?;
+            }
+            old => {
+                if let Some(old) = old {
+                    self.agents.forget_context(&old);
+                    self.downloads.forget_context(&old);
+                }
+                self.adopt(profile_dir, &ctx).await?;
+            }
+        }
+        Ok(ctx)
+    }
+
+    /// `ctx` is the agent profile `profile_dir`'s new context: recorded, and given the
+    /// profile's download policy.
+    async fn adopt(&self, profile_dir: &str, ctx: &str) -> Result<()> {
+        self.profiles
+            .lock()
+            .unwrap()
+            .insert(profile_dir.to_string(), ctx.to_string());
+        // Before the policy: `apply` takes only an agent profile's context.
+        self.agents.set(profile_dir, ctx);
+        self.downloads.forget_context(ctx);
+        self.downloads.apply(ctx, profile_dir).await
     }
 
     /// The browser's remote debugging port.
