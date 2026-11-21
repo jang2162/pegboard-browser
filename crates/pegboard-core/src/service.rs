@@ -393,6 +393,19 @@ pub fn launch_config() -> anyhow::Result<BrowserConfig> {
     })
 }
 
+/// The refusal of `browser.stop` on a daemon the browser launched: stopping only the daemon
+/// would make the browser start it again (F8).
+pub const HOSTED_STOP_REFUSED: &str = "this daemon belongs to the Pegboard browser; quit the \
+     browser or run `pegboard browser stop`";
+
+/// Whether `browser.stop` may stop the daemon of `browser`.
+fn stop_allowed(browser: &Browser) -> Result<(), RpcError> {
+    if browser.is_hosted() {
+        return Err(invalid(HOSTED_STOP_REFUSED));
+    }
+    Ok(())
+}
+
 /// Returns once the browser has ended: its connection ended (in every configuration: a
 /// daemon whose link is gone cannot reconnect its guard, recorder or downloads), or
 /// `exited` says so (checked every half second).
@@ -637,6 +650,7 @@ impl Daemon {
         match method {
             "browser.status" => to_value(self.status()),
             "browser.stop" => {
+                stop_allowed(&self.browser)?;
                 self.shutdown().await;
                 Ok(json!({}))
             }
@@ -817,6 +831,7 @@ impl Daemon {
             chrome_version: Some(self.chrome_version.clone()),
             sessions: self.sessions.list().len(),
             stopping: self.stopping.load(Ordering::SeqCst),
+            hosted: self.browser.is_hosted(),
         }
     }
 
@@ -1173,6 +1188,38 @@ impl crate::api::Handler for Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon the browser launched does not stop on `browser.stop` (the browser would only
+    /// start it again, F8): the refusal says how to end the browser instead. The status
+    /// tells a client that the daemon is hosted.
+    #[tokio::test]
+    async fn hosted_daemon_refuses_browser_stop() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(home.path());
+        let (link, mut fake) = crate::link::fake::FakeBrowser::start();
+        let start = tokio::spawn(async move { Browser::hosted(&paths, link).await });
+        for (method, result) in [
+            ("Pegboard.claim", json!({})),
+            ("Pegboard.getProfiles", json!({ "profiles": [] })),
+            ("Target.getTargets", json!({ "targetInfos": [] })),
+        ] {
+            let m = fake.next().await;
+            assert_eq!(m["method"], method, "{m}");
+            fake.answer(&m, result);
+        }
+        let browser = start.await.unwrap().unwrap();
+        assert!(browser.is_hosted());
+        let e = stop_allowed(&browser).unwrap_err();
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        assert!(
+            e.message.contains("belongs to the Pegboard browser")
+                && e.message.contains("pegboard browser stop"),
+            "{}",
+            e.message
+        );
+        // Nothing was asked of the browser.
+        fake.quiet().await;
+    }
 
     /// The daemon's stop path follows its link: when the physical connection ends (pipe EOF,
     /// websocket gone), `browser_ended` returns and the daemon is asked to stop, in every

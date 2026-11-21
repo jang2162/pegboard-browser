@@ -784,11 +784,7 @@ fn idle_session_is_closed_after_the_expiry() {
 #[test]
 fn browser_start_refuses_a_bad_config() {
     let home = Home::new();
-    std::fs::write(
-        home.path().join("config.toml"),
-        "[recording]\nmax_age_days = 0\n",
-    )
-    .unwrap();
+    home.write_config("[recording]\nmax_age_days = 0\n");
     // No browser is needed: the check comes before the daemon is started. A missing Chrome
     // keeps a daemon that did start from opening a window.
     let env = [("PEGBOARD_CHROME", "/nonexistent/chrome")];
@@ -810,8 +806,9 @@ fn browser_start_refuses_a_bad_config() {
         "{err}"
     );
     assert!(!home.path().join("pegboardd.sock").exists());
-    // A missing file is the defaults (here the start fails later, on the missing Chrome).
-    std::fs::remove_file(home.path().join("config.toml")).unwrap();
+    // No `[recording]` table is the defaults (here the start fails later, on the missing
+    // Chrome). The home keeps its `[browser]` table: it never opens an installed app.
+    home.write_config("");
     let (_, _, err) = home.run_limited(&env, &["browser", "start"], 30);
     assert!(!err.contains("config.toml"), "{err}");
 }
@@ -873,10 +870,11 @@ fn hosted_daemon_without_the_pipe_is_a_usage_error() {
     assert!(log.contains("fds 3 and 4"), "{log}");
 }
 
-/// A daemon stand-in on the home's socket: answers every request with an empty result and
-/// records the methods. After `browser.stop` or `browser.quit` it removes the socket, as the
+/// A daemon stand-in on the home's socket: answers `browser.status` (a daemon the browser
+/// launched when `hosted`) and every other request with an empty result, and records the
+/// methods. After `browser.stop` or `browser.quit` it removes the socket, as the
 /// daemon does.
-fn fake_daemon(home: &Home) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+fn fake_daemon(home: &Home, hosted: bool) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
     use std::io::{BufRead, BufReader, Write};
     let socket = home.path().join("pegboardd.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -892,7 +890,14 @@ fn fake_daemon(home: &Home) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
                 let req = json(&line);
                 let method = req["method"].as_str().unwrap_or("").to_string();
                 log.lock().unwrap().push(method.clone());
-                let answer = serde_json::json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} });
+                let result = if method == "browser.status" {
+                    serde_json::json!({ "running": true, "pid": 1, "chromeVersion": null,
+                        "sessions": 0, "stopping": false, "hosted": hosted })
+                } else {
+                    serde_json::json!({})
+                };
+                let answer =
+                    serde_json::json!({ "jsonrpc": "2.0", "id": req["id"], "result": result });
                 let _ = writeln!(writer, "{answer}");
                 if method == "browser.stop" || method == "browser.quit" {
                     let _ = std::fs::remove_file(&socket);
@@ -915,7 +920,7 @@ fn stop_without_a_terminal_needs_yes() {
         "[browser]\nkind = \"fork\"\n",
     )
     .unwrap();
-    let seen = fake_daemon(&home);
+    let seen = fake_daemon(&home, false);
     let (code, _, err) = home.run(&["browser", "stop"]);
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("--yes"), "{err}");
@@ -939,7 +944,7 @@ fn stock_stop_asks_nothing() {
         "[browser]\nkind = \"stock\"\n",
     )
     .unwrap();
-    let seen = fake_daemon(&home);
+    let seen = fake_daemon(&home, false);
     let (code, out, err) = home.run(&["browser", "stop"]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(out.trim(), "stopped");
@@ -975,4 +980,78 @@ fn fork_start_without_the_app_says_how_to_go_on() {
     let (code, _, err) = home.run(&["browser", "start"]);
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("config.toml") && err.contains("kind"), "{err}");
+}
+
+/// The test homes pin stock mode (`common::STOCK_BROWSER`): even with a Pegboard.app
+/// installed, `browser stop` asks the daemon to stop (no question, no `browser.quit`), and
+/// `browser start` starts the daemon rather than open the app. The MCP tests use the same
+/// homes.
+#[test]
+fn test_homes_never_choose_the_installed_app() {
+    let home = Home::new();
+    let apps = tempfile::tempdir().unwrap();
+    std::fs::create_dir(apps.path().join("Pegboard.app")).unwrap();
+    let apps_dir = apps.path().display().to_string();
+    let env = [
+        ("PEGBOARD_TEST_HOOKS", "1"),
+        ("PEGBOARD_TEST_APPLICATIONS", apps_dir.as_str()),
+    ];
+    let seen = fake_daemon(&home, false);
+    // The installed app is seen: a home without the table would choose the fork.
+    let config = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    std::fs::write(home.path().join("config.toml"), "").unwrap();
+    let (code, _, err) = home.run_env(&env, &["browser", "stop"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(seen.lock().unwrap().is_empty());
+    // The home as the harness makes it, and with a config a test writes.
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
+    let (code, out, err) = home.run_env(&env, &["browser", "stop"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), "stopped");
+    assert_eq!(*seen.lock().unwrap(), vec!["browser.stop".to_string()]);
+    let home = Home::new();
+    home.write_config("[recording]\nmax_age_days = 3\n");
+    let seen = fake_daemon(&home, false);
+    let (code, _, err) = home.run_env(&env, &["browser", "stop"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(*seen.lock().unwrap(), vec!["browser.stop".to_string()]);
+}
+
+/// A `config.toml` that cannot be read does not keep the browser from being stopped: the
+/// running daemon says whether the browser launched it. Without a daemon: no daemon, as
+/// before.
+#[test]
+fn stop_works_with_a_broken_config() {
+    let broken = "[browser]\nkind = \"x\"\n";
+    // No daemon.
+    let home = Home::new();
+    std::fs::write(home.path().join("config.toml"), broken).unwrap();
+    let (code, _, err) = home.run(&["browser", "stop"]);
+    assert_eq!(code, 3, "{err}");
+    // A daemon that launched its browser: `browser.stop`.
+    let seen = fake_daemon(&home, false);
+    let (code, out, err) = home.run(&["browser", "stop"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), "stopped");
+    assert!(err.contains("config.toml"), "{err}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["browser.status".to_string(), "browser.stop".to_string()]
+    );
+    // A daemon the browser launched: the fork's way, `--yes` needed without a terminal.
+    let home = Home::new();
+    std::fs::write(home.path().join("config.toml"), broken).unwrap();
+    let seen = fake_daemon(&home, true);
+    let (code, _, err) = home.run(&["browser", "stop"]);
+    assert_eq!(code, 2, "{err}");
+    let (code, _, err) = home.run(&["browser", "stop", "--yes"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            "browser.status".to_string(),
+            "browser.status".to_string(),
+            "browser.quit".to_string()
+        ]
+    );
 }

@@ -1212,11 +1212,21 @@ fn start_daemon(paths: &Paths) -> Result<bool, RpcError> {
 /// Stock: the daemon closes its sessions and its browser (`browser.stop`). Fork: the
 /// browser is asked to quit (`browser.quit`), which closes the person's windows too, so a
 /// person at a terminal confirms it and anyone else passes `--yes`.
+///
+/// A `config.toml` that cannot be read does not keep the browser from being stopped: the
+/// running daemon says then whether the browser launched it.
 fn browser_stop(paths: &Paths, yes: bool) -> Result<(), RpcError> {
-    let settings = BrowserSettings::load(paths).map_err(|e| error(codes::INVALID_PARAMS, e))?;
-    let method = match settings.kind {
-        BrowserKind::Stock => "browser.stop",
-        BrowserKind::Fork => {
+    let fork = match BrowserSettings::load(paths) {
+        Ok(settings) => settings.kind == BrowserKind::Fork,
+        Err(e) => {
+            let status: BrowserStatus = call(paths, "browser.status", json!({}))?;
+            eprintln!("pegboard: {e}; going by the running daemon");
+            status.hosted
+        }
+    };
+    let method = match fork {
+        false => "browser.stop",
+        true => {
             if !yes {
                 if !std::io::stdin().is_terminal() {
                     usage(

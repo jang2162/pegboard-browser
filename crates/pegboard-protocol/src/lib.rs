@@ -280,6 +280,10 @@ pub struct BrowserStatus {
     /// Shutdown has begun: the daemon still answers but is about to go away.
     #[serde(default)]
     pub stopping: bool,
+    /// The browser launched this daemon (`pegboard daemon --cdp-pipe`): `browser.stop` is
+    /// refused, and the browser is ended with `browser.quit`.
+    #[serde(default)]
+    pub hosted: bool,
 }
 
 /// One recording as `recording.list` and `recording.keep` tell it.

@@ -42,10 +42,9 @@ impl Env {
     pub fn browser_executable(&self) -> PathBuf {
         match &self.cfg {
             BrowserConfig::Stock { chrome, .. } => chrome.clone(),
-            BrowserConfig::ForkLaunched { binary } if binary.is_dir() => {
-                binary.join("Contents/MacOS/Pegboard")
+            BrowserConfig::ForkLaunched { binary } => {
+                pegboard_core::browser::fork_executable(binary)
             }
-            BrowserConfig::ForkLaunched { binary } => binary.clone(),
         }
     }
 }

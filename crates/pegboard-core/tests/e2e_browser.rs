@@ -109,7 +109,7 @@ async fn human_tab_opened_meanwhile_is_not_mistaken_for_the_agent_profile() {
 #[tokio::test]
 #[ignore]
 async fn hosted_start_closes_leftover_agent_tabs() {
-    use pegboard_core::browser::{test_fork_binary, DevToolsPipes};
+    use pegboard_core::browser::{fork_executable, test_fork_binary, DevToolsPipes};
     use pegboard_core::link::BrowserLink;
 
     std::env::set_var("PEGBOARD_TEST_HOOKS", "1");
@@ -117,11 +117,7 @@ async fn hosted_start_closes_leftover_agent_tabs() {
         eprintln!("skipped: needs PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>");
         return;
     };
-    let exe = if binary.is_dir() {
-        binary.join("Contents/MacOS/Pegboard")
-    } else {
-        binary
-    };
+    let exe = fork_executable(&binary);
     let e = common::env();
     let pipes = DevToolsPipes::new().unwrap();
     let mut cmd = tokio::process::Command::new(&exe);

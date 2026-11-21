@@ -382,11 +382,29 @@ pub struct Home {
     tmp: tempfile::TempDir,
 }
 
+/// The `[browser]` table of every test home: stock mode, so `browser start` starts the
+/// daemon (which launches the fork when `PEGBOARD_TEST_BROWSER=fork:...` says so) and never
+/// opens an installed Pegboard.app, and `browser stop` asks nothing.
+pub const STOCK_BROWSER: &str = "[browser]\nkind = \"stock\"\n";
+
 impl Home {
     pub fn new() -> Home {
-        Home {
+        let home = Home {
             tmp: tempfile::tempdir().unwrap(),
-        }
+        };
+        home.write_config("");
+        home
+    }
+
+    /// Writes `config.toml`: `text`, after `STOCK_BROWSER` unless `text` has a `[browser]`
+    /// table of its own.
+    pub fn write_config(&self, text: &str) {
+        let text = if text.contains("[browser]") {
+            text.to_string()
+        } else {
+            format!("{STOCK_BROWSER}{text}")
+        };
+        std::fs::write(self.path().join("config.toml"), text).unwrap();
     }
 
     pub fn path(&self) -> &Path {
@@ -562,7 +580,7 @@ pub fn screen_home_with(config: &str, env: &[(&str, &str)]) -> Home {
 /// Writes `config` to `home`'s `config.toml` and starts its daemon and browser as
 /// `screen_home_with` does (for a test that puts files in the home first).
 pub fn start_screen_daemon(home: &Home, config: &str, env: &[(&str, &str)]) {
-    std::fs::write(home.path().join("config.toml"), config).unwrap();
+    home.write_config(config);
     let rules = host_rules();
     let browser_rules = browser_only_host_rules();
     let spaces = format!(

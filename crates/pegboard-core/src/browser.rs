@@ -53,7 +53,7 @@ pub fn test_fork_binary() -> Option<PathBuf> {
 }
 
 /// The executable of `binary`: itself, or the one inside it when it is an app bundle.
-fn fork_executable(binary: &Path) -> PathBuf {
+pub fn fork_executable(binary: &Path) -> PathBuf {
     if binary.is_dir() {
         binary.join(FORK_EXECUTABLE)
     } else {
@@ -371,6 +371,11 @@ impl Browser {
             downloads: parts.downloads,
             profile_watch: Some(parts.profile_watch),
         }
+    }
+
+    /// Whether the browser launched the daemon (and hands it its DevTools pipe).
+    pub fn is_hosted(&self) -> bool {
+        self.child.is_none()
     }
 
     /// Whether this is the Pegboard fork (launched or hosting).

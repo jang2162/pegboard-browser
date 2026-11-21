@@ -180,7 +180,7 @@ kind = "fork"                # "fork"(Pegboard.app) 또는 "stock"(순정 Chrome
 - `[browser] kind`는 `pegboard browser start`/`stop`이 어느 브라우저를 다루는지 정한다. 없으면 `/Applications` 또는 `~/Applications`에 `Pegboard.app`이 있을 때 `fork`, 없으면 `stock`.
   - `fork`: `browser start`는 앱을 켜고(`open -b app.pegboard.browser`) 앱이 띄운 데몬이 응답할 때까지 20초 기다린다. 앱이 없으면 `Pegboard.app not found; set [browser] kind = "stock"`. `browser stop`은 브라우저에 종료를 요청한다(`browser.quit`). 사람이 쓰던 창도 모두 닫히므로 터미널에서는 확인을 묻고, 터미널이 아니면 `--yes`가 있어야 한다(없으면 종료 코드 2). MCP에는 이 동작이 없다.
   - `stock`: 지금까지처럼 데몬이 순정 Chrome을 띄우고 끈다.
-- 포크에서는 브라우저가 데몬을 `pegboard daemon --cdp-pipe`로 띄우고 DevTools 파이프(fd 3 읽기, fd 4 쓰기)를 넘긴다. 이 데몬은 `<PEGBOARD_HOME>/daemon.log`에 기록하고, 다른 데몬이 잠금을 쥐고 있으면 종료 코드 4로 끝난다(브라우저는 다시 띄우지 않는다). 시작할 때 에이전트 프로필에 남은 탭을 모두 닫고, 파이프가 끝나면 세션을 정리하고 끝난다. 어느 구성이든 데몬은 브라우저와의 연결이 끊기면 세션을 정리하고 끝난다.
+- 포크에서는 브라우저가 데몬을 `pegboard daemon --cdp-pipe`로 띄우고 DevTools 파이프(fd 3 읽기, fd 4 쓰기)를 넘긴다. 이 데몬은 `<PEGBOARD_HOME>/daemon.log`에 기록하고, 다른 데몬이 잠금을 쥐고 있으면 종료 코드 4로 끝난다(브라우저는 다시 띄우지 않는다). 시작할 때 에이전트 프로필에 남은 탭을 모두 닫고, 파이프가 끝나면 세션을 정리하고 끝난다. 어느 구성이든 데몬은 브라우저와의 연결이 끊기면 세션을 정리하고 끝난다. 브라우저가 띄운 데몬은 `browser.stop` API(MCP 운영자 도구 포함)를 거부한다: 데몬만 끄면 브라우저가 다시 띄우기 때문이다. 브라우저를 끄거나 `pegboard browser stop`을 쓴다. `config.toml`을 읽을 수 없어도 `browser stop`은 떠 있는 데몬에게 물어 그에 맞게 끈다.
 - 데몬이 시작할 때 한 번 읽는다. 바꾸면 `pegboard browser stop`, `pegboard browser start`로 데몬을 다시 띄운다.
 - 잘못 쓰면 `pegboard browser start`가 `invalid_params`와 종료 코드 2로 끝나고(파일 경로와 키를 알려 준다) 데몬이 뜨지 않는다.
 
