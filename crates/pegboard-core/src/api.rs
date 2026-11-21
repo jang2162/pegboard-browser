@@ -39,7 +39,7 @@ impl Drop for SocketFile {
 #[async_trait]
 pub trait Handler: Send + Sync + 'static {
     async fn handle(&self, req: Request) -> Response;
-    /// Called after the answer to a successful `browser.stop` was written.
+    /// Called after the answer to a successful `browser.stop` or `browser.quit` was written.
     fn request_stop(&self) {}
     /// Called when the answer to `req` could not be written (the caller went away). The
     /// handler decides which methods need cleaning up after.
@@ -153,7 +153,7 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
         }
         let (response, stop, request) = match serde_json::from_slice::<Request>(&line) {
             Ok(req) => {
-                let (id, stop) = (req.id, req.method == "browser.stop");
+                let (id, stop) = (req.id, is_stop(&req.method));
                 let kept = req.clone();
                 let d = daemon.clone();
                 // A task of its own: a panic becomes an error, and the work finishes even
@@ -187,6 +187,11 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
             daemon.request_stop();
         }
     }
+}
+
+/// Methods after whose answer the daemon ends.
+fn is_stop(method: &str) -> bool {
+    matches!(method, "browser.stop" | "browser.quit")
 }
 
 async fn write_line(
@@ -307,7 +312,7 @@ impl Client {
             // A page load and the attach of agent-browser.
             "session.create" => Duration::from_secs(180),
             // Closes every session in turn.
-            "browser.stop" => Duration::from_secs(300),
+            "browser.stop" | "browser.quit" => Duration::from_secs(300),
             _ => Duration::from_secs(60),
         };
         let limit = self.limit.unwrap_or(limit);

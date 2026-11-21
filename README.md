@@ -54,7 +54,7 @@ pegboard recording delete <기록 id>   # 진행 중인 녹화는 recording_runn
 pegboard recording prune --dry-run    # 지금 정리하면 지울 것
 
 pegboard session close "$PEGBOARD_SESSION"   # 탭을 닫고 기록을 마감한다
-pegboard browser stop
+pegboard browser stop          # 포크(Pegboard.app)면 브라우저 전체를 끈다: 터미널에서 확인을 받고, 아니면 --yes
 ```
 
 `recording list --json`은 배열이 아니라 객체다: `{"recordings": [...], "totalBytes": …, "keptBytes": …}`. `--session`, `--failed`, `--kept`는 `recordings`만 거르고, `totalBytes`와 `keptBytes`는 거르지 않은 전체 녹화의 크기다.
@@ -172,6 +172,15 @@ screen_off_domains = ["bank.example", "mail.example"]   # 화면을 찍지 않�
 
 - GB는 10^9바이트다. 크기는 0.001(1 MB) 이상.
 - `screen_off_domains`는 그 도메인과 하위 도메인이다(IP 주소도 된다. 한글 도메인은 `xn--` 꼴로 쓴다). 탭의 주 프레임이 그 주소에 있는 동안 화면을 찍지 않고, 재생 화면에는 "화면 기록 꺼짐"으로 보인다(화면만 끈다: 아래 "알려진 한계"의 녹화). 그 주소에서 나온 뒤에는 새 페이지가 처음 그려질 때까지 찍지 않는다(그 사이 몇 장은 잃는다).
+```toml
+[browser]
+kind = "fork"                # "fork"(Pegboard.app) 또는 "stock"(순정 Chrome)
+```
+
+- `[browser] kind`는 `pegboard browser start`/`stop`이 어느 브라우저를 다루는지 정한다. 없으면 `/Applications` 또는 `~/Applications`에 `Pegboard.app`이 있을 때 `fork`, 없으면 `stock`.
+  - `fork`: `browser start`는 앱을 켜고(`open -b app.pegboard.browser`) 앱이 띄운 데몬이 응답할 때까지 20초 기다린다. 앱이 없으면 `Pegboard.app not found; set [browser] kind = "stock"`. `browser stop`은 브라우저에 종료를 요청한다(`browser.quit`). 사람이 쓰던 창도 모두 닫히므로 터미널에서는 확인을 묻고, 터미널이 아니면 `--yes`가 있어야 한다(없으면 종료 코드 2). MCP에는 이 동작이 없다.
+  - `stock`: 지금까지처럼 데몬이 순정 Chrome을 띄우고 끈다.
+- 포크에서는 브라우저가 데몬을 `pegboard daemon --cdp-pipe`로 띄우고 DevTools 파이프(fd 3 읽기, fd 4 쓰기)를 넘긴다. 이 데몬은 `<PEGBOARD_HOME>/daemon.log`에 기록하고, 다른 데몬이 잠금을 쥐고 있으면 종료 코드 4로 끝난다(브라우저는 다시 띄우지 않는다). 시작할 때 에이전트 프로필에 남은 탭을 모두 닫고, 파이프가 끝나면 세션을 정리하고 끝난다. 어느 구성이든 데몬은 브라우저와의 연결이 끊기면 세션을 정리하고 끝난다.
 - 데몬이 시작할 때 한 번 읽는다. 바꾸면 `pegboard browser stop`, `pegboard browser start`로 데몬을 다시 띄운다.
 - 잘못 쓰면 `pegboard browser start`가 `invalid_params`와 종료 코드 2로 끝나고(파일 경로와 키를 알려 준다) 데몬이 뜨지 않는다.
 

@@ -99,6 +99,17 @@ impl AgentContexts {
             .cloned()
     }
 
+    /// Every agent context known now.
+    pub fn contexts(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .by_context
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// The agent profile directory of `context`, when it is an agent context.
     pub fn profile_of(&self, context: &str) -> Option<String> {
         self.inner.read().unwrap().by_context.get(context).cloned()

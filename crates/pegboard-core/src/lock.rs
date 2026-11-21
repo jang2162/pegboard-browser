@@ -8,6 +8,11 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use crate::paths::Paths;
 
+/// The exit code of `pegboard daemon --cdp-pipe` when another process holds the lock (a
+/// daemon of another browser instance, or a stock-mode daemon). The browser does not start
+/// a daemon again after it (F8).
+pub const EXIT_LOCK_HELD: i32 = 4;
+
 /// Held while this value (the open file) lives. The descriptor is close-on-exec, so the
 /// browser and agent-browser processes the daemon starts do not inherit the lock.
 pub struct DaemonLock {

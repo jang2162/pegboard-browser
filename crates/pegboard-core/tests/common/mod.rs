@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::path::PathBuf;
 
-use pegboard_core::browser::{find_chrome, Browser, BrowserConfig};
+use pegboard_core::browser::{find_chrome, test_fork_binary, Browser, BrowserConfig};
 use pegboard_core::cdp::{page_targets, CdpConn};
 use pegboard_core::paths::{paths_in, Paths};
 use tempfile::TempDir;
@@ -14,17 +14,39 @@ pub struct Env {
     _tmp: TempDir,
 }
 
-/// Fresh temporary pegboard home plus the repository's bridge extension.
+/// Fresh temporary pegboard home plus the browser to launch: stock Chrome with the
+/// repository's bridge extension, or the Pegboard fork when the test variable
+/// `PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>` says so (with `PEGBOARD_TEST_HOOKS`).
 pub fn env() -> Env {
     let tmp = tempfile::tempdir().unwrap();
-    let extension_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extension/bridge");
+    let cfg = match test_fork_binary() {
+        Some(binary) => BrowserConfig::ForkLaunched { binary },
+        None => {
+            let extension_dir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extension/bridge");
+            BrowserConfig::Stock {
+                chrome: find_chrome().unwrap(),
+                extension_dir: extension_dir.canonicalize().unwrap(),
+            }
+        }
+    };
     Env {
         paths: paths_in(tmp.path()),
-        cfg: BrowserConfig {
-            chrome: find_chrome().unwrap(),
-            extension_dir: extension_dir.canonicalize().unwrap(),
-        },
+        cfg,
         _tmp: tmp,
+    }
+}
+
+impl Env {
+    /// The browser executable (invoked again to open a window in the running browser).
+    pub fn browser_executable(&self) -> PathBuf {
+        match &self.cfg {
+            BrowserConfig::Stock { chrome, .. } => chrome.clone(),
+            BrowserConfig::ForkLaunched { binary } if binary.is_dir() => {
+                binary.join("Contents/MacOS/Pegboard")
+            }
+            BrowserConfig::ForkLaunched { binary } => binary.clone(),
+        }
     }
 }
 
@@ -492,7 +514,7 @@ pub async fn establish_human_premise(
         .into_iter()
         .map(|t| t.target_id)
         .collect();
-    let status = tokio::process::Command::new(&env.cfg.chrome)
+    let status = tokio::process::Command::new(env.browser_executable())
         .arg(format!(
             "--user-data-dir={}",
             env.paths.chrome_udd.display()
@@ -592,7 +614,7 @@ impl SessionFixture {
 }
 
 pub async fn session_fixture() -> SessionFixture {
-    use pegboard_core::bridge::{ExtensionBridge, TabBridge};
+    use pegboard_core::bridge::TabBridge;
     use pegboard_core::proxy::server::{LinkUpstream, ProxyServer};
     use std::sync::Arc;
 
@@ -611,15 +633,8 @@ pub async fn session_fixture() -> SessionFixture {
         .navigate(&human_session, &format!("{}/cookie/set", fixture.origin))
         .await
         .unwrap();
-    let agent_context = browser
-        .open_profile_window(&env.paths, &env.cfg, "PegboardAgent")
-        .await
-        .unwrap();
-    let bridge: Arc<dyn TabBridge> = Arc::new(
-        ExtensionBridge::attach(&browser.conn, &agent_context)
-            .await
-            .unwrap(),
-    );
+    let agent_context = browser.open_profile_window("PegboardAgent").await.unwrap();
+    let bridge: Arc<dyn TabBridge> = browser.tab_bridge(&agent_context).await.unwrap();
     let (group, first_target) = bridge.create_group("proxy", "blue").await.unwrap();
     let upstream = Arc::new(LinkUpstream {
         link: browser.link.clone(),
@@ -812,7 +827,6 @@ impl Shared {
             proxy.clone(),
             profiles,
             env.paths.clone(),
-            env.cfg.clone(),
             recorder.clone(),
             vec![replay.port()],
         );
@@ -841,14 +855,10 @@ impl Shared {
             .get_or_init(|| async {
                 let ctx = self
                     .browser
-                    .open_profile_window(&self.env.paths, &self.env.cfg, "PegboardAgent")
+                    .open_profile_window("PegboardAgent")
                     .await
                     .unwrap();
-                let bridge =
-                    pegboard_core::bridge::ExtensionBridge::attach(&self.browser.conn, &ctx)
-                        .await
-                        .unwrap();
-                let bridge: Arc<dyn pegboard_core::bridge::TabBridge> = Arc::new(bridge);
+                let bridge = self.browser.tab_bridge(&ctx).await.unwrap();
                 (ctx, bridge)
             })
             .await

@@ -815,3 +815,164 @@ fn browser_start_refuses_a_bad_config() {
     let (_, _, err) = home.run_limited(&env, &["browser", "start"], 30);
     assert!(!err.contains("config.toml"), "{err}");
 }
+
+/// Review Focus 5: a browser that starts a daemon while another daemon holds the lock (a
+/// stock-mode daemon, or a second browser instance's) gets exit code 4 and the daemon that
+/// holds the lock is left be. The pipe is the browser's: fds 3 and 4 of the child.
+#[test]
+fn hosted_daemon_exits_4_when_the_lock_is_held() {
+    use std::os::unix::process::CommandExt;
+
+    let home = Home::new();
+    let paths = pegboard_core::paths::paths_in(home.path());
+    let held = pegboard_core::lock::DaemonLock::try_acquire(&paths)
+        .unwrap()
+        .expect("the lock is free in a new home");
+    let pipes = pegboard_core::browser::DevToolsPipes::new().unwrap();
+    let mut cmd = home.command(&["daemon", "--cdp-pipe"]);
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    // SAFETY: the closure only makes async-signal-safe system calls.
+    unsafe { cmd.pre_exec(pipes.child_setup()) };
+    let mut child = cmd.spawn().unwrap();
+    // The browser's ends stay open: the daemon must not wait for the pipe to end.
+    let _browser_ends = pipes.into_parent_ends();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the daemon did not end within 10 s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(pegboard_core::lock::EXIT_LOCK_HELD));
+    assert_eq!(pegboard_core::lock::EXIT_LOCK_HELD, 4);
+    // It wrote why in its own log (the browser gives it none), and the log is the owner's.
+    let log_path = home.path().join("daemon.log");
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("another daemon holds"), "{log}");
+    let mode = std::fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    // The lock is still the holder's.
+    assert!(pegboard_core::lock::DaemonLock::try_acquire(&paths)
+        .unwrap()
+        .is_none());
+    drop(held);
+}
+
+/// `pegboard daemon --cdp-pipe` without the pipe is a usage error.
+#[test]
+fn hosted_daemon_without_the_pipe_is_a_usage_error() {
+    let home = Home::new();
+    // The test runner's fds 3 and 4 are not handed on: `Command` closes them on exec.
+    let (code, _, _) = home.run(&["daemon", "--cdp-pipe"]);
+    assert_eq!(code, 2);
+    let log = std::fs::read_to_string(home.path().join("daemon.log")).unwrap();
+    assert!(log.contains("fds 3 and 4"), "{log}");
+}
+
+/// A daemon stand-in on the home's socket: answers every request with an empty result and
+/// records the methods. After `browser.stop` or `browser.quit` it removes the socket, as the
+/// daemon does.
+fn fake_daemon(home: &Home) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    use std::io::{BufRead, BufReader, Write};
+    let socket = home.path().join("pegboardd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let req = json(&line);
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                log.lock().unwrap().push(method.clone());
+                let answer = serde_json::json!({ "jsonrpc": "2.0", "id": req["id"], "result": {} });
+                let _ = writeln!(writer, "{answer}");
+                if method == "browser.stop" || method == "browser.quit" {
+                    let _ = std::fs::remove_file(&socket);
+                    return;
+                }
+                line.clear();
+            }
+        }
+    });
+    seen
+}
+
+/// On the fork, `browser stop` closes the person's windows too: without a terminal it needs
+/// `--yes` (usage error, nothing asked of the daemon); with it, it asks `browser.quit`.
+#[test]
+fn stop_without_a_terminal_needs_yes() {
+    let home = Home::new();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[browser]\nkind = \"fork\"\n",
+    )
+    .unwrap();
+    let seen = fake_daemon(&home);
+    let (code, _, err) = home.run(&["browser", "stop"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--yes"), "{err}");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+    let (code, out, err) = home.run(&["browser", "stop", "--yes"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), "stopped");
+    assert_eq!(*seen.lock().unwrap(), vec!["browser.quit".to_string()]);
+}
+
+/// Stock mode stops as before: `browser.stop`, no question, `--yes` or not.
+#[test]
+fn stock_stop_asks_nothing() {
+    let home = Home::new();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[browser]\nkind = \"stock\"\n",
+    )
+    .unwrap();
+    let seen = fake_daemon(&home);
+    let (code, out, err) = home.run(&["browser", "stop"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), "stopped");
+    assert_eq!(*seen.lock().unwrap(), vec!["browser.stop".to_string()]);
+}
+
+/// The fork chosen in the file and not installed: a clear error, and no daemon is started.
+#[test]
+fn fork_start_without_the_app_says_how_to_go_on() {
+    let home = Home::new();
+    let apps = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[browser]\nkind = \"fork\"\n",
+    )
+    .unwrap();
+    let apps_dir = apps.path().display().to_string();
+    let (code, _, err) = home.run_env(
+        &[
+            ("PEGBOARD_TEST_HOOKS", "1"),
+            ("PEGBOARD_TEST_APPLICATIONS", apps_dir.as_str()),
+        ],
+        &["browser", "start"],
+    );
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("Pegboard.app not found; set [browser] kind = \"stock\""),
+        "{err}"
+    );
+    assert!(!home.path().join("daemon.pid").exists());
+    // A wrong kind is a usage error, before anything starts.
+    std::fs::write(home.path().join("config.toml"), "[browser]\nkind = \"x\"\n").unwrap();
+    let (code, _, err) = home.run(&["browser", "start"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("config.toml") && err.contains("kind"), "{err}");
+}

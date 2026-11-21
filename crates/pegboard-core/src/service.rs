@@ -20,9 +20,10 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
 use crate::actionlog::{ActionLog, Manifest, SessionLog};
-use crate::browser::{find_chrome, Browser, BrowserConfig};
+use crate::browser::{find_chrome, test_fork_binary, Browser, BrowserConfig};
 use crate::daemon::run_command;
 use crate::downloads::list_files;
+use crate::link::BrowserLink;
 use crate::paths::{ensure, Paths};
 use crate::profiles::{rpc_error, Profiles};
 use crate::proxy::server::{LinkUpstream, ProxyServer};
@@ -370,9 +371,49 @@ fn to_value<T: Serialize>(v: T) -> Result<Value, RpcError> {
     serde_json::to_value(v).map_err(|e| internal(e.to_string()))
 }
 
+/// How the daemon gets its browser.
+pub enum DaemonStart {
+    /// The daemon launches the browser and closes it when it ends.
+    Launch(BrowserConfig),
+    /// The browser launched the daemon (`pegboard daemon --cdp-pipe`) and handed it this
+    /// DevTools pipe. The daemon neither launches nor closes it.
+    Hosted(BrowserLink),
+}
+
+/// The browser `pegboard daemon` launches: the fork when the test variable
+/// `PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>` says so (F13), else stock Chrome with the
+/// bridge extension.
+pub fn launch_config() -> anyhow::Result<BrowserConfig> {
+    if let Some(binary) = test_fork_binary() {
+        return Ok(BrowserConfig::ForkLaunched { binary });
+    }
+    Ok(BrowserConfig::Stock {
+        chrome: find_chrome()?,
+        extension_dir: find_extension()?,
+    })
+}
+
+/// Returns once the browser has ended: its connection ended (in every configuration: a
+/// daemon whose link is gone cannot reconnect its guard, recorder or downloads), or
+/// `exited` says so (checked every half second).
+async fn browser_ended(link: &BrowserLink, exited: impl Fn() -> bool) {
+    let polled = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if exited() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        _ = link.closed() => {}
+        _ = polled => {}
+    }
+}
+
 impl Daemon {
-    /// Starts the browser, the proxy and everything that depends on them.
-    pub async fn start(paths: Paths) -> anyhow::Result<Arc<Daemon>> {
+    /// Starts (or takes over) the browser, the proxy and everything that depends on them.
+    pub async fn start(paths: Paths, how: DaemonStart) -> anyhow::Result<Arc<Daemon>> {
         // Before anything is started: a daemon does not run with settings it cannot use.
         let recording = RecordingConfig::load(&paths).map_err(|e| anyhow!(e))?;
         ensure(&paths)?;
@@ -380,12 +421,11 @@ impl Daemon {
         let runner =
             Arc::new(Runner::new(paths.clone()).map_err(|e| anyhow!("{}: {}", e.code, e.message))?);
         runner.cleanup_leftovers();
-        let cfg = BrowserConfig {
-            chrome: find_chrome()?,
-            extension_dir: find_extension()?,
-        };
-        let browser = Arc::new(Browser::launch(&paths, &cfg).await?);
-        match Self::assemble(paths, runner, browser.clone(), cfg, recording).await {
+        let browser = Arc::new(match how {
+            DaemonStart::Launch(cfg) => Browser::launch(&paths, &cfg).await?,
+            DaemonStart::Hosted(link) => Browser::hosted(&paths, link).await?,
+        });
+        match Self::assemble(paths, runner, browser.clone(), recording).await {
             Ok(daemon) => Ok(daemon),
             Err(e) => {
                 browser.close().await;
@@ -398,7 +438,6 @@ impl Daemon {
         paths: Paths,
         runner: Arc<Runner>,
         browser: Arc<Browser>,
-        cfg: BrowserConfig,
         recording: RecordingConfig,
     ) -> anyhow::Result<Arc<Daemon>> {
         let version = browser
@@ -428,7 +467,6 @@ impl Daemon {
             proxy.clone(),
             profiles,
             paths.clone(),
-            cfg,
             recorder.clone(),
             vec![replay.port()],
         );
@@ -462,16 +500,18 @@ impl Daemon {
                 let context = context.to_string();
                 tokio::spawn(async move { d.close_sessions_in(&context).await });
             }));
-        // The daemon ends with its browser.
+        // The daemon ends with its browser, or with its connection to it.
         let weak = Arc::downgrade(&daemon);
+        let link = daemon.browser.link.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let Some(d) = weak.upgrade() else { return };
-                if d.browser.has_exited() {
-                    d.request_stop();
-                    return;
-                }
+            let exited = {
+                let weak = weak.clone();
+                move || weak.upgrade().is_none_or(|d| d.browser.has_exited())
+            };
+            browser_ended(&link, exited).await;
+            if let Some(d) = weak.upgrade() {
+                eprintln!("pegboard: the browser or its connection ended; stopping");
+                d.request_stop();
             }
         });
         // Retention: recordings cut off by an earlier daemon get their end, then the rules
@@ -598,6 +638,14 @@ impl Daemon {
             "browser.status" => to_value(self.status()),
             "browser.stop" => {
                 self.shutdown().await;
+                Ok(json!({}))
+            }
+            // The browser ends, whoever launched it (`pegboard browser stop` on the fork):
+            // the sessions close first, then `Browser.close` on the control connection. Not
+            // offered over MCP.
+            "browser.quit" => {
+                self.shutdown().await;
+                self.browser.quit().await;
                 Ok(json!({}))
             }
             "profile.list" => to_value(self.sessions.list_profiles().await),
@@ -1056,7 +1104,8 @@ impl Daemon {
         result
     }
 
-    /// Closes every session and the browser. Safe to call more than once.
+    /// Closes every session, then the browser if the daemon launched it. Safe to call more
+    /// than once.
     pub async fn shutdown(&self) {
         let mut done = self.shutdown_done.lock().await;
         if *done {
@@ -1124,6 +1173,30 @@ impl crate::api::Handler for Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon's stop path follows its link: when the physical connection ends (pipe EOF,
+    /// websocket gone), `browser_ended` returns and the daemon is asked to stop, in every
+    /// configuration, even when the browser process looks alive.
+    #[tokio::test]
+    async fn the_daemon_stops_when_its_link_ends() {
+        let (link, mut fake) = crate::link::fake::FakeBrowser::start();
+        let ended = tokio::spawn({
+            let link = link.clone();
+            async move { browser_ended(&link, || false).await }
+        });
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!ended.is_finished(), "ended while the link was up");
+        fake.disconnect();
+        tokio::time::timeout(Duration::from_secs(3), ended)
+            .await
+            .expect("the link's end was not seen")
+            .unwrap();
+        // The browser process ending is seen too, with the link up.
+        let (link, _fake) = crate::link::fake::FakeBrowser::start();
+        tokio::time::timeout(Duration::from_secs(3), browser_ended(&link, || true))
+            .await
+            .expect("the browser's exit was not seen");
+    }
 
     #[test]
     fn misspelt_fields_of_create_and_close_are_invalid_params() {

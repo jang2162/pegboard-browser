@@ -45,12 +45,14 @@ impl Default for RecordingConfig {
     }
 }
 
-/// The whole file: only a `[recording]` table.
+/// The whole file: a `[recording]` table and a `[browser]` table, which `settings` reads.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     #[serde(default)]
     recording: RecordingConfig,
+    #[serde(default, rename = "browser")]
+    _browser: Option<toml::Table>,
 }
 
 impl RecordingConfig {
@@ -162,6 +164,15 @@ fn toml_error(text: &str, e: &toml::de::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_browser_table_is_the_settings_not_an_unknown_table() {
+        let c =
+            RecordingConfig::parse("[browser]\nkind = \"fork\"\n[recording]\nmax_age_days = 3\n")
+                .unwrap();
+        assert_eq!(c.max_age_days, 3);
+        assert!(RecordingConfig::parse("[brwser]\nkind = \"fork\"\n").is_err());
+    }
 
     #[test]
     fn defaults_without_a_file() {

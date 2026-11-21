@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::eventually;
-use pegboard_core::bridge::{ExtensionBridge, GroupId, TabBridge};
+use pegboard_core::bridge::{GroupId, TabBridge};
 use pegboard_core::browser::Browser;
 use pegboard_core::cdp::page_targets;
 use pegboard_core::profiles::Profiles;
@@ -81,15 +81,8 @@ struct OwnHarness {
 impl OwnHarness {
     async fn start() -> OwnHarness {
         let (env, fixture, browser) = common::launched().await;
-        let agent = browser
-            .open_profile_window(&env.paths, &env.cfg, "PegboardAgent")
-            .await
-            .unwrap();
-        let bridge: Arc<dyn TabBridge> = Arc::new(
-            ExtensionBridge::attach(&browser.conn, &agent)
-                .await
-                .unwrap(),
-        );
+        let agent = browser.open_profile_window("PegboardAgent").await.unwrap();
+        let bridge: Arc<dyn TabBridge> = browser.tab_bridge(&agent).await.unwrap();
         let upstream = Arc::new(LinkUpstream {
             link: browser.link.clone(),
         });
@@ -108,7 +101,6 @@ impl OwnHarness {
             proxy.clone(),
             profiles,
             env.paths.clone(),
-            env.cfg.clone(),
             recorder,
             Vec::new(),
         );

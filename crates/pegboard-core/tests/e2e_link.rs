@@ -805,9 +805,12 @@ async fn the_daemon_opens_one_browser_connection() {
     let _hooks = EnvVar::set("PEGBOARD_TEST_HOOKS", "1");
     let env = common::env();
     let fixture = common::fixture().await;
-    let daemon = pegboard_core::service::Daemon::start(env.paths.clone())
-        .await
-        .unwrap();
+    let daemon = pegboard_core::service::Daemon::start(
+        env.paths.clone(),
+        pegboard_core::service::DaemonStart::Launch(env.cfg.clone()),
+    )
+    .await
+    .unwrap();
     let mut next = 0;
     let mut call = |method: &str, params: Value| {
         next += 1;

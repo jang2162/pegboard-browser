@@ -1,7 +1,7 @@
 //! The `pegboard` command line: manages the daemon, profiles, sessions and recordings, and
 //! sends every other command to agent-browser through the daemon.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -14,12 +14,15 @@ use clap::{Parser, Subcommand};
 use pegboard_core::actionlog::{valid_recording_id, ActionEntry, EntryKind};
 use pegboard_core::api::{serve, Client};
 use pegboard_core::daemon::Daemon;
-use pegboard_core::lock::DaemonLock;
+use pegboard_core::link::BrowserLink;
+use pegboard_core::lock::{DaemonLock, EXIT_LOCK_HELD};
 use pegboard_core::paths::{ensure_home, paths, socket_path_fits, Paths};
 use pegboard_core::policy;
 use pegboard_core::recording::config::RecordingConfig;
 use pegboard_core::recording::screen::valid_frame_name;
 use pegboard_core::runner::succeeded;
+use pegboard_core::service::{launch_config, DaemonStart};
+use pegboard_core::settings::{installed_app, BrowserKind, BrowserSettings, BUNDLE_ID};
 use pegboard_protocol::{
     codes, ActionClass, BrowserStatus, CommandExecParams, CommandExecResult, FileInfo, ProfileInfo,
     RecordExtra, RecordingList, RecordingSummary, RpcError, SessionCreateParams, SessionId,
@@ -106,7 +109,12 @@ enum Cmd {
         policy: PolicyArgs,
     },
     #[command(hide = true)]
-    Daemon,
+    Daemon {
+        /// Run hosted by the browser, on the DevTools pipe it hands over: read fd 3, write
+        /// fd 4. Exits 4 when another daemon holds the lock.
+        #[arg(long)]
+        cdp_pipe: bool,
+    },
     #[command(external_subcommand)]
     Agent(Vec<String>),
 }
@@ -114,7 +122,11 @@ enum Cmd {
 #[derive(Subcommand)]
 enum BrowserCmd {
     Start,
-    Stop,
+    Stop {
+        /// Do not ask before closing the Pegboard browser (it closes every window of it).
+        #[arg(long)]
+        yes: bool,
+    },
     Status,
 }
 
@@ -327,7 +339,7 @@ fn print_json<T: Serialize>(value: &T) {
 fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
     let json = cli.json;
     match cli.command {
-        Cmd::Daemon => daemon_main(paths),
+        Cmd::Daemon { cdp_pipe } => daemon_main(paths, cdp_pipe),
         Cmd::Mcp {
             operator,
             tools,
@@ -359,7 +371,7 @@ fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
                 );
                 Ok(())
             }
-            BrowserCmd::Stop => browser_stop(paths),
+            BrowserCmd::Stop { yes } => browser_stop(paths, yes),
             BrowserCmd::Status => {
                 let s: BrowserStatus = call(paths, "browser.status", json!({}))?;
                 if json {
@@ -1099,12 +1111,60 @@ fn daemon_is_usable(paths: &Paths) -> bool {
         .is_ok_and(|s| !s.stopping)
 }
 
-/// Starts the daemon unless one is usable; `true` when this call started it. A
-/// `config.toml` that cannot be used is a usage error, found before anything starts (the
-/// daemon checks it again).
+/// Starts the browser and its daemon unless a daemon is usable; `true` when this call
+/// started it. A `config.toml` that cannot be used is a usage error, found before anything
+/// starts (the daemon checks it again). Stock: the daemon is started, and it launches
+/// Chrome. Fork: the Pegboard app is opened, and it starts the daemon.
 pub(crate) fn browser_start(paths: &Paths) -> Result<bool, RpcError> {
     RecordingConfig::load(paths).map_err(|e| error(codes::INVALID_PARAMS, e))?;
+    let settings = BrowserSettings::load(paths).map_err(|e| error(codes::INVALID_PARAMS, e))?;
     ensure_home(paths).map_err(|e| io_failure("creating the pegboard home", e))?;
+    match settings.kind {
+        BrowserKind::Stock => start_daemon(paths),
+        BrowserKind::Fork => start_app(paths),
+    }
+}
+
+/// The message when the fork is chosen and not installed.
+const APP_NOT_FOUND: &str = "Pegboard.app not found; set [browser] kind = \"stock\"";
+
+/// Opens the Pegboard app (`open -b`) unless its daemon is usable, and waits for the daemon
+/// it starts to answer.
+fn start_app(paths: &Paths) -> Result<bool, RpcError> {
+    if daemon_is_usable(paths) {
+        return Ok(false);
+    }
+    if installed_app().is_none() {
+        return Err(error(codes::BROWSER_FAILED, APP_NOT_FOUND));
+    }
+    let opened = Command::new("open")
+        .args(["-b", BUNDLE_ID])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| io_failure("running open", e))?;
+    if !opened.success() {
+        return Err(error(codes::BROWSER_FAILED, APP_NOT_FOUND));
+    }
+    let deadline = Instant::now() + START_TIMEOUT;
+    while !daemon_is_usable(paths) {
+        if Instant::now() >= deadline {
+            return Err(error(
+                codes::BROWSER_FAILED,
+                format!(
+                    "Pegboard's daemon did not answer within 20 s; see {}",
+                    paths.home.join("daemon.log").display()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(true)
+}
+
+/// Starts the daemon (which launches the browser) unless one is usable.
+fn start_daemon(paths: &Paths) -> Result<bool, RpcError> {
     let log_path = paths.home.join("daemon.log");
     let deadline = Instant::now() + START_TIMEOUT;
     let mut child: Option<std::process::Child> = None;
@@ -1149,8 +1209,32 @@ pub(crate) fn browser_start(paths: &Paths) -> Result<bool, RpcError> {
     }
 }
 
-fn browser_stop(paths: &Paths) -> Result<(), RpcError> {
-    let _: Value = call(paths, "browser.stop", json!({}))?;
+/// Stock: the daemon closes its sessions and its browser (`browser.stop`). Fork: the
+/// browser is asked to quit (`browser.quit`), which closes the person's windows too, so a
+/// person at a terminal confirms it and anyone else passes `--yes`.
+fn browser_stop(paths: &Paths, yes: bool) -> Result<(), RpcError> {
+    let settings = BrowserSettings::load(paths).map_err(|e| error(codes::INVALID_PARAMS, e))?;
+    let method = match settings.kind {
+        BrowserKind::Stock => "browser.stop",
+        BrowserKind::Fork => {
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    usage(
+                        "browser stop closes every Pegboard window, including yours; \
+                         pass --yes when not at a terminal",
+                    );
+                }
+                if !confirmed(
+                    "This closes every Pegboard window, including yours. Continue? [y/N] ",
+                ) {
+                    eprintln!("pegboard: not stopped");
+                    return Ok(());
+                }
+            }
+            "browser.quit"
+        }
+    };
+    let _: Value = call(paths, method, json!({}))?;
     // The daemon answers first and then removes its socket.
     let deadline = Instant::now() + STOP_TIMEOUT;
     while socket_answers(paths) {
@@ -1163,11 +1247,39 @@ fn browser_stop(paths: &Paths) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// `pegboard daemon`: runs until `browser.stop`, SIGTERM/SIGINT or the browser's end. On
-/// every path the sessions close first, then the browser, then the socket goes, and the
-/// lock is released when the process exits.
-fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
+/// Asks on the terminal; only `y` or `yes` is a yes.
+fn confirmed(question: &str) -> bool {
+    eprint!("{question}");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// `pegboard daemon`: runs until `browser.stop` (or `browser.quit`), SIGTERM/SIGINT, or the
+/// end of the browser or of the connection to it. On every path the sessions close first,
+/// then the browser (when the daemon launched it), then the socket goes, and the lock is
+/// released when the process exits.
+///
+/// With `--cdp-pipe` the browser launched this daemon and handed it a DevTools pipe on fds 3
+/// (read) and 4 (write): the daemon writes its own log, takes the pipe, and exits
+/// `EXIT_LOCK_HELD` when another daemon holds the lock.
+fn daemon_main(paths: &Paths, cdp_pipe: bool) -> Result<(), RpcError> {
     ensure_home(paths).map_err(|e| io_failure("creating the pegboard home", e))?;
+    if cdp_pipe {
+        log_to_daemon_log(paths)?;
+    }
+    let pipe = if cdp_pipe {
+        Some(inherited_pipe().unwrap_or_else(|e| {
+            usage(&format!(
+                "--cdp-pipe needs the DevTools pipe on fds 3 and 4: {e}"
+            ))
+        }))
+    } else {
+        None
+    };
     // Before anything is started or cleaned up, and held until the process ends.
     // A short grace: a client probing the lock (see `lock_is_held`) holds it for an instant.
     // It must stay short: a daemon that waits long could take over the lock from a daemon
@@ -1180,6 +1292,14 @@ fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(20));
             }
+            Ok(None) if cdp_pipe => {
+                // The browser does not start this daemon again (F8).
+                eprintln!(
+                    "pegboard: another daemon holds {}; not starting",
+                    paths.home.join("daemon.lock").display()
+                );
+                std::process::exit(EXIT_LOCK_HELD);
+            }
             Ok(None) => return Err(error(codes::INTERNAL, "already running")),
             Err(e) => return Err(io_failure("taking the daemon lock", e)),
         }
@@ -1191,7 +1311,11 @@ fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate())?;
         let mut int = signal(SignalKind::interrupt())?;
-        let daemon = Daemon::start(paths.clone()).await?;
+        let how = match pipe {
+            Some((read, write)) => DaemonStart::Hosted(BrowserLink::pipe(read, write)?),
+            None => DaemonStart::Launch(launch_config()?),
+        };
+        let daemon = Daemon::start(paths.clone(), how).await?;
         let mut pid = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -1225,6 +1349,48 @@ fn daemon_main(paths: &Paths) -> Result<(), RpcError> {
     });
     let _ = std::fs::remove_file(&pid_file);
     result.map_err(|e: anyhow::Error| error(codes::INTERNAL, format!("{e:#}")))
+}
+
+/// A hosted daemon's stdout and stderr go to `<home>/daemon.log` (appended, owner only):
+/// the browser gives it no log of its own.
+fn log_to_daemon_log(paths: &Paths) -> Result<(), RpcError> {
+    use std::os::fd::AsRawFd;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(paths.home.join("daemon.log"))
+        .map_err(|e| io_failure("opening daemon.log", e))?;
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: plain dup2 of an open descriptor onto a standard one.
+        if unsafe { libc::dup2(log.as_raw_fd(), fd) } < 0 {
+            return Err(io_failure(
+                "sending output to daemon.log",
+                std::io::Error::last_os_error(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The DevTools pipe the browser handed over: fd 3 to read, fd 4 to write. They are made
+/// close-on-exec, so agent-browser and other children of the daemon never hold the pipe
+/// (the browser must see its end when the daemon goes).
+fn inherited_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    for fd in [3, 4] {
+        // SAFETY: fcntl on a descriptor number; it fails cleanly when nothing is open there.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    // SAFETY: both are open (checked above) and nothing else in this process owns them.
+    Ok(unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(3),
+            std::os::fd::OwnedFd::from_raw_fd(4),
+        )
+    })
 }
 
 #[cfg(test)]

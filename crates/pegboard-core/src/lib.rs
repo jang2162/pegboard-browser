@@ -19,5 +19,6 @@ pub mod recording;
 pub mod runner;
 pub mod service;
 pub mod session;
+pub mod settings;
 pub mod testenv;
 pub mod upload;

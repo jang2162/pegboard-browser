@@ -20,8 +20,8 @@ use tokio::sync::{broadcast, OnceCell};
 use tokio::task::JoinHandle;
 
 use crate::address::Verdict;
-use crate::bridge::{ExtensionBridge, GroupId, TabBridge};
-use crate::browser::{Browser, BrowserConfig};
+use crate::bridge::{GroupId, TabBridge};
+use crate::browser::Browser;
 use crate::cdp::{page_targets, CdpConn, CdpEvent};
 use crate::downloads::{PolicyLost, Report, SessionView};
 use crate::guard::{judge_request, Guard, Resolver};
@@ -160,7 +160,6 @@ struct Inner {
     /// in it, so a profile cannot be deleted while a session is being created in it.
     profiles: tokio::sync::Mutex<Profiles>,
     paths: Paths,
-    cfg: BrowserConfig,
     /// Profile name -> its runtime. The async lock also keeps two callers from opening
     /// the same profile's window twice.
     runtimes: tokio::sync::Mutex<HashMap<String, Arc<ProfileRuntime>>>,
@@ -204,7 +203,6 @@ impl SessionManager {
         proxy: Arc<ProxyServer>,
         profiles: Profiles,
         paths: Paths,
-        cfg: BrowserConfig,
         recorder: Arc<Recorder>,
         extra_own_ports: Vec<u16>,
     ) -> Self {
@@ -254,7 +252,6 @@ impl SessionManager {
             proxy,
             profiles: tokio::sync::Mutex::new(profiles),
             paths,
-            cfg,
             runtimes: tokio::sync::Mutex::new(HashMap::new()),
             table: Mutex::new(Table::default()),
             pins,
@@ -1166,7 +1163,7 @@ impl Inner {
         let mut runtimes = self.runtimes.lock().await;
         let context = self
             .browser
-            .open_profile_window(&self.paths, &self.cfg, &profile_dir(name))
+            .open_profile_window(&profile_dir(name))
             .await
             .map_err(browser_failed)?;
         self.contexts
@@ -1178,11 +1175,11 @@ impl Inner {
                 return Ok(rt.clone());
             }
         }
-        let bridge: Arc<dyn TabBridge> = Arc::new(
-            ExtensionBridge::attach(&self.browser.conn, &context)
-                .await
-                .map_err(browser_failed)?,
-        );
+        let bridge: Arc<dyn TabBridge> = self
+            .browser
+            .tab_bridge(&context)
+            .await
+            .map_err(browser_failed)?;
         // Tab switches in the profile, for the recordings (a person's possible intervention).
         let recorder = self.recorder.clone();
         bridge
