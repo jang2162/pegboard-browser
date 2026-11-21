@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use tokio::sync::watch;
+
 /// Whether `dir` is an agent profile's directory name.
 pub fn is_agent_profile_dir(dir: &str) -> bool {
     dir == AGENT_PROFILE_DIR || dir.starts_with(AGENT_PROFILE_PREFIX)
@@ -31,9 +33,20 @@ impl Maps {
 }
 
 /// The browser contexts of the agent profiles that are loaded now, by profile directory.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AgentContexts {
     inner: Arc<RwLock<Maps>>,
+    /// Bumped whenever a context becomes an agent's (`subscribe`).
+    added: Arc<watch::Sender<u64>>,
+}
+
+impl Default for AgentContexts {
+    fn default() -> Self {
+        AgentContexts {
+            inner: Arc::default(),
+            added: Arc::new(watch::channel(0).0),
+        }
+    }
 }
 
 impl AgentContexts {
@@ -45,6 +58,9 @@ impl AgentContexts {
             return;
         }
         let mut m = self.inner.write().unwrap();
+        if m.by_profile.get(profile_dir).map(String::as_str) == Some(context) {
+            return;
+        }
         if let Some(old) = m.by_profile.remove(profile_dir) {
             m.by_context.remove(&old);
         }
@@ -53,6 +69,14 @@ impl AgentContexts {
             .insert(profile_dir.to_string(), context.to_string());
         m.by_context
             .insert(context.to_string(), profile_dir.to_string());
+        drop(m);
+        self.added.send_modify(|n| *n += 1);
+    }
+
+    /// Told (changed) whenever a context becomes an agent profile's: targets of it that were
+    /// there before were taken for a person's and need looking at again (the request guard).
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.added.subscribe()
     }
 
     /// The context is gone (Chrome unloaded the profile): it counts as the person's again.
@@ -141,6 +165,22 @@ mod tests {
         assert!(!a.is_agent("C1"));
         assert_eq!(a.context_of("PegboardAgent"), None);
         assert!(a.is_agent("W1"));
+    }
+
+    #[test]
+    fn a_new_agent_context_is_announced() {
+        let a = AgentContexts::default();
+        let mut rx = a.subscribe();
+        a.set("PegboardAgent", "C1");
+        assert!(rx.has_changed().unwrap());
+        rx.mark_unchanged();
+        // The same context again, a person's profile, a forgotten one: nothing new.
+        a.set("PegboardAgent", "C1");
+        a.set("Default", "H1");
+        a.forget_context("C1");
+        assert!(!rx.has_changed().unwrap());
+        a.set("PegboardAgent", "C2");
+        assert!(rx.has_changed().unwrap());
     }
 
     #[test]

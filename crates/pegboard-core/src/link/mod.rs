@@ -9,6 +9,8 @@
 //! the browser: its browser session's id is taken off what it receives, as a top-level
 //! connection sees no session id there.
 
+#[cfg(test)]
+pub(crate) mod fake;
 mod mux;
 mod transport;
 

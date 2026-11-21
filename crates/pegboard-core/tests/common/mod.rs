@@ -532,6 +532,10 @@ pub async fn establish_human_premise(
 /// with): the one context of the open pages that is not an agent profile's. Panics when there
 /// is none or more than one (the tests run one human profile), so an agent window landing in
 /// the human profile is caught here too.
+///
+/// Panics too when called while an agent profile's window is opening
+/// (`Browser::open_profile_window` not returned yet): its context is not an agent's until
+/// then, so two non-agent contexts are seen. Call it before opening one, or after.
 pub async fn human_context(browser: &Browser) -> String {
     let mut contexts: Vec<String> = page_targets(&browser.conn)
         .await

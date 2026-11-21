@@ -36,7 +36,7 @@
 //!   `clipboard-write` denial that stops `navigator.clipboard` is the download policy
 //!   connection's job (`downloads`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -632,6 +632,9 @@ struct State {
     early_pending: Pending,
     /// The current connection's event loop runs (`ready` is set only while it does).
     live: bool,
+    /// Targets the guard asked to attach to because their context became an agent's
+    /// (`adopt`): their attachment is set up like one at a (re)connect.
+    adopting: HashSet<String>,
 }
 
 struct Inner {
@@ -682,14 +685,39 @@ struct Inner {
     reloading: Mutex<Option<Reloading>>,
 }
 
-/// Whether the guard lets an attached target go untouched: every target outside the agent
-/// profiles (a person's, or of a context not known to be an agent's), and the bridge
-/// extension's service worker, which runs in every profile. Any other extension target in an
-/// agent profile is judged.
-fn is_foreign(agents: &AgentContexts, context: &str, kind: &str, url: &str) -> bool {
+/// The context the guard judges an attached target under, or `None` when it lets the target
+/// go untouched. `parent`: the context of the guard's session the target was attached
+/// through (`None`: attached at the browser level, or through a session it does not hold).
+///
+/// - A target without a context (a worker or worklet attached below a page) takes its
+///   parent's; at the top level it is judged by the default rules (context `""`).
+/// - A target of a context that is not an agent profile's (any of a person's profiles, or
+///   one not known to be an agent's yet) is let go. One that becomes an agent's later is
+///   attached again then (`adopt`).
+/// - The bridge extension's service worker runs in every profile and is let go. Any other
+///   extension target in an agent profile is judged.
+fn judged_under(
+    agents: &AgentContexts,
+    context: &str,
+    parent: Option<&str>,
+    kind: &str,
+    url: &str,
+) -> Option<String> {
     let bridge_worker = kind == "service_worker" && url.starts_with("chrome-extension://");
-    !agents.is_agent(context) || bridge_worker
+    if bridge_worker {
+        return None;
+    }
+    let context = if context.is_empty() {
+        parent.unwrap_or("")
+    } else {
+        context
+    };
+    (context.is_empty() || agents.is_agent(context)).then(|| context.to_string())
 }
+
+/// Target kinds attached at the browser level, the ones `adopt` attaches itself (frames and
+/// dedicated workers come through their page's session).
+const ADOPTED: &[&str] = &["page", "service_worker", "shared_worker", "background_page"];
 
 /// See `Guard::on_reloading`.
 pub type Reloading = Arc<dyn Fn(&str) + Send + Sync>;
@@ -917,6 +945,7 @@ async fn supervise(inner: Weak<Inner>) {
             state.documents.clear();
             state.frame_reloads.clear();
             state.early_pending.clear();
+            state.adopting.clear();
         }
         guard.changed.send_modify(|n| *n += 1);
         drop(guard);
@@ -958,6 +987,19 @@ impl Inner {
             state.live = true;
             state.connections > 1
         };
+        // A context that becomes an agent's from now on: its targets attached before were let
+        // go as a person's, and are attached again (`adopt`). Earlier ones are judged by
+        // the auto-attach of this connection.
+        let adopter = {
+            let me = self.clone();
+            let conn = conn.clone();
+            let mut added = self.agents.subscribe();
+            tokio::spawn(async move {
+                while added.changed().await.is_ok() {
+                    me.adopt(&conn).await;
+                }
+            })
+        };
         let mut early = Vec::new();
         while let Ok(event) = events.try_recv() {
             if event.method == "Target.attachedToTarget" {
@@ -996,6 +1038,58 @@ impl Inner {
         }
         self.state.lock().unwrap().live = false;
         readiness.abort();
+        adopter.abort();
+    }
+
+    /// Attaches to the targets of agent contexts the guard holds no session of (they were
+    /// attached while their context was not known to be an agent's, and let go). Their
+    /// attachment (`Target.attachedToTarget`) is set up as one at a (re)connect: commands of
+    /// the profile's clipboard-denied sessions wait for it, and a running page is shielded
+    /// and reloaded when its sessions deny the clipboard.
+    async fn adopt(self: &Arc<Self>, conn: &CdpConn) {
+        let Ok(r) = conn.send("Target.getTargets", json!({}), None).await else {
+            return;
+        };
+        let infos = r["targetInfos"].as_array().cloned().unwrap_or_default();
+        let wanted: Vec<(String, String)> = {
+            let mut state = self.state.lock().unwrap();
+            let held: HashSet<String> = state.sessions.values().map(|a| a.target.clone()).collect();
+            let mut wanted = Vec::new();
+            for t in &infos {
+                let s = |k: &str| t[k].as_str().unwrap_or_default();
+                let (target, kind, context) = (s("targetId"), s("type"), s("browserContextId"));
+                if target.is_empty()
+                    || !ADOPTED.contains(&kind)
+                    || context.is_empty()
+                    || held.contains(target)
+                    || state.adopting.contains(target)
+                    || judged_under(&self.agents, context, None, kind, s("url")).is_none()
+                {
+                    continue;
+                }
+                state.adopting.insert(target.to_string());
+                state.early_pending.start(target, context);
+                wanted.push((target.to_string(), context.to_string()));
+            }
+            wanted
+        };
+        for (target, _) in wanted {
+            let attached = conn
+                .send(
+                    "Target.attachToTarget",
+                    json!({ "targetId": target, "flatten": true }),
+                    None,
+                )
+                .await;
+            if attached.is_err() {
+                // Gone meanwhile, most likely; nothing of it is pending any more.
+                let mut state = self.state.lock().unwrap();
+                state.adopting.remove(&target);
+                state.early_pending.done(&target);
+                drop(state);
+                self.changed.send_modify(|n| *n += 1);
+            }
+        }
     }
 
     fn on_event(self: &Arc<Self>, conn: &CdpConn, event: CdpEvent) {
@@ -1267,7 +1361,7 @@ impl Inner {
         self: &Arc<Self>,
         conn: &CdpConn,
         event: CdpEvent,
-        early: bool,
+        mut early: bool,
     ) -> JoinHandle<()> {
         let p = &event.params;
         let s = |ptr: &str| p.pointer(ptr).and_then(Value::as_str).unwrap_or_default();
@@ -1275,11 +1369,32 @@ impl Inner {
         let target = s("/targetInfo/targetId").to_string();
         let kind = s("/targetInfo/type").to_string();
         let url = s("/targetInfo/url").to_string();
-        let context = s("/targetInfo/browserContextId").to_string();
+        let reported = s("/targetInfo/browserContextId").to_string();
         let waiting = p["waitingForDebugger"].as_bool().unwrap_or(false);
         // The session the event came on owns the new one (`None`: the browser's).
         let parent = event.session_id.clone();
-        let foreign = is_foreign(&self.agents, &context, &kind, &url);
+        let adopted;
+        let parent_context = {
+            let mut state = self.state.lock().unwrap();
+            adopted = parent.is_none() && state.adopting.remove(&target);
+            if adopted {
+                // `adopt` counted it pending already.
+                early = true;
+            }
+            parent
+                .as_ref()
+                .and_then(|p| state.sessions.get(p))
+                .map(|a| a.context.clone())
+        };
+        let judged = judged_under(
+            &self.agents,
+            &reported,
+            parent_context.as_deref(),
+            &kind,
+            &url,
+        );
+        let foreign = judged.is_none();
+        let context = judged.unwrap_or(reported);
         if !foreign && !session.is_empty() {
             let mut state = self.state.lock().unwrap();
             state.sessions.insert(
@@ -1292,7 +1407,7 @@ impl Inner {
                 },
             );
         }
-        if early && !foreign {
+        if early && !foreign && !adopted {
             self.state
                 .lock()
                 .unwrap()
@@ -1972,26 +2087,160 @@ mod tests {
         }
     }
 
-    #[test]
-    fn guard_treats_a_second_human_profile_as_foreign() {
+    fn one_agent() -> AgentContexts {
         let agents = AgentContexts::default();
         agents.set("PegboardAgent", "A1");
-        // The person's two profiles, an empty and an unknown context: let go.
-        for context in ["H1", "H2", "", "X"] {
-            assert!(
-                is_foreign(&agents, context, "page", "https://a.test/"),
-                "{context:?}"
+        agents
+    }
+
+    const PAGE: &str = "https://a.test/";
+
+    #[test]
+    fn guard_treats_a_second_human_profile_as_foreign() {
+        let agents = one_agent();
+        // The person's two profiles and a context nobody knows: let go.
+        for context in ["H1", "H2", "X"] {
+            assert_eq!(
+                judged_under(&agents, context, None, "page", PAGE),
+                None,
+                "{context}"
             );
         }
         // The agent profile's pages are judged; the bridge's worker there is let go.
-        assert!(!is_foreign(&agents, "A1", "page", "https://a.test/"));
-        assert!(!is_foreign(&agents, "A1", "iframe", "https://a.test/"));
-        assert!(is_foreign(
-            &agents,
-            "A1",
-            "service_worker",
-            "chrome-extension://abc/sw.js"
-        ));
+        assert_eq!(
+            judged_under(&agents, "A1", None, "page", PAGE).as_deref(),
+            Some("A1")
+        );
+        assert_eq!(
+            judged_under(&agents, "A1", Some("A1"), "iframe", PAGE).as_deref(),
+            Some("A1")
+        );
+        let worker = "chrome-extension://abc/sw.js";
+        assert_eq!(
+            judged_under(&agents, "A1", None, "service_worker", worker),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_context_child_inherits_its_parent() {
+        let agents = one_agent();
+        for kind in ["worker", "iframe", "worklet"] {
+            assert_eq!(
+                judged_under(&agents, "", Some("A1"), kind, PAGE).as_deref(),
+                Some("A1"),
+                "{kind}"
+            );
+            // Below a target judged by the default rules: the default rules too.
+            assert_eq!(
+                judged_under(&agents, "", Some(""), kind, PAGE).as_deref(),
+                Some(""),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_top_level_empty_context_is_judged_by_default_rules() {
+        let agents = one_agent();
+        for kind in ["page", "service_worker", "shared_worker"] {
+            assert_eq!(
+                judged_under(&agents, "", None, kind, PAGE).as_deref(),
+                Some(""),
+                "{kind}"
+            );
+        }
+    }
+
+    /// A guard on a fake browser: its connection's auto-attach is answered and it is ready.
+    async fn guard_on_fake(agents: &AgentContexts) -> (Guard, crate::link::fake::FakeBrowser) {
+        let (link, mut fake) = crate::link::fake::FakeBrowser::start();
+        let guard = Guard::start(
+            &link,
+            agents.clone(),
+            Arc::new(|_: &str| SessionPolicy::default()),
+            Arc::new(|_: &str| None),
+            Arc::new(|| Box::pin(async {})),
+            Arc::new(Vec::new),
+            Resolver::from_rules(""),
+        );
+        let on = fake.next().await;
+        assert_eq!(on["method"], "Target.setAutoAttach");
+        fake.answer(&on, json!({}));
+        guard.wait_ready(Duration::from_secs(3)).await.unwrap();
+        (guard, fake)
+    }
+
+    fn attached_event(session: &str, target: &Value, waiting: bool) -> Value {
+        json!({ "method": "Target.attachedToTarget", "sessionId": "B1", "params": {
+            "sessionId": session, "targetInfo": target, "waitingForDebugger": waiting } })
+    }
+
+    #[tokio::test]
+    async fn a_context_that_becomes_agent_gets_its_existing_targets_guarded() {
+        let agents = AgentContexts::default();
+        let (guard, mut fake) = guard_on_fake(&agents).await;
+        let page = json!({ "targetId": "P1", "type": "page", "browserContextId": "A1",
+            "url": "https://a.test/" });
+        let worker = json!({ "targetId": "W1", "type": "service_worker",
+            "browserContextId": "A1", "url": "https://a.test/sw.js" });
+        let human = json!({ "targetId": "H1", "type": "page", "browserContextId": "C-human",
+            "url": "https://h.test/" });
+        // The agent profile's first tab, attached before its context is known: let go.
+        fake.send(attached_event("S0", &page, true));
+        let mut released = Vec::new();
+        while released.len() < 2 {
+            let m = fake.next().await;
+            assert_eq!(
+                m["sessionId"],
+                if m["method"] == "Target.detachFromTarget" {
+                    "B1"
+                } else {
+                    "S0"
+                }
+            );
+            released.push(m["method"].as_str().unwrap().to_string());
+            fake.answer(&m, json!({}));
+        }
+        assert_eq!(
+            released,
+            ["Runtime.runIfWaitingForDebugger", "Target.detachFromTarget"]
+        );
+        // The context becomes an agent's: its targets are attached and guarded.
+        agents.set("PegboardAgent", "A1");
+        let list = fake.next().await;
+        assert_eq!(list["method"], "Target.getTargets");
+        fake.answer(&list, json!({ "targetInfos": [page, worker, human] }));
+        let mut fetch_on = Vec::new();
+        let mut attached = Vec::new();
+        while fetch_on.len() < 2 {
+            let m = fake.next().await;
+            match m["method"].as_str().unwrap() {
+                "Target.attachToTarget" => {
+                    let target = m["params"]["targetId"].as_str().unwrap().to_string();
+                    let session = format!("S-{target}");
+                    let info = if target == "P1" { &page } else { &worker };
+                    fake.send(attached_event(&session, info, false));
+                    fake.answer(&m, json!({ "sessionId": session }));
+                    attached.push(target);
+                }
+                "Fetch.enable" => {
+                    fetch_on.push(m["sessionId"].as_str().unwrap().to_string());
+                    fake.answer(&m, json!({}));
+                }
+                _ => fake.answer(&m, json!({})),
+            }
+        }
+        attached.sort();
+        fetch_on.sort();
+        assert_eq!(attached, ["P1", "W1"], "the person's tab is never attached");
+        assert_eq!(fetch_on, ["S-P1", "S-W1"]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while guard.early_pending("A1") {
+            assert!(tokio::time::Instant::now() < deadline, "still pending");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(guard);
     }
 
     #[test]
