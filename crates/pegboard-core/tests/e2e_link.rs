@@ -271,7 +271,8 @@ struct Rig {
 
 async fn rig() -> Rig {
     let (env, fixture, browser) = common::launched().await;
-    let link = RawLink::connect(&browser.ws_url).await;
+    // A websocket of its own, beside the daemon's link: these tests measure Chrome itself.
+    let link = RawLink::connect(browser.ws_url.as_deref().expect("stock mode")).await;
     Rig {
         _env: env,
         fixture,
@@ -698,5 +699,324 @@ async fn proxy_allowlist_behaves_the_same_on_a_browser_session() {
     assert_eq!(
         kinds[0], kinds[1],
         "create/attach/detach/close answer differently on a browser session"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 3a task 3: every connection of the daemon rides its one `BrowserLink`.
+// ---------------------------------------------------------------------------------------------
+
+/// A virtual connection of a browser's link, spoken to in raw JSON. Messages that are not the
+/// awaited answer are kept in `seen`.
+struct Virtual {
+    tx: pegboard_core::link::VirtualSender,
+    rx: pegboard_core::link::VirtualReceiver,
+    next_id: u64,
+    seen: Vec<Value>,
+}
+
+impl Virtual {
+    async fn open(link: &pegboard_core::link::BrowserLink) -> Virtual {
+        let (tx, rx) = link.open().await.unwrap().split();
+        Virtual {
+            tx,
+            rx,
+            next_id: 0,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Sends a command (on `session`, or on its own browser session) and returns the whole
+    /// answer, result or error.
+    async fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut msg = json!({ "id": id, "method": method, "params": params });
+        if let Some(s) = session {
+            msg["sessionId"] = json!(s);
+        }
+        self.tx.send(msg.to_string()).unwrap();
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let text = tokio::time::timeout_at(deadline, self.rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no answer to {method} in {LIMIT:?}"))
+                .expect("the virtual connection ended");
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v["id"] == json!(id) {
+                return v;
+            }
+            self.seen.push(v);
+        }
+    }
+
+    /// Keeps what arrives for `d`.
+    async fn settle(&mut self, d: Duration) {
+        let deadline = Instant::now() + d;
+        while let Ok(Some(text)) = tokio::time::timeout_at(deadline, self.rx.recv()).await {
+            self.seen.push(serde_json::from_str(&text).unwrap());
+        }
+    }
+}
+
+/// ESTABLISHED TCP connections of process `pid` on `port` (either end), by `lsof`.
+fn established(pid: u32, port: u16) -> usize {
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-n", "-P", "-p", &pid.to_string()])
+        .arg(format!("-iTCP:{port}"))
+        .arg("-sTCP:ESTABLISHED")
+        .output()
+        .expect("running lsof");
+    // A header line, then one line a connection; nothing at all when there is none.
+    String::from_utf8_lossy(&out.stdout).lines().skip(1).count()
+}
+
+/// The daemon with two sessions (each with agent-browser attached through the proxy), their
+/// screen recording and the request guard running: the browser has ONE DevTools connection,
+/// and every connection of the daemon is a virtual connection over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn the_daemon_opens_one_browser_connection() {
+    std::env::set_var("PEGBOARD_TEST_HOOKS", "1");
+    let env = common::env();
+    let fixture = common::fixture().await;
+    let daemon = pegboard_core::service::Daemon::start(env.paths.clone())
+        .await
+        .unwrap();
+    let mut next = 0;
+    let mut call = |method: &str, params: Value| {
+        next += 1;
+        daemon.handle(pegboard_protocol::Request {
+            jsonrpc: "2.0".into(),
+            id: next,
+            method: method.into(),
+            params,
+        })
+    };
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let r = call(
+            "session.create",
+            json!({ "url": format!("{}/counter", fixture.origin) }),
+        )
+        .await;
+        let info = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
+        sessions.push((
+            info["id"].as_str().unwrap().to_string(),
+            info["token"].as_str().unwrap().to_string(),
+        ));
+    }
+    // A command in each, so agent-browser is connected through the proxy and the recorder
+    // has worked.
+    for (id, token) in &sessions {
+        let r = call(
+            "command.exec",
+            json!({ "sessionId": id, "token": token, "argv": ["get", "url"], "timeoutMs": 30000 }),
+        )
+        .await;
+        let result = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
+        assert_eq!(result["exitCode"], 0, "{result}");
+    }
+    let pid = call("browser.status", json!({})).await.result.unwrap()["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    let port: u16 = std::fs::read_to_string(env.paths.chrome_udd.join("DevToolsActivePort"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let (id, token) = sessions[0].clone();
+    let mut virtual_count = 0;
+    // The main connection, the download policy, the guard and the recorder at least; the
+    // proxy's upstreams while agent-browser holds them.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while virtual_count < 4 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let r = call("test.linkStats", json!({ "sessionId": id, "token": token })).await;
+        let stats = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
+        virtual_count = stats["virtual"].as_u64().unwrap();
+    }
+    let physical = established(pid, port);
+    println!("OBSERVED one_browser_connection: physical={physical} virtual={virtual_count}");
+    assert!(
+        virtual_count >= 4,
+        "only {virtual_count} virtual connections"
+    );
+    assert_eq!(
+        physical, 1,
+        "the browser has {physical} DevTools connections"
+    );
+    daemon.shutdown().await;
+}
+
+/// Session A's proxy client turns target discovery on; session B opens a tab. A hears of
+/// its own tab but not of B's, and B (which never asked) hears of none: the discovery of A's
+/// browser session stays on A's virtual connection.
+#[test]
+#[ignore]
+fn sessions_stay_isolated_over_one_connection() {
+    common::run(async {
+        let s = common::shared_session_fixture().await;
+        let (g2, t2) = s.bridge.create_group("second", "red").await.unwrap();
+        let id2 = pegboard_protocol::SessionId::generate();
+        let ep2 = s
+            .proxy
+            .register(&id2, &s.agent_context, g2, s.bridge.clone(), vec![t2]);
+        let a = common::client(&s.endpoint).await;
+        let b = common::client(&ep2).await;
+        let mut a_events = a.events();
+        let mut b_events = b.events();
+        a.send(
+            "Target.setDiscoverTargets",
+            json!({ "discover": true }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let target_of = |e: &pegboard_core::cdp::CdpEvent| {
+            e.params
+                .pointer("/targetInfo/targetId")
+                .or_else(|| e.params.get("targetId"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        };
+        // Control: A hears of a tab of its own, so its discovery works.
+        let own = a
+            .send("Target.createTarget", json!({ "url": "about:blank" }), None)
+            .await
+            .unwrap()["targetId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let e = tokio::time::timeout_at(deadline, a_events.recv())
+                .await
+                .expect("A did not hear of its own tab")
+                .unwrap();
+            if e.method == "Target.targetCreated" && target_of(&e).as_deref() == Some(&own) {
+                break;
+            }
+        }
+
+        let theirs = b
+            .send("Target.createTarget", json!({ "url": "about:blank" }), None)
+            .await
+            .unwrap()["targetId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut heard_a = Vec::new();
+        let mut heard_b = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            tokio::select! {
+                e = a_events.recv() => if let Ok(e) = e { heard_a.push(e) },
+                e = b_events.recv() => if let Ok(e) = e { heard_b.push(e) },
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        let about_theirs: Vec<_> = heard_a
+            .iter()
+            .filter(|e| target_of(e).as_deref() == Some(&theirs))
+            .map(|e| e.method.clone())
+            .collect();
+        let discovery_b: Vec<_> = heard_b
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.method.as_str(),
+                    "Target.targetCreated" | "Target.targetInfoChanged" | "Target.targetDestroyed"
+                )
+            })
+            .map(|e| e.method.clone())
+            .collect();
+        println!(
+            "OBSERVED sessions_isolated: a_about_b={about_theirs:?} b_discovery={discovery_b:?}"
+        );
+        assert!(
+            about_theirs.is_empty(),
+            "A heard of B's tab: {about_theirs:?}"
+        );
+        assert!(
+            discovery_b.is_empty(),
+            "B got A's discovery: {discovery_b:?}"
+        );
+        drop((a, b));
+        s.shutdown().await;
+    });
+}
+
+/// Over the daemon's link, V1 attaches to a tab (child C1). V2 names C1 in the params of
+/// `Target.detachFromTarget` and `Target.sendMessageToTarget`: both are refused, and C1 still
+/// answers V1 (no detach reached V1).
+#[tokio::test]
+#[ignore]
+async fn another_connections_child_cannot_be_detached_by_params() {
+    let (_env, fixture, browser) = common::launched().await;
+    let mut v1 = Virtual::open(&browser.link).await;
+    let mut v2 = Virtual::open(&browser.link).await;
+    let created = v1
+        .call(
+            None,
+            "Target.createTarget",
+            json!({ "url": format!("{}/counter", fixture.origin) }),
+        )
+        .await;
+    let tid = created["result"]["targetId"].as_str().unwrap().to_string();
+    let attached = v1
+        .call(
+            None,
+            "Target.attachToTarget",
+            json!({ "targetId": tid, "flatten": true }),
+        )
+        .await;
+    let c1 = attached["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let eval = json!({ "expression": "1 + 1", "returnByValue": true });
+    let before = v1.call(Some(&c1), "Runtime.evaluate", eval.clone()).await;
+    assert_eq!(before["result"]["result"]["value"], 2, "{before}");
+
+    let detach = v2
+        .call(None, "Target.detachFromTarget", json!({ "sessionId": c1 }))
+        .await;
+    let message = json!({ "id": 1, "method": "Runtime.evaluate", "params": eval }).to_string();
+    let forward = v2
+        .call(
+            None,
+            "Target.sendMessageToTarget",
+            json!({ "sessionId": c1, "message": message }),
+        )
+        .await;
+    println!(
+        "OBSERVED params_session: detach={} send={}",
+        response_kind(&detach),
+        response_kind(&forward)
+    );
+    assert!(detach.get("error").is_some(), "V2 detached C1: {detach}");
+    assert!(forward.get("error").is_some(), "V2 reached C1: {forward}");
+
+    v1.settle(Duration::from_millis(500)).await;
+    let after = v1.call(Some(&c1), "Runtime.evaluate", eval).await;
+    assert_eq!(after["result"]["result"]["value"], 2, "C1 is gone: {after}");
+    let gone = v1
+        .seen
+        .iter()
+        .any(|m| m["method"] == "Target.detachedFromTarget");
+    assert!(!gone, "V1 was told C1 detached: {:?}", v1.seen);
+    // V2 got nothing of C1's either.
+    v2.settle(Duration::from_millis(300)).await;
+    assert!(
+        !v2.seen
+            .iter()
+            .any(|m| m.get("sessionId") == Some(&json!(c1))),
+        "{:?}",
+        v2.seen
     );
 }

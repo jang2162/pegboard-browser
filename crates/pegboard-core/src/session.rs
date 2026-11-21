@@ -240,7 +240,7 @@ impl SessionManager {
                 })
             });
             Guard::start(
-                &browser.ws_url,
+                &browser.link,
                 &browser.human_context,
                 policy_of,
                 clipboard_of,

@@ -20,13 +20,13 @@ pub(crate) struct Transport {
 }
 
 /// The browser's DevTools websocket, taking messages up to 256 MiB like a queued `CdpConn`.
-pub(crate) async fn websocket(ws_url: &str) -> Result<Transport> {
+pub(crate) async fn websocket(url: &str) -> Result<Transport> {
     let config = WebSocketConfig::default()
         .max_message_size(Some(QUEUED_MAX_MESSAGE))
         .max_frame_size(Some(QUEUED_MAX_MESSAGE));
-    let (ws, _) = tokio_tungstenite::connect_async_with_config(ws_url, Some(config), false)
+    let (ws, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), false)
         .await
-        .with_context(|| format!("connecting to {ws_url}"))?;
+        .with_context(|| format!("connecting to {url}"))?;
     let (mut sink, mut stream) = ws.split();
     let (in_tx, incoming) = mpsc::unbounded_channel();
     let (outgoing, mut out_rx) = mpsc::unbounded_channel::<String>();

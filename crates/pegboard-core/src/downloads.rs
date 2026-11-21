@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::actionlog::{url_for_log, ActionEntry};
 use crate::cdp::{page_targets, CdpConn, CdpEvent};
+use crate::link::BrowserLink;
 use crate::paths::{ensure_owned_private_dir, ensure_session_files, Paths};
 
 /// Largest file one download may be.
@@ -552,7 +553,9 @@ struct State {
 }
 
 struct Inner {
-    ws_url: String,
+    /// The daemon's connection to the browser: each policy connection is a virtual
+    /// connection of it.
+    link: BrowserLink,
     human_context: String,
     /// The daemon's browser connection, for looking at targets and cancelling downloads.
     conn: CdpConn,
@@ -627,7 +630,7 @@ impl Downloads {
     /// Empties the staging root (`<home>/downloads`) left by an earlier run and starts the
     /// sweeper. Must be called inside a tokio runtime.
     pub fn new(
-        ws_url: &str,
+        link: &BrowserLink,
         human_context: &str,
         conn: CdpConn,
         paths: &Paths,
@@ -641,7 +644,7 @@ impl Downloads {
         }
         ensure_owned_private_dir(&root)?;
         let inner = Arc::new(Inner {
-            ws_url: ws_url.to_string(),
+            link: link.clone(),
             human_context: human_context.to_string(),
             conn,
             paths: paths.clone(),
@@ -717,7 +720,7 @@ impl Downloads {
             Lift::Nothing => None,
             Lift::Held(conn) => Some(conn),
             Lift::Lost => Some(
-                CdpConn::connect(&self.inner.ws_url)
+                CdpConn::over(&self.inner.link)
                     .await
                     .context("could not lift the clipboard denial of the agent profile")?,
             ),
@@ -979,7 +982,7 @@ impl Inner {
         ensure_owned_private_dir(&self.root)?;
         ensure_owned_private_dir(&staging)?;
         let staging = staging.canonicalize()?;
-        let (conn, events) = CdpConn::connect_queued(&self.ws_url).await?;
+        let (conn, events) = CdpConn::over_queued(&self.link).await?;
         let mut last = anyhow!("the profile did not become the default context");
         for attempt in 0..tries {
             if attempt > 0 {
@@ -1104,7 +1107,7 @@ impl Inner {
     /// default context (as `establish` does), then `clipboard-read` and `clipboard-write` are
     /// set to denied for it. The caller holds `applying`.
     async fn deny_clipboard(self: &Arc<Self>, context: &str, tries: u32) -> Result<()> {
-        let (conn, events) = CdpConn::connect_queued(&self.ws_url).await?;
+        let (conn, events) = CdpConn::over_queued(&self.link).await?;
         let mut last = anyhow!("the profile did not become the default context");
         'attempt: for attempt in 0..tries {
             if attempt > 0 {

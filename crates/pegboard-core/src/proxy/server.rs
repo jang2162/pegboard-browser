@@ -28,9 +28,10 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 
 use crate::bridge::{Bridge, GroupId};
+use crate::link::{BrowserLink, VirtualReceiver, VirtualSender};
 use crate::proxy::filter::{self, BrowserDecision, ClientDecision, Scope};
 
 /// CDP screenshots and snapshots can be large.
@@ -71,44 +72,39 @@ pub trait UpstreamConn: Send {
     async fn recv(&mut self) -> Option<String>;
 }
 
-/// Phase 1: a fresh WebSocket to the browser endpoint per client.
-pub struct WsUpstream {
-    pub browser_ws_url: String,
+/// A virtual connection of the daemon's browser link per client connection: to the browser,
+/// a browser session of its own (`Target.attachToBrowserTarget`); to the proxy, a connection
+/// of its own. Dropping it closes the virtual connection, which detaches its sessions.
+pub struct LinkUpstream {
+    pub link: BrowserLink,
 }
 
-struct WsUpstreamConn {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+struct LinkUpstreamConn {
+    tx: VirtualSender,
+    rx: VirtualReceiver,
 }
 
 #[async_trait]
-impl Upstream for WsUpstream {
+impl Upstream for LinkUpstream {
     async fn open(&self) -> Result<Box<dyn UpstreamConn>> {
-        let (ws, _) = tokio_tungstenite::connect_async_with_config(
-            self.browser_ws_url.as_str(),
-            Some(ws_config()),
-            false,
-        )
-        .await
-        .context("connecting to the browser")?;
-        Ok(Box::new(WsUpstreamConn { ws }))
+        let (tx, rx) = self
+            .link
+            .open()
+            .await
+            .context("connecting to the browser")?
+            .split();
+        Ok(Box::new(LinkUpstreamConn { tx, rx }))
     }
 }
 
 #[async_trait]
-impl UpstreamConn for WsUpstreamConn {
+impl UpstreamConn for LinkUpstreamConn {
     async fn send(&mut self, text: String) -> Result<()> {
-        self.ws.send(Message::text(text)).await?;
-        Ok(())
+        self.tx.send(text)
     }
 
     async fn recv(&mut self) -> Option<String> {
-        loop {
-            match self.ws.next().await? {
-                Ok(Message::Text(t)) => return Some(t.as_str().to_owned()),
-                Ok(Message::Close(_)) | Err(_) => return None,
-                Ok(_) => {}
-            }
-        }
+        self.rx.recv().await
     }
 }
 

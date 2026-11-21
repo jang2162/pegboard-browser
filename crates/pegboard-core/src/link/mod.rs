@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use mux::{Inner, VconnId};
+use mux::{Handle, Inner};
 
 /// A physical connection to the browser. Cheap to clone; all clones share it.
 #[derive(Clone)]
@@ -28,8 +28,8 @@ pub struct BrowserLink {
 
 impl BrowserLink {
     /// Connects to the browser's DevTools websocket (messages up to 256 MiB).
-    pub async fn websocket(ws_url: &str) -> Result<BrowserLink> {
-        Ok(Self::start(transport::websocket(ws_url).await?))
+    pub async fn websocket(url: &str) -> Result<BrowserLink> {
+        Ok(Self::start(transport::websocket(url).await?))
     }
 
     /// The daemon's end of a DevTools pipe: reads `read`, writes `write` (fork mode: fds 3
@@ -46,16 +46,26 @@ impl BrowserLink {
 
     /// A new virtual connection: a new browser session (`Target.attachToBrowserTarget`).
     pub async fn open(&self) -> Result<VirtualConn> {
-        let (id, rx) = self.inner.open().await?;
+        let (handle, rx) = self.inner.open().await?;
         Ok(VirtualConn {
             sender: VirtualSender {
-                shared: Arc::new(SenderShared {
-                    inner: self.inner.clone(),
-                    id,
-                }),
+                shared: Arc::new(handle),
             },
             receiver: VirtualReceiver { rx },
         })
+    }
+
+    /// How many virtual connections are open now.
+    pub fn virtual_connections(&self) -> usize {
+        self.inner.virtual_connections()
+    }
+
+    /// A link whose physical connection has already ended (for tests of its users).
+    #[cfg(test)]
+    pub(crate) fn ended_for_test() -> BrowserLink {
+        let (_, incoming) = mpsc::unbounded_channel();
+        let (outgoing, _) = mpsc::unbounded_channel();
+        Self::start(transport::Transport { incoming, outgoing })
     }
 
     /// Resolves once the physical connection has ended.
@@ -84,18 +94,7 @@ impl VirtualConn {
 /// Sends CDP messages on a virtual connection. Cheap to clone.
 #[derive(Clone)]
 pub struct VirtualSender {
-    shared: Arc<SenderShared>,
-}
-
-struct SenderShared {
-    inner: Arc<Inner>,
-    id: VconnId,
-}
-
-impl Drop for SenderShared {
-    fn drop(&mut self) {
-        self.inner.close(self.id);
-    }
+    shared: Arc<Handle>,
 }
 
 impl VirtualSender {
@@ -103,11 +102,12 @@ impl VirtualSender {
     /// virtual connection does not own is not sent; its error reply comes back on the
     /// receiver instead. Fails once the virtual or the physical connection has ended.
     pub fn send(&self, text: String) -> Result<()> {
-        self.shared.inner.send(self.shared.id, text)
+        self.shared.send(text)
     }
 }
 
-/// Receives the messages of a virtual connection.
+/// Receives the messages of a virtual connection. Dropping it while senders live closes the
+/// virtual connection when the next message for it arrives.
 pub struct VirtualReceiver {
     rx: mpsc::UnboundedReceiver<String>,
 }

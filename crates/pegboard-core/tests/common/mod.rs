@@ -567,7 +567,7 @@ impl SessionFixture {
 
 pub async fn session_fixture() -> SessionFixture {
     use pegboard_core::bridge::Bridge;
-    use pegboard_core::proxy::server::{ProxyServer, WsUpstream};
+    use pegboard_core::proxy::server::{LinkUpstream, ProxyServer};
     use std::sync::Arc;
 
     let (env, fixture, browser) = launched().await;
@@ -590,8 +590,8 @@ pub async fn session_fixture() -> SessionFixture {
         .unwrap();
     let bridge = Arc::new(Bridge::attach(&browser.conn, &agent_context).await.unwrap());
     let (group, first_target) = bridge.create_group("proxy", "blue").await.unwrap();
-    let upstream = Arc::new(WsUpstream {
-        browser_ws_url: browser.ws_url.clone(),
+    let upstream = Arc::new(LinkUpstream {
+        link: browser.link.clone(),
     });
     let proxy = ProxyServer::start(upstream).await.unwrap();
     let session = pegboard_protocol::SessionId::generate();
@@ -639,7 +639,7 @@ pub async fn client(endpoint: &pegboard_core::proxy::server::Endpoint) -> CdpCon
 // ---------------------------------------------------------------------------------------------
 
 use pegboard_core::profiles::Profiles;
-use pegboard_core::proxy::server::{Endpoint, ProxyServer, WsUpstream};
+use pegboard_core::proxy::server::{Endpoint, LinkUpstream, ProxyServer};
 use pegboard_core::recording::recorder::{Recorder, RecorderOptions};
 use pegboard_core::recording::replay::ReplayServer;
 use pegboard_core::runner::Runner;
@@ -764,13 +764,13 @@ impl Shared {
             format!("127.0.0.1:{public_port}=public"),
         );
         let browser = Arc::new(Browser::launch(&env.paths, &env.cfg).await.unwrap());
-        let upstream = Arc::new(WsUpstream {
-            browser_ws_url: browser.ws_url.clone(),
+        let upstream = Arc::new(LinkUpstream {
+            link: browser.link.clone(),
         });
         let proxy = Arc::new(ProxyServer::start(upstream).await.unwrap());
         let profiles = Profiles::load(&env.paths).unwrap();
         let recorder = Recorder::start(RecorderOptions {
-            ws_url: browser.ws_url.clone(),
+            link: browser.link.clone(),
             human_context: browser.human_context.clone(),
             config: Default::default(),
         });
@@ -1237,8 +1237,8 @@ pub async fn shared_session_fixture() -> SharedSessionFixture {
         .await
         .unwrap();
     let (group, first_target) = bridge.create_group("proxy", "blue").await.unwrap();
-    let upstream = Arc::new(WsUpstream {
-        browser_ws_url: browser.ws_url.clone(),
+    let upstream = Arc::new(LinkUpstream {
+        link: browser.link.clone(),
     });
     let proxy = ProxyServer::start(upstream).await.unwrap();
     let session = pegboard_protocol::SessionId::generate();

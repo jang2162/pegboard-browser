@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::actionlog::{url_for_log, ActionEntry, ManifestHandle, ScreenStatus, SessionLog};
 use crate::cdp::{CdpConn, CdpEvent};
+use crate::link::BrowserLink;
 use crate::recording::config::RecordingConfig;
 use crate::recording::events::{
     classify, console_line, nav_line, CommandWindows, NavFollow, Requests, Signal,
@@ -168,7 +169,8 @@ fn now_ts() -> String {
 }
 
 pub struct RecorderOptions {
-    pub ws_url: String,
+    /// The daemon's connection to the browser; the recorder's is a virtual connection of it.
+    pub link: BrowserLink,
     pub human_context: String,
     pub config: RecordingConfig,
 }
@@ -491,7 +493,7 @@ impl Recorder {
         let task = tokio::spawn(supervise(
             Arc::downgrade(&recorder),
             recorder.wake.clone(),
-            recorder.opts.ws_url.clone(),
+            recorder.opts.link.clone(),
         ));
         *recorder.task.lock().unwrap() = Some(task);
         recorder
@@ -1903,7 +1905,7 @@ enum Ticket {
 
 /// The recorder's connection: made once a recording begins, made again (with backoff) when
 /// it ends while recordings are running.
-async fn supervise(recorder: Weak<Recorder>, wake: Arc<Notify>, ws_url: String) {
+async fn supervise(recorder: Weak<Recorder>, wake: Arc<Notify>, link: BrowserLink) {
     let mut backoff = FIRST_BACKOFF;
     loop {
         let (wanted, held) = match recorder.upgrade() {
@@ -1921,7 +1923,7 @@ async fn supervise(recorder: Weak<Recorder>, wake: Arc<Notify>, ws_url: String) 
             wake.notified().await;
             continue;
         }
-        let (conn, queue) = match CdpConn::connect_queued(&ws_url).await {
+        let (conn, queue) = match CdpConn::over_queued(&link).await {
             Ok(c) => c,
             Err(e) => {
                 if crate::testenv::hooks() {
@@ -2438,7 +2440,7 @@ mod tests {
         extras: Vec<RecordExtra>,
     ) -> (Arc<Recorder>, SessionId, ManifestHandle) {
         let recorder = Recorder::start(RecorderOptions {
-            ws_url: "ws://127.0.0.1:9/none".into(),
+            link: BrowserLink::ended_for_test(),
             human_context: "HUMAN".into(),
             config: off_config(),
         });
@@ -2769,7 +2771,7 @@ mod tests {
         // first tab before it is navigated, the recording begins after.
         let tmp = tempfile::tempdir().unwrap();
         let r = Recorder::start(RecorderOptions {
-            ws_url: "ws://127.0.0.1:9/none".into(),
+            link: BrowserLink::ended_for_test(),
             human_context: "HUMAN".into(),
             config: off_config(),
         });
@@ -3851,7 +3853,7 @@ mod tests {
     async fn session_create_counts_as_a_command() {
         let tmp = tempfile::tempdir().unwrap();
         let r = Recorder::start(RecorderOptions {
-            ws_url: "ws://127.0.0.1:9/none".into(),
+            link: BrowserLink::ended_for_test(),
             human_context: "HUMAN".into(),
             config: off_config(),
         });

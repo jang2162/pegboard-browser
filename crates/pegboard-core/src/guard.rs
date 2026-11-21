@@ -49,6 +49,7 @@ use url::Url;
 
 use crate::address::{self, judge_resolved, judge_url, Target, Verdict};
 use crate::cdp::{CdpConn, CdpEvent};
+use crate::link::BrowserLink;
 
 /// The address policy that applies in a browser context (an agent profile).
 pub type PolicyOf = Arc<dyn Fn(&str) -> SessionPolicy + Send + Sync>;
@@ -632,7 +633,7 @@ struct State {
 }
 
 struct Inner {
-    ws_url: String,
+    link: BrowserLink,
     human_context: String,
     policy_of: PolicyOf,
     clipboard_of: ClipboardOf,
@@ -697,10 +698,10 @@ impl Drop for Guard {
 }
 
 impl Guard {
-    /// Starts the guard on its own connection to the browser at `ws_url`, and keeps it
+    /// Starts the guard on a connection of its own over `link`, and keeps it
     /// connected (reconnecting after a loss). Must be called inside a tokio runtime.
     pub fn start(
-        ws_url: &str,
+        link: &BrowserLink,
         human_context: &str,
         policy_of: PolicyOf,
         clipboard_of: ClipboardOf,
@@ -709,7 +710,7 @@ impl Guard {
         resolver: Resolver,
     ) -> Guard {
         let inner = Arc::new(Inner {
-            ws_url: ws_url.to_string(),
+            link: link.clone(),
             human_context: human_context.to_string(),
             policy_of,
             clipboard_of,
@@ -914,7 +915,7 @@ async fn supervise(inner: Weak<Inner>) {
 
 impl Inner {
     async fn connect(&self) -> Result<(CdpConn, mpsc::UnboundedReceiver<CdpEvent>)> {
-        let (conn, events) = CdpConn::connect_queued(&self.ws_url).await?;
+        let (conn, events) = CdpConn::over_queued(&self.link).await?;
         // Existing targets are attached as well (without waiting); new ones wait for us.
         let on = conn
             .send(

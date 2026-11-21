@@ -11,7 +11,7 @@ use pegboard_core::bridge::{Bridge, GroupId};
 use pegboard_core::browser::Browser;
 use pegboard_core::cdp::page_targets;
 use pegboard_core::profiles::Profiles;
-use pegboard_core::proxy::server::{ProxyServer, WsUpstream};
+use pegboard_core::proxy::server::{LinkUpstream, ProxyServer};
 use pegboard_core::session::SessionManager;
 use pegboard_protocol::{
     codes, ProfileKind, SessionCloseParams, SessionCreateParams, SessionId, SessionInfo,
@@ -86,15 +86,15 @@ impl OwnHarness {
             .await
             .unwrap();
         let bridge = Arc::new(Bridge::attach(&browser.conn, &agent).await.unwrap());
-        let upstream = Arc::new(WsUpstream {
-            browser_ws_url: browser.ws_url.clone(),
+        let upstream = Arc::new(LinkUpstream {
+            link: browser.link.clone(),
         });
         let proxy = Arc::new(ProxyServer::start(upstream).await.unwrap());
         let profiles = Profiles::load(&env.paths).unwrap();
         let browser = Arc::new(browser);
         let recorder = pegboard_core::recording::recorder::Recorder::start(
             pegboard_core::recording::recorder::RecorderOptions {
-                ws_url: browser.ws_url.clone(),
+                link: browser.link.clone(),
                 human_context: browser.human_context.clone(),
                 config: Default::default(),
             },

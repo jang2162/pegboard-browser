@@ -12,6 +12,7 @@ use tokio::process::{Child, Command};
 
 use crate::cdp::{page_targets, CdpConn};
 use crate::downloads::Downloads;
+use crate::link::BrowserLink;
 use crate::paths::{ensure, Paths};
 
 pub const HUMAN_PROFILE_DIR: &str = "Default";
@@ -65,7 +66,10 @@ fn version_key(p: &std::path::Path) -> Vec<u64> {
 
 pub struct Browser {
     pub pid: u32,
-    pub ws_url: String,
+    /// The DevTools websocket (stock mode only: the browser listens on a port).
+    pub ws_url: Option<String>,
+    /// The daemon's one connection to the browser; every connection it makes rides it.
+    pub link: BrowserLink,
     pub conn: CdpConn,
     pub human_context: String,
     child: Mutex<Child>,
@@ -109,12 +113,13 @@ impl Browser {
             }
         };
         let setup = async {
-            let conn = CdpConn::connect(&ws_url).await?;
+            let link = BrowserLink::websocket(&ws_url).await?;
+            let conn = CdpConn::over(&link).await?;
             let human_context = wait_for_first_context(&conn).await?;
-            let downloads = Downloads::new(&ws_url, &human_context, conn.clone(), paths)?;
-            anyhow::Ok((conn, human_context, downloads))
+            let downloads = Downloads::new(&link, &human_context, conn.clone(), paths)?;
+            anyhow::Ok((link, conn, human_context, downloads))
         };
-        let (conn, human_context, downloads) = match setup.await {
+        let (link, conn, human_context, downloads) = match setup.await {
             Ok(v) => v,
             Err(e) => {
                 let _ = child.kill().await;
@@ -123,7 +128,8 @@ impl Browser {
         };
         Ok(Browser {
             pid,
-            ws_url,
+            ws_url: Some(ws_url),
+            link,
             conn,
             human_context,
             child: Mutex::new(child),
@@ -217,7 +223,7 @@ impl Browser {
 
     /// The browser's remote debugging port.
     pub fn debugging_port(&self) -> Option<u16> {
-        url::Url::parse(&self.ws_url).ok()?.port()
+        url::Url::parse(self.ws_url.as_deref()?).ok()?.port()
     }
 
     /// Whether the browser process has ended.

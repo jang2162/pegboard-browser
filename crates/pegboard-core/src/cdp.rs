@@ -1,4 +1,5 @@
-//! Minimal Chrome DevTools Protocol client over a single websocket.
+//! Minimal Chrome DevTools Protocol client over a single connection: a virtual connection of
+//! the daemon's `BrowserLink`, or a websocket of its own.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,13 +7,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+use crate::link::{BrowserLink, VirtualReceiver, VirtualSender};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const NAVIGATE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -40,8 +46,102 @@ struct PendingState {
 
 type Pending = Mutex<PendingState>;
 
+/// What the writer task is given: a message to send, or the end of the connection.
+enum Out {
+    Text(String),
+    Close,
+}
+
+/// The two ends a connection runs on: text messages out and in.
+struct Channel {
+    sink: ChannelSink,
+    stream: ChannelStream,
+}
+
+enum ChannelSink {
+    Websocket(SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>),
+    Virtual(Option<VirtualSender>),
+}
+
+enum ChannelStream {
+    Websocket(SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>),
+    Virtual(VirtualReceiver),
+}
+
+impl Channel {
+    async fn websocket(
+        url: &str,
+        headers: &[(&str, &str)],
+        config: Option<WebSocketConfig>,
+    ) -> Result<Channel> {
+        let mut request = url
+            .into_client_request()
+            .with_context(|| format!("invalid websocket url {url}"))?;
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                HeaderName::from_bytes(name.as_bytes()).context("invalid header name")?,
+                HeaderValue::from_str(value).context("invalid header value")?,
+            );
+        }
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(request, config, false)
+            .await
+            .with_context(|| format!("connecting to {url}"))?;
+        let (sink, stream) = ws.split();
+        Ok(Channel {
+            sink: ChannelSink::Websocket(sink),
+            stream: ChannelStream::Websocket(stream),
+        })
+    }
+
+    async fn link(link: &BrowserLink) -> Result<Channel> {
+        let (sender, receiver) = link.open().await?.split();
+        Ok(Channel {
+            sink: ChannelSink::Virtual(Some(sender)),
+            stream: ChannelStream::Virtual(receiver),
+        })
+    }
+}
+
+impl ChannelSink {
+    /// False once the connection cannot take messages any more.
+    async fn send(&mut self, text: String) -> bool {
+        match self {
+            ChannelSink::Websocket(sink) => sink.send(Message::text(text)).await.is_ok(),
+            ChannelSink::Virtual(Some(sender)) => sender.send(text).is_ok(),
+            ChannelSink::Virtual(None) => false,
+        }
+    }
+
+    /// Ends the connection: a close frame, or the virtual connection's sender dropped (which
+    /// detaches its sessions).
+    async fn close(&mut self) {
+        match self {
+            ChannelSink::Websocket(sink) => {
+                let _ = sink.send(Message::Close(None)).await;
+            }
+            ChannelSink::Virtual(sender) => drop(sender.take()),
+        }
+    }
+}
+
+impl ChannelStream {
+    /// The next text message; `None` once the connection has ended or failed.
+    async fn next(&mut self) -> Option<String> {
+        match self {
+            ChannelStream::Websocket(stream) => loop {
+                match stream.next().await? {
+                    Ok(Message::Text(text)) => return Some(text.as_str().to_owned()),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            },
+            ChannelStream::Virtual(receiver) => receiver.recv().await,
+        }
+    }
+}
+
 struct Inner {
-    out: mpsc::UnboundedSender<Message>,
+    out: mpsc::UnboundedSender<Out>,
     pending: Pending,
     next_id: AtomicU64,
     events: broadcast::Sender<CdpEvent>,
@@ -65,56 +165,62 @@ impl Drop for Waiter {
     }
 }
 
-/// Cheap to clone; all clones share one websocket.
+/// Cheap to clone; all clones share one connection.
 #[derive(Clone)]
 pub struct CdpConn {
     inner: Arc<Inner>,
 }
 
 impl CdpConn {
-    pub async fn connect(ws_url: &str) -> Result<CdpConn> {
-        Self::connect_with_headers(ws_url, &[]).await
+    /// A connection of its own to `url` (a websocket). The daemon's connections ride its
+    /// `BrowserLink` (`over`); this is for tests and other endpoints (the session proxy).
+    pub async fn connect(url: &str) -> Result<CdpConn> {
+        Self::connect_with_headers(url, &[]).await
     }
 
     /// Connects sending extra HTTP headers with the upgrade request (e.g. `Authorization`).
-    pub async fn connect_with_headers(ws_url: &str, headers: &[(&str, &str)]) -> Result<CdpConn> {
-        Self::open(ws_url, headers, None, None).await
+    pub async fn connect_with_headers(url: &str, headers: &[(&str, &str)]) -> Result<CdpConn> {
+        Ok(Self::start(
+            Channel::websocket(url, headers, None).await?,
+            None,
+        ))
     }
 
     /// Connects and also hands every event to the returned queue, none dropped (the
     /// broadcast of `events` drops events for a reader that lags). The queue ends when the
     /// connection does. Messages up to 256 MiB are accepted (tungstenite's default is 64 MiB
     /// a message and 16 MiB a frame).
-    pub async fn connect_queued(
-        ws_url: &str,
-    ) -> Result<(CdpConn, mpsc::UnboundedReceiver<CdpEvent>)> {
+    pub async fn connect_queued(url: &str) -> Result<(CdpConn, mpsc::UnboundedReceiver<CdpEvent>)> {
         let (tx, rx) = mpsc::unbounded_channel();
         let config = WebSocketConfig::default()
             .max_message_size(Some(QUEUED_MAX_MESSAGE))
             .max_frame_size(Some(QUEUED_MAX_MESSAGE));
-        Ok((Self::open(ws_url, &[], Some(tx), Some(config)).await?, rx))
+        let channel = Channel::websocket(url, &[], Some(config)).await?;
+        Ok((Self::start(channel, Some(tx)), rx))
     }
 
-    async fn open(
-        ws_url: &str,
-        headers: &[(&str, &str)],
-        queue: Option<mpsc::UnboundedSender<CdpEvent>>,
-        config: Option<WebSocketConfig>,
-    ) -> Result<CdpConn> {
-        let mut request = ws_url
-            .into_client_request()
-            .with_context(|| format!("invalid websocket url {ws_url}"))?;
-        for (name, value) in headers {
-            request.headers_mut().insert(
-                HeaderName::from_bytes(name.as_bytes()).context("invalid header name")?,
-                HeaderValue::from_str(value).context("invalid header value")?,
-            );
-        }
-        let (ws, _) = tokio_tungstenite::connect_async_with_config(request, config, false)
-            .await
-            .with_context(|| format!("connecting to {ws_url}"))?;
-        let (mut sink, mut stream) = ws.split();
-        let (out, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    /// A connection on a new virtual connection of `link`: to its user, a connection of its
+    /// own to the browser. `close` closes the virtual connection (its sessions are detached).
+    pub async fn over(link: &BrowserLink) -> Result<CdpConn> {
+        Ok(Self::start(Channel::link(link).await?, None))
+    }
+
+    /// `over`, also handing every event to the returned queue, none dropped (as
+    /// `connect_queued`; the link takes messages up to 256 MiB).
+    pub async fn over_queued(
+        link: &BrowserLink,
+    ) -> Result<(CdpConn, mpsc::UnboundedReceiver<CdpEvent>)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Ok((Self::start(Channel::link(link).await?, Some(tx)), rx))
+    }
+
+    /// Runs a connection on `channel`: a writer task and a reader task.
+    fn start(channel: Channel, queue: Option<mpsc::UnboundedSender<CdpEvent>>) -> CdpConn {
+        let Channel {
+            mut sink,
+            mut stream,
+        } = channel;
+        let (out, mut out_rx) = mpsc::unbounded_channel::<Out>();
         let (events, _) = broadcast::channel(1024);
         let inner = Arc::new(Inner {
             out,
@@ -127,16 +233,20 @@ impl CdpConn {
 
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
-                if sink.send(msg).await.is_err() {
+                let sent = match msg {
+                    Out::Text(text) => sink.send(text).await,
+                    Out::Close => false,
+                };
+                if !sent {
                     break;
                 }
             }
+            sink.close().await;
         });
 
         let reader = inner.clone();
         tokio::spawn(async move {
-            while let Some(Ok(msg)) = stream.next().await {
-                let Message::Text(text) = msg else { continue };
+            while let Some(text) = stream.next().await {
                 let Ok(v) = serde_json::from_str::<Value>(&text) else {
                     continue;
                 };
@@ -164,9 +274,9 @@ impl CdpConn {
                 }
             }
             reader.queue.lock().unwrap().take();
-            // The stream ended or failed (e.g. a message over the limit): close the socket
-            // too, so the other side sees the end and nothing half-open is left.
-            let _ = reader.out.send(Message::Close(None));
+            // The stream ended or failed (e.g. a message over the limit): close the sending
+            // side too, so the other side sees the end and nothing half-open is left.
+            let _ = reader.out.send(Out::Close);
             // Connection closed: fail every outstanding request, and every later one.
             let waiters: Vec<_> = {
                 let mut pending = reader.pending.lock().unwrap();
@@ -179,7 +289,7 @@ impl CdpConn {
             }
         });
 
-        Ok(CdpConn { inner })
+        CdpConn { inner }
     }
 
     pub async fn send(
@@ -229,7 +339,7 @@ impl CdpConn {
             }
         };
         let sent = sent && {
-            let ok = self.inner.out.send(Message::text(msg.to_string())).is_ok();
+            let ok = self.inner.out.send(Out::Text(msg.to_string())).is_ok();
             if !ok {
                 self.inner.pending.lock().unwrap().waiters.remove(&id);
             }
@@ -261,10 +371,11 @@ impl CdpConn {
         }
     }
 
-    /// Closes the websocket; outstanding and later requests fail. Chrome drops what the
-    /// connection had set (permissions, download behavior, interception).
+    /// Closes the connection (the websocket, or the virtual connection and its sessions);
+    /// outstanding and later requests fail. Chrome drops what the connection had set
+    /// (permissions, download behavior, interception).
     pub fn close(&self) {
-        let _ = self.inner.out.send(Message::Close(None));
+        let _ = self.inner.out.send(Out::Close);
     }
 
     pub fn events(&self) -> broadcast::Receiver<CdpEvent> {

@@ -25,7 +25,7 @@ use crate::daemon::run_command;
 use crate::downloads::list_files;
 use crate::paths::{ensure, Paths};
 use crate::profiles::{rpc_error, Profiles};
-use crate::proxy::server::{ProxyServer, WsUpstream};
+use crate::proxy::server::{LinkUpstream, ProxyServer};
 use crate::recording::config::RecordingConfig;
 use crate::recording::recorder::{Recorder, RecorderOptions};
 use crate::recording::replay::ReplayServer;
@@ -408,8 +408,8 @@ impl Daemon {
             .context("asking the browser for its version")?;
         let chrome_version = version["product"].as_str().unwrap_or("unknown").to_string();
         let proxy = Arc::new(
-            ProxyServer::start(Arc::new(WsUpstream {
-                browser_ws_url: browser.ws_url.clone(),
+            ProxyServer::start(Arc::new(LinkUpstream {
+                link: browser.link.clone(),
             }))
             .await?,
         );
@@ -417,7 +417,7 @@ impl Daemon {
         // The settings read at start; the file is not read again.
         let store = RecordingStore::new(paths.clone(), recording.clone());
         let recorder = Recorder::start(RecorderOptions {
-            ws_url: browser.ws_url.clone(),
+            link: browser.link.clone(),
             human_context: browser.human_context.clone(),
             config: recording,
         });
@@ -683,6 +683,14 @@ impl Daemon {
                 self.authorize(&id, p.token.as_deref())?;
                 let set = self.recorder.set_screen_for_test(&id, p.on).await;
                 Ok(json!({ "set": set }))
+            }
+            // Test hook: how many virtual connections ride the daemon's one browser
+            // connection now. Needs a session's token, like the other hooks.
+            "test.linkStats" if crate::testenv::hooks() => {
+                let p: SessionIdParams = params(p)?;
+                let id = checked_session(&p.session_id)?;
+                self.authorize(&id, p.token.as_deref())?;
+                Ok(json!({ "virtual": self.browser.link.virtual_connections() }))
             }
             // Test hook: the bridge of the session's profile detaches from its worker (a
             // diagnostic of how the worker stops and starts without pegboard holding it).

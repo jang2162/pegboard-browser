@@ -22,7 +22,29 @@ pub(crate) type VconnId = u64;
 /// How long opening a browser session may take.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
-type Opened = Result<(VconnId, mpsc::UnboundedReceiver<String>)>;
+type Opened = Result<(Handle, mpsc::UnboundedReceiver<String>)>;
+
+/// A virtual connection, closed when this is dropped. Made as soon as the browser session
+/// exists, so a session nobody takes (its `open` was cancelled) is closed too.
+pub(crate) struct Handle {
+    inner: Arc<Inner>,
+    id: VconnId,
+}
+
+impl Handle {
+    pub(crate) fn send(&self, text: String) -> Result<()> {
+        self.inner.send(self.id, text)
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.inner.close(self.id);
+    }
+}
+
+/// Methods that name a session in their params, which must then be the sender's own.
+const PARAMS_SESSION_METHODS: [&str; 2] = ["Target.detachFromTarget", "Target.sendMessageToTarget"];
 
 /// A request on the physical connection, by the id the browser saw.
 enum Pending {
@@ -82,7 +104,7 @@ impl Inner {
         tokio::spawn(async move {
             while let Some(text) = incoming.recv().await {
                 let Some(inner) = weak.upgrade() else { return };
-                inner.dispatch(&text);
+                Inner::dispatch(&inner, &text);
             }
             if let Some(inner) = weak.upgrade() {
                 inner.end();
@@ -104,7 +126,8 @@ impl Inner {
                 .map_err(|_| anyhow!("the browser connection has ended"))?;
             st.pending.insert(id, Pending::Open(tx));
         }
-        // If this is dropped or times out, the session is detached when its answer comes.
+        // If this is dropped or times out, the session is detached once its answer came: the
+        // handle made for it is dropped unused.
         match tokio::time::timeout(OPEN_TIMEOUT, rx).await {
             Ok(Ok(opened)) => opened,
             Ok(Err(_)) => bail!("the browser connection ended while opening a session"),
@@ -118,7 +141,8 @@ impl Inner {
             .as_object_mut()
             .context("a CDP message is not a JSON object")?;
         let id = obj.get("id").cloned().context("a CDP message has no id")?;
-        let claims = obj.get("method").and_then(Value::as_str) == Some("Target.attachToTarget");
+        let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
+        let claims = method == "Target.attachToTarget";
 
         let mut st = self.state.lock().unwrap();
         let st = &mut *st;
@@ -128,18 +152,20 @@ impl Inner {
         let Some(vc) = st.vconns.get(&vconn) else {
             bail!("the virtual connection has ended");
         };
-        match obj.get("sessionId") {
-            None => {
-                obj.insert("sessionId".into(), vc.browser_session.clone().into());
-            }
-            Some(Value::String(s)) if st.owners.get(s) == Some(&vconn) => {}
-            Some(_) => {
-                // Not its session: the browser never sees it.
-                let error = json!({"id": id, "error": {"code": -32001,
-                    "message": "Session with given id not found."}});
-                let _ = vc.tx.send(error.to_string());
-                return Ok(());
-            }
+        let owns = |s: &Value| matches!(s, Value::String(s) if st.owners.get(s) == Some(&vconn));
+        // A session it names, on the message or in the params of a method that acts on
+        // another session, must be its own: the browser never sees one that is not.
+        let foreign = obj.get("sessionId").is_some_and(|s| !owns(s))
+            || (PARAMS_SESSION_METHODS.contains(&method)
+                && params_session_value(obj).is_some_and(|s| !owns(s)));
+        if foreign {
+            let error = json!({"id": id, "error": {"code": -32001,
+                "message": "Session with given id not found."}});
+            let _ = vc.tx.send(error.to_string());
+            return Ok(());
+        }
+        if !obj.contains_key("sessionId") {
+            obj.insert("sessionId".into(), vc.browser_session.clone().into());
         }
         let link_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         obj.insert("id".into(), link_id.into());
@@ -163,6 +189,10 @@ impl Inner {
 
     pub(crate) fn is_closed(&self) -> bool {
         *self.closed.borrow()
+    }
+
+    pub(crate) fn virtual_connections(&self) -> usize {
+        self.state.lock().unwrap().vconns.len()
     }
 
     fn close_locked(&self, st: &mut State, vconn: VconnId) {
@@ -195,11 +225,14 @@ impl Inner {
     }
 
     /// Routes one message from the browser.
-    fn dispatch(&self, text: &str) {
+    fn dispatch(self: &Arc<Self>, text: &str) {
         let Ok(Value::Object(mut msg)) = serde_json::from_str::<Value>(text) else {
             dropped("not a JSON object", None);
             return;
         };
+        // A new virtual connection nobody took; dropped (which closes it) after the lock is
+        // released, as it is declared before the lock.
+        let mut _untaken: Option<Opened> = None;
         let mut st = self.state.lock().unwrap();
         let st = &mut *st;
         let session = match msg.get("sessionId") {
@@ -224,9 +257,11 @@ impl Inner {
                         }
                     }
                     msg.insert("id".into(), id);
-                    deliver(vc, msg);
+                    if !deliver(vc, msg) {
+                        self.close_locked(st, vconn);
+                    }
                 }
-                Some(Pending::Open(tx)) => self.opened(st, msg, tx),
+                Some(Pending::Open(tx)) => _untaken = self.opened(st, msg, tx),
                 Some(Pending::Ignore) => {}
                 None => dropped("an answer to no request", Some(&msg)),
             }
@@ -275,22 +310,32 @@ impl Inner {
             _ => {}
         }
         match st.vconns.get(&owner) {
-            Some(vc) => deliver(vc, msg),
+            Some(vc) => {
+                if !deliver(vc, msg) {
+                    self.close_locked(st, owner);
+                }
+            }
             None => dropped("a session of a closed connection", Some(&msg)),
         }
     }
 
-    /// The answer to `Target.attachToBrowserTarget`: a new virtual connection.
-    fn opened(&self, st: &mut State, msg: Map<String, Value>, tx: oneshot::Sender<Opened>) {
+    /// The answer to `Target.attachToBrowserTarget`: a new virtual connection. Returns it when
+    /// nobody waits for it any more; the caller drops it once the state is unlocked.
+    fn opened(
+        self: &Arc<Self>,
+        st: &mut State,
+        msg: Map<String, Value>,
+        tx: oneshot::Sender<Opened>,
+    ) -> Option<Opened> {
         if let Some(error) = msg.get("error") {
             let _ = tx.send(Err(anyhow!("Target.attachToBrowserTarget failed: {error}")));
-            return;
+            return None;
         }
         let Some(session) = msg.get("result").and_then(session_of) else {
             let _ = tx.send(Err(anyhow!(
                 "Target.attachToBrowserTarget gave no session id"
             )));
-            return;
+            return None;
         };
         let vconn = st.next_vconn;
         st.next_vconn += 1;
@@ -303,10 +348,13 @@ impl Inner {
             },
         );
         st.owners.insert(session.to_owned(), vconn);
-        if tx.send(Ok((vconn, vrx))).is_err() {
-            // Nobody waits for it any more.
-            self.close_locked(st, vconn);
-        }
+        // From here on the handle closes it, also when the `open` that waits for it is
+        // cancelled after this (the answer then sits unread in the channel and is dropped).
+        let handle = Handle {
+            inner: self.clone(),
+            id: vconn,
+        };
+        tx.send(Ok((handle, vrx))).err()
     }
 }
 
@@ -338,12 +386,13 @@ fn claim(owners: &mut HashMap<String, VconnId>, session: &str, owner: VconnId) {
 }
 
 /// Hands a message to a virtual connection. Its browser session is its root: that session id
-/// is taken off, as a connection of its own would see no session id there.
-fn deliver(vc: &Vconn, mut msg: Map<String, Value>) {
+/// is taken off, as a connection of its own would see no session id there. False when nobody
+/// reads the connection any more.
+fn deliver(vc: &Vconn, mut msg: Map<String, Value>) -> bool {
     if msg.get("sessionId").and_then(Value::as_str) == Some(vc.browser_session.as_str()) {
         msg.remove("sessionId");
     }
-    let _ = vc.tx.send(Value::Object(msg).to_string());
+    vc.tx.send(Value::Object(msg).to_string()).is_ok()
 }
 
 fn session_of(v: &Value) -> Option<&str> {
@@ -352,6 +401,11 @@ fn session_of(v: &Value) -> Option<&str> {
 
 fn params_session(msg: &Map<String, Value>) -> Option<&str> {
     msg.get("params").and_then(session_of)
+}
+
+/// `params.sessionId`, whatever its type.
+fn params_session_value(msg: &Map<String, Value>) -> Option<&Value> {
+    msg.get("params").and_then(|p| p.get("sessionId"))
 }
 
 /// Notes a message given to no one, with its method and session only (never its content),
@@ -875,6 +929,145 @@ mod tests {
             .await
             .unwrap()
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_open_does_not_leak_its_session() {
+        let (link, mut fake) = FakeBrowser::start();
+        let mut opening = Box::pin(link.open());
+        // Polled once: the request is out. Then the answer is routed while nobody polls.
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(opening.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(pending);
+        tokio::time::sleep(QUIET).await;
+        drop(opening);
+        let m = fake.next().await;
+        assert_eq!(m["method"], "Target.detachFromTarget");
+        assert_eq!(m["params"]["sessionId"], "B1");
+        assert!(m.get("sessionId").is_none(), "not sent on the root: {m}");
+        // Nothing of it is left: its session belongs to nobody, the link works on.
+        let (s2, mut r2) = open(&link).await;
+        fake.send(event("B1", "Page.loadEventFired"));
+        nothing(&mut r2).await;
+        send(&s2, json!({"id": 1, "method": "Browser.getVersion"}));
+        assert_eq!(fake.next().await["sessionId"], "B2");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_receiver_closes_the_connection() {
+        let (link, mut fake) = FakeBrowser::start();
+        let (s1, mut r1) = open(&link).await;
+        let (_s2, mut r2) = open(&link).await;
+        fake.send(attached("B1", "C1"));
+        recv(&mut r1).await;
+        drop(r1);
+        fake.quiet().await;
+        // The next message for it finds nobody reading: it is closed, its sessions detached.
+        fake.send(event("C1", "Page.loadEventFired"));
+        let mut detached = Vec::new();
+        for _ in 0..2 {
+            let m = fake.next().await;
+            assert_eq!(m["method"], "Target.detachFromTarget");
+            detached.push(m["params"]["sessionId"].as_str().unwrap().to_string());
+        }
+        assert_eq!(detached, ["C1", "B1"]);
+        assert!(s1
+            .send(json!({"id": 1, "method": "Browser.getVersion"}).to_string())
+            .is_err());
+        // An answer meets the same end.
+        let (s3, r3) = open(&link).await;
+        send(&s3, json!({"id": 1, "method": "Browser.getVersion"}));
+        let m = fake.next().await;
+        drop(r3);
+        fake.answer(&m, json!({}));
+        let m = fake.next().await;
+        assert_eq!(m["method"], "Target.detachFromTarget");
+        assert_eq!(m["params"]["sessionId"], "B3");
+        fake.quiet().await;
+        nothing(&mut r2).await;
+    }
+
+    #[tokio::test]
+    async fn params_session_of_another_connection_is_refused() {
+        let (link, mut fake) = FakeBrowser::start();
+        let (s1, mut r1) = open(&link).await;
+        let (s2, mut r2) = open(&link).await;
+        fake.send(attached("B1", "C1"));
+        recv(&mut r1).await;
+
+        for method in ["Target.detachFromTarget", "Target.sendMessageToTarget"] {
+            for (id, session) in [
+                (1, json!("C1")),
+                (2, json!("B1")),
+                (3, json!("NOPE")),
+                (4, json!(5)),
+            ] {
+                send(
+                    &s2,
+                    json!({"id": id, "method": method,
+                        "params": {"sessionId": session, "message": "{}"}}),
+                );
+                fake.quiet().await;
+                assert_eq!(
+                    recv(&mut r2).await,
+                    not_found(json!(id)),
+                    "{method} {session}"
+                );
+            }
+        }
+        nothing(&mut r1).await;
+
+        // Its owner may.
+        send(
+            &s1,
+            json!({"id": 5, "method": "Target.detachFromTarget", "params": {"sessionId": "C1"}}),
+        );
+        let m = fake.next().await;
+        assert_eq!(m["sessionId"], "B1");
+        assert_eq!(m["params"]["sessionId"], "C1");
+        // Without a session in the params (by target), it goes on as before.
+        send(
+            &s2,
+            json!({"id": 6, "method": "Target.detachFromTarget", "params": {"targetId": "T1"}}),
+        );
+        assert_eq!(fake.next().await["sessionId"], "B2");
+    }
+
+    /// `CdpConn` rides a virtual connection unchanged: requests on its browser session,
+    /// events without it, and `close` detaches.
+    #[tokio::test]
+    async fn a_cdp_connection_rides_a_virtual_connection() {
+        let (link, mut fake) = FakeBrowser::start();
+        let (conn, mut queue) = crate::cdp::CdpConn::over_queued(&link).await.unwrap();
+        let reply = conn.send_now("Browser.getVersion", json!({}), None);
+        let m = fake.next().await;
+        assert_eq!(m["sessionId"], "B1");
+        fake.answer(&m, json!({"product": "x"}));
+        assert_eq!(reply.await.unwrap(), json!({"product": "x"}));
+        fake.send(event("B1", "Target.targetCreated"));
+        let got = tokio::time::timeout(WAIT, queue.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.method, "Target.targetCreated");
+        assert_eq!(got.session_id, None);
+        assert_eq!(link.virtual_connections(), 1);
+
+        conn.close();
+        let m = fake.next().await;
+        assert_eq!(m["method"], "Target.detachFromTarget");
+        assert_eq!(m["params"]["sessionId"], "B1");
+        assert!(tokio::time::timeout(WAIT, queue.recv())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(conn
+            .send("Browser.getVersion", json!({}), None)
+            .await
+            .is_err());
+        assert_eq!(link.virtual_connections(), 0);
     }
 
     #[tokio::test]
