@@ -877,20 +877,20 @@ fn parallel_downloads_over_the_session_limit_are_cut_while_running() {
     });
 }
 
-/// The application macOS has in front (`System Events`), or why it could not be read.
+/// The application macOS has in front (`lsappinfo`), or why it could not be read. Not
+/// `System Events` through `osascript`: that asks the person for automation consent, and the
+/// unanswered prompt stays in front, so the browser can no longer make a profile the default
+/// context for the rest of the run.
 fn frontmost() -> String {
-    std::process::Command::new("osascript")
-        .args([
-            "-e",
-            "tell application \"System Events\" to get name of first process whose frontmost is true",
-        ])
+    std::process::Command::new("sh")
+        .args(["-c", "lsappinfo info -only name \"$(lsappinfo front)\""])
         .output()
         .map(|o| {
-            let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if out.is_empty() {
-                format!("unknown ({})", String::from_utf8_lossy(&o.stderr).trim())
-            } else {
-                out
+            let out = String::from_utf8_lossy(&o.stdout);
+            // `"<name>" ASN:...: (in front)` on the first line.
+            match out.lines().next().and_then(|l| l.split('"').nth(1)) {
+                Some(name) if !name.is_empty() => name.to_string(),
+                _ => format!("unknown ({})", String::from_utf8_lossy(&o.stderr).trim()),
             }
         })
         .unwrap_or_else(|e| format!("unknown ({e})"))
@@ -937,7 +937,7 @@ fn a_limit_cancel_works_when_the_agent_profile_is_not_the_default() {
         click_go(&h, &tab).await;
         let outcome = stream_end(&name, 25).await;
         let after = h.browser.downloads.cancel_counts();
-        // Information only: a failed AppleScript call reads as "unknown (...)".
+        // Information only: a failed lookup reads as "unknown (...)".
         let front_after = frontmost();
         eprintln!(
             "MEASURE stream {outcome:?}; cancels [worked, refused] before {before:?} after \
