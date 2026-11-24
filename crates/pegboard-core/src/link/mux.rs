@@ -108,6 +108,13 @@ impl Inner {
                     Incoming::Text(text) => Inner::dispatch(&inner, &text),
                     Incoming::Oversized { head, tail } => inner.oversized(&head, &tail),
                 }
+                drop(inner);
+                // While a backlog is queued `recv` is always ready, and this task would go on
+                // routing until tokio's budget runs out (128 messages; seconds for large
+                // ones). A task it woke meanwhile (the user of a virtual connection, a
+                // timeout) waits for it on this worker, so it lets them run after every
+                // message.
+                tokio::task::yield_now().await;
             }
             if let Some(inner) = weak.upgrade() {
                 inner.end();
@@ -1152,5 +1159,35 @@ mod tests {
             .unwrap();
         assert!(opening.await.unwrap().is_err());
         assert!(!link.is_closed());
+    }
+
+    /// The link hands on a backlog of messages for one virtual connection (one whose user
+    /// does not read, say) without holding up another: a task woken by a message it routed
+    /// runs while it goes on, not only once the whole backlog is through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backlog_for_one_connection_does_not_hold_up_another() {
+        let (link, fake) = FakeBrowser::start();
+        let (_s1, _r1) = open(&link).await;
+        let (_s2, mut r2) = open(&link).await;
+        let got = tokio::spawn(async move {
+            r2.recv().await.expect("the virtual connection ended");
+            std::time::Instant::now()
+        });
+        // The receiver waits before anything comes.
+        tokio::time::sleep(QUIET).await;
+
+        let mut big = event("B1", "Runtime.consoleAPICalled");
+        big["params"]["value"] = "x".repeat(1 << 20).into();
+        let big = big.to_string();
+        let sent = std::time::Instant::now();
+        fake.send(event("B2", "Page.loadEventFired"));
+        for _ in 0..200 {
+            fake.send_text(big.clone());
+        }
+        let latency = got.await.unwrap() - sent;
+        assert!(
+            latency < Duration::from_millis(150),
+            "V2 got its message after {latency:?}"
+        );
     }
 }
