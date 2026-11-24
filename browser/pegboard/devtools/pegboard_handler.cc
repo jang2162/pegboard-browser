@@ -14,21 +14,26 @@
 #include "base/functional/bind.h"
 #include "base/memory/raw_ptr.h"
 #include "base/no_destructor.h"
+#include "base/scoped_observation.h"
 #include "base/strings/strcat.h"
 #include "base/strings/string_util.h"
 #include "base/strings/utf_string_conversions.h"
+#include "base/task/single_thread_task_runner.h"
 #include "base/time/time.h"
+#include "base/timer/timer.h"
 #include "base/types/expected.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/profiles/profile_attributes_entry.h"
 #include "chrome/browser/profiles/profile_attributes_storage.h"
+#include "chrome/browser/tab_group_sync/tab_group_sync_service_factory.h"
 #include "chrome/browser/tab_list/tab_list_interface.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
 #include "chrome/browser/ui/browser_window/public/desktop_browser_window_capabilities.h"
 #include "chrome/browser/ui/navigator/browser_navigator.h"
 #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+#include "components/saved_tab_groups/public/tab_group_sync_service.h"
 #include "components/tab_groups/tab_group_color.h"
 #include "components/tab_groups/tab_group_id.h"
 #include "components/tab_groups/tab_group_visual_data.h"
@@ -335,6 +340,36 @@ void CloseTab(tabs::TabInterface* tab) {
   }
 }
 
+// How long openProfileWindow waits for the profile's saved-tab-group service.
+constexpr base::TimeDelta kTabGroupSyncWait = base::Seconds(30);
+
+// Whether the saved-tab-group service of `profile` has started (or there is
+// none). Until it has, a group made in the profile can lose its tabs: when the
+// service starts it closes the tabs of a local group that its saved copy does
+// not have (TabGroupSyncCoordinatorImpl::InitializeTabGroupSync). The service
+// has no getter; AddObserver tells a late observer at once that it started.
+bool IsTabGroupSyncReady(Profile* profile) {
+  tab_groups::TabGroupSyncService* service =
+      tab_groups::TabGroupSyncServiceFactory::GetForProfile(profile);
+  if (!service) {
+    return true;
+  }
+  class Probe : public tab_groups::TabGroupSyncService::Observer {
+   public:
+    void OnInitialized() override { started = true; }
+    bool started = false;
+  } probe;
+  service->AddObserver(&probe);
+  service->RemoveObserver(&probe);
+  return probe.started;
+}
+
+Response NotStarted() {
+  return Response::ServerError(
+      "the agent profile's tab groups have not started yet (open it with "
+      "openProfileWindow first)");
+}
+
 Response TabStripBusy() {
   return Response::ServerError("a tab strip of the profile is being dragged");
 }
@@ -548,7 +583,64 @@ void PegboardHandler::OnProfileReady(
                                                 profile_directory));
     return;
   }
-  callback->sendSuccess(profile->UniqueId());
+  if (IsTabGroupSyncReady(profile)) {
+    callback->sendSuccess(profile->UniqueId());
+    return;
+  }
+  // A profile just loaded: answer once its saved-tab-group service started,
+  // so the groups the daemon makes next keep their tabs.
+  const int id = next_waiter_id_++;
+  waiters_[id] = std::make_unique<TabGroupSyncWaiter>(
+      tab_groups::TabGroupSyncServiceFactory::GetForProfile(profile),
+      base::BindOnce(&PegboardHandler::OnTabGroupSyncStarted,
+                     weak_factory_.GetWeakPtr(), id, profile->UniqueId(),
+                     profile_directory, std::move(callback)));
+}
+
+void PegboardHandler::OnTabGroupSyncStarted(
+    int waiter,
+    std::string browser_context_id,
+    std::string profile_directory,
+    std::unique_ptr<OpenProfileWindowCallback> callback,
+    bool started) {
+  waiters_.erase(waiter);
+  if (!started) {
+    callback->sendFailure(Response::ServerError(
+        "the tab groups of " + profile_directory + " did not start"));
+    return;
+  }
+  callback->sendSuccess(browser_context_id);
+}
+
+TabGroupSyncWaiter::TabGroupSyncWaiter(tab_groups::TabGroupSyncService* service,
+                                       base::OnceCallback<void(bool)> done)
+    : done_(std::move(done)) {
+  timer_.Start(FROM_HERE, kTabGroupSyncWait,
+               base::BindOnce(&TabGroupSyncWaiter::Finish,
+                              base::Unretained(this), false));
+  observation_.Observe(service);
+}
+
+TabGroupSyncWaiter::~TabGroupSyncWaiter() = default;
+
+void TabGroupSyncWaiter::OnInitialized() {
+  Finish(true);
+}
+
+void TabGroupSyncWaiter::OnWillBeDestroyed() {
+  Finish(false);
+}
+
+void TabGroupSyncWaiter::Finish(bool started) {
+  if (!done_) {
+    return;
+  }
+  observation_.Reset();
+  timer_.Stop();
+  // Posted: the service runs its own start-up (the coordinator's, which
+  // closes tabs) in the same task, and the owner deletes this waiter.
+  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+      FROM_HERE, base::BindOnce(std::move(done_), started));
 }
 
 Response PegboardHandler::CreateGroup(const std::string& browser_context_id,
@@ -569,6 +661,9 @@ Response PegboardHandler::CreateGroup(const std::string& browser_context_id,
   }
   if (!TabListInterface::CanEditTabList(*profile)) {
     return TabStripBusy();
+  }
+  if (!IsTabGroupSyncReady(profile)) {
+    return NotStarted();
   }
   tabs::TabInterface* tab =
       OpenTab(profile, TabbedWindowOf(profile), GURL(url::kAboutBlankURL));
@@ -605,6 +700,9 @@ Response PegboardHandler::CreateTab(const std::string& browser_context_id,
   }
   if (!TabListInterface::CanEditTabList(*profile)) {
     return TabStripBusy();
+  }
+  if (!IsTabGroupSyncReady(profile)) {
+    return NotStarted();
   }
   auto [window, group] = FindGroup(group_id);
   if (window) {

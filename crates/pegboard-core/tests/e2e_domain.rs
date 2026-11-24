@@ -552,7 +552,9 @@ async fn tab_activated_reports_switches() {
     assert_eq!(common::context_of(&c, &second_human).await, default);
     let human = first_human.first().expect("no page of Default").clone();
     let ctx = agent_context(&c, AGENT).await;
+    let mut steps = vec![("opened", agent_pages(&c, &ctx).await)];
     let made = create_group(&c, &ctx).await.unwrap();
+    steps.push(("group", agent_pages(&c, &ctx).await));
     let group = made["groupId"].as_i64().unwrap();
     let t1 = made["targetId"].as_str().unwrap().to_string();
     let t2 = c
@@ -568,6 +570,7 @@ async fn tab_activated_reports_switches() {
         .unwrap()
         .to_string();
 
+    steps.push(("tab", agent_pages(&c, &ctx).await));
     let mut events = c.events();
     for t in [&t2, &t1] {
         let before = common_ms();
@@ -575,8 +578,22 @@ async fn tab_activated_reports_switches() {
             .send("Target.activateTarget", json!({ "targetId": t }), None)
             .await
         {
-            let pages = page_targets(&c).await.unwrap();
-            panic!("activating {t} (t1 {t1}, t2 {t2}): {e:#}; pages {pages:?}");
+            let all = c.send("Target.getTargets", json!({}), None).await;
+            let info = c
+                .send("Target.getTargetInfo", json!({ "targetId": t }), None)
+                .await;
+            let members = c
+                .send(
+                    "Pegboard.getGroupMembers",
+                    json!({ "groupId": group }),
+                    None,
+                )
+                .await;
+            steps.push(("failed", agent_pages(&c, &ctx).await));
+            panic!(
+                "activating {t} (t1 {t1}, t2 {t2}, made {made}): {e:#}\n\
+                 steps {steps:?}\ntargets {all:?}\ninfo {info:?}\nmembers {members:?}"
+            );
         }
         let e = wait_event(
             &mut events,
@@ -608,6 +625,21 @@ async fn tab_activated_reports_switches() {
         }
     }
     assert_eq!(pegboard_events(&mut others), Vec::<String>::new());
+}
+
+/// The agent context's pages as (id, url, title), for diagnostics.
+async fn agent_pages(c: &CdpConn, ctx: &str) -> Vec<(String, String, String)> {
+    let r = c.send("Target.getTargets", json!({}), None).await.unwrap();
+    r["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["type"] == "page" && t["browserContextId"] == ctx)
+        .map(|t| {
+            let s = |k: &str| t[k].as_str().unwrap_or("").to_string();
+            (s("targetId"), s("url"), s("title"))
+        })
+        .collect()
 }
 
 fn common_ms() -> f64 {
@@ -918,6 +950,48 @@ async fn exposed_protocol_binding_has_no_domain() {
         assert_eq!(out["childClaim"]["error"]["code"], -32601, "{when}: {out}");
         if when == "before the claim" {
             c.send("Pegboard.claim", json!({}), None).await.unwrap();
+        }
+    }
+}
+
+/// A new agent profile's saved-tab-group service starts a moment after the profile loads,
+/// and when it starts it closes the tabs of a local group that its saved copy does not have
+/// (`TabGroupSyncCoordinatorImpl::InitializeTabGroupSync`). So `openProfileWindow` answers
+/// only once that service has started: groups and tabs made right after it stay. Several
+/// fresh profiles, as the race is short.
+#[tokio::test]
+#[ignore]
+async fn tabs_made_right_after_a_new_profile_opens_stay() {
+    let Some(f) = Fork::start(&[]).await else {
+        return;
+    };
+    let c = f.control().await;
+    for n in 1..=4 {
+        let ctx = agent_context(&c, &format!("PegboardAgent-r{n}")).await;
+        let made = create_group(&c, &ctx).await.unwrap();
+        let group = made["groupId"].as_i64().unwrap();
+        let mut tabs = vec![made["targetId"].as_str().unwrap().to_string()];
+        for _ in 0..3 {
+            let r = c
+                .send(
+                    "Pegboard.createTab",
+                    json!({ "browserContextId": ctx, "groupId": group, "url": "about:blank",
+                            "title": "t", "color": "blue" }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(r["newGroupId"].is_null(), "{r}");
+            tabs.push(r["targetId"].as_str().unwrap().to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut now = members(&c, group).await;
+        now.sort();
+        tabs.sort();
+        assert_eq!(now, tabs, "profile r{n}: the group lost tabs");
+        let pages = pages_in(&c, &ctx).await;
+        for t in &tabs {
+            assert!(pages.contains(t), "profile r{n}: {t} is gone: {pages:?}");
         }
     }
 }

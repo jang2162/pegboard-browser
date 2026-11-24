@@ -983,7 +983,7 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; fini
 
 | 시험 | 결과 |
 |---|---|
-| `e2e_domain` | 10 passed(검토 뒤 셋 더함: 원격 디버깅 포트, 페이지 세션, `exposeDevToolsProtocol` 바인딩). 2차 검토 반영 뒤 전체 실행 6번 중 2번 `tab_activated_reports_switches`가 실패했다(아래 열린 항목). 그 시험만 5번, 이어서 전체 4번은 모두 통과했다 |
+| `e2e_domain` | 11 passed. 검토 뒤 넷을 더했다: 원격 디버깅 포트, 페이지 세션, `exposeDevToolsProtocol` 바인딩, 새 프로필 직후의 탭. `tab_activated_reports_switches`가 가끔 실패하던 것을 고친 뒤(아래) 전체를 12번 이어 돌려 모두 통과했다 |
 | `e2e_bridge` | 8 passed |
 | `e2e_proxy` | 24 passed |
 | `e2e_browser hosted_start_closes_leftover_agent_tabs` | 1 passed |
@@ -1011,12 +1011,18 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; fini
 
 - 사람이 쓰는 브라우저가 DCHECK 하나로 죽을 수 있다는 뜻이다. 그래서 `args.gn`에 `dcheck_always_on = false`를 넣었다(Chrome 배포판과 같다). 모든 컴파일 인자가 바뀌어 다시 빌드에 2시간 44분이 걸렸다(위 표). 그 빌드에서 두 팝업 시험이 통과했다.
 
-#### 열린 항목: `tab_activated_reports_switches`가 가끔 실패한다
+#### `tab_activated_reports_switches`가 가끔 실패하던 원인 (해결)
 
-`Pegboard.createGroup`·`createTab`이 돌려준 탭에 `Target.activateTarget`을 보내면 가끔 `-32602 "No target with given id found"`가 돌아온다. 전체 실행 중에만 나왔고 원인은 모른다 [미확인].
-- 페이지 타깃(`RenderFrameDevToolsAgentHost`)은 프레임이 사는 동안 남아 있고, ID는 프레임 노드의 토큰이다(소스 확인).
-- 그렇다면 탭이 그 사이 다른 `WebContents`로 바뀌었거나, 돌려준 ID가 그 탭의 것이 아닐 수 있다.
-- 시험은 이제 실패하면 그때의 페이지 목록을 출력한다. 다음 실패 때 원인을 볼 수 있다.
+`Pegboard.createTab`이 돌려준 탭에 `Target.activateTarget`을 보내면 가끔 `-32602 "No target with given id found"`가 돌아왔다.
+
+- **실측**: 실패 순간 그 탭은 대상 목록에도 그룹에도 없었다. 다른 ID로 남은 것도 아니어서, 에이전트 컨텍스트의 페이지는 창의 첫 탭과 `createGroup`의 탭뿐이었다. 도메인이 오래된 ID를 준 것이 아니다. `createTab` 응답 바로 뒤(5ms)에 탭이 닫혔다.
+- **닫은 것**(임시 로그와 스택으로 확인): `TabGroupSyncServiceImpl::NotifyServiceInitialized` → `TabGroupSyncCoordinatorImpl::InitializeTabGroupSync` → `TabGroupSyncDelegateDesktop::ConnectLocalTabGroup` → `TabStripModel::CloseWebContents`.
+  - 저장된 탭그룹 서비스는 프로필이 올라온 뒤 잠시 있다가 비동기로 시작한다.
+  - 시작할 때 로컬 그룹을 저장된 사본에 잇는데, 사본에 없는 탭은 닫는다.
+  - 새 에이전트 프로필에서 서비스가 시작되기 전에 만든 그룹의 탭이 닫혔다. 시작이 그룹을 만든 뒤에 오느냐에 따라 갈려서 가끔이었다.
+- **고침**: `openProfileWindow`는 그 프로필의 서비스가 시작된 뒤에 답한다. 기다림은 30초이고, 넘으면 실패로 답한다. 서비스가 자기 시작 일을 끝내도록 답은 다음 작업으로 미룬다. `createGroup`/`createTab`은 서비스가 아직 시작되지 않은 프로필에는 `-32000`으로 거부한다. 탭을 잃는 대신 실패로 알리는 것이다.
+- **시험**: `tabs_made_right_after_a_new_profile_opens_stay`(새 프로필 넷에 그룹과 탭 넷씩)는 고치기 전에 세 번 모두 실패했다(두 번째 프로필이 탭 셋을 잃었다). 고친 뒤에는 `e2e_domain` 전체(11개)를 12번 이어 돌려 모두 통과했고, 포크 구성 `e2e_bridge`도 8 passed였다.
+- **남은 것**: 프로필마다 저장된 탭그룹이 쌓인다. 다음에 프로필을 올릴 때 서비스가 그것을 어떻게 다루는지(다시 열기 등)는 보지 않았다 [미확인]. F11의 남은 상태 정리와 함께 3b에서 본다.
 
 #### 그 밖에 본 것
 

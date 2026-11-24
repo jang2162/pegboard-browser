@@ -5,6 +5,7 @@
 #ifndef PEGBOARD_DEVTOOLS_PEGBOARD_HANDLER_H_
 #define PEGBOARD_DEVTOOLS_PEGBOARD_HANDLER_H_
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -12,6 +13,7 @@
 #include "base/memory/weak_ptr.h"
 #include "base/scoped_multi_source_observation.h"
 #include "base/scoped_observation.h"
+#include "base/timer/timer.h"
 #include "chrome/browser/devtools/protocol/pegboard.h"
 #include "chrome/browser/profiles/profile_manager.h"
 #include "chrome/browser/profiles/profile_manager_observer.h"
@@ -19,6 +21,7 @@
 #include "chrome/browser/ui/browser_tab_strip_tracker.h"
 #include "chrome/browser/ui/browser_tab_strip_tracker_delegate.h"
 #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+#include "components/saved_tab_groups/public/tab_group_sync_service.h"
 
 class Profile;
 
@@ -27,6 +30,30 @@ class DevToolsAgentHostClientChannel;
 }  // namespace content
 
 namespace pegboard {
+
+// Calls back once a profile's saved-tab-group service has started (true), or
+// went or took too long (false); in a later task, never from its own methods.
+class TabGroupSyncWaiter : public tab_groups::TabGroupSyncService::Observer {
+ public:
+  TabGroupSyncWaiter(tab_groups::TabGroupSyncService* service,
+                     base::OnceCallback<void(bool)> done);
+  TabGroupSyncWaiter(const TabGroupSyncWaiter&) = delete;
+  TabGroupSyncWaiter& operator=(const TabGroupSyncWaiter&) = delete;
+  ~TabGroupSyncWaiter() override;
+
+  // tab_groups::TabGroupSyncService::Observer:
+  void OnInitialized() override;
+  void OnWillBeDestroyed() override;
+
+ private:
+  void Finish(bool started);
+
+  base::OnceCallback<void(bool)> done_;
+  base::OneShotTimer timer_;
+  base::ScopedObservation<tab_groups::TabGroupSyncService,
+                          tab_groups::TabGroupSyncService::Observer>
+      observation_{this};
+};
 
 // The Pegboard domain on one browser session of the DevTools pipe client
 // (pegboard_protocol.pdl). Exactly one session at a time owns the domain: the
@@ -111,6 +138,12 @@ class PegboardHandler : public protocol::Pegboard::Backend,
   void OnProfileReady(std::string profile_directory,
                       std::unique_ptr<OpenProfileWindowCallback> callback,
                       Profile* profile);
+  void OnTabGroupSyncStarted(
+      int waiter,
+      std::string browser_context_id,
+      std::string profile_directory,
+      std::unique_ptr<OpenProfileWindowCallback> callback,
+      bool started);
 
   std::unique_ptr<protocol::Pegboard::Frontend> frontend_;
   base::ScopedObservation<ProfileManager, ProfileManagerObserver>
@@ -118,6 +151,9 @@ class PegboardHandler : public protocol::Pegboard::Backend,
   base::ScopedMultiSourceObservation<Profile, ProfileObserver>
       profile_observations_{this};
   std::unique_ptr<BrowserTabStripTracker> tab_strip_tracker_;
+  // openProfileWindow calls waiting for a profile's tab groups to start.
+  std::map<int, std::unique_ptr<TabGroupSyncWaiter>> waiters_;
+  int next_waiter_id_ = 1;
   base::WeakPtrFactory<PegboardHandler> weak_factory_{this};
 };
 
