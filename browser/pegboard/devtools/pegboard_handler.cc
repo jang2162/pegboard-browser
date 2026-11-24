@@ -21,6 +21,8 @@
 #include "base/types/expected.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/profiles/profile.h"
+#include "chrome/browser/profiles/profile_attributes_entry.h"
+#include "chrome/browser/profiles/profile_attributes_storage.h"
 #include "chrome/browser/tab_list/tab_list_interface.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
@@ -70,6 +72,29 @@ bool IsCreatableAgentDirectoryName(std::string_view dir) {
 
 std::string DirectoryOf(const Profile* profile) {
   return profile->GetBaseName().AsUTF8Unsafe();
+}
+
+// Whether a profile the browser knows (loaded, or in the profile list) has a
+// directory named `dir` apart from case. On a case-insensitive file system
+// (macOS by default) that is the same directory under another name: a
+// person's "pegboardagent" would be opened as the agent's "PegboardAgent".
+bool CollidesApartFromCase(ProfileManager* manager, std::string_view dir) {
+  auto collides = [dir](const base::FilePath& path) {
+    const std::string name = path.BaseName().AsUTF8Unsafe();
+    return name != dir && base::EqualsCaseInsensitiveASCII(name, dir);
+  };
+  for (Profile* profile : manager->GetLoadedProfiles()) {
+    if (collides(profile->GetPath())) {
+      return true;
+    }
+  }
+  for (ProfileAttributesEntry* entry :
+       manager->GetProfileAttributesStorage().GetAllProfilesAttributes()) {
+    if (collides(entry->GetPath())) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The profiles getProfiles lists: a regular profile of the user data
@@ -272,7 +297,9 @@ tabs::TabInterface* OpenTab(Profile* profile,
     params.browser = window;
   } else {
     params.disposition = WindowOpenDisposition::NEW_WINDOW;
-    params.window_action = NavigateParams::WindowAction::kShowWindow;
+    // Never takes focus from the person's window (as the extension's
+    // active:false tabs did not).
+    params.window_action = NavigateParams::WindowAction::kShowWindowInactive;
   }
   Navigate(&params);
   if (!params.navigated_or_inserted_contents) {
@@ -280,15 +307,20 @@ tabs::TabInterface* OpenTab(Profile* profile,
   }
   tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(
       params.navigated_or_inserted_contents);
-  if (!tab || !IsNormalWindow(tab->GetBrowserWindowInterface())) {
+  BrowserWindowInterface* opened_in =
+      tab ? tab->GetBrowserWindowInterface() : nullptr;
+  if (!IsNormalWindow(opened_in) || opened_in->GetProfile() != profile) {
     return nullptr;
   }
   return tab;
 }
 
 void CloseTab(tabs::TabInterface* tab) {
-  if (TabListInterface* list =
-          TabListInterface::From(tab->GetBrowserWindowInterface())) {
+  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
+  if (!window) {
+    return;
+  }
+  if (TabListInterface* list = TabListInterface::From(window)) {
     list->CloseTab(tab->GetHandle());
   }
 }
@@ -301,8 +333,8 @@ Response TabStripBusy() {
 std::optional<int> StartGroup(tabs::TabInterface* tab,
                               const std::string& title,
                               tab_groups::TabGroupColorId color) {
-  TabListInterface* list =
-      TabListInterface::From(tab->GetBrowserWindowInterface());
+  BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
+  TabListInterface* list = window ? TabListInterface::From(window) : nullptr;
   if (!list) {
     return std::nullopt;
   }
@@ -337,8 +369,11 @@ base::expected<std::vector<tabs::TabHandle>, std::string> AgentTabsOf(
 bool CanEdit(const std::vector<tabs::TabHandle>& tabs) {
   for (const tabs::TabHandle& handle : tabs) {
     tabs::TabInterface* tab = handle.Get();
-    if (tab && !TabListInterface::CanEditTabList(
-                   *tab->GetBrowserWindowInterface()->GetProfile())) {
+    if (!tab) {
+      continue;
+    }
+    BrowserWindowInterface* window = tab->GetBrowserWindowInterface();
+    if (!window || !TabListInterface::CanEditTabList(*window->GetProfile())) {
       return false;
     }
   }
@@ -351,9 +386,21 @@ bool CanEdit(const std::vector<tabs::TabHandle>& tabs) {
 bool PegboardHandler::IsAvailable(
     content::DevToolsAgentHostClientChannel* channel) {
   content::DevToolsAgentHostClient* client = channel->GetClient();
-  return channel->GetAgentHost()->GetType() ==
-             content::DevToolsAgentHost::kTypeBrowser &&
-         client->IsTrusted() && client->AllowUnsafeOperations();
+  if (channel->GetAgentHost()->GetType() !=
+          content::DevToolsAgentHost::kTypeBrowser ||
+      !client->IsTrusted() || !client->AllowUnsafeOperations()) {
+    return false;
+  }
+  // The pipe's own session ("RemoteDebugger") and the sessions opened on it
+  // with Target.attachToBrowserTarget (content's TargetHandler::Session,
+  // "DevTools"). content has no type to test, so the client's kind comes from
+  // the name it gives metrics; everything else (Target.exposeDevToolsProtocol's
+  // BrowserConnectorHostClient says "Other") is refused. A session opened from
+  // such a binding would say "DevTools" too: pegboard-cdp-domain.patch keeps
+  // the binding from inheriting AllowUnsafeOperations, so its sessions fail
+  // the test above.
+  const std::string kind = client->GetTypeForMetrics();
+  return kind == "RemoteDebugger" || kind == "DevTools";
 }
 
 PegboardHandler::PegboardHandler(protocol::UberDispatcher* dispatcher)
@@ -402,7 +449,7 @@ void PegboardHandler::StartObserving() {
       }
     }
   }
-  tab_strip_tracker_ = std::make_unique<BrowserTabStripTracker>(this, nullptr);
+  tab_strip_tracker_ = std::make_unique<BrowserTabStripTracker>(this, this);
   tab_strip_tracker_->Init();
 }
 
@@ -451,6 +498,12 @@ void PegboardHandler::OpenProfileWindow(
   ProfileManager* manager = g_browser_process->profile_manager();
   if (!manager) {
     callback->sendFailure(Response::ServerError("no profile manager"));
+    return;
+  }
+  if (CollidesApartFromCase(manager, profile_directory)) {
+    callback->sendFailure(Response::ServerError(
+        "another profile's directory differs only in case: " +
+        profile_directory));
     return;
   }
   const base::FilePath path =
@@ -602,8 +655,12 @@ Response PegboardHandler::AddToGroup(int group_id,
   TabListInterface* list = TabListInterface::From(window);
   const tabs::TabHandle handle = tab->GetHandle();
   if (tab->GetBrowserWindowInterface() != window) {
-    TabListInterface::From(tab->GetBrowserWindowInterface())
-        ->MoveTabToWindow(handle, window->GetSessionID(), list->GetTabCount());
+    TabListInterface* from =
+        TabListInterface::From(tab->GetBrowserWindowInterface());
+    if (!from) {
+      return Response::ServerError("could not move the tab to its group");
+    }
+    from->MoveTabToWindow(handle, window->GetSessionID(), list->GetTabCount());
     tab = handle.Get();
     if (!tab || tab->GetBrowserWindowInterface() != window) {
       return Response::ServerError("could not move the tab to its group");
@@ -674,7 +731,7 @@ Response PegboardHandler::UngroupTargets(
   }
   for (const tabs::TabHandle& handle : *tabs) {
     tabs::TabInterface* tab = handle.Get();
-    if (!tab || !tab->GetGroup()) {
+    if (!tab || !tab->GetGroup() || !tab->GetBrowserWindowInterface()) {
       continue;
     }
     if (TabListInterface* list =
@@ -734,6 +791,10 @@ void PegboardHandler::OnProfileWillBeDestroyed(Profile* profile) {
   }
 }
 
+bool PegboardHandler::ShouldTrackBrowser(BrowserWindowInterface* browser) {
+  return IsNormalWindow(browser) && IsAgentProfile(browser->GetProfile());
+}
+
 void PegboardHandler::OnTabStripModelChanged(
     TabStripModel* tab_strip_model,
     const TabStripModelChange& change,
@@ -748,7 +809,11 @@ void PegboardHandler::OnTabStripModelChanged(
   }
   content::WebContents* contents = selection.new_contents;
   Profile* profile = Profile::FromBrowserContext(contents->GetBrowserContext());
-  if (!IsAgentProfile(profile)) {
+  tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(contents);
+  BrowserWindowInterface* window =
+      tab ? tab->GetBrowserWindowInterface() : nullptr;
+  if (!IsAgentProfile(profile) || !IsNormalWindow(window) ||
+      window->GetProfile() != profile) {
     return;
   }
   frontend_->TabActivated(profile->UniqueId(), TargetIdOf(contents),

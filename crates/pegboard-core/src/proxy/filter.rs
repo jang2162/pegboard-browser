@@ -1294,6 +1294,32 @@ mod tests {
         ));
     }
 
+    /// `Target.exposeDevToolsProtocol` hands a page a browser session of the caller's client;
+    /// with `inheritPermissions` it would be the kind of client the fork's `Pegboard` domain
+    /// is open to (`browser/pegboard/devtools/pegboard_handler.cc`, `IsAvailable`, which with
+    /// pegboard-cdp-domain.patch also keeps the binding from inheriting unsafe operations).
+    /// An agent must never get to call it.
+    #[test]
+    fn expose_devtools_protocol_stays_refused() {
+        let method = "Target.exposeDevToolsProtocol";
+        assert!(GUARD_METHODS.contains(&method));
+        assert!(!ALLOWED_METHODS.contains(&method));
+        for msg in [
+            json!({"id": 1, "method": method,
+                   "params": {"targetId": "T1", "inheritPermissions": true}}),
+            json!({"id": 1, "sessionId": "S1", "method": method,
+                   "params": {"targetId": "T1", "inheritPermissions": true}}),
+        ] {
+            match client_message(&msg, &scope()) {
+                ClientDecision::Error { code, message } => {
+                    assert_eq!(code, -32000, "{msg}");
+                    assert_eq!(message, GUARD_REFUSED, "{msg}");
+                }
+                other => panic!("{msg} was not refused: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn methods_that_could_switch_off_the_request_guard_are_refused_on_every_level() {
         let fetch = [

@@ -6,9 +6,10 @@ Subject: [PATCH] pegboard-cdp-domain.patch
 Adds the Pegboard CDP domain (//pegboard/devtools, pegboard_protocol.pdl):
 tab groups, agent profile windows, the profile table and tab switches for
 pegboardd (design 4.2, F10, F12). The handler exists only on browser
-sessions of a trusted client that may do unsafe operations, which only the
-DevTools pipe client is; the first of those sessions to call Pegboard.claim
-owns the domain, every other session gets "method not found".
+sessions of the DevTools pipe client, its own and those opened on it (a
+trusted client that may do unsafe operations and is the pipe or content's
+TargetHandler session). The first of those to call Pegboard.claim owns the
+domain; every other session gets "method not found".
 
 Upstream files:
 - chrome/browser/devtools/BUILD.gn: appends
@@ -21,12 +22,18 @@ Upstream files:
 - chrome/browser/devtools/chrome_devtools_session.{h,cc}: makes the handler
   for sessions PegboardHandler::IsAvailable accepts; never for an untrusted
   client (chrome.debugger).
+- content/browser/devtools/protocol/target_handler.cc:
+  Target.exposeDevToolsProtocol never lets a page's binding inherit unsafe
+  operations (inheritPermissions keeps the rest). Otherwise a browser session
+  the binding opens with Target.attachToBrowserTarget would pass
+  PegboardHandler::IsAvailable as the pipe's own sessions do.
 ---
  chrome/browser/devtools/BUILD.gn                      | 11 ++++++++++-
  chrome/browser/devtools/chrome_devtools_session.cc    |  9 +++++++++
  chrome/browser/devtools/chrome_devtools_session.h     |  5 +++++
  .../browser/devtools/inspector_protocol_config.json   |  4 ++++
- 4 files changed, 28 insertions(+), 1 deletion(-)
+ content/browser/devtools/protocol/target_handler.cc   |  7 +++----
+ 5 files changed, 31 insertions(+), 5 deletions(-)
 
 diff --git a/chrome/browser/devtools/BUILD.gn b/chrome/browser/devtools/BUILD.gn
 index b754a843cd90..85152520fa87 100644
@@ -135,3 +142,22 @@ index c972f74e20b4..d2129daedbba 100644
              {
                "domain": "WebMCP",
                "include": [ "enable" ],
+diff --git a/content/browser/devtools/protocol/target_handler.cc b/content/browser/devtools/protocol/target_handler.cc
+index e77c87427f88..60e9877d253e 100644
+--- a/content/browser/devtools/protocol/target_handler.cc
++++ b/content/browser/devtools/protocol/target_handler.cc
+@@ -1341,11 +1341,10 @@ void TargetHandler::ExposeDevToolsProtocol(
+     return;
+   }
+ 
++  // Pegboard: a page's binding never inherits unsafe operations, which would
++  // make its browser sessions look like the DevTools pipe's to the Pegboard
++  // domain (//pegboard/devtools/pegboard_handler.cc).
+   BrowserConnectorHostClientPermissions permissions;
+-  if (inherit_permissions.value_or(false)) {
+-    permissions.allow_unsafe_operations =
+-        root_session_->GetClient()->AllowUnsafeOperations();
+-  }
+ 
+   new BrowserToPageConnector(binding_name.value_or("cdp"), agent_host.get(),
+                              permissions, std::move(callback));

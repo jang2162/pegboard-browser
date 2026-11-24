@@ -4,8 +4,12 @@
 # pegboard.{h,cc} from it. The handler is //pegboard/devtools/pegboard_handler.
 #
 # The domain exists only on browser sessions of the DevTools pipe client
-# (--remote-debugging-pipe: pegboardd), and there only for the one session
-# that called claim; every other session gets -32601 as for an unknown method.
+# (--remote-debugging-pipe: pegboardd), its own and those opened on it with
+# Target.attachToBrowserTarget; not for chrome.debugger, the remote debugging
+# port, the DevTools front end, page sessions or a page's
+# Target.exposeDevToolsProtocol binding. There it is only for the one session
+# that called claim; every other session gets -32601 as for an unknown method
+# (-32602 when the parameters are malformed: they are checked first).
 # Every method refuses (-32000) a browser context, tab or group that is not an
 # agent profile's: a profile whose directory is exactly "PegboardAgent" or
 # starts with "PegboardAgent-". A target is a tab's page target ID, a group an

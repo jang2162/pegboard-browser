@@ -17,6 +17,7 @@
 #include "chrome/browser/profiles/profile_manager_observer.h"
 #include "chrome/browser/profiles/profile_observer.h"
 #include "chrome/browser/ui/browser_tab_strip_tracker.h"
+#include "chrome/browser/ui/browser_tab_strip_tracker_delegate.h"
 #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
 
 class Profile;
@@ -30,17 +31,22 @@ namespace pegboard {
 // The Pegboard domain on one browser session of the DevTools pipe client
 // (pegboard_protocol.pdl). Exactly one session at a time owns the domain: the
 // first to call Pegboard.claim, until it goes. On every other session each
-// method answers -32601 as an unknown one. Only the owner observes the
-// browser, so the domain's events go to the owner alone.
+// method answers -32601 as an unknown one. (The generated dispatcher checks
+// the parameters first, so a malformed call gets -32602 there instead; that
+// says nothing beyond that the domain is defined.) Only the owner observes the
+// browser, and only agent profiles' normal windows, so the domain's events go
+// to the owner alone.
 class PegboardHandler : public protocol::Pegboard::Backend,
                         public ProfileManagerObserver,
                         public ProfileObserver,
-                        public TabStripModelObserver {
+                        public TabStripModelObserver,
+                        public BrowserTabStripTrackerDelegate {
  public:
-  // Whether `channel` may have the domain at all: a browser target session
-  // of a trusted client that may do unsafe operations, which only the
-  // DevTools pipe client is (not chrome.debugger, the DevTools front end or
-  // the remote debugging port).
+  // Whether `channel` may have the domain at all: a browser target session of
+  // the DevTools pipe client, its own or one opened on it. That is, a trusted
+  // client that may do unsafe operations (not chrome.debugger, the DevTools
+  // front end or the remote debugging port) and that is the pipe or a session
+  // of content's TargetHandler (not a Target.exposeDevToolsProtocol binding).
   static bool IsAvailable(content::DevToolsAgentHostClientChannel* channel);
 
   explicit PegboardHandler(protocol::UberDispatcher* dispatcher);
@@ -85,6 +91,9 @@ class PegboardHandler : public protocol::Pegboard::Backend,
 
   // ProfileObserver:
   void OnProfileWillBeDestroyed(Profile* profile) override;
+
+  // BrowserTabStripTrackerDelegate:
+  bool ShouldTrackBrowser(BrowserWindowInterface* browser) override;
 
   // TabStripModelObserver:
   void OnTabStripModelChanged(

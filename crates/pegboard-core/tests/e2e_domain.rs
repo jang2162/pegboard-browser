@@ -417,8 +417,16 @@ async fn open_profile_window_creates_and_reports_context() {
     assert_eq!(p["browserContextId"], ctx.as_str());
     assert_eq!(p["isAgent"], true);
     assert!(exists(&f.udd, "PegboardAgent-t1"));
+    // One window with one about:blank tab: no first-run or welcome page.
+    let opened: Vec<_> = page_targets(&c)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.browser_context_id.as_deref() == Some(ctx.as_str()))
+        .collect();
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert_eq!(opened[0].url, "about:blank", "{opened:?}");
     let pages = pages_in(&c, &ctx).await;
-    assert!(!pages.is_empty(), "no window of the agent profile");
 
     assert_eq!(agent_context(&c, "PegboardAgent-t1").await, ctx);
     assert_eq!(pages_in(&c, &ctx).await, pages);
@@ -435,7 +443,17 @@ async fn open_profile_window_creates_and_reports_context() {
         let r = open_profile_window(&c, dir).await;
         assert_eq!(code(&r), -32000, "{dir:?}: {}", message(&r));
     }
-    for dir in ["Profile 1", "PegboardAgentX", "pegboardagent", "evil"] {
+    // A name apart from case of a known profile is the same directory on macOS.
+    let r = open_profile_window(&c, "PegboardAgent-T1").await;
+    assert_eq!(code(&r), -32000, "PegboardAgent-T1: {}", message(&r));
+    for dir in [
+        "Profile 1",
+        "PegboardAgentX",
+        "pegboardagent",
+        "evil",
+        "PegboardAgent-..",
+        "PegboardAgent-a",
+    ] {
         assert!(!exists(&f.udd, dir), "{dir} was made");
     }
     assert!(!f.udd.parent().unwrap().join("evil").exists());
@@ -741,4 +759,141 @@ async fn proxy_refuses_pegboard_methods() {
         .any(|t| t.target_id == fx.human_target));
     assert!(!profiles(&fx.browser.conn).await.is_empty());
     fx.shutdown().await;
+}
+
+/// The domain is the pipe's alone: a client of the remote debugging port (turned on here
+/// beside the pipe, tests only; the product has no port) has no `Pegboard` domain on its own
+/// browser session or on one it opens, even while nobody has claimed it.
+#[tokio::test]
+#[ignore]
+async fn remote_debugging_port_has_no_domain() {
+    let Some(f) = Fork::start(&["--remote-debugging-port=0".to_string()]).await else {
+        return;
+    };
+    let pipe = f.session().await;
+    let port_file = f.udd.join("DevToolsActivePort");
+    let mut ws = None;
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(&port_file) {
+            let mut lines = text.lines();
+            if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
+                ws = Some(format!("ws://127.0.0.1:{port}{path}"));
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let ws = ws.expect("no DevToolsActivePort");
+    let root = CdpConn::connect(&ws).await.unwrap();
+    let link = BrowserLink::websocket(&ws).await.unwrap();
+    let child = CdpConn::over(&link).await.unwrap();
+    for (name, c) in [
+        ("port root session", &root),
+        ("port browser session", &child),
+    ] {
+        for method in ["Pegboard.claim", "Pegboard.getProfiles"] {
+            let r = c.send(method, json!({}), None).await;
+            assert_eq!(code(&r), -32601, "{name} {method}: {}", message(&r));
+            assert!(
+                message(&r).contains("wasn't found"),
+                "{name}: {}",
+                message(&r)
+            );
+        }
+    }
+    // The port took nothing: the pipe's session can claim.
+    pipe.send("Pegboard.claim", json!({}), None).await.unwrap();
+    let r = child.send("Pegboard.claim", json!({}), None).await;
+    assert_eq!(code(&r), -32601, "{}", message(&r));
+}
+
+/// Only browser sessions have the domain: a page session on the pipe gets "method not
+/// found", before and after the claim.
+#[tokio::test]
+#[ignore]
+async fn page_sessions_have_no_domain() {
+    let Some(f) = Fork::start(&[]).await else {
+        return;
+    };
+    let c = f.session().await;
+    let default = c
+        .send("Target.createTarget", json!({ "url": "about:blank" }), None)
+        .await
+        .unwrap()["targetId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let page = c.attach(&default).await.unwrap();
+    let r = c.send("Pegboard.claim", json!({}), Some(&page)).await;
+    assert_eq!(code(&r), -32601, "{}", message(&r));
+    assert!(message(&r).contains("wasn't found"), "{}", message(&r));
+    c.send("Pegboard.claim", json!({}), None).await.unwrap();
+    let r = c.send("Pegboard.getProfiles", json!({}), Some(&page)).await;
+    assert_eq!(code(&r), -32601, "{}", message(&r));
+}
+
+/// `Target.exposeDevToolsProtocol {inheritPermissions: true}` from the pipe gives a page a
+/// browser session (`window.cdp`). Neither it nor a browser session it opens has the domain,
+/// before or after the pipe's claim. (The proxy refuses the method to agents anyway:
+/// `GUARD_METHODS`.)
+#[tokio::test]
+#[ignore]
+async fn exposed_protocol_binding_has_no_domain() {
+    let Some(f) = Fork::start(&[]).await else {
+        return;
+    };
+    let c = f.session().await;
+    let target = c
+        .send("Target.createTarget", json!({ "url": "about:blank" }), None)
+        .await
+        .unwrap()["targetId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(
+        "Target.exposeDevToolsProtocol",
+        json!({ "targetId": target, "inheritPermissions": true }),
+        None,
+    )
+    .await
+    .unwrap();
+    let page = c.attach(&target).await.unwrap();
+    // The page's own CDP client over window.cdp: claim on the binding's session, then on a
+    // browser session it opens.
+    let probe = r#"new Promise((resolve) => {
+  const out = {};
+  const waiting = {};
+  let next = 1;
+  window.cdp.onmessage = (m) => {
+    const v = JSON.parse(m);
+    if (waiting[v.id]) waiting[v.id](v);
+  };
+  const send = (method, sessionId) => new Promise((r) => {
+    const id = next++;
+    waiting[id] = r;
+    const msg = { id, method, params: {} };
+    if (sessionId) msg.sessionId = sessionId;
+    window.cdp.send(JSON.stringify(msg));
+  });
+  setTimeout(() => { out.timedOut = true; resolve(out); }, 5000);
+  (async () => {
+    out.claim = await send('Pegboard.claim');
+    out.attach = await send('Target.attachToBrowserTarget');
+    const s = out.attach.result && out.attach.result.sessionId;
+    if (s) out.childClaim = await send('Pegboard.claim', s);
+    resolve(out);
+  })();
+})"#;
+    for when in ["before the claim", "after the claim"] {
+        let out = c.evaluate(&page, probe).await.unwrap();
+        eprintln!("window.cdp {when}: {out}");
+        assert!(out["timedOut"].is_null(), "{when}: {out}");
+        assert_eq!(out["claim"]["error"]["code"], -32601, "{when}: {out}");
+        if out["attach"]["result"]["sessionId"].is_string() {
+            assert_eq!(out["childClaim"]["error"]["code"], -32601, "{when}: {out}");
+        }
+        if when == "before the claim" {
+            c.send("Pegboard.claim", json!({}), None).await.unwrap();
+        }
+    }
 }
