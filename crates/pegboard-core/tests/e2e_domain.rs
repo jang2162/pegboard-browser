@@ -443,9 +443,12 @@ async fn open_profile_window_creates_and_reports_context() {
         let r = open_profile_window(&c, dir).await;
         assert_eq!(code(&r), -32000, "{dir:?}: {}", message(&r));
     }
-    // A name apart from case of a known profile is the same directory on macOS.
-    let r = open_profile_window(&c, "PegboardAgent-T1").await;
-    assert_eq!(code(&r), -32000, "PegboardAgent-T1: {}", message(&r));
+    // Agent names are lowercase after the prefix: no two of them differ only in case (one
+    // directory on macOS).
+    for dir in ["PegboardAgent-T1", "PegboardAgent-Work"] {
+        let r = open_profile_window(&c, dir).await;
+        assert_eq!(code(&r), -32000, "{dir}: {}", message(&r));
+    }
     for dir in [
         "Profile 1",
         "PegboardAgentX",
@@ -453,6 +456,7 @@ async fn open_profile_window_creates_and_reports_context() {
         "evil",
         "PegboardAgent-..",
         "PegboardAgent-a",
+        "PegboardAgent-Work",
     ] {
         assert!(!exists(&f.udd, dir), "{dir} was made");
     }
@@ -567,9 +571,13 @@ async fn tab_activated_reports_switches() {
     let mut events = c.events();
     for t in [&t2, &t1] {
         let before = common_ms();
-        c.send("Target.activateTarget", json!({ "targetId": t }), None)
+        if let Err(e) = c
+            .send("Target.activateTarget", json!({ "targetId": t }), None)
             .await
-            .unwrap();
+        {
+            let pages = page_targets(&c).await.unwrap();
+            panic!("activating {t} (t1 {t1}, t2 {t2}): {e:#}; pages {pages:?}");
+        }
         let e = wait_event(
             &mut events,
             "Pegboard.tabActivated",
@@ -832,10 +840,11 @@ async fn page_sessions_have_no_domain() {
     assert_eq!(code(&r), -32601, "{}", message(&r));
 }
 
-/// `Target.exposeDevToolsProtocol {inheritPermissions: true}` from the pipe gives a page a
-/// browser session (`window.cdp`). Neither it nor a browser session it opens has the domain,
-/// before or after the pipe's claim. (The proxy refuses the method to agents anyway:
-/// `GUARD_METHODS`.)
+/// `Target.exposeDevToolsProtocol` from the pipe gives a page a browser session
+/// (`window.cdp`). The fork refuses `inheritPermissions: true` (it would hand the page the
+/// pipe's unsafe operations, the domain's test). Neither the binding nor a browser session it
+/// opens has the domain, before or after the pipe's claim. (The proxy refuses the method to
+/// agents anyway: `GUARD_METHODS`.)
 #[tokio::test]
 #[ignore]
 async fn exposed_protocol_binding_has_no_domain() {
@@ -850,9 +859,22 @@ async fn exposed_protocol_binding_has_no_domain() {
         .as_str()
         .unwrap()
         .to_string();
+    let r = c
+        .send(
+            "Target.exposeDevToolsProtocol",
+            json!({ "targetId": target, "inheritPermissions": true }),
+            None,
+        )
+        .await;
+    assert_eq!(code(&r), -32000, "{}", message(&r));
+    assert!(
+        message(&r).contains("inheritPermissions is not supported"),
+        "{}",
+        message(&r)
+    );
     c.send(
         "Target.exposeDevToolsProtocol",
-        json!({ "targetId": target, "inheritPermissions": true }),
+        json!({ "targetId": target }),
         None,
     )
     .await
@@ -889,9 +911,11 @@ async fn exposed_protocol_binding_has_no_domain() {
         eprintln!("window.cdp {when}: {out}");
         assert!(out["timedOut"].is_null(), "{when}: {out}");
         assert_eq!(out["claim"]["error"]["code"], -32601, "{when}: {out}");
-        if out["attach"]["result"]["sessionId"].is_string() {
-            assert_eq!(out["childClaim"]["error"]["code"], -32601, "{when}: {out}");
-        }
+        assert!(
+            out["attach"]["result"]["sessionId"].is_string(),
+            "{when}: {out}"
+        );
+        assert_eq!(out["childClaim"]["error"]["code"], -32601, "{when}: {out}");
         if when == "before the claim" {
             c.send("Pegboard.claim", json!({}), None).await.unwrap();
         }

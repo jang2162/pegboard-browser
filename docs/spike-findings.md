@@ -950,9 +950,9 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; fini
 | `.cc` 두 개의 서식만 바꾼 증분 | 37초 |
 | 검토 반영(핸들러, `.pdl`, content 파일 하나) 증분 | 73초. `.pdl` 주석이 바뀌어 생성 코드도 다시 만들었다 |
 | `dcheck_always_on = false` 뒤 빈 상태와 같은 다시 빌드(55,323단계) | 2시간 44분: 2시간 0분에 도구 시간 제한으로 끊긴 뒤(42,509단계) 이어서 43분 51초 |
-| 패치 예산(`budget.sh`, 전체) | 업스트림 파일 9개, 추가 39줄, 삭제 13줄, 합계 52줄 |
+| 패치 예산(`budget.sh`, 전체) | 업스트림 파일 9개, 추가 42줄, 삭제 11줄, 합계 53줄 |
 | `branding.patch` | 파일 4개, +8 −8, 16줄(작업 7과 같다) |
-| `pegboard-cdp-domain.patch` | 파일 5개, +31 −5, 36줄: `chrome/browser/devtools/BUILD.gn` +10 −1, `chrome_devtools_session.cc` +9, `chrome_devtools_session.h` +5, `inspector_protocol_config.json` +4, `content/browser/devtools/protocol/target_handler.cc` +3 −4 |
+| `pegboard-cdp-domain.patch` | 파일 5개, +34 −3, 37줄: `chrome/browser/devtools/BUILD.gn` +10 −1, `chrome_devtools_session.cc` +9, `chrome_devtools_session.h` +5, `inspector_protocol_config.json` +4, `content/browser/devtools/protocol/target_handler.cc` +6 −2 |
 
 - **A10의 남은 항목(헤더 수정 증분)**: 0단계의 한 줄 수정 증분 89초보다 짧다. 이 헤더들은 포함하는 파일이 적어서다. 많이 포함되는 업스트림 헤더를 고치면 훨씬 길어질 수 있다. 그런 헤더는 재지 않았다.
 - **도메인을 여는 조건**(`PegboardHandler::IsAvailable`): 핸들러는 `ChromeDevToolsSession`이 만든다. 세 가지를 모두 만족해야 한다.
@@ -960,12 +960,17 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; fini
   - 클라이언트가 `IsTrusted()`와 `AllowUnsafeOperations()`를 둘 다 참으로 답한다.
   - 클라이언트의 종류(`GetTypeForMetrics()`)가 `RemoteDebugger`(파이프 자신의 세션)나 `DevTools`(그 위에 `Target.attachToBrowserTarget`으로 연 content의 `TargetHandler::Session`)다.
   - content에는 검사할 형식이 없어(RTTI 없음) 종류는 측정용 이름으로 본다. 허용 목록이므로 모르는 종류는 막힌다.
+  - 156에서 실제로 막는 것은 unsafe 조건이다. `IsTrusted()` 검사와 종류 검사는 방어용이고 156에서는 중복이라, 어느 변형으로도 결과를 바꿀 수 없다(그래서 고정하는 시험이 없다).
+  - DevTools 화면(`DevToolsUIBindings`)도 종류가 `DevTools`다. unsafe 조건에서만 막히며, 직접 확인하는 e2e는 없다(간접적으로만 다룬다).
   - 156에서 `AllowUnsafeOperations()`가 참인 클라이언트는 파이프, 그 자식 세션, 그리고 파이프가 `Target.exposeDevToolsProtocol {inheritPermissions:true}`로 페이지에 준 바인딩(`BrowserConnectorHostClient`, 종류 `Other`)이다. TCP 원격 디버깅, DevTools 화면, `chrome.debugger`는 거짓이다.
-  - **바인딩 구멍**(검토에서 나옴, 실측 [확인]): 바인딩 자신은 종류 검사로 막힌다. 하지만 바인딩이 `Target.attachToBrowserTarget`으로 연 세션은 종류가 `DevTools`이고, 권한은 루트인 바인딩을 따른다. 그래서 `IsAvailable`만으로는 막을 수 없었다. `pegboard-cdp-domain.patch`가 content의 `ExposeDevToolsProtocol`에서 바인딩이 unsafe 권한을 물려받지 않게 했다(다른 권한은 그대로). 이 줄을 되돌린 빌드에서는 `exposed_protocol_binding_has_no_domain`의 자식 세션 `Pegboard.claim`이 성공했다.
+  - **바인딩 구멍**(검토에서 나옴, 실측 [확인]): 바인딩 자신은 종류 검사로 막힌다. 하지만 바인딩이 `Target.attachToBrowserTarget`으로 연 세션은 종류가 `DevTools`이고, 권한은 루트인 바인딩을 따른다. 그래서 `IsAvailable`만으로는 막을 수 없었다. `pegboard-cdp-domain.patch`가 content의 `ExposeDevToolsProtocol`에서 `inheritPermissions: true`를 거부하게 했다(`"inheritPermissions is not supported in Pegboard"`).
+    - 이 옵션이 물려주는 권한은 unsafe 하나뿐이다. 그래서 바인딩이 잃는 것은 PWA 도메인, `Page.addCompilationCache`, 그리고 여기서는 Pegboard 도메인이다.
+    - 이 거부를 되돌린 빌드(그때는 조용히 권한만 낮추던 판)에서는 `exposed_protocol_binding_has_no_domain`의 자식 세션 `Pegboard.claim`이 성공했다.
   - 세션 프록시는 에이전트에게 이 메서드를 원래 막는다(`GUARD_METHODS`). 단위 시험 `expose_devtools_protocol_stays_refused`가 이것을 고정한다.
   - 파이프 세션 사이에서는 `Pegboard.claim`이 주인을 가린다. 주인이 아닌 세션의 `Pegboard.*`는 디스패처가 없는 메서드에 주는 것과 같은 `-32601 "'Pegboard.<m>' wasn't found"`를 받는다. 다만 생성된 디스패처가 매개변수를 먼저 보므로, 모양이 틀린 호출은 `-32602`를 받는다(도메인이 정의되어 있다는 것만 드러난다).
 - **에이전트 프로필 판정**: 브라우저가 디렉터리 이름으로 직접 한다(`PegboardAgent` 또는 `PegboardAgent-` 접두). 거기에 더해 일반 프로필이어야 하고(시크릿·게스트·시스템이 아님) 사용자 데이터 디렉터리 바로 아래에 있어야 한다. 모르는 컨텍스트, 시크릿 컨텍스트, 사람 프로필의 컨텍스트는 `-32000`으로 거부한다. 타깃은 탭 자신의 페이지 타깃이어야 하고(프레임이나 미리 렌더링된 페이지의 타깃은 아님) 그 탭이 에이전트 프로필의 일반 창에 있어야 한다. `closeTargets`, `ungroupTargets`는 하나라도 에이전트 탭이 아니면 아무것도 하지 않고 거부한다.
 - **`openProfileWindow`가 만드는 이름**은 더 좁다. 에이전트 이름이면서 ASCII 영숫자, `-`, `_`만 쓰고 128자 이하여야 한다(경로 구분자나 `..`는 받지 않는다). Rust가 만드는 이름(`[a-z0-9-]`)은 모두 들어간다.
+  - `PegboardAgent-` 뒤는 소문자만 받는다. 그래서 두 에이전트 이름이 대소문자만 다를 수 없고, 동시에 두 프로필을 만들 때의 경쟁도 닫힌다.
   - 브라우저가 아는 프로필(불러온 것과 프로필 목록)의 디렉터리와 대소문자만 다른 이름도 거부한다. 맥의 기본 파일 시스템에서는 같은 디렉터리이기 때문이다.
   - 디스크에만 있고 목록에 없는 디렉터리는 보지 않는다(UI 스레드에서 파일 시스템을 읽지 않으려고) [미확인 위험]. 프로필은 `ProfileManager::CreateProfileAsync`로 만들고 창은 `Navigate`(`NEW_WINDOW`, `about:blank`)로 연다. 시작 브라우저를 거치지 않으므로 첫 실행 화면이 뜨지 않았다. 새 프로필의 페이지는 `about:blank` 하나다(시험이 단언한다). 이 창을 포함해 도메인이 여는 창과 탭은 모두 뒤에 열린다(`kShowWindowInactive`, 백그라운드 탭). 사람의 창에서 포커스를 가져가지 않는다.
 - **그룹 ID**: 브라우저 프로세스 동안 도메인이 1부터 매기는 정수다(`TabGroupId` 대응표). 탭을 만들 때는 그룹이 없어졌는지 먼저 보고, 색 이름도 탭을 만들기 전에 확인한다. 그래서 `failed_tab_creation_leaves_no_orphan`의 경우 탭이 아예 생기지 않는다(확장 판은 만든 뒤 닫는다).
@@ -978,7 +983,7 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; fini
 
 | 시험 | 결과 |
 |---|---|
-| `e2e_domain` | 10 passed(검토 뒤 셋 더함: 원격 디버깅 포트, 페이지 세션, `exposeDevToolsProtocol` 바인딩) |
+| `e2e_domain` | 10 passed(검토 뒤 셋 더함: 원격 디버깅 포트, 페이지 세션, `exposeDevToolsProtocol` 바인딩). 2차 검토 반영 뒤 전체 실행 6번 중 2번 `tab_activated_reports_switches`가 실패했다(아래 열린 항목). 그 시험만 5번, 이어서 전체 4번은 모두 통과했다 |
 | `e2e_bridge` | 8 passed |
 | `e2e_proxy` | 24 passed |
 | `e2e_browser hosted_start_closes_leftover_agent_tabs` | 1 passed |
@@ -990,6 +995,7 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; fini
 - `IsAvailable`에서 `AllowUnsafeOperations()`를 빼면 `remote_debugging_port_has_no_domain`과 `exposed_protocol_binding_has_no_domain`이 실패했다.
 - `kTypeBrowser` 조건을 빼면 `page_sessions_have_no_domain`이 실패했다.
 - content 줄을 되돌리면 `exposed_protocol_binding_has_no_domain`이 실패했다.
+- `IsTrusted()` 검사와 종류(`GetTypeForMetrics`) 검사는 156에서 중복이라 변형으로 고정되지 않는다. DevTools 화면은 unsafe 조건으로만, 간접적으로 다룬다.
 
 `chrome.debugger`로 본 것(`extension_debugger_cannot_see_domain`, 주인이 생기기 전과 뒤가 같다):
 
@@ -1004,6 +1010,13 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; fini
 `e2e_session`의 팝업 시험 둘에서 브라우저가 `SIGABRT`로 죽었다. 충돌 보고서의 스택은 `content::protocol::PageHandler::SetWebLifecycleState` → `WebContentsImpl::SetPageFrozen`의 `DCHECK_NE(Visibility::VISIBLE, GetVisibility())`다. 세션 관리자의 포커스 흉내(`session.rs`)가 앞에 보이는 팝업 탭에 `Page.setWebLifecycleState {state:"active"}`를 보내면 이 검사가 실패한다. `args.gn`에 `dcheck_always_on`이 없어서, 공식 빌드가 아닌 Chromium 빌드의 기본값(참)을 따른다. 순정 Chrome for Testing은 DCHECK가 꺼져 있어 같은 호출이 그냥 지나간다. 도메인과는 상관없다 [확인: 스택]. 도메인 패치 전 빌드에서도 같았을 것으로 보지만 돌려 보지는 않았다.
 
 - 사람이 쓰는 브라우저가 DCHECK 하나로 죽을 수 있다는 뜻이다. 그래서 `args.gn`에 `dcheck_always_on = false`를 넣었다(Chrome 배포판과 같다). 모든 컴파일 인자가 바뀌어 다시 빌드에 2시간 44분이 걸렸다(위 표). 그 빌드에서 두 팝업 시험이 통과했다.
+
+#### 열린 항목: `tab_activated_reports_switches`가 가끔 실패한다
+
+`Pegboard.createGroup`·`createTab`이 돌려준 탭에 `Target.activateTarget`을 보내면 가끔 `-32602 "No target with given id found"`가 돌아온다. 전체 실행 중에만 나왔고 원인은 모른다 [미확인].
+- 페이지 타깃(`RenderFrameDevToolsAgentHost`)은 프레임이 사는 동안 남아 있고, ID는 프레임 노드의 토큰이다(소스 확인).
+- 그렇다면 탭이 그 사이 다른 `WebContents`로 바뀌었거나, 돌려준 ID가 그 탭의 것이 아닐 수 있다.
+- 시험은 이제 실패하면 그때의 페이지 목록을 출력한다. 다음 실패 때 원인을 볼 수 있다.
 
 #### 그 밖에 본 것
 

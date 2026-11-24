@@ -61,13 +61,23 @@ bool IsAgentDirectoryName(std::string_view dir) {
   return dir == kAgentDirectory || base::StartsWith(dir, kAgentDirectoryPrefix);
 }
 
-// The names openProfileWindow makes a directory of: agent names of ASCII
-// letters, digits, '-' and '_' only (no separator, no "..").
+// The names openProfileWindow makes a directory of: "PegboardAgent", or
+// "PegboardAgent-" and lowercase ASCII letters, digits, '-' and '_' (no
+// separator, no ".."). Lowercase only, so two agent names never differ only in
+// case: on a case-insensitive file system they would be one directory, and two
+// creations at once could both pass the collision check below.
 bool IsCreatableAgentDirectoryName(std::string_view dir) {
-  return IsAgentDirectoryName(dir) && dir.size() <= 128 &&
-         std::ranges::all_of(dir, [](char c) {
-           return base::IsAsciiAlphaNumeric(c) || c == '-' || c == '_';
-         });
+  if (dir == kAgentDirectory) {
+    return true;
+  }
+  if (!base::StartsWith(dir, kAgentDirectoryPrefix) || dir.size() > 128) {
+    return false;
+  }
+  return std::ranges::all_of(
+      dir.substr(kAgentDirectoryPrefix.size()), [](char c) {
+        return base::IsAsciiLower(c) || base::IsAsciiDigit(c) || c == '-' ||
+               c == '_';
+      });
 }
 
 std::string DirectoryOf(const Profile* profile) {
@@ -391,14 +401,16 @@ bool PegboardHandler::IsAvailable(
       !client->IsTrusted() || !client->AllowUnsafeOperations()) {
     return false;
   }
-  // The pipe's own session ("RemoteDebugger") and the sessions opened on it
-  // with Target.attachToBrowserTarget (content's TargetHandler::Session,
-  // "DevTools"). content has no type to test, so the client's kind comes from
-  // the name it gives metrics; everything else (Target.exposeDevToolsProtocol's
-  // BrowserConnectorHostClient says "Other") is refused. A session opened from
-  // such a binding would say "DevTools" too: pegboard-cdp-domain.patch keeps
-  // the binding from inheriting AllowUnsafeOperations, so its sessions fail
-  // the test above.
+  // The unsafe clause above is what does the work in 156: only the pipe, the
+  // sessions opened on it and a Target.exposeDevToolsProtocol binding that
+  // inherited permissions answer true, and pegboard-cdp-domain.patch refuses
+  // inheritPermissions. The DevTools front end (DevToolsUIBindings) also says
+  // "DevTools" below and is stopped by that clause. The IsTrusted check and
+  // the kind check here are defensive and redundant in 156 (no test can make
+  // them matter): the pipe's own session says "RemoteDebugger", the sessions
+  // opened on it with Target.attachToBrowserTarget (content's
+  // TargetHandler::Session) "DevTools", and a binding "Other". content has no
+  // type to test, so the kind is the name the client gives metrics.
   const std::string kind = client->GetTypeForMetrics();
   return kind == "RemoteDebugger" || kind == "DevTools";
 }

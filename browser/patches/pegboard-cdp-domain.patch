@@ -23,17 +23,18 @@ Upstream files:
   for sessions PegboardHandler::IsAvailable accepts; never for an untrusted
   client (chrome.debugger).
 - content/browser/devtools/protocol/target_handler.cc:
-  Target.exposeDevToolsProtocol never lets a page's binding inherit unsafe
-  operations (inheritPermissions keeps the rest). Otherwise a browser session
-  the binding opens with Target.attachToBrowserTarget would pass
-  PegboardHandler::IsAvailable as the pipe's own sessions do.
+  Target.exposeDevToolsProtocol refuses inheritPermissions: true (the only
+  permission it hands on is unsafe operations, which give the PWA domain,
+  Page.addCompilationCache and, here, the Pegboard domain). With it a
+  browser session the binding opens with Target.attachToBrowserTarget would
+  pass PegboardHandler::IsAvailable as the pipe's own sessions do.
 ---
  chrome/browser/devtools/BUILD.gn                      | 11 ++++++++++-
  chrome/browser/devtools/chrome_devtools_session.cc    |  9 +++++++++
  chrome/browser/devtools/chrome_devtools_session.h     |  5 +++++
  .../browser/devtools/inspector_protocol_config.json   |  4 ++++
- content/browser/devtools/protocol/target_handler.cc   |  7 +++----
- 5 files changed, 31 insertions(+), 5 deletions(-)
+ content/browser/devtools/protocol/target_handler.cc   |  8 ++++++--
+ 5 files changed, 34 insertions(+), 3 deletions(-)
 
 diff --git a/chrome/browser/devtools/BUILD.gn b/chrome/browser/devtools/BUILD.gn
 index b754a843cd90..85152520fa87 100644
@@ -143,21 +144,23 @@ index c972f74e20b4..d2129daedbba 100644
                "domain": "WebMCP",
                "include": [ "enable" ],
 diff --git a/content/browser/devtools/protocol/target_handler.cc b/content/browser/devtools/protocol/target_handler.cc
-index e77c87427f88..60e9877d253e 100644
+index e77c87427f88..ecae088a4f58 100644
 --- a/content/browser/devtools/protocol/target_handler.cc
 +++ b/content/browser/devtools/protocol/target_handler.cc
-@@ -1341,11 +1341,10 @@ void TargetHandler::ExposeDevToolsProtocol(
+@@ -1341,10 +1341,14 @@ void TargetHandler::ExposeDevToolsProtocol(
      return;
    }
  
-+  // Pegboard: a page's binding never inherits unsafe operations, which would
-+  // make its browser sessions look like the DevTools pipe's to the Pegboard
-+  // domain (//pegboard/devtools/pegboard_handler.cc).
++  // Pegboard: a binding that inherited unsafe operations would make its
++  // browser sessions look like the DevTools pipe's to the Pegboard domain
++  // (//pegboard/devtools/pegboard_handler.cc), so that is refused.
    BrowserConnectorHostClientPermissions permissions;
--  if (inherit_permissions.value_or(false)) {
+   if (inherit_permissions.value_or(false)) {
 -    permissions.allow_unsafe_operations =
 -        root_session_->GetClient()->AllowUnsafeOperations();
--  }
++    callback->sendFailure(Response::ServerError(
++        "inheritPermissions is not supported in Pegboard"));
++    return;
+   }
  
    new BrowserToPageConnector(binding_name.value_or("cdp"), agent_host.get(),
-                              permissions, std::move(callback));
