@@ -913,6 +913,33 @@ fn established(pid: u32, port: u16) -> usize {
     String::from_utf8_lossy(&out.stdout).lines().skip(1).count()
 }
 
+/// TCP sockets process `pid` listens on, by `lsof`.
+fn listening(pid: u32) -> usize {
+    let out = std::process::Command::new("lsof")
+        .args([
+            "-a",
+            "-n",
+            "-P",
+            "-p",
+            &pid.to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+        ])
+        .output()
+        .expect("running lsof");
+    String::from_utf8_lossy(&out.stdout).lines().skip(1).count()
+}
+
+/// The browser's DevTools connections. Stock Chrome (`port`, its DevTools port): the
+/// ESTABLISHED TCP connections on that port. The fork (no port): its DevTools is the pipe it
+/// was launched with, the one connection, plus any TCP port it listens on (none is expected).
+fn devtools_connections(pid: u32, port: Option<u16>) -> usize {
+    match port {
+        Some(port) => established(pid, port),
+        None => 1 + listening(pid),
+    }
+}
+
 /// The daemon with two sessions (each with agent-browser attached through the proxy), their
 /// screen recording and the request guard running: the browser has ONE DevTools connection,
 /// and every connection of the daemon is a virtual connection over it.
@@ -966,14 +993,11 @@ async fn the_daemon_opens_one_browser_connection() {
     let pid = call("browser.status", json!({})).await.result.unwrap()["pid"]
         .as_u64()
         .unwrap() as u32;
-    let port: u16 = std::fs::read_to_string(env.paths.chrome_udd.join("DevToolsActivePort"))
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    // Stock Chrome only; the fork's DevTools is a pipe.
+    let port: Option<u16> =
+        std::fs::read_to_string(env.paths.chrome_udd.join("DevToolsActivePort"))
+            .ok()
+            .map(|text| text.lines().next().unwrap().trim().parse().unwrap());
     let (id, token) = sessions[0].clone();
     let mut virtual_count = 0;
     // The main connection, the download policy, the guard and the recorder at least; the
@@ -985,7 +1009,7 @@ async fn the_daemon_opens_one_browser_connection() {
         let stats = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
         virtual_count = stats["virtual"].as_u64().unwrap();
     }
-    let physical = established(pid, port);
+    let physical = devtools_connections(pid, port);
     println!("OBSERVED one_browser_connection: physical={physical} virtual={virtual_count}");
     assert!(
         virtual_count >= 4,
@@ -1218,8 +1242,7 @@ fn an_oversized_eval_does_not_cut_other_sessions() {
             .send("Browser.getVersion", json!({}), None)
             .await;
         let after = link.virtual_connections();
-        let port = s.browser.debugging_port().unwrap();
-        let physical = established(s.browser.pid, port);
+        let physical = devtools_connections(s.browser.pid, s.browser.debugging_port());
         println!(
             "OBSERVED oversized_eval: a={outcome} b={b_works:?} main_ok={} link_closed={} \
              virtual_before={before} virtual_after={after} physical={physical}",
