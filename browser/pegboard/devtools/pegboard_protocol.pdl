@@ -1,0 +1,112 @@
+# Pegboard's own DevTools domain. chrome/browser/devtools/BUILD.gn appends this
+# file to Chrome's protocol (as it does cros_protocol.pdl on ChromeOS), and
+# inspector_protocol_config.json generates chrome/browser/devtools/protocol/
+# pegboard.{h,cc} from it. The handler is //pegboard/devtools/pegboard_handler.
+#
+# The domain exists only on browser sessions of the DevTools pipe client
+# (--remote-debugging-pipe: pegboardd), and there only for the one session
+# that called claim; every other session gets -32601 as for an unknown method.
+# Every method refuses (-32000) a browser context, tab or group that is not an
+# agent profile's: a profile whose directory is exactly "PegboardAgent" or
+# starts with "PegboardAgent-". A target is a tab's page target ID, a group an
+# integer this domain hands out.
+
+version
+  major 1
+  minor 0
+
+experimental domain Pegboard
+
+  type ProfileInfo extends object
+    properties
+      string profileDirectory
+      string browserContextId
+      # Whether the directory name makes it an agent profile.
+      boolean isAgent
+
+  # Makes this session the domain's owner. Fails with "already claimed" when
+  # another session owns it; the owner going frees it.
+  command claim
+
+  # The loaded profiles (not incognito, guest or system ones).
+  command getProfiles
+    returns
+      array of ProfileInfo profiles
+
+  # Loads the agent profile (making it when it does not exist) and opens a
+  # window of it unless one is open. No first-run UI.
+  command openProfileWindow
+    parameters
+      string profileDirectory
+    returns
+      string browserContextId
+
+  # Opens a background about:blank tab in the profile and starts a group with
+  # it.
+  command createGroup
+    parameters
+      string browserContextId
+      string title
+      # grey, blue, red, yellow, green, pink, purple, cyan or orange.
+      string color
+    returns
+      integer groupId
+      string targetId
+
+  # Opens a background tab in the group. When the group is gone, the tab
+  # starts a new one with this title and color, returned as newGroupId. URLs:
+  # about:blank, absolute http:, https: and data: ones.
+  command createTab
+    parameters
+      string browserContextId
+      integer groupId
+      string url
+      string title
+      string color
+    returns
+      string targetId
+      optional integer newGroupId
+
+  command addToGroup
+    parameters
+      integer groupId
+      string targetId
+
+  # The group's tabs; none for a group that is gone.
+  command getGroupMembers
+    parameters
+      integer groupId
+    returns
+      array of string targetIds
+
+  command closeTargets
+    parameters
+      array of string targetIds
+
+  # Takes these tabs out of whatever group each is in.
+  command ungroupTargets
+    parameters
+      array of string targetIds
+
+  # Takes every tab out of the group (which then is gone).
+  command ungroup
+    parameters
+      integer groupId
+
+  # An agent profile's tab became the active one of its window.
+  event tabActivated
+    parameters
+      string browserContextId
+      string targetId
+      # Milliseconds since the Unix epoch.
+      number timestamp
+
+  event profileLoaded
+    parameters
+      string profileDirectory
+      string browserContextId
+
+  event profileUnloaded
+    parameters
+      string profileDirectory
+      string browserContextId

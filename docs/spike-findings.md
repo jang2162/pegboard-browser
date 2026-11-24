@@ -938,3 +938,58 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; fini
 - **결론**: 파이프 위에서도 F7의 전제가 맞다.
 - 한 번(다섯 번 중) `download_behavior_fetch_and_screencast_are_per_session`이 `P1 still got frames after stopScreencast`로 실패했다. `stopScreencast` 응답 뒤에 이미 만들어진 P1 자신의 프레임이 하나 더 온 것으로 보인다. 다른 세션으로 샌 것이 아니라 F7과는 상관없지만, 녹화기가 멈춘 뒤 프레임 하나를 더 받을 수 있다고 보고 다뤄야 한다. 같은 시험을 네 번 더 돌린 것은 모두 통과했다. **후속**: 녹화기(`recorder`)는 `Page.stopScreencast` 뒤에 프레임이 하나 더 와도 견뎌야 한다(그 프레임을 버리거나 받아도 문제가 없어야 한다). 작업 10에서 녹화기 쪽 처리를 확인한다.
 - 파이프 판은 첫 명령 전에 브라우저가 답할 때까지 30초까지 기다린다(웹소켓 판은 주소를 받은 뒤라 이미 떠 있다). 기다리지 않으면 첫 명령이 3초 안에 답을 못 받았다.
+
+### 3a 작업 8. `Pegboard` CDP 도메인 (2026-11-24)
+
+`//pegboard/devtools`(정의 `pegboard_protocol.pdl`, 핸들러 `pegboard_handler.{h,cc}`)와 업스트림 연결 패치 `pegboard-cdp-domain.patch`를 더했다. 빌드는 작업 기기, 시험은 두 번째 기기의 GUI 세션에서 했다.
+
+| 항목 | 값 |
+|---|---|
+| 도메인 첫 빌드(새 소스, `chrome_devtools_session.h` 수정, `protocol.json`과 생성 코드 다시 만들기) | `build.sh` 47초. 그 전에 생성 단계(3초)와 새 `.o` 두 개를 따로 컴파일했다(따로 재지 않았다, 파일 하나에 수십 초) |
+| 헤더 수정 증분(`chrome_devtools_session.h`, `pegboard_handler.h`를 `touch`) | 36초(`build.sh` 출력). 다시 컴파일되는 것은 두 `.cc`뿐이고 대부분이 프레임워크 링크다 |
+| `.cc` 두 개의 서식만 바꾼 증분 | 37초 |
+| 패치 예산(`budget.sh`, 전체) | 업스트림 파일 8개, 추가 36줄, 삭제 9줄, 합계 45줄 |
+| `branding.patch` | 파일 4개, +8 −8, 16줄(작업 7과 같다) |
+| `pegboard-cdp-domain.patch` | 파일 4개, +28 −1, 29줄: `chrome/browser/devtools/BUILD.gn` +10 −1, `chrome_devtools_session.cc` +9, `chrome_devtools_session.h` +5, `inspector_protocol_config.json` +4 |
+
+- **A10의 남은 항목(헤더 수정 증분)**: 0단계의 한 줄 수정 증분 89초보다 짧다. 이 헤더들은 포함하는 파일이 적어서다. 많이 포함되는 업스트림 헤더를 고치면 훨씬 길어질 수 있다. 그런 헤더는 재지 않았다.
+- **도메인을 여는 조건**: 핸들러는 `ChromeDevToolsSession`이 만든다. 조건은 브라우저 타깃 세션이고, 클라이언트가 `IsTrusted()`와 `AllowUnsafeOperations()`를 둘 다 참으로 답하는 것이다. 156에서 `AllowUnsafeOperations()`가 참인 클라이언트는 파이프 핸들러(`DevToolsPipeHandler`)와 그 자식 세션(`TargetHandler::Session`은 루트 클라이언트의 답을 따른다)뿐이다. TCP 원격 디버깅, DevTools 화면, `chrome.debugger`는 거짓이다(소스 확인). 그래서 확장에는 처음부터 핸들러가 없다. 파이프 세션 사이에서는 `Pegboard.claim`이 주인을 가린다. 주인이 아닌 세션의 `Pegboard.*`는 디스패처가 없는 메서드에 주는 것과 같은 `-32601 "'Pegboard.<m>' wasn't found"`를 받는다.
+- **에이전트 프로필 판정**: 브라우저가 디렉터리 이름으로 직접 한다(`PegboardAgent` 또는 `PegboardAgent-` 접두). 거기에 더해 일반 프로필이어야 하고(시크릿·게스트·시스템이 아님) 사용자 데이터 디렉터리 바로 아래에 있어야 한다. 모르는 컨텍스트, 시크릿 컨텍스트, 사람 프로필의 컨텍스트는 `-32000`으로 거부한다. 타깃은 탭 자신의 페이지 타깃이어야 하고(프레임이나 미리 렌더링된 페이지의 타깃은 아님) 그 탭이 에이전트 프로필의 일반 창에 있어야 한다. `closeTargets`, `ungroupTargets`는 하나라도 에이전트 탭이 아니면 아무것도 하지 않고 거부한다.
+- **`openProfileWindow`가 만드는 이름**은 더 좁다. 에이전트 이름이면서 ASCII 영숫자, `-`, `_`만 쓰고 128자 이하여야 한다(경로 구분자나 `..`는 받지 않는다). Rust가 만드는 이름(`[a-z0-9-]`)은 모두 들어간다. 프로필은 `ProfileManager::CreateProfileAsync`로 만들고 창은 `Navigate`(`NEW_WINDOW`, `about:blank`)로 연다. 시작 브라우저를 거치지 않으므로 첫 실행 화면이 뜨지 않았다(시험에서 본 페이지는 `about:blank` 창 하나).
+- **그룹 ID**: 브라우저 프로세스 동안 도메인이 1부터 매기는 정수다(`TabGroupId` 대응표). 탭을 만들 때는 그룹이 없어졌는지 먼저 보고, 색 이름도 탭을 만들기 전에 확인한다. 그래서 `failed_tab_creation_leaves_no_orphan`의 경우 탭이 아예 생기지 않는다(확장 판은 만든 뒤 닫는다).
+- **이벤트**: 주인 세션만 프로필(`ProfileManagerObserver`, `ProfileObserver`)과 탭 띠(`BrowserTabStripTracker`)를 지켜본다. 그래서 다른 세션으로는 이벤트가 갈 길이 없다. `tabActivated`는 에이전트 프로필의 탭만 알린다. 주인이 된 순간 이미 열려 있던 창들의 "처음 상태" 알림은 보내지 않는다.
+- **프로필 내리기** [확인]: 에이전트 프로필의 마지막 창을 닫으면 프로필이 내려가 `profileUnloaded`가 오고, 다시 열면 새 컨텍스트 ID로 `profileLoaded`가 온다(`profile_events_follow_unload_and_reload`, 시험 전체 10초 안).
+
+#### 시험 결과 (두 번째 기기 GUI 세션, `--test-threads=1`)
+
+포크 구성(`PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>`), 마지막 빌드로:
+
+| 시험 | 결과 |
+|---|---|
+| `e2e_domain` | 7 passed |
+| `e2e_bridge` | 8 passed |
+| `e2e_proxy` | 24 passed |
+| `e2e_browser hosted_start_closes_leftover_agent_tabs` | 1 passed |
+| `e2e_session` | 13 passed, 2 failed(`popup_of_a_session_tab_joins_the_session_without_a_client`, `popup_of_session_a_is_not_adopted_by_session_b`, 아래). 두 시험을 빼고 돌리면 13 passed |
+
+순정 구성 `e2e_bridge`: 8 passed(퇴행 없음).
+
+`chrome.debugger`로 본 것(`extension_debugger_cannot_see_domain`, 주인이 생기기 전과 뒤가 같다):
+
+```
+{"Pegboard.claim":{"error":"{\"code\":-32601,\"message\":\"'Pegboard.claim' wasn't found\"}"},
+ "Pegboard.getProfiles":{"error":"{\"code\":-32601,\"message\":\"'Pegboard.getProfiles' wasn't found\"}"},
+ "Target.attachToBrowserTarget":{"error":"{\"code\":-32000,\"message\":\"Not allowed\"}"}}
+```
+
+#### 포크 개발 빌드는 DCHECK가 켜져 있다 (열린 항목)
+
+`e2e_session`의 팝업 시험 둘에서 브라우저가 `SIGABRT`로 죽었다. 충돌 보고서의 스택은 `content::protocol::PageHandler::SetWebLifecycleState` → `WebContentsImpl::SetPageFrozen`의 `DCHECK_NE(Visibility::VISIBLE, GetVisibility())`다. 세션 관리자의 포커스 흉내(`session.rs`)가 앞에 보이는 팝업 탭에 `Page.setWebLifecycleState {state:"active"}`를 보내면 이 검사가 실패한다. `args.gn`에 `dcheck_always_on`이 없어서, 공식 빌드가 아닌 Chromium 빌드의 기본값(참)을 따른다. 순정 Chrome for Testing은 DCHECK가 꺼져 있어 같은 호출이 그냥 지나간다. 도메인과는 상관없다 [확인: 스택]. 도메인 패치 전 빌드에서도 같았을 것으로 보지만 돌려 보지는 않았다.
+
+- 사람이 쓰는 브라우저가 DCHECK 하나로 죽을 수 있다는 뜻이므로, 개발 빌드도 `dcheck_always_on = false`가 맞다고 본다. 이것을 바꾸면 모든 컴파일 인자가 바뀌어 빈 상태 빌드(2시간 반~3시간)가 된다. 작업 8에서는 바꾸지 않았다. 결정이 필요하다.
+- 다른 길(이것만으로는 부족하다): 데몬이 보이는 탭에는 `setWebLifecycleState`를 보내지 않는다. 이 경우를 피할 뿐이고, 다른 DCHECK는 남는다.
+
+#### 그 밖에 본 것
+
+- 포크에서 컨텍스트 없이 보낸 `Target.createTarget`은 마지막으로 쓴 프로필에 탭을 연다. 에이전트 창을 연 뒤라면 에이전트 프로필이다. 크롬의 `Target.createTarget`이 `browserContextId`로 아는 컨텍스트는 "마지막으로 쓴 프로필"과 DevTools가 만든 시크릿 컨텍스트뿐이다(`DevToolsBrowserContextManager::GetProfileById`). 그래서 사람 프로필을 고르려고 그 컨텍스트를 줘도 늘 되지는 않는다. 시험은 에이전트 창을 열기 전에 사람 탭을 만든다.
+- `openProfileWindow`로 만든 에이전트 프로필은 보통 프로필처럼 프로필 목록(`ProfileAttributesStorage`)에 들어간다. 프로필 메뉴에 보이고, 프로필이 여럿이면 다음 시작 때 프로필 선택 화면이 뜰 수 있다 [미확인]. 순정 모드(`--profile-directory`)도 같다. 숨기는 것은 3b.

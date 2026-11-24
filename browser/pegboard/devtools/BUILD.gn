@@ -1,0 +1,35 @@
+# The Pegboard CDP domain's handler (pegboard_protocol.pdl). The domain's
+# generated code (protocol/pegboard.{h,cc}) is built with the rest of Chrome's
+# protocol in //chrome/browser/devtools, whose ChromeDevToolsSession creates
+# the handler (pegboard-cdp-domain.patch).
+
+source_set("devtools") {
+  visibility = [ "//chrome/browser/devtools:*" ]
+  sources = [
+    "pegboard_handler.cc",
+    "pegboard_handler.h",
+  ]
+
+  # Like //chrome/browser/devtools, this uses //chrome/browser headers without
+  # depending on //chrome/browser, which depends on it.
+  check_includes = false
+  public_deps = [ "//chrome/browser:browser_public_dependencies" ]
+  deps = [
+    "//base",
+    "//chrome/browser/devtools:protocol_generated_sources",
+    "//chrome/browser/profiles:profile",
+    "//chrome/browser/profiles:profile_manager",
+    "//chrome/browser/tab_list",
+    "//chrome/browser/ui/browser_window",
+    "//chrome/browser/ui/navigator",
+    "//chrome/browser/ui/tabs:tab_strip",
+    "//chrome/browser/ui/tabs:tabs_public",
+    "//components/tab_groups",
+    "//components/tabs:public",
+    "//content/public/browser",
+    "//third_party/inspector_protocol:crdtp",
+    "//ui/base",
+    "//ui/gfx/range",
+    "//url",
+  ]
+}

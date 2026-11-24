@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pegboard <noreply@pegboard.invalid>
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] pegboard-cdp-domain.patch
+
+Adds the Pegboard CDP domain (//pegboard/devtools, pegboard_protocol.pdl):
+tab groups, agent profile windows, the profile table and tab switches for
+pegboardd (design 4.2, F10, F12). The handler exists only on browser
+sessions of a trusted client that may do unsafe operations, which only the
+DevTools pipe client is; the first of those sessions to call Pegboard.claim
+owns the domain, every other session gets "method not found".
+
+Upstream files:
+- chrome/browser/devtools/BUILD.gn: appends
+  //pegboard/devtools/pegboard_protocol.pdl to Chrome's protocol as
+  cros_protocol.pdl is on ChromeOS, lists the generated
+  protocol/pegboard.{h,cc}, lets //pegboard/devtools see the generated
+  sources and links it into the devtools library.
+- chrome/browser/devtools/inspector_protocol_config.json: generates the
+  Pegboard domain (openProfileWindow is async).
+- chrome/browser/devtools/chrome_devtools_session.{h,cc}: makes the handler
+  for sessions PegboardHandler::IsAvailable accepts; never for an untrusted
+  client (chrome.debugger).
+---
+ chrome/browser/devtools/BUILD.gn                      | 11 ++++++++++-
+ chrome/browser/devtools/chrome_devtools_session.cc    |  9 +++++++++
+ chrome/browser/devtools/chrome_devtools_session.h     |  5 +++++
+ .../browser/devtools/inspector_protocol_config.json   |  4 ++++
+ 4 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/devtools/BUILD.gn b/chrome/browser/devtools/BUILD.gn
+index b754a843cd90..85152520fa87 100644
+--- a/chrome/browser/devtools/BUILD.gn
++++ b/chrome/browser/devtools/BUILD.gn
+@@ -21,6 +21,8 @@ _protocol_generated = [
+   "protocol/browser.h",
+   "protocol/target.cc",
+   "protocol/target.h",
++  "protocol/pegboard.cc",
++  "protocol/pegboard.h",
+ ]
+ 
+ if (enable_devtools_frontend) {
+@@ -79,13 +81,19 @@ action("concatenate_protocols") {
+     inputs += [ "cros_protocol.pdl" ]
+     args += [ rebase_path("cros_protocol.pdl", root_build_dir) ]
+   }
++  inputs += [ "//pegboard/devtools/pegboard_protocol.pdl" ]
++  args += [ rebase_path("//pegboard/devtools/pegboard_protocol.pdl",
++                        root_build_dir) ]
+ 
+   args += [ rebase_path(output_file, root_build_dir) ]
+ }
+ 
+ inspector_protocol_generate("protocol_generated_sources") {
+   inspector_protocol_dir = _inspector_protocol
+-  visibility = [ ":*" ]  # Only targets in this file can depend on this.
++  visibility = [
++    ":*",
++    "//pegboard/devtools:*",
++  ]
+   deps = [ ":concatenate_protocols" ]
+   out_dir = target_gen_dir
+   config_file = "inspector_protocol_config.json"
+@@ -178,6 +186,7 @@ static_library("devtools") {
+     "//components/webapps/common",
+     "//content/public/browser",
+     "//net",
++    "//pegboard/devtools",
+     "//services/metrics/public/cpp:ukm_builders",
+     "//services/viz/privileged/mojom/compositing",
+     "//third_party/blink/public:buildflags",
+diff --git a/chrome/browser/devtools/chrome_devtools_session.cc b/chrome/browser/devtools/chrome_devtools_session.cc
+index a93a5d26c146..598b13c4646c 100644
+--- a/chrome/browser/devtools/chrome_devtools_session.cc
++++ b/chrome/browser/devtools/chrome_devtools_session.cc
+@@ -30,6 +30,7 @@
+ #include "content/public/browser/devtools_agent_host.h"
+ #include "content/public/browser/devtools_agent_host_client.h"
+ #include "content/public/browser/devtools_agent_host_client_channel.h"
++#include "pegboard/devtools/pegboard_handler.h"
+ #include "third_party/blink/public/common/features.h"
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -142,6 +143,14 @@ ChromeDevToolsSession::ChromeDevToolsSession(
+           std::make_unique<PWAHandler>(dispatcher(), agent_host->GetId());
+     }
+   }
++  // Pegboard: never for an untrusted client (chrome.debugger), and only for the
++  // DevTools pipe's browser sessions (PegboardHandler::IsAvailable).
++  if (IsDomainAvailableToUntrustedClient<pegboard::PegboardHandler>() ||
++      (channel->GetClient()->IsTrusted() &&
++       pegboard::PegboardHandler::IsAvailable(channel))) {
++    pegboard_handler_ =
++        std::make_unique<pegboard::PegboardHandler>(dispatcher());
++  }
+ #if BUILDFLAG(IS_CHROMEOS)
+   window_manager_handler_ =
+       std::make_unique<WindowManagerHandler>(dispatcher());
+diff --git a/chrome/browser/devtools/chrome_devtools_session.h b/chrome/browser/devtools/chrome_devtools_session.h
+index f703912a1b78..ccf1ee86e565 100644
+--- a/chrome/browser/devtools/chrome_devtools_session.h
++++ b/chrome/browser/devtools/chrome_devtools_session.h
+@@ -14,6 +14,10 @@ namespace content {
+ class DevToolsAgentHostClientChannel;
+ }  // namespace content
+ 
++namespace pegboard {
++class PegboardHandler;
++}  // namespace pegboard
++
+ class AdsHandler;
+ class AutofillHandler;
+ class EmulationHandler;
+@@ -55,6 +59,7 @@ class ChromeDevToolsSession : public ChromeDevToolsSessionBase {
+   std::unique_ptr<SystemInfoHandler> system_info_handler_;
+   std::unique_ptr<TargetHandler> target_handler_;
+   std::unique_ptr<WebMCPHandler> webmcp_handler_;
++  std::unique_ptr<pegboard::PegboardHandler> pegboard_handler_;
+ #if BUILDFLAG(IS_CHROMEOS)
+   std::unique_ptr<WindowManagerHandler> window_manager_handler_;
+ #endif
+diff --git a/chrome/browser/devtools/inspector_protocol_config.json b/chrome/browser/devtools/inspector_protocol_config.json
+index c972f74e20b4..d2129daedbba 100644
+--- a/chrome/browser/devtools/inspector_protocol_config.json
++++ b/chrome/browser/devtools/inspector_protocol_config.json
+@@ -65,6 +65,10 @@
+                 "domain": "PWA",
+                 "async": [ "changeAppUserSettings", "getOsAppState", "install", "launch", "launchFilesInApp", "uninstall" ]
+             },
++            {
++                "domain": "Pegboard",
++                "async": [ "openProfileWindow" ]
++            },
+             {
+               "domain": "WebMCP",
+               "include": [ "enable" ],
