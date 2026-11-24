@@ -1053,9 +1053,11 @@ async fn another_connections_child_cannot_be_detached_by_params() {
     );
 }
 
-/// Session A's client evaluates a string over 256 MiB by value. That answer is too large for
-/// the link: it ends A's virtual connection only. Session B, the daemon's own connection and
-/// the one physical connection go on.
+/// Session A's client evaluates by value a string longer than the link's limit (64 MiB in
+/// tests, see `common::LINK_MAX_MESSAGE`; Chrome never sends an answer over the real 256 MiB).
+/// That answer is too large for the link: A gets an error saying so and its virtual connection
+/// ends, only that one. Session B, the daemon's own connection and the one physical connection
+/// go on.
 #[test]
 #[ignore]
 fn an_oversized_eval_does_not_cut_other_sessions() {
@@ -1077,11 +1079,12 @@ fn an_oversized_eval_does_not_cut_other_sessions() {
         let link = &s.browser.link;
         let before = link.virtual_connections();
 
-        // 3e8 characters: over 256 MiB as JSON.
+        // 1 MiB over the limit as JSON.
+        let len = common::LINK_MAX_MESSAGE + (1 << 20);
         let big = a
             .send(
                 "Runtime.evaluate",
-                json!({ "expression": "'x'.repeat(3e8)", "returnByValue": true }),
+                json!({ "expression": format!("'x'.repeat({len})"), "returnByValue": true }),
                 Some(&sa),
             )
             .await;
@@ -1105,13 +1108,19 @@ fn an_oversized_eval_does_not_cut_other_sessions() {
             main_works.is_ok(),
             link.is_closed()
         );
-        // A's answer never arrived: refused by the link (too large) and its connection closed,
-        // not refused by Chrome on its own (which would make this test say nothing).
+        // A's answer never arrived: the link refused it as too large (not a timeout, not
+        // Chrome on its own) and ended A's virtual connection, so A's connection is gone.
         let a_err = format!("{:#}", big.as_ref().expect_err("A got its huge answer"));
         assert!(
-            a_err.contains("too large") || a_err.contains("closed"),
+            a_err.contains("The message is too large."),
             "A failed otherwise: {a_err}"
         );
+        assert!(
+            after < before,
+            "A's virtual connection is still open ({before} before, {after} after)"
+        );
+        let a_after = a.evaluate(&sa, "1 + 1").await;
+        assert!(a_after.is_err(), "A's connection still works: {a_after:?}");
         assert_eq!(b_works.unwrap(), json!(2));
         main_works.unwrap();
         assert!(!link.is_closed());

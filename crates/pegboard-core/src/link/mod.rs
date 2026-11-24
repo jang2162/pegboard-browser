@@ -23,6 +23,17 @@ use tokio::sync::mpsc;
 use crate::cdp::QUEUED_MAX_MESSAGE;
 use mux::{Handle, Inner};
 
+/// The largest message the link hands on: 256 MiB, or `PEGBOARD_TEST_LINK_MAX_MESSAGE` bytes
+/// with test hooks on. Chrome itself does not send a page's message over 256 MiB: measured, a
+/// 257 MiB `Runtime.evaluate` answer never came (150 s) where a 255 MiB one came in 9 s, and
+/// the page went on answering. So a test of what the link does with a message over its limit
+/// needs a lower limit.
+fn max_message() -> usize {
+    crate::testenv::var("PEGBOARD_TEST_LINK_MAX_MESSAGE")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(QUEUED_MAX_MESSAGE)
+}
+
 /// A physical connection to the browser. Cheap to clone; all clones share it.
 #[derive(Clone)]
 pub struct BrowserLink {
@@ -30,23 +41,17 @@ pub struct BrowserLink {
 }
 
 impl BrowserLink {
-    /// Connects to the browser's DevTools websocket. A message over 256 MiB ends only the
-    /// virtual connection it belongs to, never the link.
+    /// Connects to the browser's DevTools websocket. A message over 256 MiB (see
+    /// `max_message`) ends only the virtual connection it belongs to, never the link.
     pub async fn websocket(url: &str) -> Result<BrowserLink> {
-        Ok(Self::start(
-            transport::websocket(url, QUEUED_MAX_MESSAGE).await?,
-        ))
+        Ok(Self::start(transport::websocket(url, max_message()).await?))
     }
 
     /// The daemon's end of a DevTools pipe: reads `read`, writes `write` (fork mode: fds 3
     /// and 4). Messages are JSON, each ended by a NUL; one over 256 MiB is skipped and ends
     /// only the virtual connection it belongs to. Needs a tokio runtime.
     pub fn pipe(read: OwnedFd, write: OwnedFd) -> Result<BrowserLink> {
-        Ok(Self::start(transport::pipe(
-            read,
-            write,
-            QUEUED_MAX_MESSAGE,
-        )?))
+        Ok(Self::start(transport::pipe(read, write, max_message())?))
     }
 
     fn start(transport: transport::Transport) -> BrowserLink {

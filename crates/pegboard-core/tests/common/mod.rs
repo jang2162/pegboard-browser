@@ -201,6 +201,9 @@ pub const PUBLIC_NAME: &str = "public.test";
 /// Size of the `/big` page and of what `/bomb` decodes to: over the guard's 16 MiB limit.
 pub const OVERSIZED: usize = 20 << 20;
 
+/// The largest message the shared browser's link takes (`PEGBOARD_TEST_LINK_MAX_MESSAGE`).
+pub const LINK_MAX_MESSAGE: usize = 64 << 20;
+
 fn crc32(crc: u32, bytes: &[u8]) -> u32 {
     let mut c = !crc;
     for &b in bytes {
@@ -795,6 +798,12 @@ impl Shared {
         // 4 MiB a download, 6 MiB a session (and a profile's running downloads), so the
         // limits can be reached by the slow fixture streams.
         std::env::set_var("PEGBOARD_TEST_DOWNLOAD_LIMITS", "4194304,6291456");
+        // The link takes messages up to 64 MiB (instead of 256 MiB, which Chrome never goes
+        // over), so a page can make one too large for it.
+        std::env::set_var(
+            "PEGBOARD_TEST_LINK_MAX_MESSAGE",
+            LINK_MAX_MESSAGE.to_string(),
+        );
         let env = env();
         let public_fixture = fixture().await;
         let fixture = self::fixture().await;
