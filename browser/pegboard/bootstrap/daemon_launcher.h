@@ -40,12 +40,16 @@ namespace pegboard {
 //   daemon holds the lock). After that the browser goes on without one (F8).
 // - When the browser quits, the pipe is closed (the daemon sees its end,
 //   closes its sessions and exits); a daemon still there after kQuitWait gets
-//   SIGTERM.
+//   SIGTERM, and SIGKILL kKillWait later. A daemon that closed its end of the
+//   pipe and stays gets the same.
 // - The daemon is in its own process group and nothing of it is waited on by
 //   the browser's own work: its death never takes the browser with it.
-// - The descriptors are close-on-exec in the browser, so no other child of
-//   the browser holds the pipe. The daemon opens its own log
-//   (<PEGBOARD_HOME>/daemon.log); it inherits the browser's environment.
+// - The descriptors are made close-on-exec right after the pipes are made, so
+//   no other child of the browser holds the pipe. The daemon opens its own log
+//   (<PEGBOARD_HOME>/daemon.log). It inherits the browser's environment, with
+//   PEGBOARD_AGENT_BROWSER set to the bundle's Contents/Helpers/agent-browser
+//   and, unless the browser itself has PEGBOARD_TEST_HOOKS, without any
+//   PEGBOARD_TEST_* variable.
 //
 // Lives on the UI thread; added to Chrome's main parts by
 // pegboard-bootstrap.patch.
@@ -58,6 +62,8 @@ class DaemonLauncher : public ChromeBrowserMainExtraParts {
   static constexpr base::TimeDelta kRestartWindow = base::Minutes(1);
   static constexpr base::TimeDelta kRestartDelay = base::Seconds(1);
   static constexpr base::TimeDelta kQuitWait = base::Seconds(5);
+  // After SIGTERM, how long before SIGKILL (a restart must not wait forever).
+  static constexpr base::TimeDelta kKillWait = base::Seconds(3);
   // The switch that keeps the browser from starting a daemon.
   static constexpr char kNoDaemonSwitch[] = "pegboard-no-daemon";
 
@@ -79,8 +85,12 @@ class DaemonLauncher : public ChromeBrowserMainExtraParts {
   void OnExited(int run, int exit_code);
   // Stops the pipe handler and closes the browser's ends of the pipe.
   void EndPipe();
-  // SIGTERM for the daemon of launch `run` if it is still there.
+  // SIGTERM for the daemon of launch `run` if it is still there, then SIGKILL
+  // after kKillWait.
   void TerminateIfRunning(int run);
+  void KillIfRunning(int run);
+  // Whether the daemon of launch `run` has not been seen gone.
+  bool Running(int run) const;
 
   base::FilePath executable_;
   // Which launch the callbacks are about; stale ones are ignored.

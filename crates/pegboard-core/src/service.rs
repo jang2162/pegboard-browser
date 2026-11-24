@@ -522,6 +522,14 @@ impl Daemon {
                 move || weak.upgrade().is_none_or(|d| d.browser.has_exited())
             };
             browser_ended(&link, exited).await;
+            if crate::testenv::var("PEGBOARD_TEST_IGNORE_PIPE_EOF").as_deref() == Some("1")
+                && weak.upgrade().is_some_and(|d| d.browser.is_hosted())
+            {
+                // Test-only: a hosted daemon that outlives its pipe, for the browser's
+                // SIGTERM after 5 s (e2e_bootstrap).
+                eprintln!("pegboard: the connection ended; staying (test hook)");
+                return;
+            }
             if let Some(d) = weak.upgrade() {
                 eprintln!("pegboard: the browser or its connection ended; stopping");
                 d.request_stop();

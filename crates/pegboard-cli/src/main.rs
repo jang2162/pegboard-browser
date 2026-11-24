@@ -1326,6 +1326,9 @@ fn daemon_main(paths: &Paths, cdp_pipe: bool) -> Result<(), RpcError> {
             None => DaemonStart::Launch(launch_config()?),
         };
         let daemon = Daemon::start(paths.clone(), how).await?;
+        if cdp_pipe {
+            close_pipe_write_on_usr1()?;
+        }
         let mut pid = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -1343,8 +1346,8 @@ fn daemon_main(paths: &Paths, cdp_pipe: bool) -> Result<(), RpcError> {
         let stopper = async {
             tokio::select! {
                 _ = daemon.wait_stopped() => {}
-                _ = term.recv() => {}
-                _ = int.recv() => {}
+                _ = term.recv() => eprintln!("pegboard: SIGTERM; stopping"),
+                _ = int.recv() => eprintln!("pegboard: SIGINT; stopping"),
             }
             daemon.shutdown().await;
             Ok(())
@@ -1359,6 +1362,28 @@ fn daemon_main(paths: &Paths, cdp_pipe: bool) -> Result<(), RpcError> {
     });
     let _ = std::fs::remove_file(&pid_file);
     result.map_err(|e: anyhow::Error| error(codes::INTERNAL, format!("{e:#}")))
+}
+
+/// Test-only (`PEGBOARD_TEST_PIPE_CLOSE_ON_USR1=1` with test hooks): on SIGUSR1 the hosted
+/// daemon closes the end of the DevTools pipe it writes (fd 4) and nothing else, as a daemon
+/// that hangs up and stays would (e2e_bootstrap). The descriptor number is kept by
+/// /dev/null, so the pipe's writer goes on writing into nothing.
+fn close_pipe_write_on_usr1() -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if pegboard_core::testenv::var("PEGBOARD_TEST_PIPE_CLOSE_ON_USR1").as_deref() != Some("1") {
+        return Ok(());
+    }
+    let mut usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    tokio::spawn(async move {
+        while usr1.recv().await.is_some() {
+            if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+                // SAFETY: dup2 of an open descriptor onto fd 4, which this process owns.
+                unsafe { libc::dup2(null.as_raw_fd(), 4) };
+                eprintln!("pegboard: closed the pipe's write end (test hook)");
+            }
+        }
+    });
+    Ok(())
 }
 
 /// A hosted daemon's stdout and stderr go to `<home>/daemon.log` (appended, owner only):

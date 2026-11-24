@@ -4,14 +4,20 @@
 
 #include "pegboard/bootstrap/daemon_launcher.h"
 
+#include <crt_externs.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
 
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "base/apple/bundle_locations.h"
 #include "base/command_line.h"
+#include "base/compiler_specific.h"
+#include "base/environment.h"
 #include "base/files/file_util.h"
 #include "base/functional/bind.h"
 #include "base/logging.h"
@@ -19,6 +25,7 @@
 #include "base/posix/eintr_wrapper.h"
 #include "base/process/launch.h"
 #include "base/process/process.h"
+#include "base/strings/string_util.h"
 #include "base/task/sequenced_task_runner.h"
 #include "base/task/thread_pool.h"
 #include "base/threading/platform_thread.h"
@@ -51,7 +58,10 @@ base::ScopedFD HighCloexec(base::ScopedFD fd) {
 }
 
 // A pipe whose both ends are close-on-exec, so no child of the browser but
-// the daemon (through the remapping) holds an end.
+// the daemon (through the remapping) holds an end. base::CreatePipe makes them
+// without the flag; until HighCloexec a fork() on another thread could take
+// them along (children started by base::LaunchProcess cannot: posix_spawn
+// there passes only remapped descriptors).
 bool CloexecPipe(base::ScopedFD* read_end, base::ScopedFD* write_end) {
   base::ScopedFD r, w;
   if (!base::CreatePipe(&r, &w)) {
@@ -69,14 +79,45 @@ void Retire(base::ScopedFD fd) {
     return;
   }
   base::ScopedFD null(HANDLE_EINTR(open("/dev/null", O_RDWR | O_CLOEXEC)));
-  if (!null.is_valid() || HANDLE_EINTR(dup2(null.get(), fd.get())) < 0) {
-    // Nothing to put in its place: close it at once.
-    return;
+  if (null.is_valid() && HANDLE_EINTR(dup2(null.get(), fd.get())) >= 0) {
+    base::SetCloseOnExec(fd.get());
+  } else {
+    // Nothing to put in its place: the pipe end itself waits out the linger,
+    // so the number is not handed out again meanwhile.
+    PLOG(ERROR) << "pegboard: replacing a pipe end with /dev/null";
   }
-  base::SetCloseOnExec(fd.get());
   base::ThreadPool::PostDelayedTask(
       FROM_HERE, {base::MayBlock()},
       base::BindOnce([](base::ScopedFD) {}, std::move(fd)), kRetiredFdLinger);
+}
+
+// The environment changes for the daemon: the bundle's agent-browser, and no
+// test variables unless the browser runs with test hooks itself (the daemon
+// reads them only with PEGBOARD_TEST_HOOKS too; this keeps them out of its
+// children's way as well).
+base::EnvironmentMap DaemonEnvironment(const base::FilePath& helpers) {
+  base::EnvironmentMap env;
+  env["PEGBOARD_AGENT_BROWSER"] = helpers.Append("agent-browser").value();
+  bool test_hooks = false;
+  std::vector<std::string> test_vars;
+  char** environ_entries = *_NSGetEnviron();
+  // SAFETY: environ is an array of NUL-terminated strings ended by a null.
+  for (size_t i = 0; environ_entries && UNSAFE_BUFFERS(environ_entries[i]);
+       ++i) {
+    std::string_view entry(UNSAFE_BUFFERS(environ_entries[i]));
+    std::string_view name = entry.substr(0, entry.find('='));
+    if (name == "PEGBOARD_TEST_HOOKS") {
+      test_hooks = true;
+    } else if (base::StartsWith(name, "PEGBOARD_TEST_")) {
+      test_vars.emplace_back(name);
+    }
+  }
+  if (!test_hooks) {
+    for (const std::string& name : test_vars) {
+      env[name] = std::string();  // Unset (base::LaunchOptions::environment).
+    }
+  }
+  return env;
 }
 
 }  // namespace
@@ -129,6 +170,7 @@ void DaemonLauncher::Launch() {
   // Signals for the browser's process group (a Ctrl-C in the terminal that
   // started it) are not the daemon's.
   options.new_process_group = true;
+  options.environment = DaemonEnvironment(executable_.DirName());
   base::Process process = base::LaunchProcess(daemon, options);
   // Only the daemon holds its ends, so the browser sees the pipe end when the
   // daemon goes.
@@ -233,12 +275,33 @@ void DaemonLauncher::EndPipe() {
   Retire(std::move(read_fd_));
 }
 
+bool DaemonLauncher::Running(int run) const {
+  // The pid is only signalled while the waiting thread has not reaped it; the
+  // window between that check and kill() is the only chance of hitting a
+  // reused pid.
+  return run == run_ && pid_ != base::kNullProcessId && exited_ &&
+         !exited_->data.load();
+}
+
 void DaemonLauncher::TerminateIfRunning(int run) {
-  if (run == run_ && pid_ != base::kNullProcessId && exited_ &&
-      !exited_->data.load()) {
-    LOG(WARNING) << "pegboard: daemon " << pid_ << " is still there; SIGTERM";
-    kill(pid_, SIGTERM);
+  if (!Running(run)) {
+    return;
   }
+  LOG(WARNING) << "pegboard: daemon " << pid_ << " is still there; SIGTERM";
+  kill(pid_, SIGTERM);
+  if (!quitting_) {
+    term_timer_.Start(FROM_HERE, kKillWait,
+                      base::BindOnce(&DaemonLauncher::KillIfRunning,
+                                     base::Unretained(this), run));
+  }
+}
+
+void DaemonLauncher::KillIfRunning(int run) {
+  if (!Running(run)) {
+    return;
+  }
+  LOG(WARNING) << "pegboard: daemon " << pid_ << " outlived SIGTERM; SIGKILL";
+  kill(pid_, SIGKILL);
 }
 
 void DaemonLauncher::PostMainMessageLoopRun() {
@@ -257,6 +320,13 @@ void DaemonLauncher::PostMainMessageLoopRun() {
     base::PlatformThread::Sleep(base::Milliseconds(50));
   }
   TerminateIfRunning(run_);
+  if (Running(run_)) {
+    const base::TimeTicks kill_at = base::TimeTicks::Now() + kKillWait;
+    while (!exited_->data.load() && base::TimeTicks::Now() < kill_at) {
+      base::PlatformThread::Sleep(base::Milliseconds(50));
+    }
+    KillIfRunning(run_);
+  }
 }
 
 }  // namespace pegboard

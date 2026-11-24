@@ -46,8 +46,6 @@ const REDACTED: &str = "[redacted]";
 /// must not hang the caller).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const BIN_IN_REPO: &str = "vendor/agent-browser/agent-browser";
-/// The file name beside the executable (an app bundle's `Contents/Helpers/`).
-const BIN_NAME: &str = "agent-browser";
 
 fn rpc_error(code: &str, message: impl Into<String>) -> RpcError {
     RpcError {
@@ -68,11 +66,9 @@ fn missing(looked_at: &[PathBuf]) -> RpcError {
     )
 }
 
-/// `$PEGBOARD_AGENT_BROWSER`, else `agent-browser` beside the executable (the app bundle's
-/// `Contents/Helpers/`, browser/scripts/package-dev.sh), else
-/// `vendor/agent-browser/agent-browser` next to the executable or in the repository this
-/// crate was built from. No other directory is searched: a parent directory such as `/tmp`
-/// could hold a planted binary.
+/// `$PEGBOARD_AGENT_BROWSER`, else `vendor/agent-browser/agent-browser` next to the
+/// executable or in the repository this crate was built from. No other directory is
+/// searched: a parent directory such as `/tmp` could hold a planted binary.
 pub fn find_agent_browser() -> Result<PathBuf, RpcError> {
     if let Some(p) = std::env::var_os("PEGBOARD_AGENT_BROWSER") {
         let p = PathBuf::from(p);
@@ -88,7 +84,6 @@ pub fn find_agent_browser() -> Result<PathBuf, RpcError> {
         .as_deref()
         .and_then(Path::parent)
     {
-        candidates.push(dir.join(BIN_NAME));
         candidates.push(dir.join(BIN_IN_REPO));
     }
     candidates.push(

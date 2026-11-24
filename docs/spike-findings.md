@@ -1043,34 +1043,38 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; fini
 | `devtools-pipe-fds.patch` | 파일 2개, +15 −0, 15줄: `content/public/browser/devtools_agent_host.h` +6, `content/browser/devtools/devtools_agent_host_impl.cc` +9 |
 | `pegboard-bootstrap.patch` | 파일 2개, +6 −1, 7줄: `chrome/browser/chrome_browser_main.cc` +2, `chrome/browser/BUILD.gn` +4 −1 |
 | `branding.patch`, `pegboard-cdp-domain.patch` | 작업 8과 같다(16줄, 37줄) |
-| `//pegboard/bootstrap` | 385줄(`daemon_launcher.{h,cc}`, `BUILD.gn`) |
+| `//pegboard/bootstrap` | 471줄(`daemon_launcher.{h,cc}`, `BUILD.gn`) |
 
 - **A6 확인** [확인]: 0단계 소스 읽기의 예상("업스트림 파일 2개에 십여 줄")대로 파일 2개, 15줄이다. 새 공개 함수 `DevToolsAgentHost::StartRemoteDebuggingPipeHandlerWithFds(read_fd, write_fd, on_disconnect)` 하나이고, 기존 파이프 핸들러를 주어진 fd로 만든다. 기존 `--remote-debugging-pipe`(fd 3, 4)는 그대로다.
 - **파이프 다시 시작(설계 5절 위험 3)** [확인]: 된다. 핸들러는 프로세스에 하나인 정적 자리(`SetDevToolsPipeHandler`)에 들어가고, 멈추면(`StopRemoteDebuggingPipeHandler`) 지워지며, 다시 시작하면 새 브라우저 타깃 클라이언트가 붙는다. 남는 상태는 없었다: 데몬을 죽인 뒤 새 데몬이 `Pegboard.claim`부터 다시 해서 세션을 만들었다(`a_killed_daemon_is_restarted_and_cleans_up`). F8을 낮출 필요가 없다.
 - **업스트림 핸들러는 fd를 닫지 않는다.** 멈출 때 `shutdown(SHUT_RDWR)`만 부르는데, 이것은 소켓에만 듣고 파이프에는 아무 일도 하지 않는다(실패를 무시한다). 읽는 스레드는 상대가 쓰는 끝을 닫을 때까지 `read`에 머문다. 그래서 fd는 부트스트랩이 쥐고 있다가, 핸들러를 멈춘 뒤 `/dev/null`을 `dup2`로 그 번호에 덮어 파이프 끝을 닫고(데몬은 EOF를 본다), 번호는 10초 뒤에 닫는다. 바로 닫으면 핸들러 스레드에 남은 쓰기가 다른 파일에 재사용된 번호로 갈 수 있기 때문이다. 패치에서 핸들러가 fd를 닫게 고치는 것보다 업스트림 줄이 적다.
 - **연결 지점**: `ChromeBrowserMainExtraParts`의 하나로 맥의 메인 파츠에 더한다(`chrome_browser_main.cc`의 `AddParts` 한 줄). `PostBrowserStart`에서 데몬을 띄운다(프로필 관리자가 준비되어 있다). 이미 실행 중인 브라우저에 요청만 넘기고 끝나는 프로세스는 이 단계에 오지 않는다. `PostMainMessageLoopRun`에서 종료를 처리한다(프로필이 아직 살아 있어 DevTools 세션을 정리할 수 있다).
 - **건너뛰는 조건**: `--remote-debugging-pipe`(F13, 부모가 파이프를 가졌다), `--pegboard-no-daemon`, 번들에 `Contents/Helpers/pegboard`가 없다(경고 한 줄).
-- **데몬 실행**: `Contents/Helpers/pegboard daemon --cdp-pipe`, 자식 fd 3(데몬이 읽음)·4(데몬이 씀). 두 파이프의 네 끝은 모두 close-on-exec이고 번호를 10 이상으로 옮긴다(`posix_spawn`이 3, 4로 차례로 옮기다 서로 덮지 않게). 자식 쪽 끝은 실행 직후 브라우저에서 닫는다. 맥의 `base::LaunchProcess`는 `POSIX_SPAWN_CLOEXEC_DEFAULT`라 옮기지 않은 fd는 어차피 넘어가지 않는다. 데몬은 자기 프로세스 그룹에 둔다(터미널의 Ctrl-C가 데몬에 가지 않는다). 표준 입력은 `/dev/null`, 환경은 브라우저 것을 물려받는다. 데몬이 `daemon.log`를 직접 연다(작업 6).
-- **데몬 끝 감지**: 두 길이 있다. 파이프 EOF(핸들러의 `on_disconnect`)와 프로세스 종료(스레드 풀에서 `WaitForExit`, 종료 코드를 가져온다). 다시 띄우기는 종료 코드를 안 뒤에만 한다. 파이프는 닫았는데 5초 안에 끝나지 않는 데몬에는 `SIGTERM`을 보낸다.
+- **데몬 실행**: `Contents/Helpers/pegboard daemon --cdp-pipe`, 자식 fd 3(데몬이 읽음)·4(데몬이 씀). 두 파이프의 네 끝은 만든 직후 close-on-exec 사본(번호 10 이상, `posix_spawn`이 3, 4로 차례로 옮기다 서로 덮지 않게)으로 바꾼다. `base::CreatePipe`는 플래그 없이 만들므로 그 사이 아주 짧게 플래그 없는 때가 있다. 그 순간 다른 스레드가 `fork()`하면 따라갈 수 있다(`base::LaunchProcess`의 자식은 아니다). 자식 쪽 끝은 실행 직후 브라우저에서 닫는다. 맥의 `base::LaunchProcess`는 `POSIX_SPAWN_CLOEXEC_DEFAULT`라 옮기지 않은 fd는 어차피 넘어가지 않는다. 데몬은 자기 프로세스 그룹에 둔다(터미널의 Ctrl-C가 데몬에 가지 않는다). 표준 입력은 `/dev/null`이다. 환경은 브라우저 것을 물려받되 둘을 바꾼다. `PEGBOARD_AGENT_BROWSER`를 번들의 `Contents/Helpers/agent-browser`로 두고, 브라우저 자신의 환경에 `PEGBOARD_TEST_HOOKS`가 없으면 `PEGBOARD_TEST_*` 변수를 모두 지운다. 데몬도 시험 변수를 `PEGBOARD_TEST_HOOKS`가 있을 때만 읽으므로 결과는 같다. 다만 데몬의 자식(agent-browser)에게도 넘어가지 않게 한 겹 더 막은 것이다. 시험은 앱을 `PEGBOARD_TEST_HOOKS=1`로 켜서 시험 변수를 데몬까지 보낸다. 데몬이 `daemon.log`를 직접 연다(작업 6).
+- **데몬 끝 감지**: 두 길이 있다. 파이프 EOF(핸들러의 `on_disconnect`)와 프로세스 종료(스레드 풀에서 `WaitForExit`, 종료 코드를 가져온다). 다시 띄우기는 종료 코드를 안 뒤에만 한다. 파이프는 닫았는데 5초 안에 끝나지 않는 데몬에는 `SIGTERM`을, 그 뒤 3초 안에도 끝나지 않으면 `SIGKILL`을 보낸다(다시 띄우기가 영영 멈추지 않게).
 - **F8**: 종료 코드 4면 다시 띄우지 않는다. 그 밖에는 1초 뒤 다시 띄우되, 최근 1분 안의 다시 띄우기가 이미 3번이면 포기하고 브라우저는 데몬 없이 계속 간다(로그 한 줄). 포기는 그 브라우저 프로세스가 끝날 때까지다.
-- **종료**: 파이프를 닫고(데몬은 EOF를 받고 세션을 정리한 뒤 끝난다) 5초까지 50ms 간격으로 데몬이 끝났는지 본 뒤, 남아 있으면 `SIGTERM`. 이때는 메인 루프가 끝난 뒤라 기다림은 UI 스레드의 짧은 `Sleep` 반복이다. 브라우저가 `SIGTERM`을 받으면 크롬은 `chrome::SessionEnding`으로 이 단계 없이 바로 끝나는데, 그때도 프로세스가 끝나며 파이프가 닫혀 데몬은 EOF로 끝난다.
+- **종료**: 파이프를 닫고(데몬은 EOF를 받고 세션을 정리한 뒤 끝난다) 5초까지 50ms 간격으로 데몬이 끝났는지 본 뒤, 남아 있으면 `SIGTERM`, 다시 3초 뒤에도 남아 있으면 `SIGKILL`. 이때는 메인 루프가 끝난 뒤라 기다림은 UI 스레드의 짧은 `Sleep` 반복이다. 브라우저가 `SIGTERM`을 받으면 크롬은 `chrome::SessionEnding`으로 이 단계 없이 바로 끝나는데, 그때도 프로세스가 끝나며 파이프가 닫혀 데몬은 EOF로 끝난다.
 - **검토 중 찾은 버그(고침)**: 프로세스 종료가 파이프 EOF보다 먼저 보고되면, 늦게 온 EOF 처리가 5초 `SIGTERM` 타이머를 걸었고 그 타이머가 그사이 새로 띄운 데몬을 죽였다(다시 띄운 데몬이 5초 뒤 죽고 재시작 횟수를 쓴다). `kMaxRestarts`를 4로 바꾼 변형 빌드에서 다섯 번째 데몬이 곧 사라지는 것으로 드러났다. 타이머와 EOF 처리를 그 실행 번호에 묶고, 프로세스가 이미 끝난 뒤의 EOF는 무시한다. 두 보고의 순서는 경합이라 시험으로 늘 재현되지는 않는다. `a_killed_daemon_is_restarted_and_cleans_up`에 "다시 띄운 데몬이 8초 뒤에도 그대로"를 넣었지만, 고치기 전 빌드에서 이 시험은 한 번 통과했다.
-- **agent-browser 찾기**: 데몬은 `vendor/agent-browser/agent-browser`를 실행 파일 옆과 빌드한 저장소에서만 찾았다. 번들에서는 `Contents/Helpers/agent-browser`(실행 파일 바로 옆)에 있으므로 찾는 곳에 실행 파일 옆 `agent-browser`를 더했다(`runner.rs`). 빌드한 기기의 저장소 경로는 다른 기기에 없다.
+- **agent-browser 찾기**: 데몬은 `$PEGBOARD_AGENT_BROWSER`, 그다음 `vendor/agent-browser/agent-browser`를 실행 파일 옆과 빌드한 저장소에서 찾는다. 번들의 `Contents/Helpers/agent-browser`는 이 어디에도 없다(빌드한 기기의 저장소 경로는 다른 기기에 없다). 그래서 부트스트랩이 데몬 환경에 `PEGBOARD_AGENT_BROWSER`를 넣는다. 처음에는 `runner.rs`가 실행 파일 바로 옆의 `agent-browser`도 찾게 했는데 되돌렸다(검토에서 나옴). 그 자리가 고정한 vendor 0.42.0보다 먼저라, 순정 모드에서 `/usr/local/bin`의 `pegboard` 옆에 전역 설치된 다른 판 agent-browser를 고를 수 있었다(F4). 같은 이유로 CLI로 직접 띄운 순정 구성 데몬(`a_held_lock_is_not_retried`의 기존 데몬)은 번들의 agent-browser를 모르므로, 시험이 그 데몬에 `PEGBOARD_AGENT_BROWSER`를 준다.
 
 #### 시험 결과 (두 번째 기기 GUI 세션, `--test-threads=1`)
 
 `PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_APP=<package-dev.sh로 만든 Pegboard.app> cargo test -p pegboard-core --test e2e_bootstrap -- --ignored --test-threads=1`. 시험은 앱을 `open -n -a <앱> --env PEGBOARD_HOME=… --args --user-data-dir=<임시> --use-mock-keychain …`로 켜고, 앱 안의 `Contents/Helpers/pegboard`로 데몬에 말한다.
 
 ```
+test a_daemon_that_hangs_up_is_replaced ... ok
 test a_held_lock_is_not_retried ... ok
 test a_killed_daemon_is_restarted_and_cleans_up ... ok
 test app_start_spawns_the_daemon ... ok
 test daemon_exits_when_the_browser_quits ... ok
 test no_tcp_listener ... ok
+test quit_sigterms_a_daemon_that_stays ... ok
 test restarts_stop_after_three_in_a_minute ... ok
 test starts_without_any_window ... ok
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 43.22s
 ```
+
+검토 반영 뒤 마지막 빌드로 두 번 이어 돌려 두 번 다 9개가 통과했다(43.22초, 43.04초).
 
 - `no_tcp_listener`는 브라우저 메인 프로세스와 그 아래 모든 도우미를 `lsof -iTCP -sTCP:LISTEN`으로 본다. 데몬과 그 아래는 뺀다: 세션 프록시가 agent-browser를 위해 루프백에서 듣는 것은 순정 모드와 같다.
 - `daemon_exits_when_the_browser_quits`는 브라우저에 `SIGINT`를 보낸다(크롬의 점잖은 종료, Cmd-Q와 같은 `AttemptExit` 길). 데몬이 끝나고 세션 녹화의 `endedAt`이 채워진다.
@@ -1080,7 +1084,11 @@ test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 변형 확인 [확인]. 하나씩 바꿔 빌드하고 해당 시험을 돌렸다.
 - 종료 코드 4 검사를 빼면 `a_held_lock_is_not_retried`가 실패했다(거부 줄이 여러 번).
 - `kMaxRestarts`를 4로 하면 `restarts_stop_after_three_in_a_minute`가 "a fifth daemon started"로 실패했다(위 버그를 고친 뒤. 고치기 전에는 다섯 번째 데몬이 그 버그로 죽어 이 시험이 통과했다).
-- 종료 때의 5초 뒤 `SIGTERM`은 시험이 다루지 않는다. 데몬이 언제나 EOF로 먼저 끝났기 때문이다.
+- `kQuitWait`를 30초로 하면 `quit_sigterms_a_daemon_that_stays`와 `a_daemon_that_hangs_up_is_replaced`가 둘 다 "15초 뒤에도 남아 있다"로 실패했다.
+- 5초 뒤 `SIGTERM`은 시험 훅 두 개로 다룬다. `PEGBOARD_TEST_IGNORE_PIPE_EOF=1`을 주면 포크가 띄운 데몬이 파이프가 끝나도 남는다. `PEGBOARD_TEST_PIPE_CLOSE_ON_USR1=1`을 주면 데몬이 `SIGUSR1`을 받고 자기가 쓰는 끝(fd 4)만 닫는다(그 번호는 `/dev/null`이 잇는다). 둘 다 `PEGBOARD_TEST_HOOKS`가 있을 때만 듣는다.
+  - `quit_sigterms_a_daemon_that_stays`: 브라우저를 끄면 데몬이 4.5~8초 사이에 사라지고, `daemon.log`에 `SIGTERM; stopping`이 남는다.
+  - `a_daemon_that_hangs_up_is_replaced`: 데몬이 끊고 남으면 4.5~8초 사이에 `SIGTERM`으로 사라지고 새 데몬이 뜬다.
+  - 3초 뒤 `SIGKILL`(`SIGTERM`도 견디는 데몬)은 시험이 다루지 않는다.
 
 #### 남은 것
 
@@ -1088,4 +1096,10 @@ test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 - 사람이 `--remote-debugging-port`를 직접 주면 크롬의 `RemoteDebuggingServer`가 TCP로 듣는다(그 포트에는 `Pegboard` 도메인이 없다, 작업 8). 기본 사용자 데이터 디렉터리에서는 크롬 자체가 이 플래그를 거부한다. 부트스트랩은 이 플래그를 막지 않는다.
 - 포기(1분에 4번째)는 브라우저가 끝날 때까지 이어진다. 사람에게 알리는 화면은 없다(로그 한 줄). 3b에서 본다.
 - 데몬이 오래 살며 가끔 죽는 경우 파이프 fd는 다시 띄울 때마다 새로 만들고, 앞의 것은 10초 뒤 닫으므로 쌓이지 않는다.
-- **죽은 데몬의 agent-browser가 남는다** [확인]: 데몬을 `SIGKILL`하면 그 세션의 agent-browser 데몬(`Contents/Helpers/agent-browser`)이 부모 없이 남는다. 새 데몬의 F11 정리는 탭과 녹화만 다룬다. 시험 한 번 돌릴 때마다 둘씩 남았다(데몬을 죽이는 시험, 그리고 시험 정리의 `SIGKILL`). 새 데몬이 시작할 때 자기 소켓 디렉터리의 남은 agent-browser를 끝내는 일은 작업 10 또는 3b에서 본다.
+- **죽은 데몬의 agent-browser** [확인]: agent-browser는 스스로 데몬이 되어 pegboard 데몬과 떨어진다. 관찰값은 데몬 `pgid`=자기 pid, agent-browser `pgid`=자기 pid, `ppid`=1이었다(`sess`는 맥에서 둘 다 0). 그래서 pegboard 데몬을 `SIGKILL`하면 그 세션의 agent-browser가 남는다.
+  - 새 데몬은 시작할 때 이것을 이미 끝낸다. 순정·포크 공통으로 `Runner::cleanup_leftovers`(`service.rs`의 `Daemon::start`)가 이 홈의 `sessions/<id>`마다 `peg-<id>.pid`를 읽고, 그 프로세스가 우리 agent-browser 실행 파일이면 `SIGKILL`한다.
+  - `a_killed_daemon_is_restarted_and_cleans_up`이 이제 "죽인 데몬의 agent-browser가 새 데몬 뒤에 사라진다"를 단언한다. 소켓 디렉터리는 사용자의 모든 홈이 함께 쓰므로 이 홈의 세션 디렉터리가 있는 것만 건드린다.
+  - 처음 시험 돌리기에서 남은 것들은 시험 정리(마지막 데몬을 `SIGKILL`, 그 뒤 새 데몬이 없음)에서 생긴 것이었다. 시험의 정리가 이 홈 세션의 agent-browser를 함께 끝내게 고쳤고, 두 번 돌린 뒤 남은 프로세스가 없었다.
+- 1분 창 자체(1분이 지나면 다시 세 번 띄울 수 있다)는 시험이 고정하지 않는다. 시험은 1분 안의 네 번째만 본다.
+- `TerminateIfRunning`은 기다리는 스레드가 아직 거두지 않았는지 확인한 뒤 `kill`한다. 그 사이에 데몬이 끝나고 pid가 다른 프로세스에 다시 쓰일 틈은 무시할 만하다.
+- 핸들러를 바깥에서 멈추면(다른 코드가 `StopRemoteDebuggingPipeHandler`를 부르면) 부트스트랩이 fd를 쥐고 있어서 데몬은 EOF를 받지 못하고 남는다. 지금은 종료 중의 `RemoteDebuggingServer` 소멸자만 부르고, 그 서버는 `--remote-debugging-port`/`--remote-debugging-pipe`를 줄 때만 생긴다.

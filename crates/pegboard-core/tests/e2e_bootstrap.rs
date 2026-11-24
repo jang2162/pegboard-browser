@@ -102,6 +102,8 @@ struct App {
     server: Server,
     /// The browser's main process, known once its first daemon answered.
     browser: Option<i32>,
+    /// More variables for the app (test hooks of the daemon).
+    extra_env: Vec<(String, String)>,
 }
 
 impl App {
@@ -112,7 +114,14 @@ impl App {
             udd: tempfile::tempdir().unwrap(),
             server: Server::start(),
             browser: None,
+            extra_env: Vec::new(),
         }
+    }
+
+    fn with_env(mut self, vars: &[(&str, &str)]) -> App {
+        self.extra_env
+            .extend(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        self
     }
 
     fn helper(&self) -> PathBuf {
@@ -133,6 +142,9 @@ impl App {
             ("PEGBOARD_TEST_HOOKS".into(), "1".into()),
             ("PEGBOARD_TEST_HOST_RULES".into(), self.rules()),
         ]
+        .into_iter()
+        .chain(self.extra_env.iter().cloned())
+        .collect()
     }
 
     /// `open -n -a <app>` as a person would, with `extra` browser arguments. The test-only
@@ -248,6 +260,14 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // The agent-browser daemons of this home's sessions: a daemon killed here leaves
+        // them, as nothing starts after it to clean up.
+        for pid in agent_browsers_of(self.home.path()) {
+            if command_of(pid).starts_with(&self.app.display().to_string()) {
+                // SAFETY: plain syscall on this test's agent-browser.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
         let mut pids: Vec<i32> = self.browser.into_iter().collect();
         pids.extend(self.daemon_pid());
         for pid in pids {
@@ -269,6 +289,33 @@ impl Drop for App {
                 .output();
         }
     }
+}
+
+/// agent-browser's socket directory, shared by every pegboard home of the user
+/// (`paths::Paths::ab_socket_dir`).
+fn ab_socket_dir() -> PathBuf {
+    // SAFETY: getuid has no failure mode.
+    PathBuf::from(format!("/tmp/pegboard-{}/ab", unsafe { libc::getuid() }))
+}
+
+/// The pid agent-browser recorded for the session `handle`.
+fn agent_browser_of(handle: &str) -> Option<i32> {
+    let id = handle.split('.').next()?;
+    std::fs::read_to_string(ab_socket_dir().join(format!("peg-{id}.pid")))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The recorded agent-browser pids of the sessions under `<home>/sessions`.
+fn agent_browsers_of(home: &Path) -> Vec<i32> {
+    std::fs::read_dir(home.join("sessions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| agent_browser_of(&e.file_name().to_string_lossy()))
+        .collect()
 }
 
 fn alive(pid: i32) -> bool {
@@ -478,11 +525,30 @@ fn a_killed_daemon_is_restarted_and_cleans_up() {
     assert!(eventually(SETTLE, || pinging(&a, "/ping/human")
         && pinging(&a, "/ping/agent")));
 
+    let (code, _, err) = a.cli(&["get", "url"], Some(&s));
+    assert_eq!(code, 0, "{err}");
+    let left = agent_browser_of(&s).expect("the session's agent-browser pid");
+    assert!(alive(left));
+    eprintln!(
+        "OBSERVED daemon pid={first} pgid={} sess={} ppid={}; agent-browser pid={left} pgid={} sess={} ppid={}",
+        ps("pgid", first),
+        ps("sess", first),
+        ps("ppid", first),
+        ps("pgid", left),
+        ps("sess", left),
+        ps("ppid", left)
+    );
+
     // SAFETY: plain syscall on this test's daemon.
     unsafe { libc::kill(first, libc::SIGKILL) };
     let second = a.wait_for_daemon(Some(first), SETTLE);
     let restarted = Instant::now();
     assert_ne!(second, first);
+    // The new daemon stops the agent-browser the killed one left.
+    assert!(
+        eventually(SETTLE, || !alive(left)),
+        "agent-browser {left} of the killed daemon is still there"
+    );
     assert!(
         eventually(SETTLE, || !pinging(&a, "/ping/agent")),
         "the agent tab is still open"
@@ -559,6 +625,11 @@ fn a_held_lock_is_not_retried() {
     let mut held = Command::new(a.helper());
     held.env("PEGBOARD_HOME", a.home.path())
         .env("PEGBOARD_TEST_BROWSER", format!("fork:{}", app.display()))
+        // Started from the command line, not by the app: it is told where agent-browser is.
+        .env(
+            "PEGBOARD_AGENT_BROWSER",
+            app.join("Contents/Helpers/agent-browser"),
+        )
         .args(["browser", "start"])
         .stdin(Stdio::null());
     for (k, v) in a.test_env() {
@@ -595,4 +666,68 @@ fn a_held_lock_is_not_retried() {
 
     let (code, _, err) = a.cli(&["browser", "stop"], None);
     assert_eq!(code, 0, "{err}");
+}
+
+/// How long after `since` the daemon `pid` was seen gone (polled every 50 ms, up to 15 s).
+fn gone_after(pid: i32, since: Instant) -> Duration {
+    let deadline = since + Duration::from_secs(15);
+    while alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!alive(pid), "{pid} is still there 15 s later");
+    since.elapsed()
+}
+
+/// The browser quits while its daemon does not leave with the pipe (test hook): the browser
+/// waits 5 s, then sends SIGTERM.
+#[test]
+#[ignore]
+fn quit_sigterms_a_daemon_that_stays() {
+    let Some(app) = app_under_test() else { return };
+    let mut a = App::new(app).with_env(&[("PEGBOARD_TEST_IGNORE_PIPE_EOF", "1")]);
+    a.open(&[]);
+    let daemon = a.wait_for_daemon(None, DAEMON_START);
+    let browser = a.browser();
+    let quit = Instant::now();
+    // SAFETY: plain syscall on this test's browser.
+    unsafe { libc::kill(browser, libc::SIGINT) };
+    let after = gone_after(daemon, quit);
+    let log = a.log();
+    assert!(
+        after >= Duration::from_millis(4500) && after <= Duration::from_secs(8),
+        "the daemon went {after:?} after the quit; daemon.log:\n{log}"
+    );
+    assert!(log.contains("staying (test hook)"), "{log}");
+    assert!(log.contains("SIGTERM; stopping"), "{log}");
+    assert!(
+        eventually(SETTLE, || !alive(browser)),
+        "the browser did not quit"
+    );
+}
+
+/// A daemon that closes its end of the pipe and stays (test hooks) gets SIGTERM 5 s later
+/// and is replaced.
+#[test]
+#[ignore]
+fn a_daemon_that_hangs_up_is_replaced() {
+    let Some(app) = app_under_test() else { return };
+    let mut a = App::new(app).with_env(&[
+        ("PEGBOARD_TEST_IGNORE_PIPE_EOF", "1"),
+        ("PEGBOARD_TEST_PIPE_CLOSE_ON_USR1", "1"),
+    ]);
+    a.open(&[]);
+    let first = a.wait_for_daemon(None, DAEMON_START);
+    let hung_up = Instant::now();
+    // SAFETY: plain syscall on this test's daemon.
+    unsafe { libc::kill(first, libc::SIGUSR1) };
+    let after = gone_after(first, hung_up);
+    assert!(
+        after >= Duration::from_millis(4500) && after <= Duration::from_secs(8),
+        "the daemon went {after:?} after hanging up; daemon.log:\n{}",
+        a.log()
+    );
+    assert!(a.log().contains("SIGTERM; stopping"), "{}", a.log());
+    let second = a.wait_for_daemon(Some(first), SETTLE);
+    assert_ne!(second, first);
+    assert!(alive(a.browser()));
 }
