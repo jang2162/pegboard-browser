@@ -898,3 +898,43 @@ base에서 명령별 더해진 시간 중앙값(ms): `open` 52, `snapshot -i` 52
 | 프록시 허용 메서드 | 브라우저 수준 허용 메서드(`Browser.getVersion`, `Target.getTargets`, `setDiscoverTargets`, `setAutoAttach`, `getTargetInfo`, `closeTarget`)가 S1과 루트에서 같은 모양의 결과·오류를 낸다 [확인] | 세션 프록시는 가상 연결 위에서 그대로 동작한다 |
 
 **결론**: F7의 전제가 맞다. 중계 계층은 연결별 상태를 흉내 낼 필요 없이 "세션 ID → 가상 연결" 표와 요청 ID 다시 매기기만 하면 된다. 포크(파이프)에서 같은 결과인지는 작업 7에서 다시 본다.
+
+### 3a 작업 7. `browser/` 구조, 브랜딩, 첫 포크 빌드 (2026-11-24)
+
+Chromium `156.0.8078.109`에 브랜딩 패치 하나를 얹어 `Pegboard.app`을 빌드했다. 빌드는 작업 기기(Apple M5 Pro, 15코어, 48GB)에서, 앱 실행과 시험은 두 번째 기기의 GUI 세션에서 했다.
+
+| 항목 | 값 |
+|---|---|
+| 순정(패치 없음) 첫 빌드, `-j 8` | 2시간 23분. 그 전 시도가 기기 멈춤으로 끊긴 뒤 이어서 잰 것이라, 빈 상태부터는 2시간 반~3시간으로 본다 |
+| 브랜딩 뒤 증분 빌드 | 약 1,180단계. 걸린 시간은 기기 재시작으로 로그를 잃었다. 파일 시각으로 본 마지막 브랜딩 재적용 뒤 빌드는 약 2분 20초(빌드 로그 생성부터 프레임워크 링크까지)인데, 1,180단계 빌드와 같은 것인지는 확인 못 했다 |
+| `disable_fieldtrial_testing_config` 추가 뒤 증분 | 1분 58초(`build.sh` 출력) |
+| `apply.sh` 재적용(같은 내용, 파일 시각만 바뀜) 뒤 증분 | 42초 |
+| `out/Pegboard` 디스크 | 11GB(앱 698MB). 소스와 합쳐 74GB |
+| 패치 예산(`budget.sh`) | 업스트림 파일 4개, 추가 8줄, 삭제 8줄, 합계 16줄 |
+
+- **동시 작업은 8개로 묶는다.** 기본 병렬도(코어 수 전부)로 빌드하다 작업 기기가 두 번 커널 패닉으로 멈췄다. `build.sh`는 기본 `-j 8`에 `nice`로 돈다(`PEGBOARD_BUILD_JOBS`로 바꿀 수 있다).
+- **`args.gn`에서 `enable_nacl`을 뺐다.** 156에서는 효과가 없다고 `gn`이 경고한다.
+- **`disable_fieldtrial_testing_config = true`를 더했다.** Chromium 이름의 빌드는 기본으로 `testing/variations/fieldtrial_testing_config.json`의 실험을 켠다. 그중 `AperitifHelpers`의 도우미(`Pegboard Helper (Aperitif).app`)가 `aperitif: Failed to initialize sandbox`로 죽어 네트워크 서비스가 없었다(HTTP 요청이 서버에 닿지 않음). 실행 때 `--disable-field-trial-config`를 주면 도우미가 순정 이름으로 뜬다. 같은 실험이 켜진 Chrome for Testing의 Aperitif 도우미는 잘 돈다. 원인(임시 서명이나 빌드 차이)은 보지 않았다 [확인: 현상과 끄면 사라지는 것].
+- **키체인이 첫 요청을 막는다.** 새로 빌드한 앱은 쿠키 저장소를 열 때 키체인 항목 `Pegboard Safe Storage`를 만들며 사용자에게 묻는다. 답이 없으면(화면 잠금 등) 모든 HTTP 요청이 `URL_REQUEST_START_JOB` 뒤에서 멈춘다(넷로그). `--use-mock-keychain`을 주면 바로 된다 [확인]. 시험의 파이프 판 `RawLink`는 이 플래그를 준다. 포크 모드의 데몬 시험(작업 9, 10)도 같은 문제를 만날 것이다.
+- **이름과 경로** [확인]: `CFBundleIdentifier` = `app.pegboard.browser`, `CFBundleName`·`CFBundleDisplayName` = `Pegboard`, 실행 파일 `Contents/MacOS/Pegboard`, 프레임워크 `Pegboard Framework.framework`, 도우미 `Pegboard Helper*.app`. 앞에 뜬 앱 이름(`lsappinfo front`)과 창 주인 이름(CGWindowList)이 `Pegboard`. 응용 프로그램 메뉴 제목은 `CFBundleName`에서 오고 메뉴 항목(`About/Hide/Quit Pegboard`)은 `IDS_PRODUCT_NAME`으로 채워진다(`main_menu_builder.mm`). 메뉴 자체는 손쉬운 사용 권한이 없어 읽지 못했다 [미확인]. 맥의 창 제목은 탭 제목이라 앱 이름이 들어가지 않는다.
+- **기본 사용자 데이터**: `--user-data-dir` 없이 켜면 `~/Library/Application Support/Pegboard`에 `Default`, `Local State`가 생긴다 [확인]. 임시 `--user-data-dir`로 켜도 그 디렉터리에 `Crashpad/`가 생긴다. 업스트림이 충돌 보고 위치(`DIR_CRASH_DUMPS`)를 기본 사용자 데이터 디렉터리 아래로 정하기 때문이고(`chrome/common/chrome_paths.cc`), 프로필 데이터는 없다. 설계 F9와 어긋나지 않는다.
+- 메뉴와 화면 곳곳의 다른 문자열(`About Chromium` 등)은 아직 Chromium이다. 이번 패치는 제품 이름 두 개만 바꿨다(3b에서).
+- **패치 왕복** [확인]: `export.sh`로 뽑은 `branding.patch`를 `PEGBOARD_APPLY_FORCE=1 apply.sh`로 깨끗한 태그에 다시 얹었더니 `git apply --3way`가 네 파일 모두 깨끗하게 적용했고, 새 `pegboard-work`의 트리가 이전 것과 같았으며, 다시 뽑은 패치가 글자 하나 다르지 않았다.
+
+#### 파이프 위 F7 전제 (작업 7 5단계)
+
+작업 1의 `e2e_link.rs` 여섯 시험을 포크에 `--remote-debugging-pipe`(브라우저가 fd 3을 읽고 fd 4에 쓴다, NUL로 끝나는 JSON)로 돌렸다. `PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<Pegboard.app> cargo test -p pegboard-core --test e2e_link -- --ignored --nocapture --test-threads=1 <여섯 이름>`. 여섯 모두 통과했다. 같은 파일로 순정 Chrome for Testing도 여섯 모두 통과했다.
+
+```
+OBSERVED discover_s1_only: s1_got=true s2_got=false root_got=false
+OBSERVED auto_attach_s1_only: attached_on_s1=true attached_on_s2_or_root=false child_event_only_on_child=true
+OBSERVED page_sessions_one_tab: p2_got_event_before_its_own_enable=false both_got_m2=true
+OBSERVED per_session_download_fetch_screencast: download_a_in_a=true download_b_in_b=true download_crossed=false fetch_paused_on_p2=false p2_commands_free_while_paused=true paused_fetch_completes=true frames_p2_after_p1_stop=3 frames_p1_after_stop=false
+OBSERVED child_after_parent_detach=gone root_detach_response={"id":6,"result":{}}
+OBSERVED allowlist_root_vs_s1: same_shape=true Browser.getVersion=result Target.getTargets=result Target.setDiscoverTargets=result Target.setAutoAttach=result Target.getTargetInfo=result Target.getTargetInfo=error Target.closeTarget=error
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 7.27s
+```
+
+- **결론**: 파이프 위에서도 F7의 전제가 맞다.
+- 한 번(다섯 번 중) `download_behavior_fetch_and_screencast_are_per_session`이 `P1 still got frames after stopScreencast`로 실패했다. `stopScreencast` 응답 뒤에 이미 만들어진 P1 자신의 프레임이 하나 더 온 것으로 보인다. 다른 세션으로 샌 것이 아니라 F7과는 상관없지만, 녹화기가 멈춘 뒤 프레임 하나를 더 받을 수 있다고 보고 다뤄야 한다. 같은 시험을 네 번 더 돌린 것은 모두 통과했다.
+- 파이프 판은 첫 명령 전에 브라우저가 답할 때까지 30초까지 기다린다(웹소켓 판은 주소를 받은 뒤라 이미 떠 있다). 기다리지 않으면 첫 명령이 3초 안에 답을 못 받았다.

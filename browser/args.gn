@@ -1,0 +1,12 @@
+is_debug = false
+symbol_level = 0
+is_component_build = false
+target_cpu = "arm64"
+chrome_pgo_phase = 0
+google_api_key = ""
+google_default_client_id = ""
+google_default_client_secret = ""
+# Chromium-branded builds otherwise apply testing/variations/fieldtrial_testing_config.json,
+# which turns on experiments such as AperitifHelpers (its helpers fail to start their sandbox
+# here, so the network service never runs). Ship the default feature state, as Chrome does.
+disable_fieldtrial_testing_config = true

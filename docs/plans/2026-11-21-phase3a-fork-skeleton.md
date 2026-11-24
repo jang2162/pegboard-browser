@@ -362,7 +362,7 @@ pub const EXIT_LOCK_HELD: i32 = 4;
   - `build.sh <src-dir>`: `out/Pegboard`에 `args.gn` 복사, `gn gen`, `autoninja -C out/Pegboard chrome`. 걸린 시간을 출력.
   - `package-dev.sh <src-dir> <out.app>`: `cargo build --release -p pegboard-cli`, `Pegboard.app`을 복사하고 `pegboard`와 agent-browser(`scripts/fetch-agent-browser.sh` 결과)를 `Contents/Helpers/`에 넣고 `codesign --force --deep -s -`.
   - `budget.sh <src-dir>`: 태그 대비 `pegboard/` 밖 파일의 추가·삭제 줄 수 합계.
-- `args.gn`: `is_debug=false`, `symbol_level=0`, `is_component_build=false`, `target_cpu="arm64"`, `chrome_pgo_phase=0`, `enable_nacl=false`, `google_api_key=""`, `google_default_client_id=""`, `google_default_client_secret=""`.
+- `args.gn`: `is_debug=false`, `symbol_level=0`, `is_component_build=false`, `target_cpu="arm64"`, `chrome_pgo_phase=0`, `google_api_key=""`, `google_default_client_id=""`, `google_default_client_secret=""`, `disable_fieldtrial_testing_config=true`. (작업 7: `enable_nacl`은 156에서 효과가 없어 뺐고, 시험용 실험 설정은 끈다. `browser/README.md`)
 - 브랜딩: Chromium 브랜드 파일(`chrome/app/theme/chromium/BRANDING`의 이름, 번들 ID `app.pegboard.browser`), 사용자 데이터 디렉터리 이름 `Pegboard`(`chrome/common/chrome_paths_mac.mm`의 Chromium 쪽 경로), 아이콘은 임시로 단색 사각형에 "P"(3b에서 다시).
 
 - [ ] **Step 1: 맥미니 디스크 여유를 확인한다**(`df -h`). 100GB 미만이면 멈추고 보고.

@@ -1,0 +1,5 @@
+# Pegboard's own sources (//pegboard in the Chromium tree). Empty until the
+# bootstrap and the Pegboard CDP domain land; their patches hook targets here
+# into //chrome.
+group("pegboard") {
+}

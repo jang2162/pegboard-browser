@@ -4,14 +4,22 @@
 //! `-- --ignored --nocapture --test-threads=1` and copy those lines into the findings.
 //!
 //! These tests talk raw JSON over a single websocket (`RawLink`), not through `CdpConn`, so
-//! nothing here hides a routing difference.
+//! nothing here hides a routing difference. With `PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>`
+//! (and `PEGBOARD_TEST_HOOKS`) the same tests run on the fork over its DevTools pipe
+//! (`--remote-debugging-pipe`) instead: F7's premise checked on the fork (phase 3a task 7).
 mod common;
 
+use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use pegboard_core::browser::{fork_executable, test_fork_binary, DevToolsPipes};
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::pipe;
 use tokio::net::TcpStream;
+use tokio::process::{Child, Command};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -20,12 +28,24 @@ const LIMIT: Duration = Duration::from_secs(3);
 /// How long to listen when asserting that something does NOT arrive.
 const QUIET: Duration = Duration::from_millis(700);
 
-/// One raw websocket to the browser. Every message received is kept in `backlog` until a
-/// caller takes it, so events that arrive before their trigger's response are not lost.
+/// One raw connection to the browser: a websocket (stock Chrome) or the DevTools pipe (the
+/// fork). Every message received is kept in `backlog` until a caller takes it, so events that
+/// arrive before their trigger's response are not lost.
 struct RawLink {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    wire: Wire,
     next_id: u64,
     backlog: Vec<Value>,
+}
+
+enum Wire {
+    Ws(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
+    /// `--remote-debugging-pipe`: JSON messages, each ended by a NUL byte. `buf` holds what
+    /// was read past the last whole message.
+    Pipe {
+        read: pipe::Receiver,
+        write: pipe::Sender,
+        buf: Vec<u8>,
+    },
 }
 
 fn session_of(msg: &Value) -> Option<&str> {
@@ -36,10 +56,58 @@ impl RawLink {
     async fn connect(ws_url: &str) -> RawLink {
         let (ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
         RawLink {
-            ws,
+            wire: Wire::Ws(Box::new(ws)),
             next_id: 0,
             backlog: Vec::new(),
         }
+    }
+
+    /// Launches the fork with its DevTools on a pipe whose other end is this link, and no
+    /// daemon of its own. The browser is killed when the returned child is dropped.
+    fn launch_fork(binary: &Path, user_data_dir: &Path) -> (Child, RawLink) {
+        let pipes = DevToolsPipes::new().unwrap();
+        let mut cmd = Command::new(fork_executable(binary));
+        cmd.arg(format!("--user-data-dir={}", user_data_dir.display()))
+            .arg("--remote-debugging-pipe")
+            .arg("--pegboard-no-daemon")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            // A fresh build has no "Pegboard Safe Storage" keychain item yet: creating it asks
+            // the user, and until they answer the cookie store (so every HTTP request) waits.
+            .arg("--use-mock-keychain")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        // SAFETY: the closure only makes async-signal-safe system calls.
+        unsafe { cmd.pre_exec(pipes.child_setup()) };
+        let child = cmd.spawn().unwrap();
+        let (read, write) = pipes.into_parent_ends();
+        let link = RawLink {
+            wire: Wire::Pipe {
+                read: pipe::Receiver::from_owned_fd(read).unwrap(),
+                write: pipe::Sender::from_owned_fd(write).unwrap(),
+                buf: Vec::new(),
+            },
+            next_id: 0,
+            backlog: Vec::new(),
+        };
+        (child, link)
+    }
+
+    /// Waits until the browser answers on this link (a launched browser reads its pipe only
+    /// once it has started, which can take longer than `LIMIT`).
+    async fn wait_answering(&mut self) {
+        const STARTUP: Duration = Duration::from_secs(30);
+        let id = self.send(json!({ "method": "Browser.getVersion" })).await;
+        let deadline = Instant::now() + STARTUP;
+        while !self.backlog.iter().any(|m| m["id"] == json!(id)) {
+            assert!(
+                self.pump(deadline).await,
+                "the browser did not answer in {STARTUP:?}"
+            );
+        }
+        self.backlog.retain(|m| m["id"] != json!(id));
     }
 
     /// Sends `msg` after giving it a fresh `id`; returns the id.
@@ -47,10 +115,17 @@ impl RawLink {
         self.next_id += 1;
         let id = self.next_id;
         msg["id"] = json!(id);
-        self.ws
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .unwrap();
+        match &mut self.wire {
+            Wire::Ws(ws) => ws
+                .send(Message::Text(msg.to_string().into()))
+                .await
+                .unwrap(),
+            Wire::Pipe { write, .. } => {
+                let mut bytes = msg.to_string().into_bytes();
+                bytes.push(0);
+                write.write_all(&bytes).await.unwrap();
+            }
+        }
         id
     }
 
@@ -65,17 +140,37 @@ impl RawLink {
 
     /// Reads one more message into the backlog; false if `deadline` passed first.
     async fn pump(&mut self, deadline: Instant) -> bool {
-        loop {
-            match tokio::time::timeout_at(deadline, self.ws.next()).await {
-                Err(_) => return false,
-                Ok(None) => panic!("websocket closed"),
-                Ok(Some(Err(e))) => panic!("websocket error: {e}"),
-                Ok(Some(Ok(Message::Text(t)))) => {
-                    self.backlog.push(serde_json::from_str(t.as_str()).unwrap());
+        match &mut self.wire {
+            Wire::Ws(ws) => loop {
+                match tokio::time::timeout_at(deadline, ws.next()).await {
+                    Err(_) => return false,
+                    Ok(None) => panic!("websocket closed"),
+                    Ok(Some(Err(e))) => panic!("websocket error: {e}"),
+                    Ok(Some(Ok(Message::Text(t)))) => {
+                        self.backlog.push(serde_json::from_str(t.as_str()).unwrap());
+                        return true;
+                    }
+                    Ok(Some(Ok(_))) => continue,
+                }
+            },
+            Wire::Pipe { read, buf, .. } => loop {
+                if let Some(end) = buf.iter().position(|&b| b == 0) {
+                    let msg: Vec<u8> = buf.drain(..=end).collect();
+                    let text = std::str::from_utf8(&msg[..end]).unwrap();
+                    self.backlog.push(serde_json::from_str(text).unwrap());
                     return true;
                 }
-                Ok(Some(Ok(_))) => continue,
-            }
+                // Read straight into `buf`: a buffer inside this future would make every
+                // test's future too big for the test thread's stack (debug builds).
+                buf.reserve(64 * 1024);
+                // `read_buf` is cancel-safe: nothing is lost when the deadline drops it.
+                match tokio::time::timeout_at(deadline, read.read_buf(buf)).await {
+                    Err(_) => return false,
+                    Ok(Ok(0)) => panic!("pipe closed"),
+                    Ok(Err(e)) => panic!("pipe error: {e}"),
+                    Ok(Ok(_)) => {}
+                }
+            },
         }
     }
 
@@ -265,18 +360,38 @@ struct Rig {
     // Kept alive for the test; the browser dies with `_browser`.
     _env: common::Env,
     fixture: common::Fixture,
-    _browser: pegboard_core::browser::Browser,
+    _browser: Launched,
     link: RawLink,
 }
 
+/// The browser under test, killed when dropped.
+enum Launched {
+    Stock(#[allow(dead_code)] Box<pegboard_core::browser::Browser>),
+    Fork(#[allow(dead_code)] Child),
+}
+
+/// Stock Chrome with a websocket beside the daemon's link, or (`PEGBOARD_TEST_BROWSER=fork:`)
+/// the fork launched here with this link as the only end of its pipe: these tests measure
+/// the browser itself.
 async fn rig() -> Rig {
+    if let Some(binary) = test_fork_binary() {
+        let env = common::env();
+        let fixture = common::fixture().await;
+        let (child, mut link) = RawLink::launch_fork(&binary, &env.paths.chrome_udd);
+        link.wait_answering().await;
+        return Rig {
+            _env: env,
+            fixture,
+            _browser: Launched::Fork(child),
+            link,
+        };
+    }
     let (env, fixture, browser) = common::launched().await;
-    // A websocket of its own, beside the daemon's link: these tests measure Chrome itself.
     let link = RawLink::connect(browser.ws_url.as_deref().expect("stock mode")).await;
     Rig {
         _env: env,
         fixture,
-        _browser: browser,
+        _browser: Launched::Stock(Box::new(browser)),
         link,
     }
 }
