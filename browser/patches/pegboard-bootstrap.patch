@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pegboard <noreply@pegboard.invalid>
+Date: Tue, 24 Nov 2026 16:28:22 +0900
+Subject: [PATCH] pegboard-bootstrap.patch
+
+Adds pegboard::DaemonLauncher (//pegboard/bootstrap) to Chrome's main parts
+on macOS. After browser start it runs Contents/Helpers/pegboard daemon
+--cdp-pipe with the DevTools pipe on its fds 3 and 4, starts it again when
+it ends (F8), and closes the pipe when the browser quits (design 4.2).
+
+Upstream files:
+- chrome/browser/chrome_browser_main.cc: includes the launcher and adds it
+  after ChromeBrowserMainExtraPartsMac.
+- chrome/browser/BUILD.gn: //chrome/browser:core depends on
+  //pegboard/bootstrap on macOS.
+---
+ chrome/browser/BUILD.gn               | 5 ++++-
+ chrome/browser/chrome_browser_main.cc | 2 ++
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 5aa5b0447d68..143fe90c775c 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1999,7 +1999,10 @@ source_set("core") {
+   }
+ 
+   if (is_mac) {
+-    deps += [ ":chrome_browser_main_mac" ]
++    deps += [
++      ":chrome_browser_main_mac",
++      "//pegboard/bootstrap",
++    ]
+   }
+ 
+   if (is_chrome_for_testing) {
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index b2619baa8f61..184c6279bf68 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -230,6 +230,7 @@
+ #include "chrome/browser/ui/cocoa/keystone_infobar_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/ui_features.h"
++#include "pegboard/bootstrap/daemon_launcher.h"
+ 
+ #if defined(ARCH_CPU_X86_64)
+ #include "base/mac/mac_util.h"
+@@ -821,6 +822,7 @@ std::unique_ptr<content::BrowserMainParts> ChromeBrowserMainParts::Create(
+ 
+ #if BUILDFLAG(IS_MAC)
+   main_parts->AddParts(std::make_unique<ChromeBrowserMainExtraPartsMac>());
++  main_parts->AddParts(std::make_unique<pegboard::DaemonLauncher>());
+ #endif
+ 
+ #if BUILDFLAG(IS_CHROMEOS)

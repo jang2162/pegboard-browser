@@ -1,0 +1,22 @@
+# Starts pegboardd from the browser and hands it the DevTools pipe
+# (daemon_launcher.h). Chrome's main parts create the launcher
+# (pegboard-bootstrap.patch); content's pipe handler takes the browser's ends
+# (devtools-pipe-fds.patch).
+
+source_set("bootstrap") {
+  visibility = [ "//chrome/browser:*" ]
+  sources = [
+    "daemon_launcher.cc",
+    "daemon_launcher.h",
+  ]
+
+  # Like //pegboard/devtools, this uses a //chrome/browser header
+  # (chrome_browser_main_extra_parts.h) without depending on //chrome/browser,
+  # which depends on it.
+  check_includes = false
+  deps = [
+    "//base",
+    "//content/public/browser",
+    "//content/public/common",
+  ]
+}

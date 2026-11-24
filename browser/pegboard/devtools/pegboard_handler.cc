@@ -341,7 +341,10 @@ void CloseTab(tabs::TabInterface* tab) {
 }
 
 // How long openProfileWindow waits for the profile's saved-tab-group service.
-constexpr base::TimeDelta kTabGroupSyncWait = base::Seconds(30);
+// Well under pegboardd's 30 s request limit (cdp.rs REQUEST_TIMEOUT), which also
+// covers making and loading the profile: the daemon must get this "did not
+// start" answer rather than give up on the request first.
+constexpr base::TimeDelta kTabGroupSyncWait = base::Seconds(15);
 
 // Whether the saved-tab-group service of `profile` has started (or there is
 // none). Until it has, a group made in the profile can lose its tabs: when the

@@ -48,5 +48,6 @@ browser/scripts/package-dev.sh <src> <out>/Pegboard.app   # pegboard, agent-brow
 - 이름·번들 ID: `defaults read <앱>/Contents/Info CFBundleIdentifier` → `app.pegboard.browser`, `CFBundleName` → `Pegboard`.
 - 기본 사용자 데이터: `~/Library/Application Support/Pegboard`.
 - 파이프 위 CDP: `PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<앱> cargo test -p pegboard-core --test e2e_link -- --ignored --test-threads=1`.
+- 부트스트랩(앱이 데몬을 띄우고 파이프를 넘긴다, F8 재시작): `package-dev.sh`로 만든 앱으로 GUI 세션에서 `PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_APP=<앱> cargo test -p pegboard-core --test e2e_bootstrap -- --ignored --test-threads=1`. `--pegboard-no-daemon`을 주거나 `--remote-debugging-pipe`로 켜면 앱은 데몬을 띄우지 않는다.
 - 기본 사용자 데이터 디렉터리는 `--user-data-dir`를 줘도 생긴다. 안에는 `Crashpad/`만 있다: 업스트림이 충돌 보고 위치(`DIR_CRASH_DUMPS`)를 기본 사용자 데이터 디렉터리 아래로 정한다.
 - 새로 빌드한 앱이 처음 쿠키 저장소를 열 때 키체인 항목 `Pegboard Safe Storage`를 만들며 사용자에게 묻는다. 답할 때까지 모든 HTTP 요청이 멈춘다. 사람이 없는 시험은 `--use-mock-keychain`을 준다.

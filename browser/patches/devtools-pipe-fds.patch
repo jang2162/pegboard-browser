@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pegboard <noreply@pegboard.invalid>
+Date: Tue, 24 Nov 2026 16:28:20 +0900
+Subject: [PATCH] devtools-pipe-fds.patch
+
+Lets the embedder run content's DevTools pipe handler on descriptors of its
+choice and run it again after it stopped, so the browser can hand pegboardd
+(its own child, //pegboard/bootstrap) a pipe and give a restarted daemon a
+new one (design 4.2, F8). The message format is the existing pipe's
+(NUL-terminated JSON). --remote-debugging-pipe (fds 3 and 4) is unchanged.
+
+The descriptors stay the caller's: the handler never closes them (it only
+calls shutdown(), which does nothing on a pipe), so the caller replaces them
+once the handler is stopped (daemon_launcher.cc).
+
+Upstream files:
+- content/public/browser/devtools_agent_host.h: declares
+  StartRemoteDebuggingPipeHandlerWithFds.
+- content/browser/devtools/devtools_agent_host_impl.cc: defines it, the
+  existing handler on the given descriptors.
+---
+ content/browser/devtools/devtools_agent_host_impl.cc | 9 +++++++++
+ content/public/browser/devtools_agent_host.h         | 6 ++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/content/browser/devtools/devtools_agent_host_impl.cc b/content/browser/devtools/devtools_agent_host_impl.cc
+index 44ffa91fcac7..df711ac39b02 100644
+--- a/content/browser/devtools/devtools_agent_host_impl.cc
++++ b/content/browser/devtools/devtools_agent_host_impl.cc
+@@ -234,6 +234,15 @@ void DevToolsAgentHost::StartRemoteDebuggingPipeHandler(
+       read_fd, write_fd, std::move(on_disconnect)));
+ }
+ 
++// static
++void DevToolsAgentHost::StartRemoteDebuggingPipeHandlerWithFds(
++    int read_fd,
++    int write_fd,
++    base::OnceClosure on_disconnect) {
++  SetDevToolsPipeHandler(std::make_unique<DevToolsPipeHandler>(
++      read_fd, write_fd, std::move(on_disconnect)));
++}
++
+ // static
+ void DevToolsAgentHost::StopRemoteDebuggingServer() {
+   SetDevToolsHttpHandler(nullptr);
+diff --git a/content/public/browser/devtools_agent_host.h b/content/public/browser/devtools_agent_host.h
+index f4aa39408926..c32e28149b35 100644
+--- a/content/public/browser/devtools_agent_host.h
++++ b/content/public/browser/devtools_agent_host.h
+@@ -154,6 +154,12 @@ class CONTENT_EXPORT DevToolsAgentHost
+   // Starts remote debugging for browser target for the given fd=3
+   // for reading and fd=4 for writing remote debugging messages.
+   static void StartRemoteDebuggingPipeHandler(base::OnceClosure on_disconnect);
++  // The same on the given descriptors, which stay the caller's. It replaces a
++  // running handler, and can start again after StopRemoteDebuggingPipeHandler.
++  static void StartRemoteDebuggingPipeHandlerWithFds(
++      int read_fd,
++      int write_fd,
++      base::OnceClosure on_disconnect);
+   static void StopRemoteDebuggingPipeHandler();
+ 
+   // Observer is notified about changes in DevToolsAgentHosts.

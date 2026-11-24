@@ -1,2 +1,4 @@
 branding.patch
 pegboard-cdp-domain.patch
+devtools-pipe-fds.patch
+pegboard-bootstrap.patch
