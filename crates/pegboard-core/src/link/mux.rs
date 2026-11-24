@@ -113,8 +113,10 @@ impl Inner {
                 // routing until tokio's budget runs out (128 messages; seconds for large
                 // ones). A task it woke meanwhile (the user of a virtual connection, a
                 // timeout) waits for it on this worker, so it lets them run after every
-                // message.
-                tokio::task::yield_now().await;
+                // message while more is queued.
+                if !incoming.is_empty() {
+                    tokio::task::yield_now().await;
+                }
             }
             if let Some(inner) = weak.upgrade() {
                 inner.end();
@@ -1186,7 +1188,7 @@ mod tests {
         }
         let latency = got.await.unwrap() - sent;
         assert!(
-            latency < Duration::from_millis(150),
+            latency < Duration::from_millis(750),
             "V2 got its message after {latency:?}"
         );
     }

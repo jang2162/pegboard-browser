@@ -24,13 +24,15 @@ use crate::cdp::QUEUED_MAX_MESSAGE;
 use mux::{Handle, Inner};
 
 /// The largest message the link hands on: 256 MiB, or `PEGBOARD_TEST_LINK_MAX_MESSAGE` bytes
-/// with test hooks on. Chrome itself does not send a page's message over 256 MiB: measured, a
+/// with test hooks on (never more than 256 MiB; 0 or garbage is ignored). Chrome itself does not send a page's message over 256 MiB: measured, a
 /// 257 MiB `Runtime.evaluate` answer never came (150 s) where a 255 MiB one came in 9 s, and
 /// the page went on answering. So a test of what the link does with a message over its limit
 /// needs a lower limit.
 fn max_message() -> usize {
     crate::testenv::var("PEGBOARD_TEST_LINK_MAX_MESSAGE")
         .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .map(|n: usize| n.min(QUEUED_MAX_MESSAGE))
         .unwrap_or(QUEUED_MAX_MESSAGE)
 }
 

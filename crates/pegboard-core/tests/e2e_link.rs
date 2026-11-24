@@ -1115,9 +1115,10 @@ fn an_oversized_eval_does_not_cut_other_sessions() {
             a_err.contains("The message is too large."),
             "A failed otherwise: {a_err}"
         );
-        assert!(
-            after < before,
-            "A's virtual connection is still open ({before} before, {after} after)"
+        assert_eq!(
+            after,
+            before - 1,
+            "only A's virtual connection ends ({before} before, {after} after)"
         );
         let a_after = a.evaluate(&sa, "1 + 1").await;
         assert!(a_after.is_err(), "A's connection still works: {a_after:?}");

@@ -1699,18 +1699,66 @@ mod tests {
         async fn follow_activity(self: Arc<Self>, _: crate::bridge::ActivityFn) {}
     }
 
-    /// A virtual connection queues what the browser sends without bound, so when it closes
-    /// everything is there at once and its receiver is never empty. Draining it while
-    /// closing must still end on time, however much is queued (this browser never answers
-    /// the close, so only the deadline ends the drain).
+    /// A browser connection whose queue is never empty once the proxy starts closing it (it
+    /// turns auto-attach off): like a link virtual connection that queued what the browser
+    /// sent without bound, `recv` is ready at once every time, and each message costs time to
+    /// handle. It never answers.
+    struct FloodUpstream {
+        per_message: Duration,
+        messages: usize,
+    }
+
+    struct FloodConn {
+        per_message: Duration,
+        messages: usize,
+        left: usize,
+    }
+
+    #[async_trait]
+    impl Upstream for FloodUpstream {
+        async fn open(&self) -> Result<Box<dyn UpstreamConn>> {
+            Ok(Box::new(FloodConn {
+                per_message: self.per_message,
+                messages: self.messages,
+                left: 0,
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl UpstreamConn for FloodConn {
+        async fn send(&mut self, text: String) -> Result<()> {
+            let v: Value = serde_json::from_str(&text)?;
+            if v["method"] == "Target.setAutoAttach" && v["params"]["autoAttach"] == false {
+                self.left = self.messages;
+            }
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Option<String> {
+            if self.left == 0 {
+                return std::future::pending().await;
+            }
+            self.left -= 1;
+            // Time spent handling the message, without giving the runtime a turn.
+            std::thread::sleep(self.per_message);
+            Some(json!({"method": "Runtime.consoleAPICalled", "params": {}}).to_string())
+        }
+    }
+
+    /// Closing a client connection reads its upstream for a bounded time only, also when the
+    /// upstream always has a message ready (a deadline that is checked only while `recv`
+    /// waits would never be reached).
     #[tokio::test]
     async fn unregister_ends_the_upstream_while_its_queue_is_full() {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-        let (link, fake) = crate::link::fake::FakeBrowser::start();
-        let proxy = ProxyServer::start(Arc::new(LinkUpstream { link: link.clone() }))
-            .await
-            .unwrap();
+        // 3 s of messages, against a drain of 0.5 s.
+        let upstream = FloodUpstream {
+            per_message: Duration::from_millis(20),
+            messages: 150,
+        };
+        let proxy = ProxyServer::start(Arc::new(upstream)).await.unwrap();
         let id = SessionId("s_queuefull".into());
         let endpoint = proxy.register(&id, "C1", GroupId(1), Arc::new(NoTabs), Vec::new());
         let mut req = endpoint.url.as_str().into_client_request().unwrap();
@@ -1719,27 +1767,17 @@ mod tests {
             .insert("Authorization", auth.parse().unwrap());
         let (_ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         assert_eq!(proxy.open_connections(), 1);
-        assert_eq!(link.virtual_connections(), 1);
 
-        // Events of the connection's own browser session, each costly to read.
-        let event = json!({"method": "Runtime.consoleAPICalled", "sessionId": "B1",
-            "params": {"type": "log", "args": [{"type": "string", "value": "x".repeat(1 << 20)}]}})
-        .to_string();
-        for _ in 0..200 {
-            fake.send_text(event.clone());
-        }
         let at = Instant::now();
         proxy.unregister(&id);
-        let limit = Duration::from_millis(1500);
         while proxy.open_connections() != 0 {
-            assert!(
-                at.elapsed() < limit,
-                "the upstream is still open {limit:?} after unregister"
-            );
+            assert!(at.elapsed() < Duration::from_secs(10), "never closed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // Everything the connection held is let go of: its virtual connection is closed.
-        assert_eq!(link.virtual_connections(), 0);
-        drop(fake);
+        let took = at.elapsed();
+        assert!(
+            took < Duration::from_millis(1500),
+            "the upstream was still open {took:?} after unregister"
+        );
     }
 }
