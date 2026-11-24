@@ -943,6 +943,12 @@ impl ClientConn {
             let deadline = Instant::now() + SHUTDOWN_DRAIN;
             let mut off_confirmed = false;
             while !off_confirmed || self.release_in_flight() || !detaches.is_empty() {
+                // The timeout below fires only while nothing is queued: a virtual connection
+                // whose queue is full (a client that stopped reading) is always ready, so
+                // the deadline is checked before every message too.
+                if Instant::now() >= deadline {
+                    break;
+                }
                 let Ok(Some(text)) = tokio::time::timeout_at(deadline, self.up.recv()).await else {
                     break;
                 };
@@ -1656,5 +1662,84 @@ mod tests {
             authorize(&sessions(), &h).map(drop),
             Err("401 Unauthorized")
         );
+    }
+
+    /// A bridge for proxy tests that never make tabs.
+    struct NoTabs;
+
+    #[async_trait]
+    impl TabBridge for NoTabs {
+        async fn create_group(&self, _: &str, _: &str) -> Result<(GroupId, String)> {
+            bail!("no tabs here")
+        }
+        async fn create_tab(
+            &self,
+            _: &GroupId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(String, Option<GroupId>)> {
+            bail!("no tabs here")
+        }
+        async fn add_to_group(&self, _: &GroupId, _: &str) -> Result<()> {
+            bail!("no tabs here")
+        }
+        async fn members(&self, _: &GroupId) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn close_targets(&self, _: &[String]) -> Result<()> {
+            Ok(())
+        }
+        async fn ungroup_targets(&self, _: &[String]) -> Result<()> {
+            Ok(())
+        }
+        async fn ungroup(&self, _: &GroupId) -> Result<()> {
+            Ok(())
+        }
+        async fn follow_activity(self: Arc<Self>, _: crate::bridge::ActivityFn) {}
+    }
+
+    /// A virtual connection queues what the browser sends without bound, so when it closes
+    /// everything is there at once and its receiver is never empty. Draining it while
+    /// closing must still end on time, however much is queued (this browser never answers
+    /// the close, so only the deadline ends the drain).
+    #[tokio::test]
+    async fn unregister_ends_the_upstream_while_its_queue_is_full() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (link, fake) = crate::link::fake::FakeBrowser::start();
+        let proxy = ProxyServer::start(Arc::new(LinkUpstream { link: link.clone() }))
+            .await
+            .unwrap();
+        let id = SessionId("s_queuefull".into());
+        let endpoint = proxy.register(&id, "C1", GroupId(1), Arc::new(NoTabs), Vec::new());
+        let mut req = endpoint.url.as_str().into_client_request().unwrap();
+        let auth = format!("Bearer {}", endpoint.token);
+        req.headers_mut()
+            .insert("Authorization", auth.parse().unwrap());
+        let (_ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        assert_eq!(proxy.open_connections(), 1);
+        assert_eq!(link.virtual_connections(), 1);
+
+        // Events of the connection's own browser session, each costly to read.
+        let event = json!({"method": "Runtime.consoleAPICalled", "sessionId": "B1",
+            "params": {"type": "log", "args": [{"type": "string", "value": "x".repeat(1 << 20)}]}})
+        .to_string();
+        for _ in 0..200 {
+            fake.send_text(event.clone());
+        }
+        let at = Instant::now();
+        proxy.unregister(&id);
+        let limit = Duration::from_millis(1500);
+        while proxy.open_connections() != 0 {
+            assert!(
+                at.elapsed() < limit,
+                "the upstream is still open {limit:?} after unregister"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Everything the connection held is let go of: its virtual connection is closed.
+        assert_eq!(link.virtual_connections(), 0);
+        drop(fake);
     }
 }

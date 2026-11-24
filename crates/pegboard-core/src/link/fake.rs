@@ -69,6 +69,11 @@ impl FakeBrowser {
         self.send_incoming(Incoming::Text(v.to_string()));
     }
 
+    /// Sends a message already written out (cheaper than `send` for large ones).
+    pub(crate) fn send_text(&self, text: String) {
+        self.send_incoming(Incoming::Text(text));
+    }
+
     /// Sends `v` as the transport hands it on under a limit of `max` bytes.
     pub(crate) fn send_limited(&self, v: Value, max: usize) {
         self.send_incoming(Incoming::limited(v.to_string(), max));
