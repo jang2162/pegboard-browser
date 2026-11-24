@@ -38,10 +38,15 @@ src_dir_arg() {
   (cd "$1" && pwd)
 }
 
-# Fails unless the tree has no uncommitted changes to tracked files.
+# Fails unless the tree has no uncommitted changes to tracked files and no untracked files
+# under //pegboard (export.sh would skip them, apply.sh would delete them).
 require_clean() {
-  local src="$1"
+  local src="$1" untracked
   if ! git -C "$src" diff --quiet || ! git -C "$src" diff --cached --quiet; then
     die "$src has uncommitted changes"
+  fi
+  untracked="$(git -C "$src" ls-files --others --exclude-standard -- pegboard)"
+  if [ -n "$untracked" ]; then
+    die "$src has untracked files under pegboard/ (commit or remove them): $(echo "$untracked" | head -5 | tr '\n' ' ')"
   fi
 }

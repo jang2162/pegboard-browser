@@ -314,6 +314,9 @@ impl Browser {
             .arg("--pegboard-no-daemon")
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
+            // Test and development only: a build's first "Pegboard Safe Storage" keychain
+            // prompt would hold every HTTP request until someone answers it.
+            .arg("--use-mock-keychain")
             .args(test_host_rules())
             .args(test_address_spaces())
             .stdin(Stdio::null())

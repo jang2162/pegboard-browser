@@ -153,6 +153,8 @@ impl RawLink {
                     Ok(Some(Ok(_))) => continue,
                 }
             },
+            // No message size limit here: `BrowserLink::pipe` enforces the 256MiB one for
+            // the daemon; this helper only reads what the tests make the browser send.
             Wire::Pipe { read, buf, .. } => loop {
                 if let Some(end) = buf.iter().position(|&b| b == 0) {
                     let msg: Vec<u8> = buf.drain(..=end).collect();
@@ -357,10 +359,11 @@ fn response_kind(r: &Value) -> String {
 }
 
 struct Rig {
-    // Kept alive for the test; the browser dies with `_browser`.
+    // First, so the browser is killed before its temporary directory (`_env`) goes.
+    _browser: Launched,
+    // Kept alive for the test.
     _env: common::Env,
     fixture: common::Fixture,
-    _browser: Launched,
     link: RawLink,
 }
 

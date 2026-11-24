@@ -23,7 +23,7 @@ Upstream files:
  4 files changed, 8 insertions(+), 8 deletions(-)
 
 diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
-index d98c86e5da..f04f4d39b9 100644
+index d98c86e5dace..f04f4d39b95d 100644
 --- a/chrome/BUILD.gn
 +++ b/chrome/BUILD.gn
 @@ -670,12 +670,12 @@ if (is_win) {
@@ -42,7 +42,7 @@ index d98c86e5da..f04f4d39b9 100644
    }
  
 diff --git a/chrome/app/chromium_strings.grd b/chrome/app/chromium_strings.grd
-index 3de8ca69c9..0e7341d3fc 100644
+index 3de8ca69c924..0e7341d3fc7d 100644
 --- a/chrome/app/chromium_strings.grd
 +++ b/chrome/app/chromium_strings.grd
 @@ -294,10 +294,10 @@ If you update this file, be sure also to update google_chrome_strings.grd. -->
@@ -59,7 +59,7 @@ index 3de8ca69c9..0e7341d3fc 100644
          </else>
        </if>
 diff --git a/chrome/app/theme/chromium/BRANDING b/chrome/app/theme/chromium/BRANDING
-index f8363d5b29..aba9b1e52b 100644
+index f8363d5b294f..aba9b1e52b56 100644
 --- a/chrome/app/theme/chromium/BRANDING
 +++ b/chrome/app/theme/chromium/BRANDING
 @@ -1,10 +1,10 @@
@@ -77,7 +77,7 @@ index f8363d5b29..aba9b1e52b 100644
  MAC_CREATOR_CODE=Cr24
  MAC_TEAM_ID=
 diff --git a/chrome/common/chrome_paths_mac.mm b/chrome/common/chrome_paths_mac.mm
-index 6829c9cb92..7d594b46c5 100644
+index 6829c9cb92c2..7d594b46c55c 100644
 --- a/chrome/common/chrome_paths_mac.mm
 +++ b/chrome/common/chrome_paths_mac.mm
 @@ -37,7 +37,7 @@

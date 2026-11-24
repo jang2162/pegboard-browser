@@ -32,7 +32,10 @@ browser/scripts/package-dev.sh <src> <out>/Pegboard.app   # pegboard, agent-brow
 1. `apply.sh`가 만든 `pegboard-work`에서 고친다. 커밋 제목은 패치 파일 이름이다(`branding.patch`). 기존 패치를 고칠 때는 `git commit --fixup <그 커밋>` 뒤 `git rebase -i --autosquash <태그>`로 합친다. 새 패치는 제목이 `<이름>.patch`인 새 커밋으로 만든다.
 2. 새 소스는 `<src>/pegboard/`에 두고 제목이 `pegboard`인 첫 커밋에 합친다. 패치 커밋은 `pegboard/`를 건드리지 않는다.
 3. `browser/scripts/export.sh <src>`가 커밋을 `patches/`로 다시 쓰고 `series`를 커밋 순서로 갱신하며, `//pegboard`를 `browser/pegboard/`와 `browser/branding/`으로 되돌려 복사한다. 커밋하지 않은 변경이 있으면 거부한다.
-4. 다시 적용해 확인: `PEGBOARD_APPLY_FORCE=1 browser/scripts/apply.sh <src>`(기존 `pegboard-work`를 태그에서 새로 만든다).
+4. 다시 적용해 확인: `PEGBOARD_APPLY_FORCE=1 browser/scripts/apply.sh <src>`(기존 `pegboard-work`를 태그에서 새로 만들고, 옛 것은 `pegboard-work-prev`로 남긴다).
+5. 패치가 안 맞으면 `apply.sh`가 멈추고 남은 패치와 이어 가는 명령(`PEGBOARD_APPLY_FROM=<다음 패치>`)을 알려 준다. 고쳐 커밋한 뒤 그 명령으로 나머지를 얹고 `export.sh`로 되돌려 쓴다.
+
+버전 올리기: `CHROMIUM_VERSION`을 바꾸고 `fetch.sh`, `PEGBOARD_APPLY_FORCE=1 apply.sh`. `--3way`가 쓰려면 패치의 원본 블롭(`index` 줄)이 트리에 있어야 하므로, 옛 태그도 받아 둔 트리(`--no-history`가 아닌, 또는 `git fetch origin refs/tags/<옛 태그>`)에서 한다.
 
 `browser/scripts/budget.sh <src>`는 `//pegboard` 밖 업스트림 파일의 추가·삭제 줄 수 합계를 낸다(패치 예산).
 

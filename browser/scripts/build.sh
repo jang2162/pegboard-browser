@@ -21,4 +21,6 @@ start="$(date +%s)"
 elapsed=$(($(date +%s) - start))
 printf '== built in %dh %02dm %02ds (%d s, -j %s)\n' \
   $((elapsed / 3600)) $((elapsed % 3600 / 60)) $((elapsed % 60)) "$elapsed" "$jobs"
-echo "== $src/$OUT_DIR/Pegboard.app"
+app="$src/$OUT_DIR/Pegboard.app"
+[ -d "$app" ] || die "the build has no $app (is the branding patch applied?)"
+echo "== $app"

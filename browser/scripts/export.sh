@@ -39,7 +39,9 @@ for c in $(git -C "$src" rev-list --reverse "$tag_commit..HEAD"); do
   if echo "$files" | grep -q '^pegboard/'; then
     die "commit $c ($subject) touches pegboard/; put new sources in the $PEGBOARD_SUBJECT commit"
   fi
+  # Pinned so the patch bytes do not depend on the local git configuration.
   git -C "$src" -c diff.noprefix=false -c diff.mnemonicPrefix=false -c diff.renames=true \
+    -c core.abbrev=12 -c diff.algorithm=myers \
     format-patch -1 --stdout --no-numbered --zero-commit --no-signature "$c" \
     > "$tmp/patches/$subject"
   echo "$subject" >> "$tmp/series"

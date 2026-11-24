@@ -14,6 +14,9 @@ case "$out" in
   *.app) ;;
   *) die "<out.app> must end in .app" ;;
 esac
+out_parent="$(mkdir -p "$(dirname "$out")" && cd "$(dirname "$out")" && pwd -P)"
+[ "$out_parent/$(basename "$out")" != "$(cd "$app" && pwd -P)" ] ||
+  die "<out.app> is the build's own app; give another path"
 
 (cd "$REPO_ROOT" && cargo build --release -p pegboard-cli)
 agent_browser="$REPO_ROOT/vendor/agent-browser/agent-browser"

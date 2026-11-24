@@ -451,6 +451,10 @@ pub const EXIT_LOCK_HELD: i32 = 4;
 - [ ] **Step 4: `e2e_bootstrap` 전체 PASS.** 파이프 핸들러를 다시 시작할 수 없는 것으로 드러나면(설계 5절 위험 3) 멈추고 컨트롤러가 사용자에게 F8을 낮출지 묻는다.
 - [ ] **Step 5: A6 확인: `budget.sh`로 `devtools-pipe-fds.patch`의 업스트림 줄 수를 적는다. 커밋** `feat(browser): the browser starts pegboardd and hands it the DevTools pipe`
 
+**열린 항목 (작업 7에서 나옴, `spike-findings.md` "3a 작업 7"):**
+- 포크를 띄우는 시험은 언제나 `--use-mock-keychain`을 준다(`e2e_bootstrap.rs`가 `open -a`로 켤 때도). 제품 실행 경로에는 넣지 않는다.
+- 제품은 키체인 항목 `Pegboard Safe Storage`를 만들 때의 사용자 확인이 사람 없는 화면·잠긴 화면에서 모든 HTTP 요청을 막는 것을 다뤄야 한다: 첫 실행 안내, 또는 데몬이 요청이 멈춘 것을 알아채고 알리기. `package-dev.sh`의 임시 서명(`codesign -s -`)을 다시 하면 이 확인이 다시 뜰 수 있다 [미확인].
+
 ---
 
 ### Task 10: 포크 모드 전체 확인, 측정, 문서
@@ -461,6 +465,10 @@ pub const EXIT_LOCK_HELD: i32 = 4;
 - [ ] **Step 1: 맥미니에서 포크 구성으로 e2e 전체**(`PEGBOARD_TEST_BROWSER=fork:<app> cargo test -p pegboard-core -- --ignored --test-threads=1`)와 이 기기 순정 구성 전체. 기대: 모두 PASS. 녹화 지연 중앙값 60ms 이하(포크·파이프 위에서).
 - [ ] **Step 2: 기록한다.** 빈 상태 빌드 시간, 증분(한 줄, 헤더), 디스크, 업스트림 수정 줄 수 기준선(패치별), 파이프 위 녹화 지연.
 - [ ] **Step 3: 문서를 고치고 커밋** `docs: phase 3a done (fork skeleton), measurements`
+
+**열린 항목 (작업 7에서 나옴):**
+- 포크 구성 e2e 전체가 `--use-mock-keychain`으로 도는지 확인한다(`BrowserConfig::ForkLaunched`와 시험이 직접 띄우는 곳 전부). 키체인 확인이 HTTP를 막는 문제(작업 9의 열린 항목)를 제품에서 어떻게 다뤘는지, 못 다뤘으면 남은 위험으로 문서에 적는다.
+- 3b 또는 버전 올리기 절차에서: 제대로 서명한 빌드에 `--enable-features=AperitifHelpers`를 주고 HTTP 요청 하나가 되는지 본다. 되면 `disable_fieldtrial_testing_config`를 그대로 둘지 다시 정한다.
 
 ---
 
