@@ -5,7 +5,7 @@
 //! targets and CDP sessions are visible. Rule tables are ordered; the first
 //! matching row wins.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -15,13 +15,30 @@ pub struct Scope {
     pub context: String,
     pub targets: HashSet<String>,
     pub cdp_sessions: HashSet<String>,
+    /// The target each of `cdp_sessions` is attached to, when known.
+    pub session_targets: HashMap<String, String>,
     /// The directories `DOM.setFileInputFiles` may take files from: the session's upload
     /// directory and files directory when its policy allows upload, else none.
     pub upload_dirs: Vec<PathBuf>,
+    /// While a command a person approved uploads: exactly what it may set, once. When set,
+    /// it replaces `upload_dirs`.
+    pub upload_window: Option<UploadWindow>,
     /// Whether the client may add scripts that run in the session's pages before their own
     /// (`PAGE_SCRIPT_METHODS`): only when the session's policy allows the clipboard. Such a
     /// script could disarm the clipboard shield if it ran first (spike C12a).
     pub page_scripts_allowed: bool,
+}
+
+/// What one approved upload may do through the session's endpoint (design 4.3, security
+/// review): set exactly these files (the person's approved copies, real paths), on the tab
+/// the person was asked about (its own CDP session), into a file input of that tab's top
+/// document at the origin shown (checked by the proxy before it forwards:
+/// `ClientDecision::CheckUploadNode`), once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadWindow {
+    pub files: Vec<PathBuf>,
+    pub target: String,
+    pub origin: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -36,6 +53,15 @@ pub enum ClientDecision {
     Error { code: i64, message: String },
     /// `Target.createTarget`: the daemon creates the tab via the bridge.
     CreateTab { url: String },
+    /// `DOM.setFileInputFiles` in an approved upload's window (the window is used up): the
+    /// proxy first checks, in an isolated world of `target`'s top frame, that the node is a
+    /// file input of that document at `origin`, then forwards `msg` (files rewritten to their
+    /// real paths) with the node given as that world's object.
+    CheckUploadNode {
+        msg: Value,
+        target: String,
+        origin: String,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -369,6 +395,9 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
         else {
             return error(-32602, "Invalid params: files must be an array of strings");
         };
+        if let Some(window) = &scope.upload_window {
+            return upload_window_decision(msg, session_id, &files, window, scope);
+        }
         // The browser gets the real paths that were judged, not the strings that were sent.
         let Some(real) = files
             .iter()
@@ -395,6 +424,45 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
 
     // 9. Everything else.
     ClientDecision::Forward
+}
+
+/// Rule 7b in an approved upload's window: the call comes on the asked tab's own session and
+/// sets only (and only) approved copies; the node is checked by the proxy before it goes.
+fn upload_window_decision(
+    msg: &Value,
+    session_id: Option<&Value>,
+    files: &[&str],
+    window: &UploadWindow,
+    scope: &Scope,
+) -> ClientDecision {
+    let on_the_tab = session_id
+        .and_then(Value::as_str)
+        .and_then(|s| scope.session_targets.get(s))
+        .is_some_and(|t| *t == window.target);
+    if !on_the_tab {
+        return error(
+            -32000,
+            "an approved upload goes only into the tab a person was asked about",
+        );
+    }
+    let real: Option<Vec<PathBuf>> = files
+        .iter()
+        .map(|f| Path::new(f).canonicalize().ok())
+        .collect();
+    let Some(real) = real.filter(|r| !r.is_empty() && r.iter().all(|p| window.files.contains(p)))
+    else {
+        return error(-32000, "a file a person did not approve");
+    };
+    let mut rewritten = msg.clone();
+    rewritten["params"]["files"] = json!(real
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>());
+    ClientDecision::CheckUploadNode {
+        msg: rewritten,
+        target: window.target.clone(),
+        origin: window.origin.clone(),
+    }
 }
 
 fn target_id_of(params: &Value) -> Option<&str> {
@@ -601,10 +669,66 @@ mod tests {
         Scope {
             context: "AGENT".into(),
             targets: ["T1".to_string()].into(),
-            cdp_sessions: ["S1".to_string()].into(),
+            cdp_sessions: ["S1".to_string(), "S2".to_string()].into(),
+            session_targets: [
+                ("S1".to_string(), "T1".to_string()),
+                ("S2".to_string(), "F1".to_string()),
+            ]
+            .into(),
             upload_dirs: Vec::new(),
+            upload_window: None,
             page_scripts_allowed: false,
         }
+    }
+
+    #[test]
+    fn an_approved_upload_sets_only_its_copies_on_the_asked_tab() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (copy, other) = (root.join("0/a.txt"), root.join("1/b.txt"));
+        for f in [&copy, &other] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, "x").unwrap();
+        }
+        let mut sc = scope();
+        // A directory would allow `other`; the window replaces it.
+        sc.upload_dirs = vec![root.join("1")];
+        sc.upload_window = Some(UploadWindow {
+            files: vec![copy.clone()],
+            target: "T1".into(),
+            origin: "https://a.test".into(),
+        });
+        let path = |p: &PathBuf| json!([p.display().to_string()]);
+        let m = set_files(path(&copy));
+        assert_eq!(
+            client_message(&m, &sc),
+            ClientDecision::CheckUploadNode {
+                msg: m.clone(),
+                target: "T1".into(),
+                origin: "https://a.test".into()
+            }
+        );
+        // Another file, or the copy with another one, or none.
+        for files in [
+            path(&other),
+            json!([copy.display().to_string(), other.display().to_string()]),
+            json!([]),
+        ] {
+            assert_eq!(
+                err_code(&client_message(&set_files(files.clone()), &sc)),
+                -32000,
+                "{files}"
+            );
+        }
+        // On another target's session (an iframe's), or one whose target is unknown.
+        let mut m = set_files(path(&copy));
+        m["sessionId"] = json!("S2");
+        assert_eq!(err_code(&client_message(&m, &sc)), -32000);
+        sc.session_targets.clear();
+        assert_eq!(
+            err_code(&client_message(&set_files(path(&copy)), &sc)),
+            -32000
+        );
     }
 
     #[test]

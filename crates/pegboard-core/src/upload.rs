@@ -32,16 +32,59 @@ pub fn standing_dirs(policy: &SessionPolicy, files: PathBuf, granted: bool) -> V
     }
 }
 
+/// What a refused upload file is told, whatever the reason: the reasons differ only on the
+/// person's side (the daemon's log), so an agent cannot probe the file system through them.
+pub const NOT_TAKEN: &str = "pegboard does not upload this file: it must be an existing \
+     regular file (not a symbolic link, not hard-linked), at most 200 MiB, outside pegboard's \
+     own data and the browser's, with a path in plain text";
+
+/// Characters a person could misread in a path, although they show: letters of
+/// right-to-left scripts (they reorder what is around them), combining marks (they change
+/// the character before), slash look-alikes, and spaces other than U+0020.
+fn misleading_in_path(c: char) -> bool {
+    matches!(
+        c as u32,
+        // Right-to-left scripts: Hebrew, Arabic, Syriac, Thaana, NKo, Samaritan, Mandaic,
+        // Arabic supplements and presentation forms, and the right-to-left blocks above.
+        0x0590..=0x08FF
+            | 0xFB1D..=0xFDFF
+            | 0xFE70..=0xFEFF
+            | 0x10800..=0x10FFF
+            | 0x1E800..=0x1EFFF
+            // Combining marks.
+            | 0x0300..=0x036F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0xFE20..=0xFE2F
+            // Slash look-alikes.
+            | 0x2044
+            | 0x2215
+            | 0x29F8
+            | 0xFF0F
+            // Other spaces.
+            | 0x00A0
+            | 0x1680
+            | 0x2000..=0x200A
+            | 0x202F
+            | 0x205F
+            | 0x3000
+    )
+}
+
 /// Whether `path` is an absolute path in plain form, shown to a person exactly as it is:
 /// `/` and components that are neither empty (`//`, a trailing `/`) nor `.` or `..`, at most
-/// `MAX_PATH_BYTES` and `DETAIL_VALUE_CHARS`, and only characters `display_text` leaves alone
-/// (no control, format, bidi or invisible character, no backslash).
+/// `MAX_PATH_BYTES` bytes and `DETAIL_VALUE_CHARS` characters, only characters
+/// `display_text` leaves alone (no control, format, bidi or invisible character, no
+/// backslash), and none a person could misread (`misleading_in_path`).
 pub fn check_path_form(path: &str) -> Result<(), String> {
     let Some(rest) = path.strip_prefix('/') else {
         return Err("not an absolute path".into());
     };
     if path.len() > MAX_PATH_BYTES || path.chars().count() > DETAIL_VALUE_CHARS {
-        return Err(format!("longer than {MAX_PATH_BYTES} bytes"));
+        return Err(format!(
+            "longer than {MAX_PATH_BYTES} bytes or {DETAIL_VALUE_CHARS} characters"
+        ));
     }
     if rest
         .split('/')
@@ -52,6 +95,12 @@ pub fn check_path_form(path: &str) -> Result<(), String> {
     if !path.chars().all(shows_plainly) {
         return Err(
             "a control, format, bidirectional or invisible character, or a backslash".into(),
+        );
+    }
+    if path.chars().any(misleading_in_path) {
+        return Err(
+            "a right-to-left letter, a combining mark, a slash look-alike or a special space"
+                .into(),
         );
     }
     Ok(())
@@ -72,15 +121,39 @@ fn real_dir(d: &Path) -> PathBuf {
     d.canonicalize().unwrap_or_else(|_| d.to_path_buf())
 }
 
+/// Whether `real` is inside one of `dirs`: by name (each directory's real path), and by
+/// identity, comparing the device and inode of every directory above `real` with those of
+/// `dirs` (one directory can have two names, such as `/Users/x` and
+/// `/System/Volumes/Data/Users/x`; the path read from a descriptor and the one `realpath`
+/// gives can differ so).
+fn inside_any(real: &Path, dirs: &[PathBuf]) -> bool {
+    if dirs.iter().any(|d| real.starts_with(real_dir(d))) {
+        return true;
+    }
+    let ids: Vec<(u64, u64)> = dirs
+        .iter()
+        .filter_map(|d| std::fs::metadata(d).ok())
+        .map(|m| (m.dev(), m.ino()))
+        .collect();
+    real.ancestors().skip(1).any(|a| {
+        std::fs::metadata(a)
+            .ok()
+            .is_some_and(|m| ids.contains(&(m.dev(), m.ino())))
+    })
+}
+
 /// Whether a real path (symbolic links resolved) is where `allowed` says, and shows plainly.
 fn check_real(real: &Path, allowed: &Allowed) -> Result<(), String> {
     let s = real
         .to_str()
         .ok_or_else(|| "its real path is not text".to_string())?;
     check_path_form(s).map_err(|why| format!("its real path is not shown plainly: {why}"))?;
+    if real.starts_with("/dev") {
+        return Err("a device directory".into());
+    }
     match allowed {
         Allowed::Outside(forbidden) => {
-            if forbidden.iter().any(|d| real.starts_with(real_dir(d))) {
+            if inside_any(real, forbidden) {
                 return Err(
                     "it is inside pegboard's data directory or the browser's user data directory"
                         .into(),
@@ -104,6 +177,9 @@ fn check_real(real: &Path, allowed: &Allowed) -> Result<(), String> {
 /// file is checked again on the descriptor it is copied from (`open_checked`).
 pub fn check_absolute(path: &str, forbidden: &[PathBuf]) -> Result<PathBuf, String> {
     check_path_form(path)?;
+    if path.starts_with("/dev/") {
+        return Err("a device directory".into());
+    }
     let meta = std::fs::symlink_metadata(path).map_err(|_| "no such file".to_string())?;
     if meta.file_type().is_symlink() {
         return Err("it is a symbolic link (give the file it points to)".into());
@@ -339,10 +415,73 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         for bad in [fifo.as_path(), sock.as_path(), Path::new("/dev/null")] {
             let e = check_absolute(&bad.display().to_string(), &forbidden).unwrap_err();
-            assert!(e.contains("regular file"), "{bad:?}: {e}");
+            assert!(
+                e.contains("regular file") || e.contains("device"),
+                "{bad:?}: {e}"
+            );
             // Opening one does not block (a FIFO without a writer) and is refused.
             let e = open_checked(bad, &Allowed::Outside(forbidden.to_vec())).unwrap_err();
             assert!(e.contains("regular file"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn paths_a_person_could_misread_are_refused() {
+        for bad in [
+            "/tmp/\u{5d0}.txt",
+            "/tmp/\u{627}.txt",
+            "/tmp/e\u{301}.txt",
+            "/tmp/a\u{2215}b",
+            "/tmp/a\u{2044}b",
+            "/tmp/a\u{ff0f}b",
+            "/tmp/a\u{a0}b",
+            "/tmp/a\u{2003}b",
+            "/tmp/a\u{3000}b",
+        ] {
+            let e = check_path_form(bad).unwrap_err();
+            assert!(
+                e.contains("right-to-left") || e.contains("combining"),
+                "{bad:?}: {e}"
+            );
+        }
+        for good in [
+            "/tmp/보고서 1.pdf",
+            "/tmp/résumé.txt",
+            "/tmp/日本.txt",
+            "/tmp/a b",
+        ] {
+            assert!(check_path_form(good).is_ok(), "{good}");
+        }
+        assert!(check_absolute("/dev/null", &[])
+            .unwrap_err()
+            .contains("device"));
+        let long = format!("/{}", "a".repeat(DETAIL_VALUE_CHARS));
+        assert!(check_path_form(&long).unwrap_err().contains("characters"));
+    }
+
+    #[test]
+    fn a_forbidden_directory_is_found_under_another_name() {
+        // A directory with two names: by its real path, and through a link (the identity
+        // comparison covers names `realpath` does not give, such as macOS firmlinks under
+        // /System/Volumes/Data, which a test cannot make).
+        let r = rig();
+        let inner = r.outside.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        let alias = r.upload.join("alias");
+        symlink(&r.outside, &alias).unwrap();
+        for forbidden in [r.outside.clone(), alias.clone()] {
+            assert!(inside_any(
+                &inner.join("x"),
+                std::slice::from_ref(&forbidden)
+            ));
+            assert!(inside_any(
+                &alias.join("inner/x"),
+                std::slice::from_ref(&forbidden)
+            ));
+            assert!(!inside_any(
+                &r.files.join("x"),
+                std::slice::from_ref(&forbidden)
+            ));
         }
     }
 

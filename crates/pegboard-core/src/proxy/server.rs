@@ -152,7 +152,9 @@ impl SessionEntry {
                 context: context.to_string(),
                 targets: targets.into_iter().collect(),
                 cdp_sessions: HashSet::new(),
+                session_targets: HashMap::new(),
                 upload_dirs: Vec::new(),
+                upload_window: None,
                 page_scripts_allowed: false,
             }),
             closed: watch::channel(false).0,
@@ -278,6 +280,17 @@ impl ProxyServer {
     pub fn set_upload_dirs(&self, id: &SessionId, dirs: Vec<PathBuf>) {
         if let Some(entry) = self.shared.entry(id) {
             entry.scope.lock().unwrap().upload_dirs = dirs;
+        }
+    }
+
+    /// Opens (or, with `None`, closes) an approved upload's window (`filter::UploadWindow`).
+    pub fn set_upload_window(
+        &self,
+        id: &SessionId,
+        window: Option<crate::proxy::filter::UploadWindow>,
+    ) {
+        if let Some(entry) = self.shared.entry(id) {
+            entry.scope.lock().unwrap().upload_window = window;
         }
     }
 
@@ -724,8 +737,21 @@ struct ClientRef {
 }
 
 enum Pending {
-    /// A client request, forwarded under a proxy-assigned id.
-    Client { client: ClientRef, method: String },
+    /// A client request, forwarded under a proxy-assigned id. `target`: the target of a
+    /// `Target.attachToTarget`.
+    Client {
+        client: ClientRef,
+        method: String,
+        target: Option<String>,
+    },
+    /// A step of checking the node of an approved upload's `DOM.setFileInputFiles`
+    /// (`ClientDecision::CheckUploadNode`) before it is forwarded.
+    UploadCheck {
+        client: ClientRef,
+        msg: Value,
+        origin: String,
+        step: UploadStep,
+    },
     /// Context check of a tab the bridge created for a client `Target.createTarget`.
     VerifyTab {
         client: ClientRef,
@@ -738,6 +764,24 @@ enum Pending {
     /// Re-attach of a target whose hidden session was detached before it was resumed.
     Recover,
 }
+
+/// Where an upload node check is: the proxy's isolated world of the asked tab's top frame
+/// was made (`World`), the node's `backendNodeId` was looked up (`Describe`, with that
+/// world), the node was resolved in that world (`Resolve`), its document and origin were
+/// checked (`Verify`, with the node's object there).
+enum UploadStep {
+    World,
+    Describe { context: i64 },
+    Resolve,
+    Verify { object_id: String },
+}
+
+/// Run in the proxy's isolated world of the asked tab's top frame, with the node as `this`:
+/// a file input of that very document, at the origin the person was shown. The page cannot
+/// change what these names mean there (its scripts run in another world).
+const UPLOAD_NODE_CHECK: &str = "function (origin) { return this instanceof HTMLInputElement \
+    && this.type === 'file' && this.ownerDocument === document && document.defaultView === \
+    window && window === window.top && location.origin === origin; }";
 
 /// Outcome of closing a tab that was created in another context.
 struct StrayClosed {
@@ -1038,13 +1082,37 @@ impl ClientConn {
             );
             return self.send_client(&reply(&client, Err(err)));
         }
-        let decision = filter::client_message(&msg, &self.entry.scope.lock().unwrap());
+        let decision = {
+            let mut scope = self.entry.scope.lock().unwrap();
+            let decision = filter::client_message(&msg, &scope);
+            // An approved upload's window is used once, whatever the check finds.
+            if matches!(decision, ClientDecision::CheckUploadNode { .. }) {
+                scope.upload_window = None;
+            }
+            decision
+        };
         // The browser receives the value the decision was made on, re-serialized; never the
         // client's original bytes.
         let forward = match decision {
             ClientDecision::Forward => msg,
             ClientDecision::ForwardRewritten(v) => v,
             ClientDecision::Reply(result) => return self.send_client(&reply(&client, Ok(result))),
+            ClientDecision::CheckUploadNode {
+                msg,
+                target,
+                origin,
+            } => {
+                let mut world = json!({ "method": "Page.createIsolatedWorld",
+                    "params": { "frameId": target, "worldName": "pegboard-upload-check" } });
+                world["sessionId"] = msg["sessionId"].clone();
+                let pending = Pending::UploadCheck {
+                    client,
+                    msg,
+                    origin,
+                    step: UploadStep::World,
+                };
+                return self.send_upstream(world, pending).await.map(drop);
+            }
             ClientDecision::Error { code, message } => {
                 self.shared.count_refused(&msg);
                 return self.send_client(&reply(&client, Err((code, message))));
@@ -1073,9 +1141,20 @@ impl ClientConn {
             }
         };
         let method = forward["method"].as_str().unwrap_or_default().to_string();
-        self.send_upstream(forward, Pending::Client { client, method })
-            .await
-            .map(drop)
+        let target = (method == "Target.attachToTarget")
+            .then(|| forward.pointer("/params/targetId").and_then(Value::as_str))
+            .flatten()
+            .map(String::from);
+        self.send_upstream(
+            forward,
+            Pending::Client {
+                client,
+                method,
+                target,
+            },
+        )
+        .await
+        .map(drop)
     }
 
     async fn on_browser(&mut self, text: &str) -> Result<()> {
@@ -1091,7 +1170,20 @@ impl ClientConn {
             return Ok(());
         };
         match pending {
-            Pending::Client { client, method } => self.on_client_response(msg, client, &method),
+            Pending::Client {
+                client,
+                method,
+                target,
+            } => self.on_client_response(msg, client, &method, target),
+            Pending::UploadCheck {
+                client,
+                msg: request,
+                origin,
+                step,
+            } => {
+                self.on_upload_check(&msg, client, request, origin, step)
+                    .await
+            }
             Pending::VerifyTab { client, target_id } => {
                 self.finish_tab(&msg, client, target_id).await
             }
@@ -1100,11 +1192,125 @@ impl ClientConn {
         }
     }
 
+    /// One step of an approved upload's node check (`UploadStep`); at the end the call is
+    /// forwarded with the node as the proxy world's object, or refused.
+    async fn on_upload_check(
+        &mut self,
+        reply_msg: &Value,
+        client: ClientRef,
+        request: Value,
+        origin: String,
+        step: UploadStep,
+    ) -> Result<()> {
+        let refuse = |me: &Self, client: &ClientRef| {
+            me.send_client(&reply(
+                client,
+                Err((
+                    -32000,
+                    "the file input is not in the page a person approved the upload for"
+                        .to_string(),
+                )),
+            ))
+        };
+        if reply_msg.get("error").is_some() {
+            return refuse(self, &client);
+        }
+        let result = &reply_msg["result"];
+        let params = &request["params"];
+        let session = request["sessionId"].clone();
+        let call = |method: &str, p: Value| {
+            let mut v = json!({ "method": method, "params": p });
+            v["sessionId"] = session.clone();
+            v
+        };
+        let resolve = |context: i64, backend: &Value| {
+            call(
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend, "executionContextId": context }),
+            )
+        };
+        let (next, step) = match step {
+            UploadStep::World => {
+                let Some(context) = result["executionContextId"].as_i64() else {
+                    return refuse(self, &client);
+                };
+                if let Some(b) = params.get("backendNodeId").filter(|b| b.is_u64()) {
+                    (resolve(context, b), UploadStep::Resolve)
+                } else {
+                    let mut by = json!({});
+                    for k in ["nodeId", "objectId"] {
+                        if let Some(v) = params.get(k) {
+                            by[k] = v.clone();
+                        }
+                    }
+                    if by.as_object().is_some_and(serde_json::Map::is_empty) {
+                        return refuse(self, &client);
+                    }
+                    (
+                        call("DOM.describeNode", by),
+                        UploadStep::Describe { context },
+                    )
+                }
+            }
+            UploadStep::Describe { context } => {
+                let backend = &result["node"]["backendNodeId"];
+                if !backend.is_u64() {
+                    return refuse(self, &client);
+                }
+                (resolve(context, backend), UploadStep::Resolve)
+            }
+            UploadStep::Resolve => {
+                let Some(object_id) = result["object"]["objectId"].as_str() else {
+                    return refuse(self, &client);
+                };
+                (
+                    call(
+                        "Runtime.callFunctionOn",
+                        json!({ "objectId": object_id, "functionDeclaration": UPLOAD_NODE_CHECK,
+                                "arguments": [{ "value": origin }], "returnByValue": true }),
+                    ),
+                    UploadStep::Verify {
+                        object_id: object_id.to_string(),
+                    },
+                )
+            }
+            UploadStep::Verify { object_id } => {
+                if result["result"]["value"] != json!(true)
+                    || result.get("exceptionDetails").is_some()
+                {
+                    return refuse(self, &client);
+                }
+                // The node the check was made on, as an object of the proxy's world: the
+                // client's own reference to it is not passed on.
+                let mut forward = request;
+                if let Some(p) = forward["params"].as_object_mut() {
+                    p.remove("nodeId");
+                    p.remove("backendNodeId");
+                    p.insert("objectId".into(), json!(object_id));
+                }
+                let pending = Pending::Client {
+                    client,
+                    method: "DOM.setFileInputFiles".to_string(),
+                    target: None,
+                };
+                return self.send_upstream(forward, pending).await.map(drop);
+            }
+        };
+        let pending = Pending::UploadCheck {
+            client,
+            msg: request,
+            origin,
+            step,
+        };
+        self.send_upstream(next, pending).await.map(drop)
+    }
+
     fn on_client_response(
         &mut self,
         mut msg: Value,
         client: ClientRef,
         method: &str,
+        target: Option<String>,
     ) -> Result<()> {
         msg["id"] = client.id.clone();
         let (decision, adopted) = {
@@ -1115,6 +1321,9 @@ impl ClientConn {
                 if method == "Target.attachToTarget" {
                     if let Some(s) = v.pointer("/result/sessionId").and_then(Value::as_str) {
                         scope.cdp_sessions.insert(s.to_string());
+                        if let Some(t) = target {
+                            scope.session_targets.insert(s.to_string(), t);
+                        }
                     }
                 }
             }
@@ -1386,11 +1595,18 @@ fn track_event(msg: &Value, scope: &mut Scope) {
     match msg.get("method").and_then(Value::as_str) {
         Some("Target.attachedToTarget") => {
             if let Some(s) = str_param("sessionId") {
+                if let Some(t) = params
+                    .pointer("/targetInfo/targetId")
+                    .and_then(Value::as_str)
+                {
+                    scope.session_targets.insert(s.clone(), t.to_string());
+                }
                 scope.cdp_sessions.insert(s);
             }
         }
         Some("Target.detachedFromTarget") => {
             if let Some(s) = str_param("sessionId") {
+                scope.session_targets.remove(&s);
                 scope.cdp_sessions.remove(&s);
             }
         }

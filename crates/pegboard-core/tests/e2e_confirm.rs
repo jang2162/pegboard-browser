@@ -822,7 +822,7 @@ async fn a_cookie_approved_after_the_tab_left_lands_on_the_asked_host() {
 /// An upload from a session without an upload directory: the person sees the real path (a
 /// link in the given one resolved), its size and where it goes; what uploads is the content
 /// they were shown, under its own name, even though the original changed after the question.
-/// The copy is gone after the command, and the agent never sees its path.
+/// The agent never sees the copy's path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn upload_shows_real_paths_and_uploads_the_bytes_shown() {
@@ -871,7 +871,8 @@ async fn upload_shows_real_paths_and_uploads_the_bytes_shown() {
         "a copy's path: {result}"
     );
     assert_eq!(rig.uploaded(&s).await, "a.txt:5:first");
-    assert_eq!(rig.copies_left(&s), 0);
+    // Kept for the page until the session closes.
+    assert_eq!(rig.copies_left(&s), 1);
     let entry = rig
         .entries(&s)
         .into_iter()
@@ -1012,5 +1013,89 @@ async fn upload_with_an_upload_dir_offers_allow_for_session_and_then_stops_askin
         Some("argv_rejected"),
         "{r:?}"
     );
+    rig.finish().await;
+}
+
+/// The browser reads a file input's files when the page uses them: an approved upload's copy
+/// stays until the session closes, so a form submitted after the command sends the bytes the
+/// person was shown (not the original, changed since). Closing the session removes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn an_approved_upload_is_sent_when_the_form_is_submitted_later() {
+    let rig = rig(None).await;
+    let s = rig.session_at("/upload-form").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("later.txt");
+    std::fs::write(&file, "shown-bytes-4711").unwrap();
+    let mut person = rig.subscribe().await;
+    let run = rig.exec(&s, &["upload", "#f", file.to_str().unwrap()]);
+    let asked = person.next("confirm.required").await;
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "approve")
+        .await;
+    let r = run.await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.result.unwrap()["exitCode"], 0);
+    std::fs::write(&file, "changed-after-9999").unwrap();
+    // Submitted after the command ended.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    rig.ok(&s, &["eval", "document.getElementById('fm').submit()"])
+        .await;
+    rig.ok(&s, &["wait", "--fn", "location.pathname === '/echo'"])
+        .await;
+    let body = rig.ok(&s, &["get", "text", "body"]).await.to_string();
+    assert!(body.contains("shown-bytes-4711"), "{body}");
+    assert!(body.contains("later.txt"), "{body}");
+    assert!(!body.contains("changed-after"), "{body}");
+    assert_eq!(rig.copies_left(&s), 1, "kept for the page");
+    let close = rig
+        .call(
+            "session.close",
+            json!({ "sessionId": s.id, "token": s.token }),
+        )
+        .await;
+    assert!(close.error.is_none(), "{:?}", close.error);
+    assert_eq!(rig.copies_left(&s), 0);
+    rig.finish().await;
+}
+
+/// A ref from a snapshot reaches into an iframe (measured: `upload @eN` with the iframe's
+/// file button works without `frame`). The person was shown the tab's origin, so an approved
+/// upload's file may go only into a file input of the tab's top document: the proxy checks the
+/// node, in a world of its own, and refuses this one. Nothing reaches the frame's input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn an_upload_through_a_ref_into_an_iframe_is_refused() {
+    let rig = rig(None).await;
+    let other = common::fixture().await;
+    let port = other.origin.rsplit(':').next().unwrap().to_string();
+    let s = rig.session_at(&format!("/xorigin/{port}/upload")).await;
+    rig.ok(&s, &["wait", "--fn", "window.__frLoaded === true"])
+        .await;
+    let snap = rig.ok(&s, &["snapshot"]).await;
+    let refs = snap["data"]["refs"].as_object().expect("refs").clone();
+    let (button, _) = refs
+        .iter()
+        .find(|(_, v)| v["role"] == "button")
+        .unwrap_or_else(|| panic!("no file button in {snap}"));
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("framed.txt");
+    std::fs::write(&file, "framed").unwrap();
+    let mut person = rig.subscribe().await;
+    let run = rig.exec(
+        &s,
+        &["upload", &format!("@{button}"), file.to_str().unwrap()],
+    );
+    let asked = person.next("confirm.required").await;
+    assert_eq!(shown(&asked, "대상 페이지"), rig.fixture.origin, "{asked}");
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "approve")
+        .await;
+    let r = run.await.unwrap();
+    eprintln!("the refused upload: {r:?}");
+    let failed = r.error.is_some() || r.result.as_ref().is_some_and(|v| v["exitCode"] != 0);
+    assert!(failed, "the file went into the frame: {r:?}");
+    let after = rig.ok(&s, &["snapshot"]).await.to_string();
+    assert!(!after.contains("framed.txt"), "{after}");
     rig.finish().await;
 }

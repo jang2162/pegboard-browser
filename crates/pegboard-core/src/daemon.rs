@@ -24,6 +24,7 @@ use crate::confirm::{ConfirmAsk, ConfirmBroker, ConfirmDecision, ConfirmPlace};
 use crate::downloads::Report;
 use crate::paths::Paths;
 use crate::policy;
+use crate::proxy::filter::UploadWindow;
 use crate::proxy::server::Endpoint;
 use crate::recording::recorder::AfterFrame;
 use crate::runner::{succeeded, Runner, DEFAULT_TIMEOUT_MS};
@@ -254,7 +255,8 @@ pub async fn run_command_with_hook(
     let prepare = async {
         let mut shown = Vec::new();
         if !asked_sources.is_empty() {
-            let copies = stage_copies(paths, id, std::mem::take(&mut asked_sources)).await?;
+            let copies =
+                stage_copies(paths, confirm, id, std::mem::take(&mut asked_sources)).await?;
             shown = copies
                 .files
                 .iter()
@@ -306,7 +308,8 @@ pub async fn run_command_with_hook(
         run_argv.truncate(2);
         for f in &copies.files {
             run_argv.push(f.staged.display().to_string());
-            for path in [&f.given, &f.real, &f.staged] {
+            path_names.push((f.given.clone(), f.name.clone()));
+            for path in [&f.real, &f.staged] {
                 path_names.push((path.display().to_string(), f.name.clone()));
             }
         }
@@ -356,10 +359,21 @@ pub async fn run_command_with_hook(
     }
 
     // The proxy takes files for a file input only from where this upload may: an approved
-    // copy's directories while it runs, else the session's standing directories, which it
-    // returns to however the command ends (`UploadDirs` drops before `staged`).
-    let _upload_dirs = is_upload
-        .then(|| UploadDirs::open(sessions, paths, confirm, id, staged.as_ref()))
+    // upload's window (its copies, into the asked tab's top document at the shown origin,
+    // once) while it runs, else the session's standing directories. Closed again right after
+    // the command, however it ended.
+    let window = staged.as_ref().and_then(|copies| {
+        let StatePin::Origin(origin) = &cleared.pin else {
+            return None;
+        };
+        Some(UploadWindow {
+            files: copies.copies(),
+            target: screen_target(sessions, runner, id)?,
+            origin: origin.clone(),
+        })
+    });
+    let upload_dirs = is_upload
+        .then(|| UploadDirs::open(sessions, paths, confirm, id, window))
         .flatten();
     let had_no_tab = sessions.info(id).is_ok_and(|i| i.targets.is_empty());
     let exec_started = Instant::now();
@@ -367,6 +381,14 @@ pub async fn run_command_with_hook(
         Ok(ep) => runner.exec(id, ep, &run_argv, timeout_ms).await,
         Err(e) => Err(e.clone()),
     };
+    drop(upload_dirs);
+    // The copies of an upload that ran stay until the session closes: the page reads the
+    // files when it uses them (a form submitted later). Those of one that failed go now.
+    if let Some(copies) = staged.take() {
+        if matches!(&outcome, Ok(r) if succeeded(r)) {
+            confirm.copies().keep(id, copies);
+        }
+    }
     hide_paths(&mut outcome, &path_names);
     track_frame(runner, id, &run_argv, &outcome);
     if let (
@@ -623,6 +645,8 @@ fn hide_paths(outcome: &mut Result<CommandExecResult, RpcError>, names: &[(Strin
         }
         pairs.push((path.clone(), name.clone()));
     }
+    // The longest first, so a path is never half replaced by one it starts with.
+    pairs.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
     let scrub = |s: &mut String| {
         for (path, name) in &pairs {
             if s.contains(path.as_str()) {
@@ -643,7 +667,12 @@ fn hide_paths(outcome: &mut Result<CommandExecResult, RpcError>, names: &[(Strin
             walk(&mut r.output, &scrub);
             scrub(&mut r.stderr);
         }
-        Err(e) => scrub(&mut e.message),
+        Err(e) => {
+            scrub(&mut e.message);
+            if let Some(d) = e.data.as_mut() {
+                walk(d, &scrub);
+            }
+        }
     }
 }
 
@@ -698,7 +727,7 @@ fn resolve_asked_upload(
     paths: &Paths,
     id: &SessionId,
     words: &[String],
-) -> Result<Vec<(PathBuf, upload::Allowed)>, RpcError> {
+) -> Result<Vec<staging::Source>, RpcError> {
     let policy = sessions.policy(id)?;
     asked_upload_sources(
         policy.upload_dir.as_deref(),
@@ -713,7 +742,7 @@ fn asked_upload_sources(
     files_dir: PathBuf,
     forbidden: Vec<PathBuf>,
     words: &[String],
-) -> Result<Vec<(PathBuf, upload::Allowed)>, RpcError> {
+) -> Result<Vec<staging::Source>, RpcError> {
     let names = &words[2..];
     if names.len() > upload::MAX_UPLOAD_FILES {
         return Err(rejected(format!(
@@ -734,10 +763,14 @@ fn asked_upload_sources(
                     "this session uploads only by file name from its upload directory".to_string(),
                 ));
             }
-            let real = upload::check_absolute(name, &forbidden)
-                .map_err(|why| rejected(format!("{name}: {why}")))?;
+            let real =
+                upload::check_absolute(name, &forbidden).map_err(|why| not_taken(name, &why))?;
             // The real path is opened (and checked again there); the person sees it.
-            out.push((real, upload::Allowed::Outside(forbidden.clone())));
+            out.push(staging::Source {
+                given: name.clone(),
+                path: real,
+                allowed: upload::Allowed::Outside(forbidden.clone()),
+            });
         } else {
             let path = upload::resolve(name, &dirs).ok_or_else(|| {
                 rejected(if upload_dir.is_some() {
@@ -749,38 +782,61 @@ fn asked_upload_sources(
                     )
                 })
             })?;
-            out.push((path, upload::Allowed::DirectlyIn(dirs.clone())));
+            out.push(staging::Source {
+                given: name.clone(),
+                path,
+                allowed: upload::Allowed::DirectlyIn(dirs.clone()),
+            });
         }
     }
     Ok(out)
 }
 
+/// A file an asking upload does not take: the agent is told the same whatever the reason
+/// (`upload::NOT_TAKEN`, quoting its own text only), so it cannot probe the file system; the
+/// reason goes to the daemon's log, on the person's side.
+fn not_taken(given: &str, why: &str) -> RpcError {
+    eprintln!("pegboard: an upload of {given:?} was refused: {why}");
+    rejected(format!("{given}: {}", upload::NOT_TAKEN))
+}
+
 /// Copies an asking upload's files (`staging::stage`) on a blocking thread, into the
-/// session's confirmation directory.
+/// session's confirmation directory, within the copy budgets.
 async fn stage_copies(
     paths: &Paths,
+    confirm: &ConfirmBroker,
     id: &SessionId,
-    sources: Vec<(PathBuf, upload::Allowed)>,
+    sources: Vec<staging::Source>,
 ) -> Result<Staged, RpcError> {
-    let failed = |e: String| RpcError {
-        code: codes::INTERNAL.to_string(),
-        message: format!("copying the files for a person's confirmation failed: {e}"),
-        data: None,
+    let failed = |e: String| {
+        eprintln!("pegboard: copying files for a confirmation failed: {e}");
+        RpcError {
+            code: codes::INTERNAL.to_string(),
+            message: "copying the files for a person's confirmation failed".to_string(),
+            data: None,
+        }
     };
     let root =
         crate::paths::ensure_session_confirm(paths, id).map_err(|e| failed(e.to_string()))?;
-    tokio::task::spawn_blocking(move || staging::stage(&sources, &root))
+    let (store, session) = (confirm.copies(), id.clone());
+    tokio::task::spawn_blocking(move || staging::stage(&sources, &root, &store, &session))
         .await
         .map_err(|e| failed(e.to_string()))?
         .map_err(|e| match e {
-            StageError::Refused(why) => rejected(why),
+            StageError::Refused { given, why } => not_taken(&given, &why),
+            StageError::NoRoom(why) => RpcError {
+                code: codes::LIMIT_EXCEEDED.to_string(),
+                message: why,
+                data: None,
+            },
             StageError::Io(e) => failed(e.to_string()),
         })
 }
 
-/// The directories the proxy takes an upload's files from while the command runs; put back
-/// to the session's standing directories (`upload::standing_dirs`, given what a person
-/// allowed by now) when dropped.
+/// What the proxy lets the session's `DOM.setFileInputFiles` do while an upload runs: an
+/// approved upload's window (`UploadWindow`: its copies, its tab, its origin, once), and the
+/// session's standing directories (`upload::standing_dirs`, given what a person allowed by
+/// now), which it is put back to, the window closed, when dropped.
 struct UploadDirs<'a> {
     sessions: &'a SessionManager,
     id: &'a SessionId,
@@ -793,13 +849,13 @@ impl<'a> UploadDirs<'a> {
         paths: &Paths,
         confirm: &ConfirmBroker,
         id: &'a SessionId,
-        staged: Option<&Staged>,
+        window: Option<UploadWindow>,
     ) -> Option<UploadDirs<'a>> {
         let policy = sessions.policy(id).ok()?;
         let granted = confirm.granted(id).contains(&ActionClass::Upload);
         let after = upload::standing_dirs(&policy, paths.session_files(id), granted);
-        let during = staged.map_or_else(|| after.clone(), Staged::dirs);
-        sessions.set_upload_dirs(id, during);
+        sessions.set_upload_dirs(id, after.clone());
+        sessions.set_upload_window(id, window);
         Some(UploadDirs {
             sessions,
             id,
@@ -810,6 +866,7 @@ impl<'a> UploadDirs<'a> {
 
 impl Drop for UploadDirs<'_> {
     fn drop(&mut self) {
+        self.sessions.set_upload_window(self.id, None);
         self.sessions
             .set_upload_dirs(self.id, std::mem::take(&mut self.after));
     }
@@ -1875,14 +1932,24 @@ mod tests {
         )
         .unwrap();
         let dirs = vec![r.up.clone(), r.files.clone()];
+        let src = |given: &str, path: PathBuf, allowed| staging::Source {
+            given: given.into(),
+            path,
+            allowed,
+        };
         assert_eq!(
             sources,
             [
-                (
+                src(
+                    "a.txt",
                     r.up.join("a.txt"),
                     upload::Allowed::DirectlyIn(dirs.clone())
                 ),
-                (r.files.join("b.txt"), upload::Allowed::DirectlyIn(dirs)),
+                src(
+                    "b.txt",
+                    r.files.join("b.txt"),
+                    upload::Allowed::DirectlyIn(dirs)
+                ),
             ]
         );
     }
@@ -1902,14 +1969,16 @@ mod tests {
         assert_eq!(
             sources,
             [
-                (
-                    r.files.join("b.txt"),
-                    upload::Allowed::DirectlyIn(vec![r.files.clone()])
-                ),
-                (
-                    r.elsewhere.join("c.txt"),
-                    upload::Allowed::Outside(forbidden.clone())
-                ),
+                staging::Source {
+                    given: "b.txt".into(),
+                    path: r.files.join("b.txt"),
+                    allowed: upload::Allowed::DirectlyIn(vec![r.files.clone()])
+                },
+                staging::Source {
+                    given: c.clone(),
+                    path: r.elsewhere.join("c.txt"),
+                    allowed: upload::Allowed::Outside(forbidden.clone())
+                },
             ]
         );
         // A name is looked up in the session's files only.
@@ -1934,12 +2003,27 @@ mod tests {
             &words(&["upload", "#f", &other]),
         )
         .unwrap_err();
+        // The agent is told the same as for any other refused file, quoting its own text.
         assert_eq!(e.code, codes::ARGV_REJECTED);
-        assert!(
-            e.message.contains("pegboard's data directory"),
-            "{}",
-            e.message
-        );
+        assert_eq!(e.message, format!("{other}: {}", upload::NOT_TAKEN));
+        for (bad, made) in [
+            (r.elsewhere.join("missing.txt"), false),
+            (r.elsewhere.clone(), false),
+            (r.elsewhere.join("link"), true),
+        ] {
+            if made {
+                std::os::unix::fs::symlink(r.elsewhere.join("c.txt"), &bad).unwrap();
+            }
+            let bad = bad.display().to_string();
+            let e = asked_upload_sources(
+                None,
+                r.files.clone(),
+                forbidden.clone(),
+                &words(&["upload", "#f", &bad]),
+            )
+            .unwrap_err();
+            assert_eq!(e.message, format!("{bad}: {}", upload::NOT_TAKEN));
+        }
         // Seventeen files.
         let many: Vec<String> =
             std::iter::repeat_n(c.clone(), upload::MAX_UPLOAD_FILES + 1).collect();

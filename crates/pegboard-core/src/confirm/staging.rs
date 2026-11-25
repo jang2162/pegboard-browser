@@ -1,28 +1,52 @@
 //! The copies an upload that asks a person is shown and sends (design 4.3, TOCTOU).
 //!
-//! Before the question is asked, each file is opened without following a symbolic link,
-//! checked on its descriptor (`upload::open_checked`) and copied from that descriptor into a
-//! private directory: `<confirm root>/<random>/<n>/<name>` (directories 0700, files 0600,
-//! created new). The person is shown the real path read from the descriptor and the size
-//! copied; what uploads is the copy, so changing or replacing the original after the question
-//! changes nothing. Each file has a directory of its own, so two files of the same name keep
-//! their names, and the proxy can be opened to exactly these directories while the approved
-//! command runs. The copies go when the `Staged` is dropped (the command ended, however), when
-//! the session closes, and when the daemon starts (`remove_leftovers`).
+//! Before the question is asked, each file is opened without following a symbolic link and
+//! checked on its descriptor (`upload::open_checked`); then, within the copy budgets
+//! (`CopyStore`), it is cloned (APFS `fclonefileat` from that descriptor) or else copied from
+//! that descriptor into a private directory: `<confirm root>/<random>/<n>/<name>`
+//! (directories 0700, files 0600, created new). The person is shown the real path read from
+//! the descriptor and the size copied; what uploads is the copy, so changing or replacing the
+//! original after the question changes nothing. Each file has a directory of its own, so two
+//! files of the same name keep their names; the same file given twice is copied once.
+//!
+//! The browser reads an input's files when the page uses them (a form submitted later), so
+//! the copies of an upload that ran are kept (`CopyStore::keep`) until the session closes, or
+//! until newer copies of the session need their room. The copies of a question that was not
+//! approved, or of an upload that failed, go when the `Staged` is dropped. Whatever a daemon
+//! left behind goes when the next one starts (`remove_leftovers`).
 
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 
+use pegboard_protocol::SessionId;
 use rand::RngCore;
 
-use crate::upload::{open_checked, Allowed, MAX_UPLOAD_FILES, MAX_UPLOAD_FILE_BYTES};
+use crate::upload::{open_checked, Allowed, Opened, MAX_UPLOAD_FILES, MAX_UPLOAD_FILE_BYTES};
+
+/// The most bytes of copies one session holds (kept, and being asked about).
+pub const SESSION_COPY_BYTES: u64 = 4 << 30;
+/// The most bytes of copies the daemon holds for all sessions.
+pub const DAEMON_COPY_BYTES: u64 = 8 << 30;
+/// Free space a copy must leave on the disk of pegboard's home.
+pub const FREE_SPACE_MARGIN: u64 = 1 << 30;
+
+/// One file to copy: what the agent gave (the only text a refusal quotes), where it was
+/// found, and where it may be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub given: String,
+    pub path: PathBuf,
+    pub allowed: Allowed,
+}
 
 /// One copied file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedFile {
-    /// The path given (a bare name's resolved path, or the agent's absolute path).
-    pub given: PathBuf,
+    /// What the agent gave (a bare name, or its absolute path).
+    pub given: String,
     /// The real path of the file copied, read from its descriptor: what the person sees.
     pub real: PathBuf,
     /// The copy, which uploads.
@@ -32,21 +56,30 @@ pub struct StagedFile {
     pub size: u64,
 }
 
-/// The copies of one command. Dropping it deletes them.
+/// The copies of one command. Dropping it deletes them and gives their bytes back to the
+/// budgets.
 #[derive(Debug)]
 pub struct Staged {
     pub dir: PathBuf,
     pub files: Vec<StagedFile>,
+    account: Option<Account>,
 }
 
 impl Staged {
-    /// The directory of each copy: what the proxy may take files from while the approved
-    /// command runs.
-    pub fn dirs(&self) -> Vec<PathBuf> {
-        self.files
-            .iter()
-            .filter_map(|f| f.staged.parent().map(Path::to_path_buf))
-            .collect()
+    /// The copies' real paths, each once.
+    pub fn copies(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for f in &self.files {
+            if !out.contains(&f.staged) {
+                out.push(f.staged.clone());
+            }
+        }
+        out
+    }
+
+    /// The bytes the copies take (each copy once).
+    pub fn bytes(&self) -> u64 {
+        self.account.as_ref().map_or(0, |a| a.bytes)
     }
 }
 
@@ -56,11 +89,143 @@ impl Drop for Staged {
     }
 }
 
+/// Bytes of copies counted against the budgets while it lives.
+#[derive(Debug)]
+struct Account {
+    store: Weak<CopyStore>,
+    session: SessionId,
+    bytes: u64,
+}
+
+impl Drop for Account {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.upgrade() {
+            let mut t = store.inner.lock().unwrap();
+            if let Some(b) = t.bytes.get_mut(&self.session) {
+                *b = b.saturating_sub(self.bytes);
+            }
+            t.total = t.total.saturating_sub(self.bytes);
+        }
+    }
+}
+
+#[derive(Default)]
+struct StoreInner {
+    /// Bytes per session (kept, and being asked about).
+    bytes: HashMap<SessionId, u64>,
+    total: u64,
+    /// Copies of uploads that ran, oldest first.
+    kept: HashMap<SessionId, VecDeque<Staged>>,
+}
+
+/// The copies the daemon holds, and their budgets (`SESSION_COPY_BYTES`,
+/// `DAEMON_COPY_BYTES`).
+pub struct CopyStore {
+    inner: Mutex<StoreInner>,
+    me: Weak<CopyStore>,
+}
+
+impl std::fmt::Debug for CopyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CopyStore")
+    }
+}
+
+impl CopyStore {
+    pub fn new() -> Arc<CopyStore> {
+        Arc::new_cyclic(|me| CopyStore {
+            inner: Mutex::new(StoreInner::default()),
+            me: me.clone(),
+        })
+    }
+
+    /// Room for `bytes` more of the session's copies: its oldest kept copies make way when
+    /// the session's budget needs it; then both budgets must hold.
+    fn admit(&self, session: &SessionId, bytes: u64) -> Result<Account, String> {
+        let mut evicted = Vec::new();
+        let result = {
+            let mut t = self.inner.lock().unwrap();
+            loop {
+                let mine = t.bytes.get(session).copied().unwrap_or(0);
+                let fits =
+                    mine + bytes <= SESSION_COPY_BYTES && t.total + bytes <= DAEMON_COPY_BYTES;
+                if fits {
+                    break Ok(());
+                }
+                // Dropped below, out of the lock (a copy gives its bytes back when dropped).
+                match t.kept.get_mut(session).and_then(VecDeque::pop_front) {
+                    Some(old) => {
+                        let n = old.bytes();
+                        if let Some(b) = t.bytes.get_mut(session) {
+                            *b = b.saturating_sub(n);
+                        }
+                        t.total = t.total.saturating_sub(n);
+                        evicted.push(old);
+                    }
+                    None => break Err(()),
+                }
+            }
+            .map(|()| {
+                *t.bytes.entry(session.clone()).or_insert(0) += bytes;
+                t.total += bytes;
+            })
+        };
+        // Their bytes were taken off above: dropping them must not take them off again.
+        for mut old in evicted {
+            if let Some(a) = old.account.as_mut() {
+                a.bytes = 0;
+            }
+        }
+        result.map_err(|()| {
+            "pegboard holds as many copies for uploads as it may; close a session (or wait \
+             for its copies to go) and try again"
+                .to_string()
+        })?;
+        Ok(Account {
+            store: self.me.clone(),
+            session: session.clone(),
+            bytes,
+        })
+    }
+
+    /// Keeps the copies of an upload that ran until the session closes (the page may read
+    /// them later), or until newer copies of the session need their room.
+    pub fn keep(&self, session: &SessionId, staged: Staged) {
+        self.inner
+            .lock()
+            .unwrap()
+            .kept
+            .entry(session.clone())
+            .or_default()
+            .push_back(staged);
+    }
+
+    /// The session closed: its kept copies go.
+    pub fn forget(&self, session: &SessionId) {
+        let gone = self.inner.lock().unwrap().kept.remove(session);
+        drop(gone);
+    }
+
+    /// Bytes counted for the session (tests, diagnostics).
+    pub fn bytes_of(&self, session: &SessionId) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .bytes
+            .get(session)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// Why nothing was staged.
 #[derive(Debug)]
 pub enum StageError {
-    /// A file pegboard does not take (the reason names the given path, nothing else).
-    Refused(String),
+    /// A file pegboard does not take: `given` is the agent's own text, `why` the reason, for
+    /// the person's side only.
+    Refused { given: String, why: String },
+    /// No room for the copies (the budgets or the disk).
+    NoRoom(String),
     /// The copy could not be made.
     Io(std::io::Error),
 }
@@ -76,65 +241,167 @@ fn random_name() -> String {
     data_encoding::HEXLOWER.encode(&bytes)
 }
 
-/// Copies each of `sources` (in order) into a new directory under `root` (a private
-/// directory: `paths::ensure_session_confirm`), each checked where its `Allowed` says. One
-/// file refused or failing stages nothing (what was copied is deleted).
-pub fn stage(sources: &[(PathBuf, Allowed)], root: &Path) -> Result<Staged, StageError> {
-    if sources.is_empty() || sources.len() > MAX_UPLOAD_FILES {
-        return Err(StageError::Refused(format!(
-            "an upload that asks a person takes 1 to {MAX_UPLOAD_FILES} files"
-        )));
+/// Free bytes for an unprivileged user on the disk of `path`.
+fn free_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: a NUL-terminated path and a zeroed out-parameter of the right type.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    #[allow(clippy::unnecessary_cast)]
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// `sys/clonefile.h`: do not follow a link, do not copy the owner.
+#[cfg(target_os = "macos")]
+const CLONE_NOFOLLOW: u32 = 0x0001;
+#[cfg(target_os = "macos")]
+const CLONE_NOOWNERCOPY: u32 = 0x0002;
+
+/// Clones the open file into `dir/name` (APFS: no bytes are written until one side
+/// changes). `false` when the disk cannot (another file system), and nothing was made.
+#[cfg(target_os = "macos")]
+fn clone_into(opened: &Opened, dir: &Path, name: &str) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let dir_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    let cname = std::ffi::CString::new(name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: two open descriptors and a NUL-terminated name.
+    let r = unsafe {
+        libc::fclonefileat(
+            opened.file.as_raw_fd(),
+            dir_fd.as_raw_fd(),
+            cname.as_ptr(),
+            CLONE_NOFOLLOW | CLONE_NOOWNERCOPY,
+        )
+    };
+    Ok(r == 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_into(_: &Opened, _: &Path, _: &str) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// Makes the copy of `opened` at `dir/name`: a clone, else a byte copy from the descriptor.
+/// Returns its size (0600, the one link).
+fn copy_into(opened: &Opened, dir: &Path, name: &str) -> std::io::Result<u64> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    if clone_into(opened, dir, name)? {
+        // The clone has the original's mode; the directory (0700) is private meanwhile.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        return Ok(std::fs::symlink_metadata(&path)?.len());
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)?;
+    let copied = std::io::copy(
+        &mut (&opened.file).take(MAX_UPLOAD_FILE_BYTES + 1),
+        &mut out,
+    )?;
+    out.flush()?;
+    Ok(copied)
+}
+
+/// Copies each of `sources` (in order) into a new directory under `root` (a private
+/// directory: `paths::ensure_session_confirm`), each checked where its `Allowed` says, within
+/// the session's room in `store` and the disk's free space. One file refused or failing
+/// stages nothing (what was copied is deleted).
+pub fn stage(
+    sources: &[Source],
+    root: &Path,
+    store: &CopyStore,
+    session: &SessionId,
+) -> Result<Staged, StageError> {
+    if sources.is_empty() || sources.len() > MAX_UPLOAD_FILES {
+        return Err(StageError::Refused {
+            given: String::new(),
+            why: format!("an upload that asks a person takes 1 to {MAX_UPLOAD_FILES} files"),
+        });
+    }
+    // Every file is opened and checked first; the same file (device and inode) twice is
+    // copied once.
+    let mut opened: Vec<(Opened, String)> = Vec::new();
+    let mut which = Vec::new();
+    for src in sources {
+        let o = open_checked(&src.path, &src.allowed).map_err(|why| StageError::Refused {
+            given: src.given.clone(),
+            why,
+        })?;
+        let meta = o.file.metadata().map_err(StageError::Io)?;
+        let id = (meta.dev(), meta.ino());
+        let found = opened
+            .iter()
+            .position(|(p, _)| p.file.metadata().is_ok_and(|m| (m.dev(), m.ino()) == id));
+        match found {
+            Some(i) => which.push(i),
+            None => {
+                which.push(opened.len());
+                opened.push((o, src.given.clone()));
+            }
+        }
+    }
+    let bytes: u64 = opened.iter().map(|(o, _)| o.size).sum();
     let root = root.canonicalize().map_err(StageError::Io)?;
+    let account = store.admit(session, bytes).map_err(StageError::NoRoom)?;
+    let free = free_bytes(&root).map_err(StageError::Io)?;
+    if free < bytes.saturating_add(FREE_SPACE_MARGIN) {
+        return Err(StageError::NoRoom(
+            "the disk of pegboard's data has too little free space for a copy of these files"
+                .to_string(),
+        ));
+    }
     let dir = root.join(random_name());
     private_dir(&dir).map_err(StageError::Io)?;
     // From here on a failure deletes what was made.
     let mut staged = Staged {
         dir,
         files: Vec::new(),
+        account: Some(account),
     };
-    for (i, (given, allowed)) in sources.iter().enumerate() {
-        let opened = open_checked(given, allowed)
-            .map_err(|why| StageError::Refused(format!("{}: {why}", given.display())))?;
-        let name = opened
+    let mut copies = Vec::new();
+    for (i, (o, given)) in opened.iter().enumerate() {
+        let name = o
             .real
             .file_name()
             .and_then(|n| n.to_str())
             .filter(|n| !n.is_empty() && *n != "." && *n != "..")
-            .ok_or_else(|| {
-                StageError::Refused(format!("{}: it has no file name", given.display()))
+            .ok_or_else(|| StageError::Refused {
+                given: given.clone(),
+                why: "it has no file name".into(),
             })?
             .to_string();
         let sub = staged.dir.join(i.to_string());
         private_dir(&sub).map_err(StageError::Io)?;
-        let path = sub.join(&name);
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .map_err(StageError::Io)?;
-        // From the descriptor that was checked; never more than the limit, and exactly the
-        // size it had when opened (a file still being written is refused).
-        let copied = std::io::copy(
-            &mut (&opened.file).take(MAX_UPLOAD_FILE_BYTES + 1),
-            &mut out,
-        )
-        .map_err(StageError::Io)?;
-        out.flush().map_err(StageError::Io)?;
-        if copied != opened.size {
-            return Err(StageError::Refused(format!(
-                "{}: it changed while it was copied",
-                given.display()
-            )));
+        // Exactly the size it had when opened (a file still being written is refused).
+        let size = copy_into(o, &sub, &name).map_err(StageError::Io)?;
+        if size != o.size {
+            return Err(StageError::Refused {
+                given: given.clone(),
+                why: "it changed while it was copied".into(),
+            });
         }
+        copies.push((sub.join(&name), name));
+    }
+    for (src, i) in sources.iter().zip(which) {
+        let (o, _) = &opened[i];
+        let (path, name) = &copies[i];
         staged.files.push(StagedFile {
-            given: given.clone(),
-            real: opened.real,
-            staged: path,
-            name,
-            size: copied,
+            given: src.given.clone(),
+            real: o.real.clone(),
+            staged: path.clone(),
+            name: name.clone(),
+            size: o.size,
         });
     }
     Ok(staged)
@@ -192,19 +459,36 @@ mod tests {
         }
     }
 
+    fn session() -> SessionId {
+        SessionId("s_test".into())
+    }
+
     impl Rig {
-        fn stage(&self, sources: &[PathBuf]) -> Result<Staged, StageError> {
-            let sources: Vec<(PathBuf, Allowed)> = sources
+        fn sources(&self, paths: &[PathBuf]) -> Vec<Source> {
+            paths
                 .iter()
-                .map(|p| (p.clone(), Allowed::Outside(self.forbidden.clone())))
-                .collect();
-            stage(&sources, &self.root)
+                .map(|p| Source {
+                    given: p.display().to_string(),
+                    path: p.clone(),
+                    allowed: Allowed::Outside(self.forbidden.clone()),
+                })
+                .collect()
+        }
+
+        fn stage(&self, paths: &[PathBuf]) -> Result<Staged, StageError> {
+            stage(
+                &self.sources(paths),
+                &self.root,
+                &CopyStore::new(),
+                &session(),
+            )
         }
     }
 
+    /// The reason, prefixed with the given text.
     fn refused(r: Result<Staged, StageError>) -> String {
         match r {
-            Err(StageError::Refused(why)) => why,
+            Err(StageError::Refused { given, why }) => format!("{given}: {why}"),
             other => panic!("not refused: {other:?}"),
         }
     }
@@ -236,11 +520,8 @@ mod tests {
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
         assert_eq!(std::fs::metadata(&f.staged).unwrap().uid(), uid);
-        // The proxy opens each copy's own directory.
-        assert_eq!(
-            staged.dirs(),
-            vec![f.staged.parent().unwrap().to_path_buf()]
-        );
+        // The proxy's window takes exactly the copies.
+        assert_eq!(staged.copies(), vec![f.staged.clone()]);
     }
 
     #[test]
@@ -298,7 +579,70 @@ mod tests {
             std::fs::read_to_string(&staged.files[1].staged).unwrap(),
             "yy"
         );
-        assert_eq!(staged.dirs().len(), 2);
+        assert_eq!(staged.copies().len(), 2);
+    }
+
+    #[test]
+    fn the_same_file_twice_is_copied_once() {
+        let r = rig();
+        std::fs::write(r.src.join("a"), "aaa").unwrap();
+        let staged = r.stage(&[r.src.join("a"), r.src.join("a")]).unwrap();
+        assert_eq!(staged.files.len(), 2);
+        assert_eq!(staged.files[0].staged, staged.files[1].staged);
+        assert_eq!(staged.copies().len(), 1);
+        assert_eq!(staged.bytes(), 3);
+    }
+
+    #[test]
+    fn copies_count_against_the_budgets_and_the_oldest_kept_make_way() {
+        let r = rig();
+        let store = CopyStore::new();
+        let s1 = session();
+        std::fs::write(r.src.join("a"), "12345").unwrap();
+        let a = stage(&r.sources(&[r.src.join("a")]), &r.root, &store, &s1).unwrap();
+        assert_eq!(store.bytes_of(&s1), 5);
+        let dir = a.dir.clone();
+        // Kept: still counted, still there.
+        store.keep(&s1, a);
+        assert_eq!(store.bytes_of(&s1), 5);
+        assert!(dir.is_dir());
+        // A denied one goes, and gives its bytes back.
+        let b = stage(&r.sources(&[r.src.join("a")]), &r.root, &store, &s1).unwrap();
+        assert_eq!(store.bytes_of(&s1), 10);
+        drop(b);
+        assert_eq!(store.bytes_of(&s1), 5);
+        // Room for more is made from the session's oldest kept copies.
+        let account = store.admit(&s1, SESSION_COPY_BYTES - 2).unwrap();
+        assert!(!dir.exists(), "the oldest kept copy made way");
+        assert_eq!(store.bytes_of(&s1), SESSION_COPY_BYTES - 2);
+        // Nothing left to make way: refused.
+        assert!(store.admit(&s1, 3).is_err());
+        // Another session: the daemon's budget holds across sessions.
+        let (s2, s3) = (SessionId("s_2".into()), SessionId("s_3".into()));
+        assert!(
+            store.admit(&s2, SESSION_COPY_BYTES + 1).is_err(),
+            "per session"
+        );
+        let held = store.admit(&s2, SESSION_COPY_BYTES).unwrap();
+        // Now DAEMON_COPY_BYTES - 2 in all.
+        assert!(store.admit(&s3, 3).is_err(), "daemon-wide");
+        let last = store.admit(&s3, 2).unwrap();
+        drop((account, held, last));
+        assert_eq!(
+            (
+                store.bytes_of(&s1),
+                store.bytes_of(&s2),
+                store.bytes_of(&s3)
+            ),
+            (0, 0, 0)
+        );
+        // A session's close drops what it kept.
+        let c = stage(&r.sources(&[r.src.join("a")]), &r.root, &store, &s1).unwrap();
+        let dir = c.dir.clone();
+        store.keep(&s1, c);
+        store.forget(&s1);
+        assert!(!dir.exists());
+        assert_eq!(store.bytes_of(&s1), 0);
     }
 
     #[test]

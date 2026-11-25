@@ -41,14 +41,34 @@ impl Paths {
         self.home.join("sessions")
     }
 
-    /// Directories an upload's absolute path may not point into: pegboard's home (other
-    /// sessions' files, recordings, settings, the stock browser's user data) and the fork's
-    /// own user data directory (`~/Library/Application Support/Pegboard`, which is the home
-    /// unless `PEGBOARD_HOME` says otherwise).
+    /// Directories an upload's absolute path may not point into (design 4.3, security review):
+    /// - pegboard's home: every session's files, downloads, recordings and confirmation
+    ///   copies, the settings, the state, the stock browser's user data;
+    /// - the fork's own user data directory (`~/Library/Application Support/Pegboard`, the
+    ///   home unless `PEGBOARD_HOME` says otherwise);
+    /// - the browsers' HTTP caches: for a directory under `~/Library/Application Support`,
+    ///   its counterpart under `~/Library/Caches` (Chrome keeps a profile's cache there);
+    /// - agent-browser's directory in `/tmp` (its sockets, logs and settings name the
+    ///   sessions' endpoints);
+    /// - the fork's saved window state (`~/Library/Saved Application State/
+    ///   app.pegboard.browser.savedState`).
     pub fn upload_forbidden(&self) -> Vec<PathBuf> {
         let mut dirs = vec![self.home.clone(), self.chrome_udd.clone()];
-        if let Some(user) = std::env::var_os("HOME") {
-            dirs.push(PathBuf::from(user).join("Library/Application Support/Pegboard"));
+        if let Some(parent) = self.ab_socket_dir.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+        dirs.push(self.ab_socket_dir.clone());
+        if let Some(user) = std::env::var_os("HOME").map(PathBuf::from) {
+            let support = user.join("Library/Application Support");
+            let caches = user.join("Library/Caches");
+            dirs.push(support.join("Pegboard"));
+            dirs.push(user.join("Library/Saved Application State/app.pegboard.browser.savedState"));
+            let cached: Vec<PathBuf> = dirs
+                .iter()
+                .filter_map(|d| d.strip_prefix(&support).ok())
+                .map(|rel| caches.join(rel))
+                .collect();
+            dirs.extend(cached);
         }
         dirs
     }
@@ -187,6 +207,28 @@ pub fn ensure_owned_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploads_may_not_reach_pegboards_or_the_browsers_data() {
+        let user = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let p = paths_in(&user.join("Library/Application Support/Pegboard"));
+        let f = p.upload_forbidden();
+        for d in [
+            user.join("Library/Application Support/Pegboard"),
+            user.join("Library/Caches/Pegboard"),
+            user.join("Library/Caches/Pegboard/chrome"),
+            user.join("Library/Saved Application State/app.pegboard.browser.savedState"),
+            p.ab_socket_dir.parent().unwrap().to_path_buf(),
+            p.chrome_udd.clone(),
+        ] {
+            assert!(f.contains(&d), "{d:?} not in {f:?}");
+        }
+        // Another home: its own directories, and the fork's default ones all the same.
+        let q = paths_in(Path::new("/tmp/elsewhere"));
+        let f = q.upload_forbidden();
+        assert!(f.contains(&PathBuf::from("/tmp/elsewhere")));
+        assert!(f.contains(&user.join("Library/Caches/Pegboard")));
+    }
 
     #[test]
     fn home_follows_env_and_dirs_are_private() {

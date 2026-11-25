@@ -109,6 +109,8 @@ document.getElementById('f').addEventListener('change', async (e) => {
   window.__got = parts.join('|');
 });
 </script>"#)),
+        // A form that posts its file to `/echo`, which answers with what it received.
+        "/upload-form" => ("", page("upload-form", r#"<form id="fm" method="post" action="/echo" enctype="multipart/form-data"><input id="f" type="file" name="file"></form>"#)),
         "/writer" => ("", page("writer", "<p>writer</p><script>setInterval(() => localStorage.setItem('busy', String(Date.now())), 100);</script>")),
         _ => return None,
     })
@@ -421,6 +423,41 @@ async fn serve(mut sock: tokio::net::TcpStream) {
     if let Some(rest) = path.strip_prefix("/slow/") {
         let rest = rest.to_string();
         serve_slow(&mut sock, &rest).await;
+        return;
+    }
+    // `POST /echo`: answers with the request's body as text (a form's multipart body).
+    if req.starts_with("POST /echo") {
+        let mut got = buf[..n].to_vec();
+        let header_end = |b: &[u8]| b.windows(4).position(|w| w == b"\r\n\r\n");
+        while header_end(&got).is_none() {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(m) => got.extend_from_slice(&buf[..m]),
+            }
+        }
+        let end = header_end(&got).unwrap() + 4;
+        let length = String::from_utf8_lossy(&got[..end])
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        while got.len() < end + length {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(m) => got.extend_from_slice(&buf[..m]),
+            }
+        }
+        let body = &got[end..];
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = sock.write_all(head.as_bytes()).await;
+        let _ = sock.write_all(body).await;
+        let _ = sock.shutdown().await;
         return;
     }
     if let Some(bytes) = oversized_route(path) {

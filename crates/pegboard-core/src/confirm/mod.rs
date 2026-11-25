@@ -207,6 +207,8 @@ pub struct ConfirmBroker {
     /// Woken when a session begins to close or the daemon stops (`until_closing`).
     closing_changed: tokio::sync::Notify,
     me: Weak<ConfirmBroker>,
+    /// The copies uploads were asked about and sent (`staging`).
+    copies: Arc<staging::CopyStore>,
 }
 
 /// Closes a browser window in the background (the caller holds no lock and does not wait).
@@ -299,6 +301,7 @@ impl ConfirmBroker {
             }),
             closing_changed: tokio::sync::Notify::new(),
             me: me.clone(),
+            copies: staging::CopyStore::new(),
         })
     }
 
@@ -555,11 +558,20 @@ impl ConfirmBroker {
         self.closing_changed.notify_waiters();
     }
 
-    /// The session has closed: what a person allowed for it, and its closing mark, go.
+    /// The session has closed: what a person allowed for it, its closing mark and the
+    /// copies of its uploads go.
     pub fn forget_session(&self, id: &SessionId) {
-        let mut t = self.table.lock().unwrap();
-        t.granted.remove(id);
-        t.closing.remove(id);
+        {
+            let mut t = self.table.lock().unwrap();
+            t.granted.remove(id);
+            t.closing.remove(id);
+        }
+        self.copies.forget(id);
+    }
+
+    /// The copies uploads were asked about and sent, with their budgets.
+    pub fn copies(&self) -> Arc<staging::CopyStore> {
+        self.copies.clone()
     }
 
     /// The session's close failed and it stays open: it may be asked again (its grants

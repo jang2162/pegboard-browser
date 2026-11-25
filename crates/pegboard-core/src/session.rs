@@ -594,6 +594,16 @@ impl SessionManager {
         self.inner.proxy.set_upload_dirs(id, dirs);
     }
 
+    /// Opens or closes an approved upload's window in the proxy
+    /// (`proxy::filter::UploadWindow`).
+    pub fn set_upload_window(
+        &self,
+        id: &SessionId,
+        window: Option<crate::proxy::filter::UploadWindow>,
+    ) {
+        self.inner.proxy.set_upload_window(id, window);
+    }
+
     pub fn policy(&self, id: &SessionId) -> Result<SessionPolicy, RpcError> {
         let table = self.inner.table.lock().unwrap();
         Ok(ready(&table, id)?.info.policy.clone())

@@ -1275,6 +1275,112 @@ fn an_unapproved_file_cannot_be_set_through_the_session_endpoint() {
     });
 }
 
+/// An approved upload's window (what the daemon opens while the command runs) takes the
+/// approved copy only, once, and only into a file input of the asked tab's top document:
+/// a raw CDP client that makes an iframe's input known first (`DOM.getDocument` with
+/// `pierce`) and points the call at it is refused by the proxy's own check of the node.
+#[test]
+#[ignore]
+fn an_approved_upload_goes_only_into_the_top_document() {
+    use pegboard_core::proxy::filter::UploadWindow;
+    use pegboard_protocol::SessionPolicy;
+    common::run(async {
+        let h = common::Harness::start();
+        let port = h.fixture.origin.rsplit(':').next().unwrap().to_string();
+        let (info, ep) = h
+            .session_with_policy(&format!("/xorigin/{port}/upload"), SessionPolicy::default())
+            .await;
+        let target = h.manager.info(&info.id).unwrap().targets[0].clone();
+        let c = common::client(&ep).await;
+        let sid = c.attach(&target).await.unwrap();
+        for _ in 0..50 {
+            if c.evaluate(&sid, "window.__frLoaded === true")
+                .await
+                .unwrap()
+                == json!(true)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        c.evaluate(
+            &sid,
+            "document.body.insertAdjacentHTML('beforeend', '<input id=top type=file>')",
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().canonicalize().unwrap().join("ok.txt");
+        std::fs::write(&file, "ok").unwrap();
+        let doc = c
+            .send(
+                "DOM.getDocument",
+                json!({ "depth": -1, "pierce": true }),
+                Some(&sid),
+            )
+            .await
+            .unwrap();
+        fn node_with_id(v: &Value, id: &str) -> Option<i64> {
+            if let Some(a) = v.get("attributes").and_then(Value::as_array) {
+                if a.windows(2).any(|w| w[0] == "id" && w[1] == id) {
+                    return v["nodeId"].as_i64();
+                }
+            }
+            ["children", "contentDocument"]
+                .iter()
+                .find_map(|k| match v.get(*k) {
+                    Some(Value::Array(a)) => a.iter().find_map(|x| node_with_id(x, id)),
+                    Some(o @ Value::Object(_)) => node_with_id(o, id),
+                    _ => None,
+                })
+        }
+        let framed = node_with_id(&doc["root"], "f").expect("the iframe's input");
+        let top = node_with_id(&doc["root"], "top").expect("the top input");
+        let open = || {
+            h.manager.set_upload_window(
+                &info.id,
+                Some(UploadWindow {
+                    files: vec![file.clone()],
+                    target: target.clone(),
+                    origin: h.fixture.origin.clone(),
+                }),
+            )
+        };
+        let set = |node: i64| {
+            let c = &c;
+            let sid = &sid;
+            let file = file.display().to_string();
+            async move {
+                c.send(
+                    "DOM.setFileInputFiles",
+                    json!({ "nodeId": node, "files": [file] }),
+                    Some(sid),
+                )
+                .await
+            }
+        };
+        // Into the iframe's input: refused by the node check.
+        open();
+        let e = set(framed).await.unwrap_err();
+        assert!(format!("{e:#}").contains("not in the page"), "{e:#}");
+        // Into the top document's input: it goes, once.
+        open();
+        set(top).await.unwrap();
+        let n = c
+            .evaluate(&sid, "document.getElementById('top').files.length")
+            .await
+            .unwrap();
+        assert_eq!(n, json!(1));
+        let e = set(top).await.unwrap_err();
+        assert!(
+            format!("{e:#}").contains("upload directories"),
+            "used up: {e:#}"
+        );
+        h.manager.set_upload_window(&info.id, None);
+        h.close_session(&info.id).await;
+    });
+}
+
 /// The screen stream is the recorder's: an agent can neither start, stop nor acknowledge one
 /// on its own session (refused by the proxy), and the recording's stream goes on.
 #[test]
