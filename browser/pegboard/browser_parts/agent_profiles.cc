@@ -6,6 +6,7 @@
 
 #include <utility>
 
+#include "base/functional/bind.h"
 #include "base/values.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/profiles/profile.h"
@@ -14,9 +15,11 @@
 #include "chrome/browser/themes/theme_service.h"
 #include "chrome/browser/themes/theme_service_factory.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
 #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
 #include "chrome/browser/ui/profiles/profile_picker.h"
 #include "chrome/browser/ui/window_metadata/window_metadata_controller.h"
+#include "chrome/common/chrome_constants.h"
 #include "chrome/common/pref_names.h"
 #include "components/prefs/pref_service.h"
 #include "components/prefs/scoped_user_pref_update.h"
@@ -68,9 +71,18 @@ void AgentProfiles::Start() {
   ForgetAgentAsLastUsed();
 
   browsers_observation_.Observe(GlobalBrowserCollection::GetInstance());
+#if BUILDFLAG(IS_MAC)
+  main_window_watch_ = std::make_unique<app_last_profile::MainWindowWatch>(
+      base::BindRepeating(&AgentProfiles::KeepAppLastProfileHuman,
+                          weak_factory_.GetWeakPtr()));
+#endif
 }
 
 void AgentProfiles::Stop() {
+  weak_factory_.InvalidateWeakPtrs();
+#if BUILDFLAG(IS_MAC)
+  main_window_watch_.reset();
+#endif
   browsers_observation_.Reset();
   storage_observation_.Reset();
 }
@@ -110,15 +122,12 @@ void AgentProfiles::UpdatePickerDefault() {
       base::Value(static_cast<int>(availability)));
 }
 
-void AgentProfiles::ForgetAgentAsLastUsed() {
-  PrefService* local_state = g_browser_process->local_state();
+std::string AgentProfiles::LastPersonsDirectory() const {
   ProfileAttributesStorage* storage = Storage();
-  if (!local_state || !storage ||
-      !IsAgentDirectoryName(local_state->GetString(prefs::kProfileLastUsed))) {
-    return;
-  }
-  // The person's profile active most recently, else the default one.
   std::string human;
+  if (!storage) {
+    return human;
+  }
   base::Time latest;
   for (ProfileAttributesEntry* entry : storage->GetAllProfilesAttributes()) {
     const std::string dir = entry->GetPath().BaseName().AsUTF8Unsafe();
@@ -129,11 +138,90 @@ void AgentProfiles::ForgetAgentAsLastUsed() {
       latest = entry->GetActiveTime();
     }
   }
+  return human;
+}
+
+bool AgentProfiles::IsAgent(const Profile* profile) const {
+  if (!profile) {
+    return false;
+  }
+  const Profile* original = profile->GetOriginalProfile();
+  return !original->IsSystemProfile() && !original->IsGuestSession() &&
+         original->GetPath().DirName() == user_data_dir_ &&
+         IsAgentDirectoryName(original->GetBaseName().AsUTF8Unsafe());
+}
+
+void AgentProfiles::ForgetAgentAsLastUsed() {
+  PrefService* local_state = g_browser_process->local_state();
+  if (!local_state ||
+      !IsAgentDirectoryName(local_state->GetString(prefs::kProfileLastUsed))) {
+    return;
+  }
+  // The person's profile active most recently, else the default one.
+  const std::string human = LastPersonsDirectory();
   if (human.empty()) {
     local_state->ClearPref(prefs::kProfileLastUsed);
   } else {
     local_state->SetString(prefs::kProfileLastUsed, human);
   }
+}
+
+void AgentProfiles::OnBrowserClosed(BrowserWindowInterface* browser) {
+  // The last agent window gone, no daemon needs an agent profile as the
+  // default context: the last used profile goes back to a person's (a Dock
+  // click with no window, or the next launch, opens that).
+  for (BrowserWindowInterface* other : GetAllBrowserWindowInterfaces()) {
+    if (other != browser && IsAgent(other->GetProfile())) {
+      return;
+    }
+  }
+  ForgetAgentAsLastUsed();
+}
+
+void AgentProfiles::KeepAppLastProfileHuman() {
+#if BUILDFLAG(IS_MAC)
+  if (!IsAgent(app_last_profile::Get())) {
+    return;
+  }
+  // The profile of the person's window active most recently.
+  Profile* human = nullptr;
+  ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
+      [this, &human](BrowserWindowInterface* window) {
+        Profile* profile = window->GetProfile();
+        if (window->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
+            profile && !IsAgent(profile)) {
+          human = profile;
+          return false;
+        }
+        return true;
+      });
+  ProfileManager* manager = g_browser_process->profile_manager();
+  std::string dir = LastPersonsDirectory();
+  if (dir.empty()) {
+    dir = chrome::kInitialProfile;
+  }
+  const base::FilePath path = user_data_dir_.AppendASCII(dir);
+  if (!human && manager) {
+    human = manager->GetProfileByPath(path);
+  }
+  if (human) {
+    app_last_profile::Set(human);
+    return;
+  }
+  if (!manager) {
+    return;
+  }
+  // No person's profile is loaded: load the last one used.
+  manager->CreateProfileAsync(
+      path, base::BindOnce(
+                [](base::WeakPtr<AgentProfiles> self, Profile* profile) {
+                  if (self && profile && !self->IsAgent(profile) &&
+                      self->IsAgent(app_last_profile::Get())) {
+                    app_last_profile::Set(profile);
+                  }
+                },
+                weak_factory_.GetWeakPtr()));
+#endif
 }
 
 void AgentProfiles::OnProfileAdded(const base::FilePath& profile_path) {

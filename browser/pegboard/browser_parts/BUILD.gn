@@ -14,6 +14,13 @@ source_set("browser_parts") {
     "profile_defaults.cc",
     "profile_defaults.h",
   ]
+  if (is_mac) {
+    sources += [
+      "app_last_profile_mac.h",
+      "app_last_profile_mac.mm",
+    ]
+    frameworks = [ "AppKit.framework" ]
+  }
 
   # Like //pegboard/devtools, this uses //chrome/browser headers without
   # depending on //chrome/browser, which depends on it.

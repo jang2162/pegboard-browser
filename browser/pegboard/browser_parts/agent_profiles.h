@@ -5,15 +5,22 @@
 #ifndef PEGBOARD_BROWSER_PARTS_AGENT_PROFILES_H_
 #define PEGBOARD_BROWSER_PARTS_AGENT_PROFILES_H_
 
+#include <memory>
 #include <string>
 
 #include "base/files/file_path.h"
+#include "base/memory/weak_ptr.h"
 #include "base/scoped_observation.h"
 #include "chrome/browser/profiles/profile_attributes_storage.h"
 #include "chrome/browser/profiles/profile_attributes_storage_observer.h"
 #include "chrome/browser/ui/browser_window/public/browser_collection.h"
 #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
+#include "build/build_config.h"
 #include "third_party/skia/include/core/SkColor.h"
+
+#if BUILDFLAG(IS_MAC)
+#include "pegboard/browser_parts/app_last_profile_mac.h"
+#endif
 
 class Profile;
 
@@ -38,12 +45,20 @@ namespace pegboard {
 //   availability at startup (local state, a policy's pref) is "disabled"
 //   while there is at most one person's profile; with two or more it is the
 //   upstream default again. Only the default: a policy wins.
-// - A launch does not open an agent profile from the last run: at start the
-//   last used profile goes back to a person's when it names an agent one, and
-//   agent profiles are taken out of the profiles a launch restores. (Only at
-//   start: while the browser runs, the last used profile is what DevTools calls
-//   the default browser context, which the daemon makes the agent profile to
-//   set its download policy.)
+// - Nothing meant for the person lands in an agent profile:
+//   - A launch does not open an agent profile from the last run: at start the
+//     last used profile (local state) goes back to a person's when it names an
+//     agent one, and agent profiles are taken out of the profiles a launch
+//     restores. While agent windows are open it is left alone: the last used
+//     profile is what DevTools calls the default browser context, which the
+//     daemon makes the agent profile (by activating its tab) to set its
+//     download policy. Once the last agent window closes it goes back to a
+//     person's again.
+//   - On macOS, the app's last profile (AppController: the profile of the
+//     last main window, which links from other apps, the app menu and a Dock
+//     click with no window use) never stays an agent profile: when an agent
+//     window becomes main, it is set back to the person's profile of the most
+//     recently active person's window (or one loaded for it).
 // - Their frame wears one reserved color (a user color theme of the agent
 //   profile, kAgentThemeColor) and their normal windows the title
 //   kAgentWindowTitle (the window's user title, as "Name window").
@@ -76,6 +91,7 @@ class AgentProfiles : public ProfileAttributesStorage::Observer,
 
   // BrowserCollectionObserver:
   void OnBrowserCreated(BrowserWindowInterface* browser) override;
+  void OnBrowserClosed(BrowserWindowInterface* browser) override;
 
  private:
   // Omits the entry of `path` when it is an agent profile's.
@@ -83,6 +99,11 @@ class AgentProfiles : public ProfileAttributesStorage::Observer,
   void UpdatePickerDefault();
   // The last used profile, back to a person's when it names an agent one.
   void ForgetAgentAsLastUsed();
+  // The directory of the person's profile active most recently ("" for none).
+  std::string LastPersonsDirectory() const;
+  bool IsAgent(const Profile* profile) const;
+  // The app's last profile (macOS), back to a person's when it is an agent's.
+  void KeepAppLastProfileHuman();
 
   base::FilePath user_data_dir_;
   base::ScopedObservation<ProfileAttributesStorage,
@@ -90,6 +111,10 @@ class AgentProfiles : public ProfileAttributesStorage::Observer,
       storage_observation_{this};
   base::ScopedObservation<BrowserCollection, BrowserCollectionObserver>
       browsers_observation_{this};
+#if BUILDFLAG(IS_MAC)
+  std::unique_ptr<app_last_profile::MainWindowWatch> main_window_watch_;
+#endif
+  base::WeakPtrFactory<AgentProfiles> weak_factory_{this};
 };
 
 }  // namespace pegboard
