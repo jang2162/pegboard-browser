@@ -67,8 +67,10 @@ CHROME = {
         "Pegboard is your default browser",
         {
             "ko": (
-                "Chromium이 기본 브라우저이고 Chromium을 쓰며 Chromium은 좋고 Chromium으로 연다",
-                "Pegboard가 기본 브라우저이고 Pegboard를 쓰며 Pegboard는 좋고 Pegboard로 연다",
+                "Chromium이 기본 브라우저이고 Chromium을 쓰며 Chromium은 좋고 Chromium으로 연다. "
+                "Chromium에 권한을 주면 Chromium 이 창은 닫힌다",
+                "Pegboard가 기본 브라우저이고 Pegboard를 쓰며 Pegboard는 좋고 Pegboard로 연다. "
+                "Pegboard에 권한을 주면 Pegboard 이 창은 닫힌다",
             )
         },
     ),

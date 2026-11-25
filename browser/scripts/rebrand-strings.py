@@ -49,7 +49,7 @@ EXCLUDED_MESSAGES = frozenset()
 # "Chromium" ends in a consonant, "Pegboard" (페그보드) in a vowel: the particle after it changes.
 KOREAN_PARTICLES = (("으로", "로"), ("이", "가"), ("을", "를"), ("은", "는"), ("과", "와"))
 _KO_AFTER = re.compile(
-    "(" + "|".join(old for old, _ in KOREAN_PARTICLES) + ")(?![가-힣])"
+    "^(" + "|".join(old for old, _ in KOREAN_PARTICLES) + ")(?![가-힣])"
 )
 
 _MESSAGE = re.compile(r"(<message\b)([^>]*)(>)(.*?)(</message>)", re.DOTALL)
