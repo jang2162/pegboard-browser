@@ -1286,3 +1286,38 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 - 화면 속 화면 창이 확인 창을 가리는 동안의 누름은 무시하고(`occluded`, `ScopedPictureInPictureOcclusionObservation`), 가림이 풀리면 500ms 보호를 다시 시작한다.
 - 세션의 탭(`targetIds` 모두)을 지켜본다. 하나라도 닫히거나 다른 창으로 옮겨지면 `deny`(`tab_closed`, `tab_moved`). 창이 닫히면 떠 있던 것과 기다리던 것 모두 `deny`(`closing_the_window_denies_shown_and_queued`). 기다리는 항목은 프로필을 포인터가 아닌 컨텍스트 ID로 기억한다(프로필이 사라진 뒤 매달린 포인터가 없게).
 - **남는 위험**: 같은 사용자의 셸과 손쉬운 사용(Accessibility) 권한을 가진 에이전트는 확인 창 버튼을 직접 누를 수 있다(`AXPress`). 화면 속 화면이 아닌 다른 앞쪽 창(위치를 정한 팝업 등)으로 확인 창을 가리는 것은 막지 않는다. 에이전트 창이 전체 화면이거나 다른 Space에 있을 때 확인 창의 자리는 재지 않았다.
+
+### 3b 작업 8. 에이전트 창 표시와 에이전트 프로필 숨기기 (2026-11-25)
+
+`//pegboard/browser_parts`(`MainParts`, `AgentProfiles`)와 `//pegboard/common`(에이전트 프로필 규칙 하나)을 더했다. 부트스트랩 패치가 넣는 메인 파츠가 `DaemonLauncher`에서 `MainParts`로 바뀌었다(포함 경로, 클래스 이름, BUILD.gn 의존 이름만. 줄 수 같음). 개발 기기의 Chromium 트리에서 빌드하고 두 번째 기기의 GUI 세션에서 시험했다.
+
+| 항목 | 값 |
+|---|---|
+| 첫 빌드(새 `//pegboard/browser_parts`, 패치 두 줄) | 49초 |
+| 패치 접기·`export.sh` 뒤 빌드(파일 시각) | 3분 32초 |
+| `agent_profiles.cc` 변형 빌드 | 30~59초 |
+| 손 패치(`budget.sh`) | 업스트림 파일 15개, 추가 96, 삭제 24, 합계 120줄. 증가 0 |
+| 새 `//pegboard/browser_parts` + `//pegboard/common` | 473줄 |
+
+- **생략은 저장되지 않는다** [확인]: `ProfileAttributesEntry::SetIsOmitted`는 메모리의 값(`is_omitted_`)이고 `Local State`에 쓰지 않는다. 또 업스트림은 임시(ephemeral) 프로필만 생략한다(`DCHECK(IsEphemeral())`, 이 빌드는 DCHECK가 꺼져 있다). 에이전트 프로필을 임시로 만들 수는 없다(시작할 때 지워진다). 그래서 도메인이 프로필을 올릴 때가 아니라 브라우저가 시작할 때마다(`PreProfileInit`, 첫 프로필 전) 목록의 에이전트 항목을 모두 생략으로 두고, 그 뒤 더해지는 항목도 바로 생략한다(`ProfileAttributesStorage` 관찰자). 데몬이 없어도(`--pegboard-no-daemon`) 된다. 생략의 효과는 업스트림 그대로다: 프로필 메뉴, 프로필 선택 화면, "다른 프로필로 링크 열기"에서 빠진다.
+- **생략은 시작 때 선택 화면을 막지 못한다** [확인]: `ProfilePicker::GetStartupMode`는 프로필 목록의 항목 수(`GetNumberOfProfiles`, 생략 포함)가 2 이상이면 선택 화면을 띄운다. 설계 4.6의 대안으로 Local State의 `browser.profile_picker_availability_on_startup`(정책 `ProfilePickerOnStartupAvailability`의 설정)의 **기본값**을, 사람 프로필이 하나 이하면 "사용 안 함"(1), 둘 이상이면 업스트림 기본(0)으로 둔다. 프로필이 더해지거나 지워질 때마다 다시 정한다(Dock을 눌러 창을 다시 여는 길 `app_controller_mac.mm`도 같은 함수를 본다). 기본값만 바꾸므로 정책이 이긴다. 사람이 두 번째 프로필을 만들면 선택 화면이 다시 뜬다(`a_second_persons_profile_still_brings_the_picker`). 대가: 사람 프로필이 하나일 때 선택 화면의 "시작할 때 표시" 선택이 보이지 않고, `--profile-email`+`--create-profile-email-if-not-exists`로 선택 화면을 여는 길이 막힌다.
+- **지난번 에이전트 창이 다시 열린다** [확인, 고침]: 에이전트 창을 마지막으로 활성화하고 끄면 Local State의 `profile.last_used`가 `PegboardAgent`가 되어, 다음 시작이 사람 창과 함께 에이전트 프로필 창을 연다(고치기 전 변형 빌드에서 시작 직후 올라온 프로필 `["Default", "PegboardAgent"]`). `AgentProfiles`가 `profile.last_used`를 지켜보다 에이전트 디렉터리가 되면 바로 앞의 사람 프로필(없으면 가장 최근 활성 사람 프로필, 없으면 기본)로 되돌리고, 시작 때 `profile.last_active_profiles`에서 에이전트 이름을 뺀다. Dock 클릭으로 새 창을 열 때도 사람 프로필이 열린다.
+- **테마**: 에이전트 프로필에 사용자 색 테마 `#B45309`(짙은 호박색), 변형 `kVibrant`를 건다(`ThemeService::SetUserColorAndBrowserColorVariant`, 설정 `browser.theme.user_color2` = -4959479, `browser.theme.color_variant2` = 3). 프로필이 초기화될 때마다(`PostProfileInit`, 첫 창보다 먼저) 다르면 건다. 사람이 에이전트 프로필의 테마를 바꿔도 다음 시작에 돌아온다.
+- **창 제목**: 에이전트 프로필의 일반 창이 생길 때마다(`BrowserCollectionObserver::OnBrowserCreated`) 창 사용자 제목 "Pegboard 에이전트"(`WindowMetadataController::SetWindowUserTitle`, "창 이름 지정"과 같은 값). 맥에서는 사용자 제목이 페이지 제목을 대신한다(창 메뉴와 Mission Control에 "Pegboard 에이전트"만 보인다). 도메인이 여는 창만이 아니라 그 프로필의 모든 일반 창이다.
+- 시험 훅 기록 `{"kind":"window","profile","userTitle"}`은 모든 일반 창마다 한 줄이다(사람 창은 빈 제목).
+- `chrome://profile-internals`는 내부 디버그 페이지라 Local State의 `internal_only_uis_enabled`가 참이어야 열린다. 시험이 처음 켤 때 `Local State`에 그 값만 써 둔다.
+
+시험 결과 (두 번째 기기 GUI 세션, 포크, `--test-threads=1`): `e2e_domain`의 새 시험 6개 통과(`agent_profiles_get_the_agent_theme_and_title`, `agent_profiles_are_omitted_from_the_profile_list`, `human_profiles_are_not_marked_or_hidden`, `no_profile_picker_at_launch_with_agent_profiles`, `a_second_persons_profile_still_brings_the_picker`, `agent_windows_from_the_last_run`). 전체는 작업 10 뒤에 다시 돌렸다(아래).
+
+변형 (하나씩 빌드, 모두 그 시험이 실패) [확인]:
+
+| 변형 | 실패한 시험 |
+|---|---|
+| 테마를 거는 곳의 에이전트 검사 제거 | `human_profiles_are_not_marked_or_hidden`(`Default`의 `user_color2` = -4959479) |
+| 창 제목을 거는 곳의 에이전트 검사 제거 | `human_profiles_are_not_marked_or_hidden`(사람 창 제목이 "Pegboard 에이전트") |
+| `SetIsOmitted(true)` 제거 | `agent_profiles_are_omitted_from_the_profile_list`, `no_profile_picker_at_launch_with_agent_profiles`(다시 켠 뒤 생략 false) |
+| 선택 화면 기본값을 언제나 "사용" | `no_profile_picker_at_launch_with_agent_profiles`(`chrome://profile-picker/?startup`) |
+| `profile.last_used` 되돌리기 제거 | `agent_windows_from_the_last_run`(에이전트 프로필이 다시 열림) |
+
+- 계획의 변형 "생략 줄을 빼면 선택 화면 시험도 실패"는 생략과 선택 화면이 다른 줄이라 둘로 나눴다.
+- 남는 위험: 사람이 사람 프로필에 같은 색을 고를 수 있다(창 제목은 다르다). 에이전트 창의 프로필 메뉴에는 그 에이전트 프로필 자신이 보인다(생략은 "다른 프로필" 목록에만 걸린다). 임시가 아닌 프로필의 생략은 업스트림이 의도하지 않은 조합이다(DCHECK). 버전을 올릴 때 생략을 읽는 곳(`IsOmitted()` 호출 열 곳 남짓)을 다시 본다.
