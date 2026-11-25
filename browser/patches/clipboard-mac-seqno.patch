@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?=EC=9E=A5=EB=B3=91=ED=98=84?= <jang2162_@naver.com>
-Date: Wed, 25 Nov 2026 09:58:09 +0900
+From: Pegboard <noreply@pegboard.invalid>
+Date: Mon, 23 Nov 2026 00:00:00 +0000
 Subject: [PATCH] clipboard-mac-seqno.patch
 
 Backport of the 157 fix (crbug.com/568453825): an asynchronous pasteboard change notification no longer mints a second sequence token for an unchanged changeCount, which made Blink drop an in-flight paste.
