@@ -1389,3 +1389,94 @@ pub async fn shared_session_fixture() -> SharedSessionFixture {
         scope,
     }
 }
+
+/// An environment variable set (or removed) until this is dropped, also when the test fails,
+/// then put back as it was. A browser launched meanwhile inherits it.
+pub struct EnvVar {
+    name: &'static str,
+    before: Option<std::ffi::OsString>,
+}
+
+impl EnvVar {
+    pub fn set(name: &'static str, value: &str) -> EnvVar {
+        let before = std::env::var_os(name);
+        std::env::set_var(name, value);
+        EnvVar { name, before }
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        match &self.before {
+            Some(v) => std::env::set_var(self.name, v),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
+/// The browser's confirmation dialog log (`PEGBOARD_TEST_DIALOG_LOG`, the browser's test
+/// hook): one JSON object a line.
+pub struct DialogLog {
+    pub path: PathBuf,
+    _dir: TempDir,
+}
+
+/// The characters the dialog itself adds around and inside what it shows (isolates around a
+/// name, a mark after each `/` of a path); the text it shows without them.
+pub fn without_marks(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(*c, '\u{200E}' | '\u{2066}' | '\u{2068}' | '\u{2069}'))
+        .collect()
+}
+
+impl DialogLog {
+    pub fn new() -> DialogLog {
+        let dir = tempfile::tempdir().unwrap();
+        DialogLog {
+            path: dir.path().join("dialogs.jsonl"),
+            _dir: dir,
+        }
+    }
+
+    pub fn entries(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&self.path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The entries of `kind` (`confirm_shown`, `confirm`) for `confirm_id`.
+    pub fn of(&self, kind: &str, confirm_id: &str) -> Vec<serde_json::Value> {
+        self.entries()
+            .into_iter()
+            .filter(|e| e["kind"] == kind && e["confirmId"] == confirm_id)
+            .collect()
+    }
+
+    /// The one entry of `kind` for `confirm_id`, once it is there (within `secs`).
+    pub async fn wait(&self, kind: &str, confirm_id: &str, secs: u64) -> serde_json::Value {
+        for _ in 0..secs * 10 {
+            let mut found = self.of(kind, confirm_id);
+            assert!(found.len() <= 1, "{kind} {confirm_id} twice: {found:?}");
+            if let Some(e) = found.pop() {
+                return e;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!(
+            "no {kind} entry for {confirm_id} in {secs} s: {:?}",
+            self.entries()
+        );
+    }
+
+    /// The lines a dialog showed, without the marks it adds itself.
+    pub fn lines(entry: &serde_json::Value) -> Vec<String> {
+        entry["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| without_marks(l.as_str().unwrap()))
+            .collect()
+    }
+}

@@ -5,6 +5,12 @@
 //!
 //! Each test starts a daemon of its own (in this process, its API served on a socket in a
 //! temporary home) and stops it at the end.
+//!
+//! With `PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>` the daemon launches the fork, whose
+//! confirmation dialog is a responder beside the API's subscribers. The `fork_*` tests are
+//! for that configuration only (skipped in stock mode): the browser's test hooks
+//! (`PEGBOARD_TEST_DIALOG_*`, in the browser's own environment) press its buttons and log
+//! what it showed. The tests that need nobody to answer are for stock mode only.
 
 mod common;
 
@@ -44,6 +50,8 @@ impl Drop for EnvVar {
 }
 
 struct Rig {
+    /// The daemon launched the Pegboard fork (which has a confirmation dialog).
+    fork: bool,
     daemon: Arc<Daemon>,
     env: common::Env,
     fixture: common::Fixture,
@@ -62,15 +70,26 @@ struct Session {
 /// The daemon, its API on its socket, and the test pages. `timeout_ms` shortens the time a
 /// person has (the test hook).
 async fn rig(timeout_ms: Option<u64>) -> Rig {
+    rig_with(timeout_ms, Vec::new()).await
+}
+
+/// The rig with the variables `vars` set until it finishes (the browser it launches keeps
+/// them).
+async fn rig_with(timeout_ms: Option<u64>, extra: Vec<EnvVar>) -> Rig {
     // Zero (or none) is the full time a person has; not inherited from the caller.
-    let vars = vec![
+    let mut vars = vec![
         EnvVar::set("PEGBOARD_TEST_HOOKS", "1"),
         EnvVar::set(
             "PEGBOARD_TEST_CONFIRM_TIMEOUT_MS",
             &timeout_ms.unwrap_or(0).to_string(),
         ),
     ];
+    vars.extend(extra);
     let env = common::env();
+    let fork = matches!(
+        env.cfg,
+        pegboard_core::browser::BrowserConfig::ForkLaunched { .. }
+    );
     let fixture = common::fixture().await;
     let daemon = Daemon::start(env.paths.clone(), DaemonStart::Launch(env.cfg.clone()))
         .await
@@ -86,6 +105,7 @@ async fn rig(timeout_ms: Option<u64>) -> Rig {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     Rig {
+        fork,
         daemon,
         env,
         fixture,
@@ -108,6 +128,22 @@ impl Rig {
 
     async fn session(&self) -> Session {
         self.session_at("/counter").await
+    }
+
+    /// A session named `name` in the agent profile `profile`, at `path`.
+    async fn session_named(&self, path: &str, name: &str, profile: &str) -> Session {
+        let r = self
+            .call(
+                "session.create",
+                json!({ "url": format!("{}{path}", self.fixture.origin), "name": name,
+                        "profile": profile }),
+            )
+            .await;
+        let info = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
+        Session {
+            id: info["id"].as_str().unwrap().to_string(),
+            token: info["token"].as_str().unwrap().to_string(),
+        }
     }
 
     async fn session_at(&self, path: &str) -> Session {
@@ -408,6 +444,11 @@ async fn state_denied_by_api_is_denied_with_reason_denied() {
 #[ignore]
 async fn no_responder_denies_at_once_with_the_browser_hint() {
     let rig = rig(None).await;
+    if rig.fork {
+        eprintln!("skipped: stock only (the fork's dialog is a responder)");
+        rig.finish().await;
+        return;
+    }
     let s = rig.session().await;
     let started = Instant::now();
     let r = rig
@@ -895,6 +936,11 @@ async fn upload_shows_real_paths_and_uploads_the_bytes_shown() {
 #[ignore]
 async fn an_upload_with_nobody_to_answer_is_denied_before_its_files_are_read() {
     let rig = rig(None).await;
+    if rig.fork {
+        eprintln!("skipped: stock only (the fork's dialog is a responder)");
+        rig.finish().await;
+        return;
+    }
     let s = rig.session_at("/upload").await;
     let r = rig
         .exec(&s, &["upload", "#f", "/no/such/file.txt"])
@@ -1097,5 +1143,229 @@ async fn an_upload_through_a_ref_into_an_iframe_is_refused() {
     assert!(failed, "the file went into the frame: {r:?}");
     let after = rig.ok(&s, &["snapshot"]).await.to_string();
     assert!(!after.contains("framed.txt"), "{after}");
+    rig.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fork's confirmation dialog (phase 3b task 7). Answers come from the browser's answer
+// hook, by session name; nobody subscribes to `confirm.*`, so the dialog is the only responder.
+// ---------------------------------------------------------------------------------------------
+
+/// A rig whose daemon launches the fork with the dialog log and `answer`
+/// (`PEGBOARD_TEST_DIALOG_ANSWER`) in the browser's environment; `None` in stock mode (the
+/// test is skipped).
+async fn fork_rig(
+    answer: &str,
+    timeout_ms: Option<u64>,
+    extra: Vec<EnvVar>,
+) -> Option<(Rig, common::DialogLog)> {
+    let log = common::DialogLog::new();
+    let mut vars = vec![
+        EnvVar::set("PEGBOARD_TEST_DIALOG_LOG", log.path.to_str().unwrap()),
+        EnvVar::set("PEGBOARD_TEST_DIALOG_ANSWER", answer),
+    ];
+    vars.extend(extra);
+    let rig = rig_with(timeout_ms, vars).await;
+    if !rig.fork {
+        eprintln!("skipped: needs PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>");
+        rig.finish().await;
+        return None;
+    }
+    Some((rig, log))
+}
+
+fn confirm_id_of(r: &Response) -> String {
+    r.error.as_ref().unwrap().data.as_ref().unwrap()["confirmId"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The `confirm` entries of the log for the session `id`.
+fn dialogs_of(log: &common::DialogLog, id: &str) -> Vec<Value> {
+    log.entries()
+        .into_iter()
+        .filter(|e| e["kind"] == "confirm" && e["sessionId"] == id)
+        .collect()
+}
+
+/// An upload asks in the session's own agent window: the dialog shows the session's ID, its
+/// name escaped, its profile, the real path of the file and the page's origin; the answer
+/// (deny, by the browser) is the command's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn dialog_appears_in_the_sessions_agent_window() {
+    let Some((rig, log)) = fork_rig("*=deny", None, Vec::new()).await else {
+        return;
+    };
+    let s = rig
+        .session_named("/upload", "show\u{202E}gpj.exe", "dlg")
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let real_dir = tmp.path().canonicalize().unwrap().join("real");
+    std::fs::create_dir(&real_dir).unwrap();
+    std::fs::write(real_dir.join("a.txt"), "first").unwrap();
+    std::os::unix::fs::symlink(&real_dir, tmp.path().join("via")).unwrap();
+    let given = tmp.path().join("via/a.txt").display().to_string();
+    let real = real_dir.join("a.txt").display().to_string();
+    let r = rig.exec(&s, &["upload", "#f", &given]).await.unwrap();
+    assert_eq!(reason(&r), "denied");
+    let id = confirm_id_of(&r);
+    let e = log.wait("confirm", &id, 5).await;
+    assert_eq!(e["profile"], "PegboardAgent-dlg", "{e}");
+    assert_eq!(e["sessionId"], s.id, "{e}");
+    assert_eq!((&e["pressed"], &e["by"]), (&json!("deny"), &json!("hook")));
+    let lines = common::DialogLog::lines(&e);
+    assert!(
+        lines[1].contains(&s.id) && lines[1].contains("PegboardAgent-dlg"),
+        "{lines:?}"
+    );
+    assert!(lines[1].contains("show\\u{202e}gpj.exe"), "{lines:?}");
+    assert!(lines.iter().all(|l| !l.contains('\u{202E}')), "{lines:?}");
+    assert!(lines.contains(&real), "the real path: {lines:?}");
+    assert!(lines.contains(&rig.fixture.origin), "{lines:?}");
+    assert_eq!(e["buttons"], json!(["허용", "거부"]), "no upload directory");
+    assert_eq!(rig.copies_left(&s), 0);
+    let entry = rig
+        .entries(&s)
+        .into_iter()
+        .find(|e| e.command == "upload")
+        .unwrap();
+    assert_eq!(
+        entry.confirm.map(|c| (c.outcome, c.by)),
+        Some((
+            pegboard_protocol::ConfirmOutcome::Denied,
+            Some(pegboard_protocol::ConfirmBy::Browser)
+        ))
+    );
+    rig.finish().await;
+}
+
+/// 허용 runs the command, 거부 refuses it with the reason `denied`; both by the browser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn approve_runs_and_deny_denies_with_reason_denied() {
+    let Some((rig, log)) = fork_rig("yes=approve,no=deny", None, Vec::new()).await else {
+        return;
+    };
+    let yes = rig.session_named("/counter", "yes", "work").await;
+    let no = rig.session_named("/counter", "no", "work").await;
+    let out = rig
+        .ok(&yes, &["storage", "local", "set", "pegdlg", "y"])
+        .await;
+    assert_eq!(out["confirmed"], json!({ "by": "browser" }), "{out}");
+    assert_eq!(rig.local_storage(&yes, "pegdlg").await, "y");
+    let r = rig
+        .exec(&no, &["storage", "local", "set", "pegdlgno", "n"])
+        .await
+        .unwrap();
+    assert_eq!(reason(&r), "denied");
+    assert_eq!(rig.local_storage(&no, "pegdlgno").await, Value::Null);
+    use pegboard_protocol::{ConfirmBy, ConfirmOutcome};
+    for (s, outcome) in [
+        (&yes, ConfirmOutcome::Approved),
+        (&no, ConfirmOutcome::Denied),
+    ] {
+        let entry = rig
+            .entries(s)
+            .into_iter()
+            .find(|e| e.command == "storage")
+            .unwrap();
+        assert_eq!(
+            entry.confirm.map(|c| (c.outcome, c.by)),
+            Some((outcome, Some(ConfirmBy::Browser)))
+        );
+        assert_eq!(dialogs_of(&log, &s.id).len(), 1);
+    }
+    let _ = rig
+        .ok(&yes, &["eval", "localStorage.removeItem('pegdlg')"])
+        .await;
+    rig.finish().await;
+}
+
+/// 이 세션에서 계속 허용: the command runs, and the session's next state command runs without a
+/// dialog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn allow_for_session_skips_the_next_dialog() {
+    let Some((rig, log)) = fork_rig("keep=allowForSession", None, Vec::new()).await else {
+        return;
+    };
+    let s = rig.session_named("/counter", "keep", "work").await;
+    let out = rig
+        .ok(&s, &["storage", "local", "set", "pegkeep", "1"])
+        .await;
+    assert_eq!(out["confirmed"], json!({ "by": "browser" }), "{out}");
+    let out = rig
+        .ok(&s, &["storage", "local", "set", "pegkeep", "2"])
+        .await;
+    assert_eq!(out["confirmed"], json!({ "by": "session" }), "{out}");
+    let dialogs = dialogs_of(&log, &s.id);
+    assert_eq!(dialogs.len(), 1, "{dialogs:?}");
+    assert_eq!(
+        dialogs[0]["buttons"],
+        json!(["허용", "거부", "이 세션에서 계속 허용"])
+    );
+    assert_eq!(dialogs[0]["pressed"], "allowForSession");
+    let _ = rig
+        .ok(&s, &["eval", "localStorage.removeItem('pegkeep')"])
+        .await;
+    rig.finish().await;
+}
+
+/// Two sessions in two agent profiles ask at once: each dialog is in its own session's window
+/// and answers only its own command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn two_sessions_get_their_own_dialogs() {
+    let Some((rig, log)) = fork_rig("sa=approve,sb=deny", None, Vec::new()).await else {
+        return;
+    };
+    let a = rig.session_named("/counter", "sa", "pa").await;
+    let b = rig.session_named("/counter", "sb", "pb").await;
+    let run_a = rig.exec(&a, &["storage", "local", "set", "pegtwo", "a"]);
+    let run_b = rig.exec(&b, &["storage", "local", "set", "pegtwo", "b"]);
+    let (ra, rb) = (run_a.await.unwrap(), run_b.await.unwrap());
+    assert!(ra.error.is_none(), "{:?}", ra.error);
+    assert_eq!(reason(&rb), "denied");
+    assert_eq!(rig.local_storage(&a, "pegtwo").await, "a");
+    for (s, profile, pressed) in [
+        (&a, "PegboardAgent-pa", "approve"),
+        (&b, "PegboardAgent-pb", "deny"),
+    ] {
+        let d = dialogs_of(&log, &s.id);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0]["profile"], profile, "{d:?}");
+        assert_eq!(d[0]["pressed"], pressed, "{d:?}");
+        assert!(common::DialogLog::lines(&d[0])[1].contains(&s.id));
+    }
+    let _ = rig
+        .ok(&a, &["eval", "localStorage.removeItem('pegtwo')"])
+        .await;
+    rig.finish().await;
+}
+
+/// Without `PEGBOARD_TEST_HOOKS` in the browser's own environment (the daemon still has it),
+/// the answer hook does nothing and logs nothing: the dialog waits and the command times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn dialog_hooks_need_test_hooks() {
+    let Some((rig, log)) = fork_rig(
+        "*=approve",
+        Some(3000),
+        vec![EnvVar::set("PEGBOARD_TEST_BROWSER_NO_HOOKS", "1")],
+    )
+    .await
+    else {
+        return;
+    };
+    let s = rig.session_named("/counter", "hookless", "work").await;
+    let r = rig
+        .exec(&s, &["storage", "local", "set", "peghook", "x"])
+        .await
+        .unwrap();
+    assert_eq!(reason(&r), "timed_out");
+    assert_eq!(rig.local_storage(&s, "peghook").await, Value::Null);
+    assert!(log.entries().is_empty(), "{:?}", log.entries());
     rig.finish().await;
 }

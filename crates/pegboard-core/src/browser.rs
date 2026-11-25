@@ -53,6 +53,13 @@ pub fn test_fork_binary() -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
+/// Test-only: `PEGBOARD_TEST_BROWSER_NO_HOOKS` (with test hooks on) launches the fork without
+/// `PEGBOARD_TEST_HOOKS` in its environment, so the browser's own test hooks (its dialogs'
+/// answer hook) are off while the daemon's are on.
+fn test_browser_without_hooks() -> bool {
+    crate::testenv::var("PEGBOARD_TEST_BROWSER_NO_HOOKS").is_some()
+}
+
 /// The executable of `binary`: itself, or the one inside it when it is an app bundle.
 pub fn fork_executable(binary: &Path) -> PathBuf {
     if binary.is_dir() {
@@ -324,6 +331,9 @@ impl Browser {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        if test_browser_without_hooks() {
+            cmd.env_remove("PEGBOARD_TEST_HOOKS");
+        }
         // SAFETY: the closure only makes async-signal-safe system calls.
         unsafe { cmd.pre_exec(pipes.child_setup()) };
         let mut child = cmd
