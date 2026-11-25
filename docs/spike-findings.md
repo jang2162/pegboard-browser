@@ -1206,4 +1206,4 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 | 순정: `clipboard_keys_reach_only_their_own_tab` | 1 passed |
 | 수정 후 포크: `e2e_session` | 15 passed |
 | 수정 후 포크: `e2e_domain` | 11 passed |
-| 수정 후 포크·순정: `e2e_clipboard` 전체 | 확인 못 함. 실행 도중 기기 화면이 잠겨(`CGSSessionScreenIsLocked`, 앞 앱 `loginwindow`) 두 구성 모두 같은 11개가 `the profile did not become the default context`로 실패했다(9 passed, 11 failed). 화면을 푼 뒤 다시 돌려야 한다 |
+| 수정 후 포크·순정: `e2e_clipboard` 전체 | 첫 실행은 도중에 기기 화면이 잠겨(`CGSSessionScreenIsLocked`, 앞 앱 `loginwindow`) 두 구성 모두 같은 11개가 `the profile did not become the default context`로 실패했다. 화면을 푼 뒤 다시 돌려 **포크 20 passed, 순정 20 passed** (2026-11-25) |

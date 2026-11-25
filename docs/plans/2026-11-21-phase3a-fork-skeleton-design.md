@@ -250,7 +250,7 @@ BrowserLink (물리 연결 하나: 파이프 또는 웹소켓)
 - **About 화면과 메뉴의 문자열은 아직 Chromium이고 아이콘은 임시다**(3b).
 - **에이전트 프로필이 프로필 메뉴와 목록에 보인다.** 프로필이 여럿이면 다음 시작 때 프로필 선택 화면이 뜰 수 있다 [미확인].
 - **pegboard 홈과 브라우저 사용자 데이터가 같은 디렉터리다.** 제품 실행에서 데몬의 기본 홈(`~/Library/Application Support/Pegboard`: `sessions/`, `recordings/`, `config.toml`, 소켓)과 포크의 기본 사용자 데이터 디렉터리가 같다. 이름은 겹치지 않지만 함께 써서 생기는 영향은 보지 않았다 [미확인]. 3c 전에 나눌지 정한다.
-- ~~`Meta+v`/`Meta+c`가 창의 활성 탭에 갈 수 있다~~ **닫음(2026-11-25)**: 세션 사이 누출은 없었다(포크·순정 실측, `clipboard_keys_reach_only_their_own_tab`로 고정). CDP 키는 브라우저 단축키를 거치지 않고 대상 탭에만 간다. 포크에서만 실패한 원인은 Chromium 156의 맥 클립보드 순서 번호 버그(페이지가 쓴 뒤 첫 붙여넣기를 버림, 157에서 고침)였고 `clipboard-mac-seqno.patch`로 들여왔다. 157 이상으로 올리면 이 패치를 지운다. 수정 후 `e2e_clipboard` 전체 실행(포크·순정)은 시험 기기 화면 잠금으로 아직 확인하지 못했다. spike-findings.md "3a 작업 10 후속".
+- ~~`Meta+v`/`Meta+c`가 창의 활성 탭에 갈 수 있다~~ **닫음(2026-11-25)**: 세션 사이 누출은 없었다(포크·순정 실측, `clipboard_keys_reach_only_their_own_tab`로 고정). CDP 키는 브라우저 단축키를 거치지 않고 대상 탭에만 간다. 포크에서만 실패한 원인은 Chromium 156의 맥 클립보드 순서 번호 버그(페이지가 쓴 뒤 첫 붙여넣기를 버림, 157에서 고침)였고 `clipboard-mac-seqno.patch`로 들여왔다. 157 이상으로 올리면 이 패치를 지운다. 수정 후 `e2e_clipboard` 전체 실행은 포크·순정 모두 20 passed. spike-findings.md "3a 작업 10 후속".
 - **도메인 판 `createTab`은 주소로 바로 열어** 녹화의 탐색 기록에 첫 페이지의 `navigated` 줄이 없다(`created` 줄에 주소는 있다). 확장 판처럼 `about:blank` 뒤 탐색으로 맞출지, 시험을 고칠지 정한다.
 
 시험에 남은 것
