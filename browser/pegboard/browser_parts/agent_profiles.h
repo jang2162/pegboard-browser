@@ -8,13 +8,11 @@
 #include <string>
 
 #include "base/files/file_path.h"
-#include "base/memory/weak_ptr.h"
 #include "base/scoped_observation.h"
 #include "chrome/browser/profiles/profile_attributes_storage.h"
 #include "chrome/browser/profiles/profile_attributes_storage_observer.h"
 #include "chrome/browser/ui/browser_window/public/browser_collection.h"
 #include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
-#include "components/prefs/pref_change_registrar.h"
 #include "third_party/skia/include/core/SkColor.h"
 
 class Profile;
@@ -40,9 +38,12 @@ namespace pegboard {
 //   availability at startup (local state, a policy's pref) is "disabled"
 //   while there is at most one person's profile; with two or more it is the
 //   upstream default again. Only the default: a policy wins.
-// - An agent profile is never the last used one (the profile a launch or a
-//   Dock click opens), and is taken out of the profiles the next launch
-//   restores: the last used profile goes back to a person's.
+// - A launch does not open an agent profile from the last run: at start the
+//   last used profile goes back to a person's when it names an agent one, and
+//   agent profiles are taken out of the profiles a launch restores. (Only at
+//   start: while the browser runs, the last used profile is what DevTools calls
+//   the default browser context, which the daemon makes the agent profile to
+//   set its download policy.)
 // - Their frame wears one reserved color (a user color theme of the agent
 //   profile, kAgentThemeColor) and their normal windows the title
 //   kAgentWindowTitle (the window's user title, as "Name window").
@@ -81,19 +82,14 @@ class AgentProfiles : public ProfileAttributesStorage::Observer,
   void OmitIfAgent(const base::FilePath& path);
   void UpdatePickerDefault();
   // The last used profile, back to a person's when it names an agent one.
-  void KeepLastUsedHuman();
-  void OnLastUsedChanged();
+  void ForgetAgentAsLastUsed();
 
   base::FilePath user_data_dir_;
-  // The person's profile the last used one goes back to (a directory name).
-  std::string last_human_;
-  PrefChangeRegistrar local_state_registrar_;
   base::ScopedObservation<ProfileAttributesStorage,
                           ProfileAttributesStorage::Observer>
       storage_observation_{this};
   base::ScopedObservation<BrowserCollection, BrowserCollectionObserver>
       browsers_observation_{this};
-  base::WeakPtrFactory<AgentProfiles> weak_factory_{this};
 };
 
 }  // namespace pegboard

@@ -6,8 +6,6 @@
 
 #include <utility>
 
-#include "base/functional/bind.h"
-#include "base/task/single_thread_task_runner.h"
 #include "base/values.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/profiles/profile.h"
@@ -58,7 +56,7 @@ void AgentProfiles::Start() {
   storage_observation_.Observe(&storage);
   UpdatePickerDefault();
 
-  // The profiles the next launch restores (with "continue where you left
+  // The profiles this launch restores (with "continue where you left
   // off", or after a crash): no agent profile among them. The daemon closes
   // agent windows anyway (F11); they would only flash.
   if (local_state->HasPrefPath(prefs::kProfilesLastActive)) {
@@ -67,20 +65,13 @@ void AgentProfiles::Start() {
       return name.is_string() && IsAgentDirectoryName(name.GetString());
     });
   }
-  KeepLastUsedHuman();
-  local_state_registrar_.Init(local_state);
-  local_state_registrar_.Add(
-      prefs::kProfileLastUsed,
-      base::BindRepeating(&AgentProfiles::OnLastUsedChanged,
-                          base::Unretained(this)));
+  ForgetAgentAsLastUsed();
 
   browsers_observation_.Observe(GlobalBrowserCollection::GetInstance());
 }
 
 void AgentProfiles::Stop() {
-  weak_factory_.InvalidateWeakPtrs();
   browsers_observation_.Reset();
-  local_state_registrar_.RemoveAll();
   storage_observation_.Reset();
 }
 
@@ -119,35 +110,23 @@ void AgentProfiles::UpdatePickerDefault() {
       base::Value(static_cast<int>(availability)));
 }
 
-void AgentProfiles::KeepLastUsedHuman() {
+void AgentProfiles::ForgetAgentAsLastUsed() {
   PrefService* local_state = g_browser_process->local_state();
   ProfileAttributesStorage* storage = Storage();
-  if (!local_state || !storage) {
+  if (!local_state || !storage ||
+      !IsAgentDirectoryName(local_state->GetString(prefs::kProfileLastUsed))) {
     return;
   }
-  const std::string last = local_state->GetString(prefs::kProfileLastUsed);
-  if (!IsAgentDirectoryName(last)) {
-    last_human_ = last;
-    return;
-  }
-  // Back to the person's profile used before, if it is still there; else the
-  // person's profile active most recently; else the default.
-  auto is_person = [this, storage](const std::string& dir) {
-    if (dir.empty() || IsAgentDirectoryName(dir)) {
-      return false;
-    }
-    return storage->GetProfileAttributesWithPath(
-               user_data_dir_.AppendASCII(dir)) != nullptr;
-  };
-  std::string human = is_person(last_human_) ? last_human_ : std::string();
-  if (human.empty()) {
-    base::Time latest;
-    for (ProfileAttributesEntry* entry : storage->GetAllProfilesAttributes()) {
-      const std::string dir = entry->GetPath().BaseName().AsUTF8Unsafe();
-      if (is_person(dir) && (human.empty() || entry->GetActiveTime() > latest)) {
-        human = dir;
-        latest = entry->GetActiveTime();
-      }
+  // The person's profile active most recently, else the default one.
+  std::string human;
+  base::Time latest;
+  for (ProfileAttributesEntry* entry : storage->GetAllProfilesAttributes()) {
+    const std::string dir = entry->GetPath().BaseName().AsUTF8Unsafe();
+    if (entry->GetPath().DirName() == user_data_dir_ &&
+        !IsAgentDirectoryName(dir) &&
+        (human.empty() || entry->GetActiveTime() > latest)) {
+      human = dir;
+      latest = entry->GetActiveTime();
     }
   }
   if (human.empty()) {
@@ -155,14 +134,6 @@ void AgentProfiles::KeepLastUsedHuman() {
   } else {
     local_state->SetString(prefs::kProfileLastUsed, human);
   }
-  last_human_ = human;
-}
-
-void AgentProfiles::OnLastUsedChanged() {
-  // Not from inside the profile manager's update.
-  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
-      FROM_HERE, base::BindOnce(&AgentProfiles::KeepLastUsedHuman,
-                                weak_factory_.GetWeakPtr()));
 }
 
 void AgentProfiles::OnProfileAdded(const base::FilePath& profile_path) {

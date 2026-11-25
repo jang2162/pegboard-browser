@@ -513,7 +513,7 @@ base::TimeDelta AnswerAfter();                      // PEGBOARD_TEST_DIALOG_ANSW
 - **구현에서 정한 것** (처음 제안은 위 `MarkAgentProfile`을 도메인 핸들러에):
   - 표시와 숨기기는 도메인이 아니라 `//pegboard/browser_parts`의 `AgentProfiles`가 브라우저 시작부터 한다(데몬이 없어도). 생략(`SetIsOmitted`)은 저장되지 않는 메모리 값이고, 시작 때 선택 화면 판정은 도메인이 생기기 전이라서다. 그래서 작업 9의 `MainParts`를 이 작업에서 만들었다(부트스트랩 패치는 포함 경로, 클래스 이름, 의존 이름만 바뀌고 줄 수 같음). 에이전트 규칙은 `//pegboard/common/agent_profile.h` 하나를 핸들러와 같이 쓴다.
   - 생략이 선택 화면 판정(`GetNumberOfProfiles`, 생략 포함)을 덮지 않아서 설계 4.6의 대안: Local State `browser.profile_picker_availability_on_startup`의 기본값을 사람 프로필이 하나 이하면 1(사용 안 함), 둘 이상이면 0.
-  - `agent_windows_from_the_last_run`은 다시 열림을 보였다(`profile.last_used`). `//pegboard` 안에서 고쳤고 시험은 단언한다.
+  - `agent_windows_from_the_last_run`은 다시 열림을 보였다(`profile.last_used`). `//pegboard` 안에서 시작할 때만 고친다(실행 중의 `profile.last_used`는 DevTools의 기본 컨텍스트라 데몬의 다운로드 정책이 쓴다). 시험은 단언한다.
   - 테마는 `PostProfileInit`, 창 제목은 그 프로필의 모든 일반 창(`OnBrowserCreated`). 시험 훅 기록은 `{"kind":"window","profile","userTitle"}`(모든 일반 창). 생략은 `chrome://local-state`가 아니라 `chrome://profile-internals`로 본다(생략이 저장되지 않으므로).
 
 - [ ] **Step 1: 시험을 쓴다** (`e2e_domain.rs`, `#[ignore]`, 포크. 테마 값은 그 프로필 탭을 루트 세션에서 `chrome://prefs-internals`로 보내 읽고, 생략은 `chrome://local-state`의 프로필 항목으로 본다. 156의 키 이름은 트리에서 확인해 단언에 쓴다. 창 제목은 시험 훅 기록 `{"kind":"agent_window","title"}`으로 본다).
