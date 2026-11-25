@@ -1258,7 +1258,8 @@ async fn confirmation_limits_are_enforced() {
     log.wait("confirm_shown", &cid(2), 5).await;
     // A free place again.
     request(&c, &p17).await.unwrap();
-    for n in 2..=17 {
+    // The queued ones first (newest first), so none of them comes up.
+    for n in (2..=17).rev() {
         cancel(&c, &cid(n)).await.unwrap();
     }
     // A queued one that is cancelled was never shown and has no end line.
@@ -1649,8 +1650,8 @@ async fn a_daemon_restart_closes_open_dialogs() {
 
 /// The dialog does not take the keyboard focus or activate the app: the key window and
 /// whether the app is active are the same before it shows, right after and 200 ms later.
-/// With the app active and the person's window key, that window stays key; with the app in
-/// the background, it stays there and the Dock icon bounces once (`attention`).
+/// With the app active and the person's window key, that window stays key; with another app
+/// in front, Pegboard stays in the background and its Dock icon bounces once (`attention`).
 #[tokio::test]
 #[ignore]
 async fn the_dialog_does_not_take_focus() {
@@ -1663,23 +1664,29 @@ async fn the_dialog_does_not_take_focus() {
         .unwrap()
         .to_string();
     let (ctx, tab) = agent_tab(&c, AGENT).await;
-    let mut n = 0;
-    for (premise, foreground) in [("background", false), ("person's window", true)] {
-        if foreground {
-            // The person's window to the front and key (activating the app).
+    let osascript = |script: String| async move {
+        let _ = tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status()
+            .await;
+    };
+    for (n, front) in [(1, true), (2, false)] {
+        if front {
+            // The person's window to the front and key, the app active.
             common::activate_any_target_in(&c, &default).await;
-            let _ = tokio::process::Command::new("osascript")
-                .arg("-e")
-                .arg(format!(
-                    "tell application \"System Events\" to set frontmost of (first process \
-                     whose unix id is {}) to true",
-                    f.pid()
-                ))
-                .status()
-                .await;
-            tokio::time::sleep(Duration::from_millis(800)).await;
+            osascript(format!(
+                "tell application \"System Events\" to set frontmost of (first process \
+                 whose unix id is {}) to true",
+                f.pid()
+            ))
+            .await;
+            common::activate_any_target_in(&c, &default).await;
+        } else {
+            // Another app in front.
+            osascript("tell application \"Finder\" to activate".to_string()).await;
         }
-        n += 1;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         let id = cid(n);
         request(&c, &ask(&id, &ctx, AGENT, &[&tab], "n"))
             .await
@@ -1688,32 +1695,25 @@ async fn the_dialog_does_not_take_focus() {
         tokio::time::sleep(Duration::from_millis(600)).await;
         cancel(&c, &id).await.unwrap();
         let e = log.wait("confirm", &id, 5).await;
-        eprintln!("{premise}: {e}");
-        let key = [
-            &e["keyWindowProfileBefore"],
-            &e["keyWindowProfileAt0"],
-            &e["keyWindowProfileAt200ms"],
-        ];
-        let active = [
-            &e["appActiveBefore"],
-            &e["appActiveAt0"],
-            &e["appActiveAt200ms"],
-        ];
-        assert!(
-            key.iter().all(|k| *k == key[0]),
-            "{premise}: the key window changed: {e}"
-        );
-        assert!(
-            active.iter().all(|a| *a == active[0]),
-            "{premise}: activation changed: {e}"
-        );
-        assert_eq!(e["attention"], json!(active[0] == &json!(false)), "{e}");
-        if active[0] == &json!(true) {
-            assert_eq!(key[0], &json!("Default"), "{premise}: {e}");
+        eprintln!("front={front}: {e}");
+        let want = if front {
+            json!(["Default", "Default", "Default", true, true, true, false])
         } else {
-            assert_eq!(key[0], &json!("none"), "{premise}: {e}");
-            assert!(!foreground, "the app did not come to the front: {e}");
-        }
+            json!(["none", "none", "none", false, false, false, true])
+        };
+        assert_eq!(
+            json!([
+                e["keyWindowProfileBefore"],
+                e["keyWindowProfileAt0"],
+                e["keyWindowProfileAt200ms"],
+                e["appActiveBefore"],
+                e["appActiveAt0"],
+                e["appActiveAt200ms"],
+                e["attention"],
+            ]),
+            want,
+            "front={front}: {e}"
+        );
     }
 }
 
