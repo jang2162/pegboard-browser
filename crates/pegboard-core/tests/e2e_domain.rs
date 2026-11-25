@@ -73,7 +73,19 @@ impl Fork {
         answer: &str,
         after_ms: Option<u64>,
     ) -> Option<(Fork, common::DialogLog)> {
+        Fork::with_dialogs_and(answer, after_ms, None).await
+    }
+
+    /// `with_dialogs`, and clicks coming to each dialog `input_at` ms after it shows
+    /// (`PEGBOARD_TEST_DIALOG_INPUT_AT_MS`, comma-separated).
+    async fn with_dialogs_and(
+        answer: &str,
+        after_ms: Option<u64>,
+        input_at: Option<&str>,
+    ) -> Option<(Fork, common::DialogLog)> {
         let log = common::DialogLog::new();
+        let _input =
+            common::EnvVar::set("PEGBOARD_TEST_DIALOG_INPUT_AT_MS", input_at.unwrap_or(""));
         let _vars = [
             common::EnvVar::set("PEGBOARD_TEST_DIALOG_LOG", log.path.to_str().unwrap()),
             common::EnvVar::set("PEGBOARD_TEST_DIALOG_ANSWER", answer),
@@ -1302,8 +1314,9 @@ async fn dialog_shows_every_detail_in_order() {
     let e = log.wait("confirm", &cid(1), 5).await;
     let lines = common::DialogLog::lines(&e);
     assert_eq!(lines[0], "에이전트가 확인을 요청합니다", "{lines:?}");
-    assert_eq!(lines[1], "세션 «build» (s_0123abcd) · 프로필 PegboardAgent");
-    assert_eq!(lines[2], "파일 1개를 https://a.test 에 올리려 합니다");
+    assert_eq!(lines[1], "세션 s_0123abcd · 프로필 PegboardAgent");
+    assert_eq!(lines[2], "에이전트가 붙인 세션 이름: «build»");
+    assert_eq!(lines[3], "파일 1개를 https://a.test 에 올리려 합니다");
     let rows: Vec<String> = details
         .iter()
         .flat_map(|d| {
@@ -1314,14 +1327,14 @@ async fn dialog_shows_every_detail_in_order() {
         })
         .collect();
     assert_eq!(
-        &lines[3..3 + rows.len()],
+        &lines[4..4 + rows.len()],
         &rows[..],
         "the rows, in order, whole"
     );
-    assert_eq!(lines[3 + rows.len()], "60초 안에 답하지 않으면 거부됩니다");
-    assert_eq!(lines.len(), 4 + rows.len());
+    assert_eq!(lines[4 + rows.len()], "60초 안에 답하지 않으면 거부됩니다");
+    assert_eq!(lines.len(), 5 + rows.len());
     // The path is shown left to right: a mark after each '/' of it.
-    let shown_path = e["lines"][3 + 5].as_str().unwrap();
+    let shown_path = e["lines"][4 + 5].as_str().unwrap();
     assert_eq!(
         shown_path.matches("/\u{200E}").count(),
         path.matches('/').count(),
@@ -1368,10 +1381,10 @@ async fn bidi_text_is_shown_escaped() {
     cancel(&c, &cid(1)).await.unwrap();
     let e = log.wait("confirm", &cid(1), 5).await;
     let lines = common::DialogLog::lines(&e);
-    assert!(lines[1].contains("x\\u{202e}gpj.exe"), "{lines:?}");
-    assert_eq!(lines[3], "키\\u{2066}");
-    assert_eq!(lines[4], "a\\u{200b}b\\u{7}c");
-    assert_eq!(lines[6], "/a/\\u{202e}fdp.exe");
+    assert!(lines[2].contains("x\\u{202e}gpj.exe"), "{lines:?}");
+    assert_eq!(lines[4], "키\\u{2066}");
+    assert_eq!(lines[5], "a\\u{200b}b\\u{7}c");
+    assert_eq!(lines[7], "/a/\\u{202e}fdp.exe");
     // Of the format characters only the dialog's own marks are left.
     for l in &lines {
         assert!(
@@ -1767,4 +1780,158 @@ async fn proxy_refuses_pegboard_confirmation_methods() {
     cancel(owner, &id).await.unwrap();
     assert_eq!(log.wait("confirm", &id, 5).await["closed"], "cancelled");
     fx.shutdown().await;
+}
+
+/// Closing another of the session's tabs (not the first) denies too.
+#[tokio::test]
+#[ignore]
+async fn closing_another_listed_tab_denies() {
+    let Some((f, log)) = Fork::with_dialogs("*=none", None).await else {
+        return;
+    };
+    let c = f.control().await;
+    let mut events = c.events();
+    let (ctx, first) = agent_tab(&c, AGENT).await;
+    let (_, second) = agent_tab(&c, AGENT).await;
+    request(&c, &ask(&cid(1), &ctx, AGENT, &[&first, &second], "n"))
+        .await
+        .unwrap();
+    log.wait("confirm_shown", &cid(1), 5).await;
+    c.send(
+        "Pegboard.closeTargets",
+        json!({ "targetIds": [&second] }),
+        None,
+    )
+    .await
+    .unwrap();
+    let got = answers_within(&mut events, 3000).await;
+    assert_eq!(
+        got,
+        vec![json!({ "sessionId": null, "params": { "confirmId": cid(1), "answer": "deny" } })]
+    );
+    assert_eq!(
+        log.wait("confirm", &cid(1), 5).await["closed"],
+        "tab_closed"
+    );
+}
+
+/// The window closing (the dialog has no tab to watch here) denies the dialog up there and
+/// the one waiting behind it, once each.
+#[tokio::test]
+#[ignore]
+async fn closing_the_window_denies_shown_and_queued() {
+    let Some((f, log)) = Fork::with_dialogs("*=none", None).await else {
+        return;
+    };
+    let c = f.control().await;
+    let mut events = c.events();
+    let dir = "PegboardAgent-win";
+    let (ctx, _) = agent_tab(&c, dir).await;
+    request(&c, &ask(&cid(1), &ctx, dir, &[], "a"))
+        .await
+        .unwrap();
+    request(&c, &ask(&cid(2), &ctx, dir, &[], "b"))
+        .await
+        .unwrap();
+    log.wait("confirm_shown", &cid(1), 5).await;
+    let all = pages_in(&c, &ctx).await;
+    c.send("Pegboard.closeTargets", json!({ "targetIds": all }), None)
+        .await
+        .unwrap();
+    let mut got = answers_within(&mut events, 3000).await;
+    got.sort_by_key(|v| v["params"]["confirmId"].as_str().unwrap().to_string());
+    assert_eq!(
+        got,
+        vec![
+            json!({ "sessionId": null, "params": { "confirmId": cid(1), "answer": "deny" } }),
+            json!({ "sessionId": null, "params": { "confirmId": cid(2), "answer": "deny" } }),
+        ]
+    );
+    let e = log.wait("confirm", &cid(1), 5).await;
+    assert_eq!(
+        (&e["pressed"], &e["closed"]),
+        (&json!("deny"), &json!("window_closed"))
+    );
+    assert!(
+        log.of("confirm_shown", &cid(2)).is_empty(),
+        "{:?}",
+        log.entries()
+    );
+}
+
+/// A press right after the buttons are enabled (1.2 s: the lock is over, its 500 ms after
+/// are not) is ignored too.
+#[tokio::test]
+#[ignore]
+async fn presses_right_at_unlock_are_ignored() {
+    let Some((f, log)) = Fork::with_dialogs("*=approve", Some(1200)).await else {
+        return;
+    };
+    let c = f.control().await;
+    let mut events = c.events();
+    let (ctx, tab) = agent_tab(&c, AGENT).await;
+    request(&c, &ask(&cid(1), &ctx, AGENT, &[&tab], "n"))
+        .await
+        .unwrap();
+    assert!(answers_within(&mut events, 2500).await.is_empty());
+    cancel(&c, &cid(1)).await.unwrap();
+    let e = log.wait("confirm", &cid(1), 5).await;
+    assert_eq!(e["ignored"], "just_unlocked", "{e}");
+    assert!(e["pressed"].is_null(), "{e}");
+}
+
+/// Input on the dialog during the lock prolongs it: with a click at 900 ms the lock lasts until
+/// 1.4 s and its after-time until 1.9 s, so the press at 1.7 s (which counts without the key)
+/// is ignored.
+#[tokio::test]
+#[ignore]
+async fn input_during_the_lock_prolongs_it() {
+    let Some((f, log)) = Fork::with_dialogs_and("*=approve", Some(1700), Some("900")).await else {
+        return;
+    };
+    let c = f.control().await;
+    let mut events = c.events();
+    let (ctx, tab) = agent_tab(&c, AGENT).await;
+    request(&c, &ask(&cid(1), &ctx, AGENT, &[&tab], "n"))
+        .await
+        .unwrap();
+    assert!(answers_within(&mut events, 3000).await.is_empty());
+    cancel(&c, &cid(1)).await.unwrap();
+    let e = log.wait("confirm", &cid(1), 5).await;
+    // Each dispatch up the view chain counts (RootView hands an unhandled press to the
+    // parents).
+    assert!(
+        e["lockInputs"].as_i64().unwrap() >= 1,
+        "the click reached the dialog: {e}"
+    );
+    assert!(e["pressed"].is_null(), "{e}");
+    assert!(
+        e["ignored"] == "locked" || e["ignored"] == "just_unlocked",
+        "{e}"
+    );
+}
+
+/// A session's name cannot pass for the dialog's own header: the ID and the profile come
+/// first on their own line, and the name, on a line that says it is the agent's, has its
+/// « » ( ) · escaped.
+#[tokio::test]
+#[ignore]
+async fn the_session_name_cannot_pass_for_the_header() {
+    let Some((f, log)) = Fork::with_dialogs("*=none", None).await else {
+        return;
+    };
+    let c = f.control().await;
+    let (ctx, tab) = agent_tab(&c, AGENT).await;
+    let name = "x» (s_deadbeef) · 프로필 Default «y";
+    request(&c, &ask(&cid(1), &ctx, AGENT, &[&tab], name))
+        .await
+        .unwrap();
+    log.wait("confirm_shown", &cid(1), 5).await;
+    cancel(&c, &cid(1)).await.unwrap();
+    let lines = common::DialogLog::lines(&log.wait("confirm", &cid(1), 5).await);
+    assert_eq!(lines[1], "세션 s_0123abcd · 프로필 PegboardAgent");
+    assert_eq!(
+        lines[2],
+        "에이전트가 붙인 세션 이름: «x\\u{bb} \\u{28}s_deadbeef\\u{29} \\u{b7} 프로필 Default \\u{ab}y»"
+    );
 }

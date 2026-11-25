@@ -458,13 +458,18 @@ bool IsSessionId(std::string_view id) {
          });
 }
 
-// The normal window of `profile` whose session ID is `id`, unless it is
-// closing.
+// The normal window of the agent profile whose context is `context` and
+// whose session ID is `id`, unless it is closing. (By IDs: the profile may
+// have gone meanwhile.)
 BrowserWindowInterface* AgentWindowWithId(const SessionID& id,
-                                          const Profile* profile) {
+                                          const std::string& context) {
+  Profile* profile = AgentProfileOf(context);
+  if (!profile) {
+    return nullptr;
+  }
   for (BrowserWindowInterface* window : GetAllBrowserWindowInterfaces()) {
     if (window->GetSessionID() == id && IsNormalWindow(window) &&
-        window->GetProfile() == profile && IsAgentProfile(profile) &&
+        window->GetProfile() == profile &&
         !window->capabilities()->IsAttemptingToCloseBrowser()) {
       return window;
     }
@@ -474,9 +479,9 @@ BrowserWindowInterface* AgentWindowWithId(const SessionID& id,
 
 }  // namespace
 
-// The owner's open confirmations: one dialog at a time per window (a sheet
-// each; AppKit would queue a second one without showing it), the others of
-// that window waiting in the order they were asked for. Each ends once: with
+// The owner's open confirmations: one dialog at a time per window (two
+// dialogs over one window would cover each other), the others of that window
+// waiting in the order they were asked for. Each ends once: with
 // an answer (answered_ runs, the event), or closed without one (cancelled, its
 // safety time, the owner going).
 class Confirmations {
@@ -500,25 +505,26 @@ class Confirmations {
   size_t size() const { return entries_.size(); }
 
   // Shows `request` on `window` (an agent window of `profile`), or queues it
-  // behind the dialog up there. `tab`, when there is one, is the tab the
-  // command acts on: its closing denies. False when it could not be shown.
+  // behind the dialog up there. `tabs` are the session's tabs: one of them
+  // closing, or leaving for another window, denies. False when it could not
+  // be shown.
   bool Add(ConfirmRequest request,
            BrowserWindowInterface* window,
            Profile* profile,
-           tabs::TabInterface* tab) {
+           const std::vector<tabs::TabInterface*>& tabs) {
     const std::string id = request.confirm_id;
     auto entry = std::make_unique<Entry>();
     entry->seq = next_seq_++;
     entry->window = window->GetSessionID();
-    entry->profile = profile;
+    entry->context = profile->UniqueId();
     entry->request = std::move(request);
     entry->safety.Start(FROM_HERE, kConfirmationSafetyTime,
                         base::BindOnce(&Confirmations::Expire,
                                        base::Unretained(this), id));
-    if (tab) {
-      entry->tab_watch = tab->RegisterWillDetach(
+    for (tabs::TabInterface* tab : tabs) {
+      entry->tab_watches.push_back(tab->RegisterWillDetach(
           base::BindRepeating(&Confirmations::TabWillDetach,
-                              base::Unretained(this), id));
+                              base::Unretained(this), id)));
     }
     Entry* added = entries_.emplace(id, std::move(entry)).first->second.get();
     if (!ShownIn(added->window)) {
@@ -537,11 +543,12 @@ class Confirmations {
   struct Entry {
     uint64_t seq = 0;
     SessionID window = SessionID::InvalidValue();
-    raw_ptr<Profile> profile = nullptr;
+    // The profile's browser context ID.
+    std::string context;
     ConfirmRequest request;
     std::unique_ptr<ConfirmDialog> dialog;
     base::OneShotTimer safety;
-    base::CallbackListSubscription tab_watch;
+    std::vector<base::CallbackListSubscription> tab_watches;
   };
 
   bool ShownIn(const SessionID& window) const {
@@ -582,7 +589,7 @@ class Confirmations {
       if (!next) {
         return;
       }
-      BrowserWindowInterface* w = AgentWindowWithId(window, next->profile);
+      BrowserWindowInterface* w = AgentWindowWithId(window, next->context);
       if (w && ShowEntry(next_id, next, w)) {
         return;
       }
@@ -603,19 +610,21 @@ class Confirmations {
     ShowNext(window);
   }
 
+  // A tab of the session closing, or dragged to another window (the dialog
+  // would no longer be over the session's tabs): deny.
   void TabWillDetach(std::string id,
                      tabs::TabInterface* tab,
                      tabs::TabInterface::DetachReason reason) {
-    if (reason != tabs::TabInterface::DetachReason::kDelete) {
-      return;
-    }
+    const char* why = reason == tabs::TabInterface::DetachReason::kDelete
+                          ? "tab_closed"
+                          : "tab_moved";
     auto it = entries_.find(id);
     if (it == entries_.end()) {
       return;
     }
     if (it->second->dialog) {
       // Answers kDeny through Done.
-      it->second->dialog->Deny("tab_closed");
+      it->second->dialog->Deny(why);
       return;
     }
     entries_.erase(it);
@@ -1187,8 +1196,7 @@ Response PegboardHandler::RequestConfirmation(
   request.profile_directory = profile_directory;
   request.action_class = action_class;
   request.offer_allow_for_session = offer_allow_for_session;
-  if (!confirmations_->Add(std::move(request), window, profile,
-                           tabs.empty() ? nullptr : tabs.front())) {
+  if (!confirmations_->Add(std::move(request), window, profile, tabs)) {
     return Response::ServerError("could not show the dialog");
   }
   return Response::Success();

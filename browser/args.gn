@@ -14,3 +14,6 @@ disable_fieldtrial_testing_config = true
 # browser, the human's tabs included (Page.setWebLifecycleState on a visible popup hit one in
 # WebContentsImpl::SetPageFrozen). Chrome as shipped runs without them.
 dcheck_always_on = false
+# Development and test build: the browser's own test hooks (//pegboard/ui/test_hooks.gni) can be
+# turned on with PEGBOARD_TEST_HOOKS in its environment. A build for people leaves this false.
+pegboard_test_hooks = true

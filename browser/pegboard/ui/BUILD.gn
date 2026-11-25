@@ -2,6 +2,14 @@
 # shows (//pegboard/devtools), the display text rule for what an agent chose,
 # and the browser side's test hooks.
 
+import("//build/buildflag_header.gni")
+import("//pegboard/ui/test_hooks.gni")
+
+buildflag_header("buildflags") {
+  header = "buildflags.h"
+  flags = [ "PEGBOARD_TEST_HOOKS=$pegboard_test_hooks" ]
+}
+
 source_set("ui") {
   visibility = [ "//pegboard/devtools:*" ]
   sources = [
@@ -24,7 +32,9 @@ source_set("ui") {
   check_includes = false
   public_deps = [ "//chrome/browser:browser_public_dependencies" ]
   deps = [
+    ":buildflags",
     "//base",
+    "//chrome/browser/picture_in_picture",
     "//chrome/browser/profiles:profile",
     "//chrome/browser/ui/browser_window",
     "//ui/base",

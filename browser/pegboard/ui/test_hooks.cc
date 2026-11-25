@@ -16,6 +16,7 @@
 #include "base/strings/string_split.h"
 #include "base/strings/cstring_view.h"
 #include "base/threading/thread_restrictions.h"
+#include "pegboard/ui/buildflags.h"
 
 namespace pegboard::test_hooks {
 
@@ -25,7 +26,8 @@ constexpr char kHooks[] = "PEGBOARD_TEST_HOOKS";
 constexpr char kLog[] = "PEGBOARD_TEST_DIALOG_LOG";
 constexpr char kAnswer[] = "PEGBOARD_TEST_DIALOG_ANSWER";
 constexpr char kAnswerAfter[] = "PEGBOARD_TEST_DIALOG_ANSWER_AFTER_MS";
-constexpr base::TimeDelta kDefaultAnswerAfter = base::Milliseconds(1100);
+constexpr char kInputAt[] = "PEGBOARD_TEST_DIALOG_INPUT_AT_MS";
+constexpr base::TimeDelta kDefaultAnswerAfter = base::Milliseconds(1700);
 
 // The value of the test variable `name`, only with test hooks on.
 std::optional<std::string> Var(base::cstring_view name) {
@@ -38,7 +40,11 @@ std::optional<std::string> Var(base::cstring_view name) {
 }  // namespace
 
 bool Enabled() {
+#if BUILDFLAG(PEGBOARD_TEST_HOOKS)
   return base::Environment::Create()->HasVar(kHooks);
+#else
+  return false;
+#endif
 }
 
 void LogDialog(const base::DictValue& entry) {
@@ -94,6 +100,22 @@ base::TimeDelta AnswerAfter() {
     return kDefaultAnswerAfter;
   }
   return base::Milliseconds(value);
+}
+
+std::vector<base::TimeDelta> InputAt() {
+  std::vector<base::TimeDelta> at;
+  std::optional<std::string> spec = Var(kInputAt);
+  if (!spec) {
+    return at;
+  }
+  for (std::string_view item : base::SplitStringPiece(
+           *spec, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
+    int ms = 0;
+    if (base::StringToInt(item, &ms) && ms >= 0) {
+      at.push_back(base::Milliseconds(ms));
+    }
+  }
+  return at;
 }
 
 }  // namespace pegboard::test_hooks

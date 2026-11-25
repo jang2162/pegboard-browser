@@ -11,6 +11,7 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/task/single_thread_task_runner.h"
+#include "chrome/browser/picture_in_picture/scoped_picture_in_picture_occlusion_observation.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
@@ -21,6 +22,8 @@
 #include "ui/base/mojom/dialog_button.mojom.h"
 #include "ui/base/mojom/ui_base_types.mojom-shared.h"
 #include "ui/gfx/text_constants.h"
+#include "ui/events/event.h"
+#include "ui/views/border.h"
 #include "ui/views/controls/button/md_text_button.h"
 #include "ui/views/controls/label.h"
 #include "ui/views/controls/scroll_view.h"
@@ -29,6 +32,7 @@
 #include "ui/views/layout/layout_provider.h"
 #include "ui/views/style/typography.h"
 #include "ui/views/view_class_properties.h"
+#include "ui/views/window/dialog_client_view.h"
 #include "ui/views/window/dialog_delegate.h"
 
 namespace pegboard {
@@ -37,8 +41,14 @@ namespace {
 
 using ui::mojom::DialogButton;
 
-// Presses within this long after the dialog is shown are ignored.
+// Presses are ignored at least this long after the dialog is shown...
 constexpr base::TimeDelta kLock = base::Seconds(1);
+// ...and until this long has passed without a key or a click on the dialog
+// (a person clicking or typing on and on does not answer it) ...
+constexpr base::TimeDelta kQuiet = base::Milliseconds(500);
+// ...and then this long more once the buttons are enabled, and as long after
+// the dialog stops being covered by a picture-in-picture window.
+constexpr base::TimeDelta kAfterUnlock = base::Milliseconds(500);
 // When the test hook's log samples the key window a second time.
 constexpr base::TimeDelta kFocusSample = base::Milliseconds(200);
 
@@ -49,8 +59,13 @@ constexpr size_t kLabelChars = 40;
 // The most of a value shown: the domain refuses a longer one, so nothing is
 // cut (and a path the daemon lets through is shown exactly).
 constexpr size_t kValueChars = 1000;
-// The detail rows scroll beyond this height.
+// The detail rows scroll beyond this height, and never take less (the dialog
+// may then reach past a small window).
 constexpr int kDetailsMaxHeight = 320;
+constexpr int kDetailsMinHeight = 160;
+// A detail's value is indented under its label, so no wrapped line of a value
+// can look like a label of its own.
+constexpr int kValueIndent = 16;
 constexpr int kMinWidth = 480;
 // How far below the top of the agent's window the dialog sits (under its
 // toolbar).
@@ -73,8 +88,8 @@ std::string DirectoryOf(BrowserWindowInterface* browser) {
 }
 
 // The profile directory of the app's key window ("sheet:<dir>" when a sheet
-// of that window is key), "none" when there is no key window, "other" when
-// it is no browser window's.
+// attached to that window is key; this dialog is none), "none" when there is
+// no key window, "other" when it is no browser window's (this dialog itself).
 std::string KeyWindowProfile() {
   if (!platform::HasKeyWindow()) {
     return "none";
@@ -111,6 +126,21 @@ std::u16string PathText(std::u16string path) {
     out.push_back(c);
     if (c == u'/') {
       out.push_back(kLrm);
+    }
+  }
+  return out;
+}
+
+// A session's name as shown: DisplayText, and the characters the dialog's own
+// lines use around names and IDs (« » ( ) ·) escaped too, so that a name
+// cannot imitate them.
+std::u16string NameText(const std::string& name) {
+  std::u16string out;
+  for (char16_t c : DisplayText(name, kNameChars)) {
+    if (c == u'«' || c == u'»' || c == u'(' || c == u')' || c == u'·') {
+      out += base::ASCIIToUTF16(base::StringPrintf("\\u{%x}", c));
+    } else {
+      out.push_back(c);
     }
   }
   return out;
@@ -158,15 +188,20 @@ std::unique_ptr<views::Label> MakeLabel(const std::u16string& text,
                                         int width,
                                         int style,
                                         bool left_to_right,
-                                        base::ListValue* lines) {
+                                        base::ListValue* lines,
+                                        int indent = 0) {
   auto label = std::make_unique<views::Label>(
       text, views::style::CONTEXT_DIALOG_BODY_TEXT, style);
   label->SetMultiLine(true);
   // Long words (a path) wrap instead of being cut, and nothing is elided.
   label->SetAllowCharacterBreak(true);
   label->SetElideBehavior(gfx::NO_ELIDE);
-  label->SetMaximumWidth(width);
+  label->SetMaximumWidth(width - indent);
   label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  if (indent) {
+    label->SetBorder(
+        views::CreateEmptyBorder(gfx::Insets::TLBR(0, indent, 0, 0)));
+  }
   if (left_to_right) {
     label->SetDirectionalityMode(gfx::DIRECTIONALITY_FORCE_LTR);
   }
@@ -192,14 +227,19 @@ std::unique_ptr<views::View> MakeContents(const ConfirmRequest& request,
       views::BoxLayout::CrossAxisAlignment::kStretch);
   contents->SetBetweenChildSpacing(related);
 
-  // Always the session's ID and the profile beside the name an agent chose.
+  // First what the daemon and the browser know: the session's ID and the
+  // window's profile. The name an agent chose comes after, on a line of its
+  // own that says so, in another style, its « » ( ) · escaped.
   contents->AddChildView(MakeLabel(
-      base::StrCat(
-          {u"세션 «",
-           Isolated(DisplayText(request.session_name, kNameChars), kFsi),
-           u"» (", Isolated(DisplayText(request.session_id, kIdChars), kLri),
-           u") · 프로필 ", Isolated(DisplayText(profile, kNameChars), kLri)}),
-      width, views::style::STYLE_PRIMARY, false, lines));
+      base::StrCat({u"세션 ",
+                    Isolated(DisplayText(request.session_id, kIdChars), kLri),
+                    u" · 프로필 ",
+                    Isolated(DisplayText(profile, kNameChars), kLri)}),
+      width, views::style::STYLE_EMPHASIZED, false, lines));
+  contents->AddChildView(MakeLabel(
+      base::StrCat({u"에이전트가 붙인 세션 이름: «",
+                    Isolated(NameText(request.session_name), kFsi), u"»"}),
+      width, views::style::STYLE_SECONDARY, false, lines));
   contents->AddChildView(MakeLabel(Sentence(request), width,
                                    views::style::STYLE_EMPHASIZED, false,
                                    lines));
@@ -218,12 +258,14 @@ std::unique_ptr<views::View> MakeContents(const ConfirmRequest& request,
       shown = PathText(std::move(shown));
     }
     rows->AddChildView(MakeLabel(shown, row_width, views::style::STYLE_PRIMARY,
-                                 true, lines));
+                                 true, lines, kValueIndent));
   }
   auto scroll = std::make_unique<views::ScrollView>();
   scroll->SetHorizontalScrollBarMode(
       views::ScrollView::ScrollBarMode::kDisabled);
-  scroll->ClipHeightTo(0, kDetailsMaxHeight);
+  scroll->ClipHeightTo(
+      std::min(kDetailsMinHeight, rows->GetHeightForWidth(row_width)),
+      kDetailsMaxHeight);
   scroll->SetContents(std::move(rows));
   views::View* scroll_view = contents->AddChildView(std::move(scroll));
   scroll_view->SetProperty(views::kMarginsKey, gfx::Insets::VH(unrelated, 0));
@@ -308,6 +350,7 @@ bool ConfirmDialog::Open(BrowserWindowInterface* browser) {
   // window-modal: on macOS that is a sheet, and AppKit makes a sheet the key
   // window as it appears, taking the keyboard from the person's window.
   delegate_->SetModalType(ui::mojom::ModalType::kNone);
+  // (A person can still use the agent's window meanwhile.)
   delegate_->SetTitle(kTitle);
   delegate_->SetShowCloseButton(false);
   delegate_->set_fixed_width(width);
@@ -341,8 +384,8 @@ bool ConfirmDialog::Open(BrowserWindowInterface* browser) {
   if (request_.offer_allow_for_session) {
     allow_for_session_button_ =
         delegate_->SetExtraView(std::make_unique<views::MdTextButton>(
-            base::BindRepeating(&ConfirmDialog::Press, base::Unretained(this),
-                                ConfirmAnswer::kAllowForSession, "button"),
+            base::BindRepeating(&ConfirmDialog::OnAllowForSessionPressed,
+                                base::Unretained(this)),
             kAllowForSessionLabel));
     buttons_.Append(base::UTF16ToUTF8(kAllowForSessionLabel));
   }
@@ -364,19 +407,28 @@ bool ConfirmDialog::Open(BrowserWindowInterface* browser) {
     return false;
   }
   widget_observation_.Observe(widget_.get());
-  // Centered across the top of the agent's window, as a browser dialog.
+  // Keys and clicks on the dialog during the lock prolong it.
+  lock_input_handler_ = std::make_unique<LockInputHandler>(this);
+  widget_->GetRootView()->AddPreTargetHandler(lock_input_handler_.get());
+  // Centered across the top of the agent's window, as a browser dialog; at
+  // its full size also over a smaller window.
   const gfx::Rect over = parent->GetWindowBoundsInScreen();
-  gfx::Size size = widget_->GetRootView()->GetPreferredSize({});
-  size.SetToMin(over.size());
-  widget_->SetBounds(gfx::Rect(over.x() + (over.width() - size.width()) / 2,
-                               over.y() + std::min(kTopOffset,
-                                                   over.height() - size.height()),
-                               size.width(), size.height()));
+  const gfx::Size size = widget_->GetRootView()->GetPreferredSize({});
+  widget_->SetBounds(gfx::Rect(
+      over.x() + (over.width() - size.width()) / 2,
+      over.y() + std::max(0, std::min(kTopOffset,
+                                      over.height() - size.height())),
+      size.width(), size.height()));
   // Never Show(): that makes the dialog the key window and activates the app.
   // Shown inactive, a child window is ordered above its parent and nothing
   // else.
   widget_->ShowInactive();
   shown_at_ = base::TimeTicks::Now();
+  allow_for_session_protector_.VisibilityChanged(true);
+  // A picture-in-picture window over the dialog: no answer counts meanwhile.
+  occlusion_observation_ =
+      std::make_unique<ScopedPictureInPictureOcclusionObservation>(this);
+  occlusion_observation_->Observe(widget_.get());
   const bool attention = platform::RequestAttentionIfInactive();
   unlock_timer_.Start(FROM_HERE, kLock,
                       base::BindOnce(&ConfirmDialog::Unlock,
@@ -408,16 +460,112 @@ bool ConfirmDialog::Open(BrowserWindowInterface* browser) {
                                        base::Unretained(this), *answer,
                                        "hook"));
     }
+    // Clicks a person might make on the dialog, through the widget's own
+    // event path.
+    for (base::TimeDelta at : test_hooks::InputAt()) {
+      auto timer = std::make_unique<base::OneShotTimer>();
+      timer->Start(FROM_HERE, at,
+                   base::BindOnce(&ConfirmDialog::SendTestClick,
+                                  base::Unretained(this)));
+      input_timers_.push_back(std::move(timer));
+    }
   }
   return true;
+}
+
+void ConfirmDialog::LockInputHandler::OnKeyEvent(ui::KeyEvent* event) {
+  if (event->type() == ui::EventType::kKeyPressed) {
+    dialog_->OnInputDuringLock();
+  }
+}
+
+void ConfirmDialog::LockInputHandler::OnMouseEvent(ui::MouseEvent* event) {
+  if (event->type() == ui::EventType::kMousePressed) {
+    dialog_->OnInputDuringLock();
+  }
+}
+
+void ConfirmDialog::LockInputHandler::OnGestureEvent(
+    ui::GestureEvent* event) {
+  if (event->type() == ui::EventType::kGestureTapDown) {
+    dialog_->OnInputDuringLock();
+  }
+}
+
+void ConfirmDialog::OnInputDuringLock() {
+  if (state_ != State::kOpen || !locked_) {
+    return;
+  }
+  ++lock_inputs_;
+  // Unlocked once there has been no input for kQuiet, and not before kLock.
+  const base::TimeDelta left =
+      std::max(kQuiet, kLock - (base::TimeTicks::Now() - shown_at_));
+  unlock_timer_.Start(FROM_HERE, left,
+                      base::BindOnce(&ConfirmDialog::Unlock,
+                                     base::Unretained(this)));
+}
+
+void ConfirmDialog::SendTestClick() {
+  if (!widget_ || state_ != State::kOpen) {
+    return;
+  }
+  // A click at the dialog's top left corner (its frame, no button), as the
+  // window system hands one to the widget.
+  const gfx::Point at(2, 2);
+  ui::MouseEvent press(ui::EventType::kMousePressed, at, at,
+                       base::TimeTicks::Now(), ui::EF_LEFT_MOUSE_BUTTON,
+                       ui::EF_LEFT_MOUSE_BUTTON);
+  widget_->OnMouseEvent(&press);
+  if (!widget_ || state_ != State::kOpen) {
+    return;
+  }
+  ui::MouseEvent release(ui::EventType::kMouseReleased, at, at,
+                         base::TimeTicks::Now(), ui::EF_LEFT_MOUSE_BUTTON,
+                         ui::EF_LEFT_MOUSE_BUTTON);
+  widget_->OnMouseEvent(&release);
+}
+
+void ConfirmDialog::OnAllowForSessionPressed(const ui::Event& event) {
+  // As the dialog's own buttons: not a click too soon after it showed or
+  // after another one.
+  if (allow_for_session_protector_.IsPossiblyUnintendedInteraction(
+          event, /*allow_key_events=*/true)) {
+    Ignored("unintended");
+    return;
+  }
+  Press(ConfirmAnswer::kAllowForSession, "button");
+}
+
+void ConfirmDialog::OnOcclusionStateChanged(bool occluded) {
+  if (occluded_ && !occluded) {
+    // Uncovered: as just unlocked.
+    unlocked_at_ = base::TimeTicks::Now();
+    if (views::DialogClientView* client = delegate_->GetDialogClientView()) {
+      client->TriggerInputProtection();
+    }
+    allow_for_session_protector_.MaybeUpdateViewProtectedTimeStamp(true);
+  }
+  occluded_ = occluded;
+}
+
+void ConfirmDialog::Ignored(std::string_view why) {
+  ignored_.Append(why);
 }
 
 void ConfirmDialog::Press(ConfirmAnswer answer, std::string_view by) {
   if (state_ != State::kOpen) {
     return;
   }
-  if (base::TimeTicks::Now() - shown_at_ < kLock) {
-    ignored_locked_ = true;
+  if (locked_) {
+    Ignored("locked");
+    return;
+  }
+  if (base::TimeTicks::Now() - unlocked_at_ < kAfterUnlock) {
+    Ignored("just_unlocked");
+    return;
+  }
+  if (occluded_) {
+    Ignored("occluded");
     return;
   }
   Finish(answer, by, "answered");
@@ -434,9 +582,7 @@ void ConfirmDialog::Finish(ConfirmAnswer answer,
     return;
   }
   state_ = State::kAnswered;
-  unlock_timer_.Stop();
-  sample_timer_.Stop();
-  hook_timer_.Stop();
+  StopTimers();
   Log(answer, by, why);
   // Not from inside the widget's own event handling: `done` may delete this.
   base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
@@ -456,14 +602,24 @@ void ConfirmDialog::Close(std::string_view why) {
     Log(std::nullopt, "", why);
   }
   state_ = State::kClosed;
-  unlock_timer_.Stop();
-  sample_timer_.Stop();
-  hook_timer_.Stop();
+  StopTimers();
   done_.Reset();
   DestroyWidget();
 }
 
+void ConfirmDialog::StopTimers() {
+  unlock_timer_.Stop();
+  sample_timer_.Stop();
+  hook_timer_.Stop();
+  input_timers_.clear();
+}
+
 void ConfirmDialog::DestroyWidget() {
+  if (widget_ && lock_input_handler_) {
+    widget_->GetRootView()->RemovePreTargetHandler(lock_input_handler_.get());
+  }
+  lock_input_handler_.reset();
+  occlusion_observation_.reset();
   widget_observation_.Reset();
   allow_for_session_button_ = nullptr;
   widget_.reset();
@@ -476,6 +632,10 @@ void ConfirmDialog::OnWidgetClosing(views::Widget* widget) {
 
 void ConfirmDialog::OnWidgetDestroying(views::Widget* widget) {
   Deny("window_closed");
+  if (lock_input_handler_) {
+    widget->GetRootView()->RemovePreTargetHandler(lock_input_handler_.get());
+    lock_input_handler_.reset();
+  }
   widget_observation_.Reset();
   allow_for_session_button_ = nullptr;
 }
@@ -484,6 +644,13 @@ void ConfirmDialog::Unlock() {
   if (state_ != State::kOpen || !delegate_) {
     return;
   }
+  locked_ = false;
+  unlocked_at_ = base::TimeTicks::Now();
+  // The dialog's own click protection starts again from now.
+  if (views::DialogClientView* client = delegate_->GetDialogClientView()) {
+    client->TriggerInputProtection();
+  }
+  allow_for_session_protector_.MaybeUpdateViewProtectedTimeStamp(true);
   delegate_->SetButtonEnabled(DialogButton::kOk, true);
   delegate_->SetButtonEnabled(DialogButton::kCancel, true);
   if (allow_for_session_button_) {
@@ -520,9 +687,11 @@ void ConfirmDialog::Log(std::optional<ConfirmAnswer> answer,
     entry.Set("by", by);
   }
   entry.Set("closed", why);
-  if (ignored_locked_) {
-    entry.Set("ignored", "locked");
+  if (!ignored_.empty()) {
+    entry.Set("ignored", ignored_.front().Clone());
+    entry.Set("ignoredAll", ignored_.Clone());
   }
+  entry.Set("lockInputs", lock_inputs_);
   test_hooks::LogDialog(entry);
 }
 

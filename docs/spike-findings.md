@@ -1275,3 +1275,14 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 | `DisplayText`가 거르지 않음 | `bidi_text_is_shown_escaped`(U+202E가 그대로) |
 
 - `Enabled()` 검사는 두 겹이다(`Var()`와 확인 창의 훅 경로). `Var()`의 검사 하나만 뺀 변형은 시험을 통과했다(다른 겹이 막는다). 그래서 변형은 `Enabled()` 자체를 참으로 바꿨다.
+
+#### 보안 검토 반영 (2026-11-25)
+
+- **잠금이 조용한 시간을 요구한다**: 버튼이 꺼진 동안의 클릭은 아무 데도 닿지 않아, 처음 판에서는 1.0초 뒤의 첫 클릭이 받아들여졌다. 맥의 views 창은 첫 클릭을 받으므로(비활성 자식 창도) 페이지가 사람에게 같은 자리를 계속 누르게 만들면 승인이 될 수 있었다. 이제 잠금은 보인 뒤 최소 1초, 그리고 확인 창 위의 키·클릭이 500ms 동안 없을 때까지다(위젯 루트 뷰의 사전 처리기가 잠금 중 입력마다 다시 잰다). 버튼이 켜진 뒤 500ms 동안의 누름도 무시하고(`just_unlocked`), 그때 대화상자의 클릭 보호(`DialogClientView::TriggerInputProtection`)를 다시 시작한다. "이 세션에서 계속 허용" 버튼도 같은 보호(`InputEventActivationProtector::IsPossiblyUnintendedInteraction`)를 거친다. 답하는 훅의 기본 시각은 1,700ms가 되었다.
+  - 시험: `input_during_the_lock_prolongs_it`(900ms의 클릭 → 1,700ms의 누름이 무시됨), `presses_right_at_unlock_are_ignored`(1,200ms의 누름이 `just_unlocked`). 시험 훅 `PEGBOARD_TEST_DIALOG_INPUT_AT_MS`는 위젯에 마우스 누름을 넘긴다(창 시스템이 넘기는 길). 키는 비활성 창에서 포커스된 뷰가 없어 대상이 없다(그래서 클릭).
+- **머리줄 흉내**: 세션 이름에 `» (s_…) · 프로필 Default «`를 넣으면 진짜 ID와 프로필 앞에 가짜를 보일 수 있었다. 이제 첫 줄은 데몬과 브라우저가 아는 것만(`세션 <ID> · 프로필 <디렉터리>`, 굵게), 이름은 그다음 줄 `에이전트가 붙인 세션 이름: «…»`(흐린 글씨)이고 이름 안의 `« » ( ) ·`도 `\u{…}`로 바꾼다(`the_session_name_cannot_pass_for_the_header`).
+- **빌드 플래그**: 브라우저 쪽 시험 훅은 GN 인자 `pegboard_test_hooks`(`//pegboard/ui/test_hooks.gni`, 기본 거짓)가 참인 빌드에만 있다. 개발·시험 빌드(`browser/args.gn`)가 켠다. 사람에게 줄 빌드(3c)는 켜지 않는다. 그러면 `launchctl setenv` 등으로 환경 변수를 넣어도 자동 답이 없다. 환경 변수 검사도 그대로 둔다.
+- 값은 라벨 아래에 들여 써서(16px) 줄 바꿈된 긴 값이 다른 줄의 라벨처럼 보이지 않는다. 상세 줄 부분은 최소 160px(줄이 그보다 적으면 그 높이)이고 창이 작아도 줄이지 않는다(확인 창이 작은 창 밖으로 나갈 수 있다).
+- 화면 속 화면 창이 확인 창을 가리는 동안의 누름은 무시하고(`occluded`, `ScopedPictureInPictureOcclusionObservation`), 가림이 풀리면 500ms 보호를 다시 시작한다.
+- 세션의 탭(`targetIds` 모두)을 지켜본다. 하나라도 닫히거나 다른 창으로 옮겨지면 `deny`(`tab_closed`, `tab_moved`). 창이 닫히면 떠 있던 것과 기다리던 것 모두 `deny`(`closing_the_window_denies_shown_and_queued`). 기다리는 항목은 프로필을 포인터가 아닌 컨텍스트 ID로 기억한다(프로필이 사라진 뒤 매달린 포인터가 없게).
+- **남는 위험**: 같은 사용자의 셸과 손쉬운 사용(Accessibility) 권한을 가진 에이전트는 확인 창 버튼을 직접 누를 수 있다(`AXPress`). 화면 속 화면이 아닌 다른 앞쪽 창(위치를 정한 팝업 등)으로 확인 창을 가리는 것은 막지 않는다. 에이전트 창이 전체 화면이거나 다른 Space에 있을 때 확인 창의 자리는 재지 않았다.

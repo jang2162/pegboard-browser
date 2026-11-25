@@ -7,14 +7,17 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "base/time/time.h"
 #include "base/values.h"
 
 // Test hooks of the browser's own windows, read from the browser's own
-// environment. Every one needs PEGBOARD_TEST_HOOKS there as well: a product
-// launch (Dock, open) has no such variable, and without it each function here
-// does nothing (Enabled() false, the rest empty). Nothing here answers for a
+// environment. They exist only in a build with the GN argument
+// pegboard_test_hooks = true (test_hooks.gni; development and test builds),
+// and even there every one needs PEGBOARD_TEST_HOOKS in that environment: a
+// product launch (Dock, open) has no such variable. Otherwise each function
+// here does nothing (Enabled() false, the rest empty). Nothing here answers for a
 // person on its own: an answer hook presses a dialog's button through the
 // same function a click runs, so the dialog's own rules (its 1 s lock) hold.
 namespace pegboard::test_hooks {
@@ -33,9 +36,14 @@ void LogDialog(const base::DictValue& entry);
 std::optional<std::string> AnswerFor(const std::string& session_name);
 
 // When the answer hook presses, after the dialog is shown:
-// PEGBOARD_TEST_DIALOG_ANSWER_AFTER_MS, by default 1100 ms (just after the
-// dialog's 1 s lock).
+// PEGBOARD_TEST_DIALOG_ANSWER_AFTER_MS, by default 1700 ms (just after the
+// dialog's lock: 1 s, then 500 ms after its buttons are enabled).
 base::TimeDelta AnswerAfter();
+
+// When, after the dialog is shown, a click comes to it (on its frame, as a
+// person's would; PEGBOARD_TEST_DIALOG_INPUT_AT_MS, comma-separated
+// milliseconds): input during the lock prolongs it.
+std::vector<base::TimeDelta> InputAt();
 
 }  // namespace pegboard::test_hooks
 

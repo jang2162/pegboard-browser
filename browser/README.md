@@ -25,6 +25,7 @@ browser/scripts/package-dev.sh <src> <out>/Pegboard.app   # pegboard, agent-brow
 - `build.sh`는 `nice`로, 동시 작업 8개로 돈다. 바꾸려면 `PEGBOARD_BUILD_JOBS=<n>`. 더 높이면 빌드 기계가 멈춘 적이 있다.
 - `fetch.sh`는 이미 받은 트리에서 다시 받지 않는다. 태그가 없으면 그 태그만 받고, `pegboard-work`가 그 태그 위에 있으면 그대로 두고 `gclient sync`만 한다. 익명 요청 제한(HTTP 429) 때문에 `--jobs 4`로 돌고 실패하면 5분 뒤 다시 한다(6번까지).
 - depot_tools는 `PATH`, `$DEPOT_TOOLS`, `~/depot_tools` 순으로 찾는다.
+- `args.gn`은 개발·시험 빌드라 `pegboard_test_hooks = true`다(브라우저 쪽 시험 훅, `//pegboard/ui/test_hooks.gni`). 사람에게 줄 빌드는 이것을 켜지 않는다: 그러면 환경 변수로도 확인 창의 자동 답을 켤 수 없다.
 - `args.gn`에는 `enable_nacl`이 없다. 이 버전에서는 효과가 없다고 `gn`이 경고한다. 대신 `disable_fieldtrial_testing_config = true`가 있다. 이것이 없으면 Chromium 이름의 빌드가 `testing/variations/fieldtrial_testing_config.json`의 실험을 켜고, 그중 `AperitifHelpers`의 도우미 프로세스가 샌드박스를 못 열고 죽어 네트워크가 안 된다(작업 7에서 겪음).
 
 ## 패치 고치기

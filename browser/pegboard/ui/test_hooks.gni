@@ -1,0 +1,8 @@
+declare_args() {
+  # Whether the browser's own test hooks (//pegboard/ui/test_hooks.h: the
+  # confirmation dialog's log and answer hook) can be turned on at all. With
+  # false they are compiled out and PEGBOARD_TEST_HOOKS in the browser's
+  # environment changes nothing. Development and test builds set it
+  # (browser/args.gn); a build for people must leave it false.
+  pegboard_test_hooks = false
+}

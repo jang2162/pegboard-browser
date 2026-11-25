@@ -1224,7 +1224,7 @@ async fn dialog_appears_in_the_sessions_agent_window() {
         lines[1].contains(&s.id) && lines[1].contains("PegboardAgent-dlg"),
         "{lines:?}"
     );
-    assert!(lines[1].contains("show\\u{202e}gpj.exe"), "{lines:?}");
+    assert!(lines[2].contains("show\\u{202e}gpj.exe"), "{lines:?}");
     assert!(lines.iter().all(|l| !l.contains('\u{202E}')), "{lines:?}");
     assert!(lines.contains(&real), "the real path: {lines:?}");
     assert!(lines.contains(&rig.fixture.origin), "{lines:?}");
