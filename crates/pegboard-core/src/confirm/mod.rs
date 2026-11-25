@@ -8,6 +8,7 @@
 //! closes or the daemon stops, and when nobody is left who could answer it.
 
 pub mod details;
+pub mod staging;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -329,6 +330,15 @@ impl ConfirmBroker {
     /// session). Without it no upload is ever granted for a session.
     pub fn set_policy_lookup(&self, lookup: PolicyLookup) {
         self.table.lock().unwrap().lookup = Some(lookup);
+    }
+
+    /// Whether a question asked now would have a responder: an API subscriber, or the
+    /// browser when the question has a place to show it (`with_place`). A command that must
+    /// do work before it asks (an upload copies its files) looks first, so with nobody to
+    /// answer it is denied without touching a file. `ask` decides again.
+    pub fn has_responder(&self, with_place: bool) -> bool {
+        let t = self.table.lock().unwrap();
+        !t.closed && (t.subscribers > 0 || (with_place && t.browser.is_some()))
     }
 
     /// Asks the responders and waits for the first answer, the time limit, a cancel, or

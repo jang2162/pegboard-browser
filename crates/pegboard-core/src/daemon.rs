@@ -16,9 +16,11 @@ use crate::actionlog::{
 };
 use crate::argv::{self, rejected, Checked, TextDestination};
 use crate::confirm::details::{
-    display_text, origin_of, state_details, NotShown, StatePin, Where, NAME_CHARS,
+    display_text, origin_of, state_details, upload_details, NotShown, ShownFile, StatePin, Where,
+    NAME_CHARS,
 };
-use crate::confirm::{ConfirmAsk, ConfirmBroker, ConfirmDecision};
+use crate::confirm::staging::{self, StageError, Staged};
+use crate::confirm::{ConfirmAsk, ConfirmBroker, ConfirmDecision, ConfirmPlace};
 use crate::downloads::Report;
 use crate::paths::Paths;
 use crate::policy;
@@ -210,23 +212,54 @@ pub async fn run_command_with_hook(
     if let Err(e) = judge_navigation_urls(sessions, id, argv, &run_argv).await {
         return refuse(log, entry, argv, e, started);
     }
-    // An upload that would ask a person waits for the copy of what was asked about
-    // (staging), which is not there yet.
-    if class == ActionClass::Upload && matches!(judged, Judged::Ask) {
-        return refuse(log, entry, argv, no_confirmation_yet(class), started);
-    }
     // An upload names its files; they become paths only now that the policy allows it.
+    let is_upload = run_argv.first().map(String::as_str) == Some("upload");
     let mut path_names = Vec::new();
-    if run_argv.first().map(String::as_str) == Some("upload") {
+    // An upload that asks a person: the files it would copy, each with where it may be.
+    let mut asked_sources = Vec::new();
+    if is_upload && matches!(judged, Judged::Ask) {
+        // Nobody to answer: denied before any file is looked at or copied.
+        if !confirm.has_responder(question_place().is_some()) {
+            entry.confirm = Some(ConfirmLog {
+                outcome: ConfirmOutcome::NoResponder,
+                by: None,
+                wait_ms: 0,
+            });
+            let e = denial(class, ConfirmOutcome::NoResponder, None, confirm.timeout());
+            return refuse(log, entry, argv, e, started);
+        }
+        match resolve_asked_upload(sessions, paths, id, &run_argv) {
+            Ok(sources) => asked_sources = sources,
+            Err(e) => return refuse(log, entry, argv, e, started),
+        }
+    } else if is_upload {
         match resolve_upload(sessions, paths, id, &run_argv) {
             Ok((words, names)) => (run_argv, path_names) = (words, names),
             Err(e) => return refuse(log, entry, argv, e, started),
         }
     }
     // A person is asked, when the policy says so; the question shows the tab the command
-    // would act on, read now.
+    // would act on, read now. An upload's files are copied first (on a thread of its own,
+    // raced by the session's close like the rest of the preparation): the person is shown
+    // the copies' real paths and sizes, and the copies are what uploads.
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-    let prepare = prepare_question(sessions, runner, id, class, &run_argv, timeout_ms);
+    let mut staged: Option<Staged> = None;
+    let prepare = async {
+        let mut shown = Vec::new();
+        if !asked_sources.is_empty() {
+            let copies = stage_copies(paths, id, std::mem::take(&mut asked_sources)).await?;
+            shown = copies
+                .files
+                .iter()
+                .map(|f| ShownFile {
+                    path: f.real.display().to_string(),
+                    size: f.size,
+                })
+                .collect();
+            staged = Some(copies);
+        }
+        prepare_question(sessions, runner, id, class, &run_argv, &shown, timeout_ms).await
+    };
     let cleared = clear_command(confirm, judged, class, id, prepare).await;
     // A command that waited for a person is logged at the answer: its time and duration
     // are its own, not the wait's (which is `confirm.waitMs`), so a recording does not
@@ -261,6 +294,16 @@ pub async fn run_command_with_hook(
             return refuse(log, entry, argv, e, started);
         }
     }
+    // An approved upload sends the copies the person was shown, under the files' names.
+    if let Some(copies) = &staged {
+        run_argv.truncate(2);
+        for f in &copies.files {
+            run_argv.push(f.staged.display().to_string());
+            for path in [&f.given, &f.real, &f.staged] {
+                path_names.push((path.display().to_string(), f.name.clone()));
+            }
+        }
+    }
 
     // The frame before: the tab's last stored frame (no capture), only for a command that
     // passed every check above. From here until the command's end (and a grace after it)
@@ -291,7 +334,13 @@ pub async fn run_command_with_hook(
     };
 
     // Held to what the person was shown, right before it runs.
-    let now = where_it_acts(sessions, runner, id, is_storage(&run_argv), timeout_ms);
+    let now = where_it_acts(
+        sessions,
+        runner,
+        id,
+        reads_frame(class, &run_argv),
+        timeout_ms,
+    );
     if !apply_pin(&cleared.pin, &mut run_argv, now).await {
         if let Some(c) = entry.confirm.as_mut() {
             c.outcome = ConfirmOutcome::Stale;
@@ -305,6 +354,12 @@ pub async fn run_command_with_hook(
         return refuse(log, entry, argv, e, started);
     }
 
+    // The proxy takes files for a file input only from where this upload may: an approved
+    // copy's directories while it runs, else the session's standing directories, which it
+    // returns to however the command ends (`UploadDirs` drops before `staged`).
+    let _upload_dirs = is_upload
+        .then(|| UploadDirs::open(sessions, paths, confirm, id, staged.as_ref()))
+        .flatten();
     let had_no_tab = sessions.info(id).is_ok_and(|i| i.targets.is_empty());
     let exec_started = Instant::now();
     let mut outcome = match &endpoint {
@@ -515,6 +570,12 @@ fn resolve_names(
     let mut out = words[..2].to_vec();
     let mut names = Vec::new();
     for name in &words[2..] {
+        // Unasked uploads, and every upload of a session bound to a directory, go by name.
+        if name.starts_with('/') {
+            return Err(rejected(
+                "this session uploads only by file name from its upload directory".to_string(),
+            ));
+        }
         let path = upload::resolve(name, &dirs).ok_or_else(|| {
             rejected(format!(
                 "{name:?} was not found in the upload directory or the session's files"
@@ -600,22 +661,138 @@ fn judged_verdict(policy: &SessionPolicy, granted: &[ActionClass], class: Action
     }
 }
 
-/// An upload that would ask a person: denied at once until staging is in place.
-fn no_confirmation_yet(class: ActionClass) -> RpcError {
-    let name = class.as_str();
-    let with = if class == ActionClass::Upload {
-        " and --upload-dir <directory>"
-    } else {
-        ""
+/// Where the browser would show a question of the session: nowhere yet (the browser as a
+/// responder comes with the fork's domain), so only API subscribers answer.
+fn question_place() -> Option<ConfirmPlace> {
+    None
+}
+
+/// The files of an upload that asks a person (`upload <selector> <file>...`), each with
+/// where it may be (design 4.3): a bare name is looked up in the upload directory and the
+/// session's files (without an upload directory, the session's files only) and must be
+/// directly inside one of them; an absolute path is taken only by a session without an
+/// upload directory, and must not be inside pegboard's home or the browser's user data
+/// directory (`upload::check_absolute`). At most `MAX_UPLOAD_FILES`. Checked again on the
+/// descriptor each is copied from (`staging::stage`).
+fn resolve_asked_upload(
+    sessions: &SessionManager,
+    paths: &Paths,
+    id: &SessionId,
+    words: &[String],
+) -> Result<Vec<(PathBuf, upload::Allowed)>, RpcError> {
+    let policy = sessions.policy(id)?;
+    asked_upload_sources(
+        policy.upload_dir.as_deref(),
+        paths.session_files(id),
+        paths.upload_forbidden(),
+        words,
+    )
+}
+
+fn asked_upload_sources(
+    upload_dir: Option<&str>,
+    files_dir: PathBuf,
+    forbidden: Vec<PathBuf>,
+    words: &[String],
+) -> Result<Vec<(PathBuf, upload::Allowed)>, RpcError> {
+    let names = &words[2..];
+    if names.len() > upload::MAX_UPLOAD_FILES {
+        return Err(rejected(format!(
+            "an upload that asks a person takes at most {} files",
+            upload::MAX_UPLOAD_FILES
+        )));
+    }
+    let dirs: Vec<PathBuf> = upload_dir
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([files_dir])
+        .collect();
+    let mut out = Vec::new();
+    for name in names {
+        if name.starts_with('/') {
+            if upload_dir.is_some() {
+                return Err(rejected(
+                    "this session uploads only by file name from its upload directory".to_string(),
+                ));
+            }
+            let real = upload::check_absolute(name, &forbidden)
+                .map_err(|why| rejected(format!("{name}: {why}")))?;
+            // The real path is opened (and checked again there); the person sees it.
+            out.push((real, upload::Allowed::Outside(forbidden.clone())));
+        } else {
+            let path = upload::resolve(name, &dirs).ok_or_else(|| {
+                rejected(if upload_dir.is_some() {
+                    format!("{name:?} was not found in the upload directory or the session's files")
+                } else {
+                    format!(
+                        "{name:?} was not found in the session's files (give any other file \
+                         by its absolute path)"
+                    )
+                })
+            })?;
+            out.push((path, upload::Allowed::DirectlyIn(dirs.clone())));
+        }
+    }
+    Ok(out)
+}
+
+/// Copies an asking upload's files (`staging::stage`) on a blocking thread, into the
+/// session's confirmation directory.
+async fn stage_copies(
+    paths: &Paths,
+    id: &SessionId,
+    sources: Vec<(PathBuf, upload::Allowed)>,
+) -> Result<Staged, RpcError> {
+    let failed = |e: String| RpcError {
+        code: codes::INTERNAL.to_string(),
+        message: format!("copying the files for a person's confirmation failed: {e}"),
+        data: None,
     };
-    RpcError {
-        code: codes::POLICY_DENIED.to_string(),
-        message: format!(
-            "the {name} command needs a person's confirmation, which is not available yet; a \
-             person can allow it without asking when creating the session with --allow \
-             {name}{with}"
-        ),
-        data: Some(serde_json::json!({ "reason": "no_responder" })),
+    let root =
+        crate::paths::ensure_session_confirm(paths, id).map_err(|e| failed(e.to_string()))?;
+    tokio::task::spawn_blocking(move || staging::stage(&sources, &root))
+        .await
+        .map_err(|e| failed(e.to_string()))?
+        .map_err(|e| match e {
+            StageError::Refused(why) => rejected(why),
+            StageError::Io(e) => failed(e.to_string()),
+        })
+}
+
+/// The directories the proxy takes an upload's files from while the command runs; put back
+/// to the session's standing directories (`upload::standing_dirs`, given what a person
+/// allowed by now) when dropped.
+struct UploadDirs<'a> {
+    sessions: &'a SessionManager,
+    id: &'a SessionId,
+    after: Vec<PathBuf>,
+}
+
+impl<'a> UploadDirs<'a> {
+    fn open(
+        sessions: &'a SessionManager,
+        paths: &Paths,
+        confirm: &ConfirmBroker,
+        id: &'a SessionId,
+        staged: Option<&Staged>,
+    ) -> Option<UploadDirs<'a>> {
+        let policy = sessions.policy(id).ok()?;
+        let granted = confirm.granted(id).contains(&ActionClass::Upload);
+        let after = upload::standing_dirs(&policy, paths.session_files(id), granted);
+        let during = staged.map_or_else(|| after.clone(), Staged::dirs);
+        sessions.set_upload_dirs(id, during);
+        Some(UploadDirs {
+            sessions,
+            id,
+            after,
+        })
+    }
+}
+
+impl Drop for UploadDirs<'_> {
+    fn drop(&mut self) {
+        self.sessions
+            .set_upload_dirs(self.id, std::mem::take(&mut self.after));
     }
 }
 
@@ -752,7 +929,12 @@ fn denial(
         ConfirmOutcome::NoResponder => format!(
             "the {name} command needs a person's confirmation; confirmation needs the Pegboard \
              browser (or a client of confirm.subscribe); a person can allow it without asking \
-             when creating the session with --allow {name}"
+             when creating the session with --allow {name}{}",
+            if class == ActionClass::Upload {
+                " and --upload-dir <directory>"
+            } else {
+                ""
+            }
         ),
         ConfirmOutcome::Cancelled => format!(
             "the session closed (or the daemon stopped) while the {name} command waited for a \
@@ -780,11 +962,16 @@ fn denial(
 /// neither asked about nor run.
 fn unknown_origin(class: ActionClass) -> RpcError {
     let name = class.as_str();
+    let goes = if class == ActionClass::Upload {
+        "its files would go to"
+    } else {
+        "it would write to"
+    };
     RpcError {
         code: codes::POLICY_DENIED.to_string(),
         message: format!(
-            "the {name} command was not run: pegboard cannot tell which origin it would \
-             write to, or cannot show it truthfully (no tab is selected among several, its \
+            "the {name} command was not run: pegboard cannot tell which origin {goes}, or \
+             cannot show it truthfully (no tab is selected among several, its \
              address could not be read, or it is an about:, data: or otherwise opaque \
              origin); select a tab (`tab <id>`) at an http(s) page and run it again"
         ),
@@ -797,28 +984,47 @@ fn is_storage(run_argv: &[String]) -> bool {
     run_argv.first().map(String::as_str) == Some("storage")
 }
 
+/// Whether what a command does lands in the frame agent-browser acts in, which is then read
+/// for its question and its pin: a storage write, and an upload (its file input may be in a
+/// frame of another origin).
+fn reads_frame(class: ActionClass, run_argv: &[String]) -> bool {
+    class == ActionClass::Upload || is_storage(run_argv)
+}
+
 /// The question for an asking command: the session, and for `state` what it would write
 /// where (read now: the tab, and for storage the frame agent-browser acts in) and what
-/// pins it there. Where it would write unknown: refused (`unknown_origin`).
+/// pins it there; for `upload` where the files would go (the frame and its tab) and `files`,
+/// the copies' real paths and sizes. Where it would write unknown: refused
+/// (`unknown_origin`).
+#[allow(clippy::too_many_arguments)]
 async fn prepare_question(
     sessions: &SessionManager,
     runner: &Runner,
     id: &SessionId,
     class: ActionClass,
     run_argv: &[String],
+    files: &[ShownFile],
     timeout_ms: u64,
 ) -> Result<(ConfirmAsk, StatePin), RpcError> {
     let info = sessions.info(id)?;
-    let (acting, page) =
-        where_it_acts(sessions, runner, id, is_storage(run_argv), timeout_ms).await;
-    let (details, pin) = state_details(
-        run_argv,
-        Where {
-            page_url: page.as_deref(),
-            acting_url: acting.as_deref(),
-        },
+    let (acting, page) = where_it_acts(
+        sessions,
+        runner,
+        id,
+        reads_frame(class, run_argv),
+        timeout_ms,
     )
-    .map_err(|e| match e {
+    .await;
+    let at = Where {
+        page_url: page.as_deref(),
+        acting_url: acting.as_deref(),
+    };
+    let shown = if class == ActionClass::Upload {
+        upload_details(files, at)
+    } else {
+        state_details(run_argv, at)
+    };
+    let (details, pin) = shown.map_err(|e| match e {
         NotShown::UnknownOrigin => unknown_origin(class),
         NotShown::Unexpected => RpcError {
             code: codes::INTERNAL.to_string(),
@@ -833,16 +1039,22 @@ async fn prepare_question(
             profile: display_text(&info.profile, NAME_CHARS),
             class,
             details,
-            offer_allow_for_session: true,
-            // The browser as a responder comes with the fork's domain.
-            place: None,
+            offer_allow_for_session: offers_allow_for_session(class, &info.policy),
+            place: question_place(),
         },
         pin,
     ))
 }
 
-/// The address of the frame agent-browser acts in (for a storage command; `None` for any
-/// other) and of the tab, read now. The frame first: asking agent-browser binds it to a tab
+/// Whether a person is offered "allow for the rest of the session": for an upload only
+/// when the session has an upload directory (it then uploads from that directory unasked; a
+/// grant without one would let any path go up unasked). The broker narrows it again.
+fn offers_allow_for_session(class: ActionClass, policy: &SessionPolicy) -> bool {
+    class != ActionClass::Upload || policy.upload_dir.is_some()
+}
+
+/// The address of the frame agent-browser acts in (for a storage command or an upload;
+/// `None` for any other) and of the tab, read now. The frame first: asking agent-browser binds it to a tab
 /// when it was bound to none, and the tab read is then that one.
 async fn where_it_acts(
     sessions: &SessionManager,
@@ -1611,12 +1823,17 @@ mod tests {
     }
 
     #[test]
-    fn an_upload_that_would_ask_is_denied_until_staging() {
-        let e = no_confirmation_yet(ActionClass::Upload);
+    fn an_upload_with_nobody_to_answer_names_both_options() {
+        let e = denial(
+            ActionClass::Upload,
+            ConfirmOutcome::NoResponder,
+            None,
+            crate::confirm::CONFIRM_TIMEOUT,
+        );
         assert_eq!(e.code, codes::POLICY_DENIED);
         assert!(
             e.message
-                .contains("needs a person's confirmation, which is not available yet"),
+                .contains("confirmation needs the Pegboard browser"),
             "{}",
             e.message
         );
@@ -1627,6 +1844,207 @@ mod tests {
             e.message
         );
         assert_eq!(e.data, Some(json!({ "reason": "no_responder" })));
+        // A state command's names no directory.
+        let e = denial(
+            ActionClass::State,
+            ConfirmOutcome::NoResponder,
+            None,
+            crate::confirm::CONFIRM_TIMEOUT,
+        );
+        assert!(!e.message.contains("--upload-dir"), "{}", e.message);
+    }
+
+    /// A temporary layout: a person's folder, the session's files, pegboard's home, and a
+    /// folder elsewhere.
+    struct UploadRig {
+        _tmp: tempfile::TempDir,
+        up: PathBuf,
+        files: PathBuf,
+        home: PathBuf,
+        elsewhere: PathBuf,
+    }
+
+    fn upload_rig() -> UploadRig {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let files = home.join("sessions/s_1/files");
+        let (up, elsewhere) = (root.join("person-folder"), root.join("elsewhere"));
+        for d in [&up, &files, &elsewhere] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(up.join("a.txt"), "a").unwrap();
+        std::fs::write(files.join("b.txt"), "b").unwrap();
+        std::fs::write(elsewhere.join("c.txt"), "c").unwrap();
+        UploadRig {
+            _tmp: tmp,
+            up,
+            files,
+            home,
+            elsewhere,
+        }
+    }
+
+    #[test]
+    fn absolute_paths_are_refused_when_the_session_has_an_upload_dir() {
+        let r = upload_rig();
+        let c = r.elsewhere.join("c.txt").display().to_string();
+        let up = r.up.display().to_string();
+        // Unasked (`--allow upload --upload-dir`): by name only, as before.
+        let e = resolve_names(
+            Some(&up),
+            r.files.clone(),
+            &words(&["upload", "#f", "a.txt", &c]),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, codes::ARGV_REJECTED);
+        assert!(e.message.contains("only by file name"), "{}", e.message);
+        assert!(!e.message.contains(&up), "{}", e.message);
+        // Asking, with an upload directory: by name only too.
+        let e = asked_upload_sources(
+            Some(&up),
+            r.files.clone(),
+            vec![r.home.clone()],
+            &words(&["upload", "#f", &c]),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, codes::ARGV_REJECTED);
+        assert!(e.message.contains("only by file name"), "{}", e.message);
+        // Asking, with an upload directory: a name is looked up there, then in the files,
+        // and must be directly inside one of them when it is copied.
+        let sources = asked_upload_sources(
+            Some(&up),
+            r.files.clone(),
+            vec![r.home.clone()],
+            &words(&["upload", "#f", "a.txt", "b.txt"]),
+        )
+        .unwrap();
+        let dirs = vec![r.up.clone(), r.files.clone()];
+        assert_eq!(
+            sources,
+            [
+                (
+                    r.up.join("a.txt"),
+                    upload::Allowed::DirectlyIn(dirs.clone())
+                ),
+                (r.files.join("b.txt"), upload::Allowed::DirectlyIn(dirs)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_asking_session_without_a_directory_takes_absolute_paths_outside_pegboard() {
+        let r = upload_rig();
+        let forbidden = vec![r.home.clone()];
+        let c = r.elsewhere.join("c.txt").display().to_string();
+        let sources = asked_upload_sources(
+            None,
+            r.files.clone(),
+            forbidden.clone(),
+            &words(&["upload", "#f", "b.txt", &c]),
+        )
+        .unwrap();
+        assert_eq!(
+            sources,
+            [
+                (
+                    r.files.join("b.txt"),
+                    upload::Allowed::DirectlyIn(vec![r.files.clone()])
+                ),
+                (
+                    r.elsewhere.join("c.txt"),
+                    upload::Allowed::Outside(forbidden.clone())
+                ),
+            ]
+        );
+        // A name is looked up in the session's files only.
+        let e = asked_upload_sources(
+            None,
+            r.files.clone(),
+            forbidden.clone(),
+            &words(&["upload", "#f", "a.txt"]),
+        )
+        .unwrap_err();
+        assert!(e.message.contains("absolute path"), "{}", e.message);
+        // Inside pegboard's home (another session's files), through its absolute path.
+        let other = r
+            .home
+            .join("sessions/s_1/files/b.txt")
+            .display()
+            .to_string();
+        let e = asked_upload_sources(
+            None,
+            r.files.clone(),
+            forbidden.clone(),
+            &words(&["upload", "#f", &other]),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, codes::ARGV_REJECTED);
+        assert!(
+            e.message.contains("pegboard's data directory"),
+            "{}",
+            e.message
+        );
+        // Seventeen files.
+        let many: Vec<String> =
+            std::iter::repeat_n(c.clone(), upload::MAX_UPLOAD_FILES + 1).collect();
+        let mut line = words(&["upload", "#f"]);
+        line.extend(many);
+        let e = asked_upload_sources(None, r.files.clone(), forbidden.clone(), &line).unwrap_err();
+        assert!(e.message.contains("at most 16 files"), "{}", e.message);
+        line.pop();
+        assert!(asked_upload_sources(None, r.files.clone(), forbidden, &line).is_ok());
+    }
+
+    #[test]
+    fn allow_for_session_is_offered_only_with_an_upload_dir() {
+        let plain = SessionPolicy::default();
+        let with_dir = SessionPolicy {
+            upload_dir: Some("/up".into()),
+            ..SessionPolicy::default()
+        };
+        assert!(!offers_allow_for_session(ActionClass::Upload, &plain));
+        assert!(offers_allow_for_session(ActionClass::Upload, &with_dir));
+        assert!(offers_allow_for_session(ActionClass::State, &plain));
+    }
+
+    #[test]
+    fn an_upload_reads_the_frame_it_acts_in() {
+        assert!(reads_frame(
+            ActionClass::Upload,
+            &words(&["upload", "#f", "/a"])
+        ));
+        assert!(reads_frame(
+            ActionClass::State,
+            &words(&["storage", "local", "clear"])
+        ));
+        assert!(!reads_frame(
+            ActionClass::State,
+            &words(&["cookies", "set", "a", "b"])
+        ));
+    }
+
+    #[test]
+    fn hide_paths_covers_staged_paths() {
+        let names = vec![
+            ("/Users/p/link/a.txt".to_string(), "a.txt".to_string()),
+            ("/Users/p/real/a.txt".to_string(), "a.txt".to_string()),
+            (
+                "/h/sessions/s_1/confirm/0f/0/a.txt".to_string(),
+                "a.txt".to_string(),
+            ),
+        ];
+        let mut out = Ok(CommandExecResult {
+            exit_code: 0,
+            output: json!({"data": {"files": [
+                "/h/sessions/s_1/confirm/0f/0/a.txt", "/Users/p/real/a.txt"
+            ]}}),
+            stderr: "set /h/sessions/s_1/confirm/0f/0/a.txt".into(),
+        });
+        hide_paths(&mut out, &names);
+        let r = out.unwrap();
+        assert_eq!(r.output["data"]["files"], json!(["a.txt", "a.txt"]));
+        assert_eq!(r.stderr, "set a.txt");
     }
 
     #[test]

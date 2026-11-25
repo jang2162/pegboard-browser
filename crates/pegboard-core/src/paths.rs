@@ -29,6 +29,29 @@ impl Paths {
     pub fn session_files(&self, id: &SessionId) -> PathBuf {
         self.home.join("sessions").join(&id.0).join("files")
     }
+
+    /// Directory of the copies an upload that asks a person is shown and sends
+    /// (`<home>/sessions/<id>/confirm`, design 4.3). See `ensure_session_confirm`.
+    pub fn session_confirm_dir(&self, id: &SessionId) -> PathBuf {
+        self.home.join("sessions").join(&id.0).join("confirm")
+    }
+
+    /// Where the sessions' directories are (`<home>/sessions`).
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.home.join("sessions")
+    }
+
+    /// Directories an upload's absolute path may not point into: pegboard's home (other
+    /// sessions' files, recordings, settings, the stock browser's user data) and the fork's
+    /// own user data directory (`~/Library/Application Support/Pegboard`, which is the home
+    /// unless `PEGBOARD_HOME` says otherwise).
+    pub fn upload_forbidden(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.home.clone(), self.chrome_udd.clone()];
+        if let Some(user) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(user).join("Library/Application Support/Pegboard"));
+        }
+        dirs
+    }
 }
 
 /// `home` is `$PEGBOARD_HOME` or `~/Library/Application Support/Pegboard`.
@@ -100,6 +123,18 @@ pub fn ensure_session_files(paths: &Paths, id: &SessionId) -> std::io::Result<Pa
         ensure_owned_private_dir(dir)?;
     }
     Ok(files)
+}
+
+/// Creates the session's confirmation copies directory (`<home>/sessions/<id>/confirm`),
+/// each component a real directory owned by the current user with mode 0700.
+pub fn ensure_session_confirm(paths: &Paths, id: &SessionId) -> std::io::Result<PathBuf> {
+    let confirm = paths.session_confirm_dir(id);
+    let session = confirm.parent().unwrap_or(&paths.home);
+    let sessions = session.parent().unwrap_or(&paths.home);
+    for dir in [&paths.home, sessions, session, confirm.as_path()] {
+        ensure_owned_private_dir(dir)?;
+    }
+    Ok(confirm)
 }
 
 /// Creates `dir` and its parent (`/tmp/pegboard-<uid>` and its `ab`) when missing, and

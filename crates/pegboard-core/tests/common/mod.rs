@@ -100,6 +100,15 @@ pw.addEventListener('input', () => { if (pw.value.length >= 8) pw.form.submit();
         "/form-otp" => ("", page("form-otp", r#"<input id="otp" autocomplete="one-time-code" oninput="this.blur()">"#)),
         "/form-blur" => ("", page("form-blur", r#"<input id="pw" type="password" oninput="this.blur()">"#)),
         "/frame" => ("", page("frame", r#"<p>outer</p><iframe id="fr" src="/form"></iframe>"#)),
+        // A file input that reads what it was given: `window.__got` is `name:size:text` of
+        // each file, joined by '|'.
+        "/upload" => ("", page("upload", r#"<input id="f" type="file" multiple><script>
+document.getElementById('f').addEventListener('change', async (e) => {
+  const parts = [];
+  for (const f of e.target.files) parts.push(f.name + ':' + f.size + ':' + await f.text());
+  window.__got = parts.join('|');
+});
+</script>"#)),
         "/writer" => ("", page("writer", "<p>writer</p><script>setInterval(() => localStorage.setItem('busy', String(Date.now())), 100);</script>")),
         _ => return None,
     })

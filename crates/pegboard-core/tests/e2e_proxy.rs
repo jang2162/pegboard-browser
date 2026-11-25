@@ -1235,6 +1235,46 @@ fn set_file_input_files_only_takes_files_from_the_sessions_directories() {
     });
 }
 
+/// A session that asks a person before an upload, even with an upload directory, gives its
+/// endpoint no directory at all: a client attached to it directly cannot set a file nobody
+/// approved (design 4.3; the approved copy's directory is opened only while its command
+/// runs, by the daemon).
+#[test]
+#[ignore]
+fn an_unapproved_file_cannot_be_set_through_the_session_endpoint() {
+    use pegboard_protocol::SessionPolicy;
+    common::run(async {
+        let h = common::Harness::start();
+        let tmp = tempfile::tempdir().unwrap();
+        let up = tmp.path().canonicalize().unwrap().join("up");
+        std::fs::create_dir(&up).unwrap();
+        std::fs::write(up.join("a.txt"), "hello").unwrap();
+        let asking = SessionPolicy {
+            upload_dir: Some(up.display().to_string()),
+            ..SessionPolicy::default()
+        };
+        let (info, ep) = h.session_with_policy("/form", asking).await;
+        let files = pegboard_core::paths::ensure_session_files(&h.env.paths, &info.id).unwrap();
+        std::fs::write(files.join("got.txt"), "got").unwrap();
+        let target = h.manager.info(&info.id).unwrap().targets[0].clone();
+        let c = common::client(&ep).await;
+        let sid = c.attach(&target).await.unwrap();
+        c.evaluate(
+            &sid,
+            "document.body.innerHTML = '<input id=f type=file multiple>'",
+        )
+        .await
+        .unwrap();
+        for path in [up.join("a.txt"), files.join("got.txt")] {
+            let e = set_file(&c, &sid, &path).await.unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains("upload directories"), "{path:?}: {e}");
+            assert_eq!(chosen_names(&c, &sid).await, json!([]), "{path:?}");
+        }
+        h.close_session(&info.id).await;
+    });
+}
+
 /// The screen stream is the recorder's: an agent can neither start, stop nor acknowledge one
 /// on its own session (refused by the proxy), and the recording's stream goes on.
 #[test]

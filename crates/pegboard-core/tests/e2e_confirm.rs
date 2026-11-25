@@ -124,6 +124,37 @@ impl Rig {
         }
     }
 
+    /// A session at `path` with `policy` (the API's camelCase form).
+    async fn session_with(&self, path: &str, policy: Value) -> Session {
+        let r = self
+            .call(
+                "session.create",
+                json!({ "url": format!("{}{path}", self.fixture.origin), "policy": policy }),
+            )
+            .await;
+        let info = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
+        Session {
+            id: info["id"].as_str().unwrap().to_string(),
+            token: info["token"].as_str().unwrap().to_string(),
+        }
+    }
+
+    /// What the `/upload` page's file input read (`name:size:text|…`), once it has.
+    async fn uploaded(&self, s: &Session) -> Value {
+        self.ok(s, &["wait", "--fn", "window.__got !== undefined"])
+            .await;
+        self.ok(s, &["eval", "window.__got"]).await["data"]["result"].clone()
+    }
+
+    /// The copies made for a person's confirmation that are still there.
+    fn copies_left(&self, s: &Session) -> usize {
+        let dir = self
+            .env
+            .paths
+            .session_confirm_dir(&pegboard_protocol::SessionId(s.id.clone()));
+        std::fs::read_dir(dir).map_or(0, |d| d.count())
+    }
+
     /// Runs a command in a task of its own; its response when awaited.
     fn exec(&self, s: &Session, argv: &[&str]) -> tokio::task::JoinHandle<Response> {
         let daemon = self.daemon.clone();
@@ -769,5 +800,201 @@ async fn a_cookie_approved_after_the_tab_left_lands_on_the_asked_host() {
     assert_eq!(found[0]["domain"], "127.0.0.1", "{there}");
     assert_eq!(found[0]["path"], shown_path.as_str(), "{there}");
     assert_eq!(found[0]["value"], "v1", "{there}");
+    rig.finish().await;
+}
+
+/// An upload from a session without an upload directory: the person sees the real path (a
+/// link in the given one resolved), its size and where it goes; what uploads is the content
+/// they were shown, under its own name, even though the original changed after the question.
+/// The copy is gone after the command, and the agent never sees its path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn upload_shows_real_paths_and_uploads_the_bytes_shown() {
+    let rig = rig(None).await;
+    let s = rig.session_at("/upload").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let real_dir = tmp.path().canonicalize().unwrap().join("real");
+    std::fs::create_dir(&real_dir).unwrap();
+    std::fs::write(real_dir.join("a.txt"), "first").unwrap();
+    std::os::unix::fs::symlink(&real_dir, tmp.path().join("via")).unwrap();
+    let given = tmp.path().join("via/a.txt").display().to_string();
+    let real = real_dir.join("a.txt").display().to_string();
+    assert_ne!(given, real);
+    let mut person = rig.subscribe().await;
+    let run = rig.exec(&s, &["upload", "#f", &given]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(asked["class"], "upload", "{asked}");
+    assert_eq!(
+        asked["offerAllowForSession"], false,
+        "no upload directory: {asked}"
+    );
+    assert_eq!(asked["details"][0]["label"], "호스트", "{asked}");
+    assert_eq!(shown(&asked, "호스트"), "127.0.0.1");
+    assert_eq!(shown(&asked, "대상 페이지"), rig.fixture.origin);
+    assert_eq!(shown(&asked, "파일"), real, "the real path: {asked}");
+    assert_eq!(shown(&asked, "크기"), "5 B");
+    assert!(!asked.to_string().contains("/confirm/"), "{asked}");
+    // The original changes after the question, then becomes a link elsewhere.
+    std::fs::write(real_dir.join("a.txt"), "changed after").unwrap();
+    std::fs::write(tmp.path().join("other.txt"), "other").unwrap();
+    std::fs::remove_file(real_dir.join("a.txt")).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("other.txt"), real_dir.join("a.txt")).unwrap();
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "approve")
+        .await;
+    let r = run.await.unwrap();
+    let result = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
+    assert_eq!(result["exitCode"], 0, "{result}");
+    assert_eq!(
+        result["output"]["confirmed"],
+        json!({ "by": "api" }),
+        "{result}"
+    );
+    assert!(
+        !result.to_string().contains("/confirm/"),
+        "a copy's path: {result}"
+    );
+    assert_eq!(rig.uploaded(&s).await, "a.txt:5:first");
+    assert_eq!(rig.copies_left(&s), 0);
+    let entry = rig
+        .entries(&s)
+        .into_iter()
+        .find(|e| e.command == "upload")
+        .unwrap();
+    assert!(entry.ok, "{entry:?}");
+    assert_eq!(
+        entry.confirm.map(|c| (c.outcome, c.by)),
+        Some((
+            pegboard_protocol::ConfirmOutcome::Approved,
+            Some(pegboard_protocol::ConfirmBy::Api)
+        ))
+    );
+    rig.finish().await;
+}
+
+/// With nobody to answer, an upload is denied at once, before any file is looked at (a
+/// missing file is not even reported), and a denied one leaves no copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn an_upload_with_nobody_to_answer_is_denied_before_its_files_are_read() {
+    let rig = rig(None).await;
+    let s = rig.session_at("/upload").await;
+    let r = rig
+        .exec(&s, &["upload", "#f", "/no/such/file.txt"])
+        .await
+        .unwrap();
+    assert_eq!(reason(&r), "no_responder");
+    assert!(
+        r.error
+            .unwrap()
+            .message
+            .contains("--allow upload and --upload-dir"),
+        "both options are named"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("d.txt");
+    std::fs::write(&file, "d").unwrap();
+    let mut person = rig.subscribe().await;
+    let run = rig.exec(&s, &["upload", "#f", file.to_str().unwrap()]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(rig.copies_left(&s), 1, "copied before asking");
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "deny")
+        .await;
+    assert_eq!(reason(&run.await.unwrap()), "denied");
+    assert_eq!(rig.copies_left(&s), 0);
+    assert_eq!(
+        rig.ok(&s, &["eval", "String(window.__got)"]).await["data"]["result"],
+        "undefined"
+    );
+    rig.finish().await;
+}
+
+/// Approved after the tab went to another origin: the upload does not run (`stale`), and its
+/// copy is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn upload_origin_change_is_stale() {
+    let rig = rig(None).await;
+    let s = hopping_session(&rig, 2500).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("h.txt");
+    std::fs::write(&file, "h").unwrap();
+    let mut person = rig.subscribe().await;
+    let run = rig.exec(&s, &["upload", "#f", file.to_str().unwrap()]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(shown(&asked, "대상 페이지"), rig.fixture.origin, "{asked}");
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "approve")
+        .await;
+    let r = run.await.unwrap();
+    assert_eq!(reason(&r), "stale");
+    assert_eq!(rig.copies_left(&s), 0);
+    let entry = rig
+        .entries(&s)
+        .into_iter()
+        .find(|e| e.command == "upload")
+        .unwrap();
+    assert_eq!(
+        entry.confirm.map(|c| c.outcome),
+        Some(pegboard_protocol::ConfirmOutcome::Stale)
+    );
+    rig.finish().await;
+}
+
+/// A session with an upload directory: an upload asks, by file name only, and offers "allow
+/// for the rest of the session"; once given, the next upload goes unasked (as with
+/// `--allow upload`), and an absolute path is still refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn upload_with_an_upload_dir_offers_allow_for_session_and_then_stops_asking() {
+    let rig = rig(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let up = dir.path().canonicalize().unwrap();
+    std::fs::write(up.join("a.txt"), "aa").unwrap();
+    std::fs::write(up.join("b.txt"), "bbb").unwrap();
+    let s = rig
+        .session_with("/upload", json!({ "uploadDir": up.display().to_string() }))
+        .await;
+    let mut person = rig.subscribe().await;
+    let run = rig.exec(&s, &["upload", "#f", "a.txt"]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(asked["offerAllowForSession"], true, "{asked}");
+    assert_eq!(
+        shown(&asked, "파일"),
+        up.join("a.txt").display().to_string()
+    );
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "allowForSession")
+        .await;
+    let r = run.await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(rig.uploaded(&s).await, "a.txt:2:aa");
+    // Unasked now, from the directory.
+    rig.ok(&s, &["eval", "window.__got = undefined"]).await;
+    let out = rig.ok(&s, &["upload", "#f", "b.txt"]).await;
+    assert_eq!(out["confirmed"], json!({ "by": "session" }), "{out}");
+    assert!(
+        person
+            .try_next("confirm.required", Duration::from_secs(1))
+            .await
+            .is_none(),
+        "asked again"
+    );
+    assert_eq!(rig.uploaded(&s).await, "b.txt:3:bbb");
+    // By name only.
+    let other = tempfile::tempdir().unwrap();
+    let c = other.path().join("c.txt");
+    std::fs::write(&c, "c").unwrap();
+    let r = rig
+        .exec(&s, &["upload", "#f", c.to_str().unwrap()])
+        .await
+        .unwrap();
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("argv_rejected"),
+        "{r:?}"
+    );
     rig.finish().await;
 }

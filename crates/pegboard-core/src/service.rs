@@ -433,6 +433,8 @@ impl Daemon {
         // Before anything is started: a daemon does not run with settings it cannot use.
         let recording = RecordingConfig::load(&paths).map_err(|e| anyhow!(e))?;
         ensure(&paths)?;
+        // Copies of uploads a stopped daemon was asking about (no session of it is left).
+        crate::confirm::staging::remove_leftovers(&paths.sessions_dir());
         // First, so a missing or wrong agent-browser fails before a window opens.
         let runner =
             Arc::new(Runner::new(paths.clone()).map_err(|e| anyhow!("{}: {}", e.code, e.message))?);
@@ -992,6 +994,9 @@ impl Daemon {
     }
 
     fn remove_files(&self, id: &SessionId) {
+        // Copies an upload made for a person's confirmation (its command deletes its own;
+        // one still being made when the session closed is caught here or at the next start).
+        let _ = std::fs::remove_dir_all(self.paths.session_confirm_dir(id));
         let files = self.paths.session_files(id);
         let _ = std::fs::remove_dir_all(&files);
         if let Some(dir) = files.parent() {

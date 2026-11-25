@@ -99,6 +99,13 @@ fn is_invisible(c: char) -> bool {
     )
 }
 
+/// Whether `c` shows as itself (`display_text` leaves it alone): not a backslash, nor a
+/// control, format, bidi or invisible character. A path an upload takes must be made of
+/// these only, so the person sees it exactly.
+pub fn shows_plainly(c: char) -> bool {
+    c != '\\' && !c.is_control() && !is_format(c) && !is_invisible(c)
+}
+
 /// One character as shown: `\\` for a backslash (so an escape cannot be faked), `\u{…}`
 /// for one that shows nothing or changes how the rest looks, else itself.
 fn shown_char(c: char) -> String {
@@ -253,6 +260,75 @@ pub fn state_details(
         // Fail closed: nothing is asked about that these rules do not know.
         _ => Err(NotShown::Unexpected),
     }
+}
+
+/// A file an upload would send, as the person is shown it: its real path (symbolic links
+/// resolved, from the open file itself) and its size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownFile {
+    pub path: String,
+    pub size: u64,
+}
+
+/// `n` bytes for a person: `12 B`, `1.5 KiB (1536 B)`, `200.0 MiB (209715200 B)`.
+pub fn human_size(n: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    // Display only: the exact count follows in parentheses.
+    #[allow(clippy::cast_precision_loss)]
+    let f = |unit: u64| n as f64 / unit as f64;
+    match n {
+        n if n < KIB => format!("{n} B"),
+        n if n < MIB => format!("{:.1} KiB ({n} B)", f(KIB)),
+        n if n < GIB => format!("{:.1} MiB ({n} B)", f(MIB)),
+        n => format!("{:.1} GiB ({n} B)", f(GIB)),
+    }
+}
+
+/// What an upload shows and what pins it (design 4.3, B7): where the files go first (the
+/// host, cut from the left like a cookie's; the origin of the frame agent-browser acts in,
+/// and the tab's when that differs), then each file's real path, whole, and its size. It is
+/// held like a storage write: when it runs, the frame and its tab must still be at the shown
+/// origins (`StatePin::Origin`), else `stale`. A path that would not show exactly as it is
+/// (escaped or cut) is `Unexpected`: the daemon refuses such a path before it asks.
+pub fn upload_details(
+    files: &[ShownFile],
+    at: Where<'_>,
+) -> Result<(Vec<ConfirmDetail>, StatePin), NotShown> {
+    let (Some(acting), Some(page)) = (at.acting_url, at.page_url) else {
+        return Err(NotShown::UnknownOrigin);
+    };
+    let (acting, page) = (storage_origin(acting)?, storage_origin(page)?);
+    let host = url::Url::parse(&acting)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .filter(|h| !h.is_empty())
+        .ok_or(NotShown::UnknownOrigin)?;
+    let mut details = vec![
+        detail("호스트", display_tail(&host, HOST_SHOWN_CHARS)),
+        detail("대상 페이지", display_text(&acting, DETAIL_VALUE_CHARS)),
+    ];
+    // Inside a frame of another origin: the tab's origin too, so the person sees the files
+    // do not go to the page they see.
+    if acting != page {
+        details.push(detail(
+            "탭 출처 (파일은 그 안의 프레임으로)",
+            display_text(&page, DETAIL_VALUE_CHARS),
+        ));
+    }
+    if files.is_empty() {
+        return Err(NotShown::Unexpected);
+    }
+    for f in files {
+        let shown = display_text(&f.path, DETAIL_VALUE_CHARS);
+        if shown != f.path {
+            return Err(NotShown::Unexpected);
+        }
+        details.push(detail("파일", shown));
+        details.push(detail("크기", human_size(f.size)));
+    }
+    Ok((details, StatePin::Origin { acting, page }))
 }
 
 /// Sets a flag's value once; a second one (or none) is `Unexpected`.
@@ -797,6 +873,133 @@ mod tests {
                 Err(NotShown::Unexpected),
                 "{argv:?}"
             );
+        }
+    }
+
+    fn files(v: &[(&str, u64)]) -> Vec<ShownFile> {
+        v.iter()
+            .map(|(p, n)| ShownFile {
+                path: p.to_string(),
+                size: *n,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_upload_shows_the_host_first_then_each_real_path_and_size() {
+        let at = Where {
+            page_url: Some("https://a.test/upload?x=1"),
+            acting_url: Some("https://a.test/upload?x=1"),
+        };
+        let (details, pin) =
+            upload_details(&files(&[("/tmp/r/a.txt", 12), ("/tmp/r/b.bin", 1536)]), at).unwrap();
+        let shown: Vec<(&str, &str)> = details
+            .iter()
+            .map(|d| (d.label.as_str(), d.value.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("호스트", "a.test"),
+                ("대상 페이지", "https://a.test"),
+                ("파일", "/tmp/r/a.txt"),
+                ("크기", "12 B"),
+                ("파일", "/tmp/r/b.bin"),
+                ("크기", "1.5 KiB (1536 B)"),
+            ]
+        );
+        assert_eq!(
+            pin,
+            StatePin::Origin {
+                acting: "https://a.test".into(),
+                page: "https://a.test".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_upload_into_a_frame_shows_both_origins_and_a_long_host_keeps_its_end() {
+        let long = format!("{}.evil.test", "a".repeat(150));
+        let acting = format!("https://{long}/f");
+        let at = Where {
+            page_url: Some("https://bank.test/"),
+            acting_url: Some(&acting),
+        };
+        let (details, pin) = upload_details(&files(&[("/tmp/a", 1)]), at).unwrap();
+        assert_eq!(details[0].label, "호스트");
+        assert!(details[0].value.starts_with('…'), "{}", details[0].value);
+        assert!(
+            details[0].value.ends_with(".evil.test"),
+            "{}",
+            details[0].value
+        );
+        assert_eq!(
+            value_of(&details, "탭 출처 (파일은 그 안의 프레임으로)"),
+            "https://bank.test"
+        );
+        assert!(matches!(pin, StatePin::Origin { page, .. } if page == "https://bank.test"));
+    }
+
+    #[test]
+    fn an_upload_with_no_or_an_opaque_target_or_an_unshowable_path_is_not_shown() {
+        let ok = Where {
+            page_url: Some("https://a.test/"),
+            acting_url: Some("https://a.test/"),
+        };
+        for at in [
+            Where::default(),
+            Where {
+                page_url: Some("https://a.test/"),
+                acting_url: None,
+            },
+            Where {
+                page_url: Some("about:blank"),
+                acting_url: Some("about:blank"),
+            },
+            Where {
+                page_url: Some("https://a.test/"),
+                acting_url: Some("data:text/html,x"),
+            },
+        ] {
+            assert_eq!(
+                upload_details(&files(&[("/tmp/a", 1)]), at).unwrap_err(),
+                NotShown::UnknownOrigin,
+                "{at:?}"
+            );
+        }
+        for bad in ["/tmp/a\u{202e}txt.exe", "/tmp/a\\b", "/tmp/a\nb"] {
+            assert_eq!(
+                upload_details(&files(&[(bad, 1)]), ok).unwrap_err(),
+                NotShown::Unexpected,
+                "{bad:?}"
+            );
+        }
+        let long = format!("/{}", "a".repeat(DETAIL_VALUE_CHARS));
+        assert_eq!(
+            upload_details(&files(&[(&long, 1)]), ok).unwrap_err(),
+            NotShown::Unexpected
+        );
+        assert_eq!(upload_details(&[], ok).unwrap_err(), NotShown::Unexpected);
+    }
+
+    #[test]
+    fn sizes_read_for_a_person() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(200 << 20), "200.0 MiB (209715200 B)");
+        assert_eq!(human_size(3 << 30), "3.0 GiB (3221225472 B)");
+    }
+
+    #[test]
+    fn plain_characters_are_what_display_text_leaves_alone() {
+        for c in ['a', '/', '.', '한', 'é', ' '] {
+            assert!(shows_plainly(c), "{c:?}");
+        }
+        for c in [
+            '\\', '\n', '\u{202e}', '\u{2066}', '\u{200b}', '\u{3164}', '\0',
+        ] {
+            assert!(!shows_plainly(c), "{c:?}");
+            assert_ne!(display_text(&c.to_string(), 10), c.to_string());
         }
     }
 }

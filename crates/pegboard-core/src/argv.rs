@@ -52,7 +52,9 @@ enum Kind {
     File(&'static [&'static str]),
     /// A bare file name (any extension) kept as a name: the daemon looks it up in the
     /// session's upload directory and files directory (`upload::resolve`) once the policy
-    /// has allowed the command.
+    /// has allowed the command. Or an absolute path in plain form
+    /// (`upload::check_path_form`), which only a session that asks a person and has no
+    /// upload directory takes (the daemon refuses it otherwise).
     UploadFile,
     Choice(&'static [&'static str]),
 }
@@ -1219,9 +1221,14 @@ fn accept(kind: Kind, w: &str, files_dir: &Path) -> Result<String, String> {
             }
             Ok(files_dir.join(w).display().to_string())
         }
+        // A bare name, or an absolute path (only a session that asks a person and has no
+        // upload directory takes one: the daemon decides, once the policy is known).
+        UploadFile if w.starts_with('/') => crate::upload::check_path_form(w)
+            .map(|()| w.to_string())
+            .map_err(|why| format!("not an absolute path pegboard takes: {why}")),
         UploadFile => ok(
             is_file_name(w),
-            "a bare file name (letters, digits, '.', '_', '-'; no path)",
+            "a bare file name (letters, digits, '.', '_', '-'; no path), or an absolute path",
         ),
         Choice(options) => ok(
             options.contains(&w),
@@ -1281,7 +1288,6 @@ mod tests {
         );
         for bad in [
             "../a.txt",
-            "/etc/passwd",
             "sub/a.txt",
             "a\\b",
             "",
@@ -1300,6 +1306,47 @@ mod tests {
         refused(&["upload"]);
         refused(&["upload", "#f"]);
         refused(&["upload", "#f", "a.txt", "--multiple"]);
+    }
+
+    #[test]
+    fn upload_takes_bare_names_or_absolute_paths() {
+        // An absolute path in plain form passes the grammar (the daemon decides whether the
+        // session takes one).
+        for good in [
+            "/tmp/a.txt",
+            "/Users/x/My Files/보고서 1.pdf",
+            "/a",
+            "/etc/passwd",
+        ] {
+            assert_eq!(
+                run(&["upload", "#f", good]).unwrap(),
+                s(&["upload", "#f", good])
+            );
+        }
+        assert_eq!(
+            run(&["upload", "#f", "a.txt", "/tmp/b.txt"]).unwrap(),
+            s(&["upload", "#f", "a.txt", "/tmp/b.txt"])
+        );
+        let long = format!("/{}", "a".repeat(crate::upload::MAX_PATH_BYTES));
+        for bad in [
+            "a/b",
+            "../a",
+            "/x/../y",
+            "/x/..",
+            "/x/./y",
+            "/x//y",
+            "/x/",
+            "/",
+            "",
+            "/tmp/a\u{0}b",
+            "/tmp/a\nb",
+            "/tmp/a\u{202e}txt.exe",
+            "/tmp/a\u{200b}b",
+            "/tmp/a\\b",
+            long.as_str(),
+        ] {
+            refused(&["upload", "#f", bad]);
+        }
     }
 
     #[test]

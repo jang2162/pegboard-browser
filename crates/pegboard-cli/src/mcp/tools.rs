@@ -389,7 +389,9 @@ fn action_meta(word: &str) -> Option<(Bundle, &'static str)> {
         "upload" => (
             Core,
             "Put files into a file input. Files are bare names, looked up in the upload \
-             directory set for the session and then in the session's files.",
+             directory set for the session and then in the session's files. A session that \
+             asks a person before each upload and has no upload directory also takes \
+             absolute paths; the person sees each file's real path and size.",
         ),
         "frame" => (
             Core,
@@ -503,7 +505,8 @@ fn kind_schema(kind: ArgKind) -> Value {
         ArgKind::TabRef => text("A tab id from the tab list (t1, t2, ...), or a tab label."),
         ArgKind::File([]) => text(
             "A bare file name (letters, digits, '.', '_', '-'; no path), found in the upload \
-             directory set for the session or in the session's files.",
+             directory set for the session or in the session's files; or, when the session \
+             asks a person and has no upload directory, an absolute path.",
         ),
         ArgKind::File(exts) => text(&format!(
             "A bare file name (letters, digits, '.', '_', '-'; no path) ending in .{}, saved \

@@ -31,6 +31,7 @@ use crate::profiles::{profile_dir, rpc_error, valid_profile_name, Profiles, DEFA
 use crate::proxy::filter::normalize_url;
 use crate::proxy::server::{Endpoint, ProxyServer};
 use crate::recording::recorder::{Recorder, WATCH_WAIT};
+use crate::upload;
 
 const GROUP_COLORS: &[&str] = &[
     "grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange",
@@ -409,16 +410,12 @@ impl SessionManager {
         );
         inner.proxy.set_group_style(&id, &title, color);
         // Files for an upload may come from the person's directory and from the session's
-        // own files; without `--allow upload` the proxy takes none.
-        if session_policy.allow.contains(&ActionClass::Upload) {
-            let dirs = [
-                session_policy.upload_dir.as_deref().map(PathBuf::from),
-                Some(inner.paths.session_files(&id)),
-            ];
-            inner
-                .proxy
-                .set_upload_dirs(&id, dirs.into_iter().flatten().collect());
-        }
+        // own files; without `--allow upload` the proxy takes none (a session that asks
+        // opens only an approved copy, while its command runs: `daemon`).
+        inner.proxy.set_upload_dirs(
+            &id,
+            upload::standing_dirs(&session_policy, inner.paths.session_files(&id), false),
+        );
         // Scripts that run before a page's own could disarm the clipboard shield (K3).
         inner
             .proxy
@@ -591,6 +588,12 @@ impl SessionManager {
     }
 
     /// The policy the session was created with.
+    /// Sets the directories the proxy lets the session's `DOM.setFileInputFiles` take files
+    /// from (`upload::standing_dirs`, or an approved copy's while its command runs).
+    pub fn set_upload_dirs(&self, id: &SessionId, dirs: Vec<PathBuf>) {
+        self.inner.proxy.set_upload_dirs(id, dirs);
+    }
+
     pub fn policy(&self, id: &SessionId) -> Result<SessionPolicy, RpcError> {
         let table = self.inner.table.lock().unwrap();
         Ok(ready(&table, id)?.info.policy.clone())
