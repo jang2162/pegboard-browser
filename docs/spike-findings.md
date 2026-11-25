@@ -1207,3 +1207,29 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 | 수정 후 포크: `e2e_session` | 15 passed |
 | 수정 후 포크: `e2e_domain` | 11 passed |
 | 수정 후 포크·순정: `e2e_clipboard` 전체 | 첫 실행은 도중에 기기 화면이 잠겨(`CGSSessionScreenIsLocked`, 앞 앱 `loginwindow`) 두 구성 모두 같은 11개가 `the profile did not become the default context`로 실패했다. 화면을 푼 뒤 다시 돌려 **포크 20 passed, 순정 20 passed** (2026-11-25) |
+
+## 3b단계 측정
+
+### 3b 작업 6. 제품 이름 문자열(생성 커밋)과 아이콘 (2026-11-25)
+
+`browser/scripts/rebrand-strings.py`를 `apply.sh`가 패치 뒤에 돌려 `rebrand-strings (generated)` 커밋을 만든다. 개발 기기의 Chromium 트리(`156.0.8078.109`)에서 잰 값이다.
+
+| 항목 | 값 |
+|---|---|
+| 바꾼 메시지 | `chromium_strings.grd`(`settings_chromium_strings.grdp` 포함) 673개, `components_chromium_strings.grd` 20개 |
+| 제외(바꾼 뒤에도 "Chromium"이 남은 메시지) | 18개(ChromiumOS 이름, "The Chromium Authors"). 다시 돌리면 오픈 소스 고지 2개가 더해져 20개·2개로 센다(남은 "Chromium"이 프로젝트 링크뿐) |
+| 바꾼 번역 ID | 592개 + 20개. 언어 81개마다 번역 453+20개를 바꿨다(같은 원문을 가진 메시지는 ID가 같다). 새 ID를 받았지만 번역에 "Chromium"이 없던 것(번역가가 이름을 뺀 문장) 349+17개 |
+| 생성 커밋 크기(`budget.sh`) | 파일 165개, 추가 47,447줄, 삭제 47,447줄 |
+| 손 패치(`budget.sh`) | 파일 15개, 추가 96, 삭제 24, 합계 120줄. 3a 끝과 같다(증가 0) |
+| 스크립트 실행 | 약 2초 |
+| `PEGBOARD_APPLY_FORCE=1 apply.sh` 뒤 빌드 | 907단계, 4분 40초 / 5분 11초. 대부분은 다시 적용이 `BRANDING`과 `//pegboard/devtools`의 파일 시각을 바꿔 생긴 것이다 |
+| 문자열만 바뀐 빌드(`.xtb` 162개) | 47초. 메시지 번호가 그대로라 `branded_strings.h`는 다시 쓰이지 않았다(파일 시각이 그 전 빌드의 것) [확인] |
+
+- **번역 ID 확인**: 스크립트는 끝에 grit의 `.xtb` 읽기로 다시 세어, 번역이 있던 메시지가 번역을 잃으면 실패한다. 생성 커밋의 `.xtb` 변경 46,251줄은 모두 ID, 이름, 이름 바로 뒤 조사만 다르다(줄마다 되돌려 비교) [확인].
+- **왕복** [확인]: `export.sh`는 생성 커밋을 건너뛰고 `browser/`를 한 글자도 바꾸지 않았다. `apply.sh`를 두 번 돌린 트리의 해시가 같다. 스크립트를 다시 돌리면 0개를 바꾼다.
+- **한국어 조사**: "Chromium"은 받침이 있고 "Pegboard"(페그보드)는 없다. 한국어 번역에서 이름 바로 뒤 이/을/은/과/으로를 가/를/는/와/로로 바꾼다. 처음 판은 이름 뒤 첫 조사를 어디서나 바꿔 "액세스 권한를"을 만들었다(앱의 `InfoPlist.strings`에서 발견, 고침, 시험 추가).
+- **오픈 소스 고지**: 메시지 전체를 빼는 대신 Chromium 프로젝트 링크(`BEGIN_LINK_CHROMIUM`~`END_LINK_CHROMIUM`) 안만 남겼다. "Pegboard는 Chromium 오픈소스 프로젝트를 비롯한…"이 된다. 계획은 고지 메시지를 통째로 빼는 것이었다.
+- **맥미니 GUI 세션, `e2e_branding`** (`PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<앱>`): 2 passed. 영어 `chrome://settings/help`에 "About Pegboard", 한국어에 "Pegboard 정보", 둘 다 제품 이름 "Chromium" 없음. macOS에서는 `--lang`이 UI 언어를 바꾸지 않아 시험은 `-AppleLanguages (ko)`를 준다.
+- **변형** [확인]: `.grd`는 바꾸고 `.xtb`는 그대로 둔(ID를 안 바꾼) 빌드에서 `about_page_says_pegboard_in_korean`이 실패했다. 한국어 화면이 "설정 - About Pegboard"로 영어로 돌아갔다. 영어 시험은 통과.
+- **아이콘**: 주황색 둥근 판, 구멍 격자, 페그 하나. 맥미니의 앱 `Contents/Resources/app.icns`가 저장소 파일과 같다(SHA-1). Finder·Dock 화면은 SSH로 찍을 수 없어(배경만 찍힌다) 보지 못했다. 16·32px 렌더는 개발 기기에서 확대해 봤다.
+- 남은 것: 설정 About 화면의 로고 그림, `chrome://version`의 로고는 Chromium 트리의 그림 그대로다. 오류 페이지 등의 "Google Chrome 도움말" 같은 문구는 두 대상 `.grd` 밖(`generated_resources.grd`)이라 그대로다.
