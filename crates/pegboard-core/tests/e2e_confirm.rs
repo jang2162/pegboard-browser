@@ -132,6 +132,10 @@ impl Rig {
 
     /// A session named `name` in the agent profile `profile`, at `path`.
     async fn session_named(&self, path: &str, name: &str, profile: &str) -> Session {
+        // Made when missing (an existing one is an error, which does not matter here).
+        let _ = self
+            .call("profile.create", json!({ "name": profile }))
+            .await;
         let r = self
             .call(
                 "session.create",
