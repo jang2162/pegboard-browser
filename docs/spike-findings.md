@@ -1357,4 +1357,48 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 | `credentials_enable_service` 줄 제거 | `signin_and_password_saving_are_off_by_default`(`Default`의 값 `true`) |
 | `MainParts`가 `PostMainMessageLoopRun`을 넘기지 않음 | `quit_sigterms_a_daemon_that_stays`(데몬이 15초 뒤에도 남음) |
 
-- 계획은 두 번째 변형으로 `daemon_exits_when_the_browser_quits`가 실패한다고 했지만 통과했다. 브라우저 프로세스가 끝나면 파이프가 닫혀 데몬이 EOF로 스스로 끝나기 때문이다(작업 9 3a의 "SIGTERM으로 끝날 때"와 같은 길). 종료 처리가 빠진 것을 보이는 것은 파이프 EOF를 무시하는 데몬(시험 훅)에 5초 뒤 `SIGTERM`이 가는지다.
+- 계획은 두 번째 변형으로 `daemon_exits_when_the_browser_quits`가 실패한다고 했지만 통과했다. 브라우저 프로세스가 끝나면 파이프가 닫혀 데몬이 EOF로 스스로 끝나기 때문이다(3a 작업 9의 "브라우저가 `SIGTERM`을 받을 때"와 같은 길). 종료 처리가 빠진 것을 보이는 것은 파이프 EOF를 무시하는 데몬(시험 훅)에 5초 뒤 `SIGTERM`이 가는지다.
+
+### 3b 작업 10. 데몬 포기 알림 (2026-11-25)
+
+`//pegboard/ui/daemon_notice.{h,cc}`(`DaemonNotice`)와 `window_focus.{h,cc}`(시험 훅 기록의 키 창 함수, 확인 창과 같이 쓴다)를 더하고, `DaemonLauncher`가 포기할 때 알림을 띄운다. 업스트림 줄은 늘지 않았다.
+
+| 항목 | 값 |
+|---|---|
+| 첫 빌드 | 49초 |
+| 변형 빌드(`daemon_launcher.cc`) | 28~31초 |
+| 세 작업의 `//pegboard` 접기 뒤 마지막 빌드(파일 시각) | 4분 26초 |
+| 손 패치(`budget.sh`) | 업스트림 파일 15개, 추가 96, 삭제 24, 합계 120줄. 3b 손 패치 증가 0 |
+| 새 `daemon_notice` + `window_focus` | 475줄 |
+
+- **알림**: 제목 "Pegboard 에이전트 데몬이 멈췄습니다", 본문 "데몬이 1분 안에 네 번 끝나서 다시 띄우지 않습니다. 에이전트 기능을 다시 쓰려면 다시 시작하세요.", 버튼 "다시 시작" / "닫기"(기본 버튼과 Esc는 닫기). 확인 창처럼 모달이 아닌 자식 창을 비활성으로 띄우고(시트는 키 창을 가져간다, 작업 7), 앱이 앞에 없으면 Dock을 한 번 튕긴다. 자리는 사람 프로필(에이전트 규칙이 아닌 프로필, 시크릿 창 포함)의 가장 최근에 활성이던 일반 창이고, 화면에 없으면(막 만든 창) 250ms마다 5초까지 다시 본 뒤 그 창에 띄운다. 사람 창이 하나도 없으면 다음에 열리는 사람 창에 띄운다. 계획의 "아무 프로필의 창"은 설계 B16의 "사람 창"에 맞췄다.
+- **다시 시작**: 재시작 기록(`restarts_`)을 비우고 데몬을 띄운다. 그 뒤로는 F8이 처음부터 다시 센다(세 번 다시 띄우고 네 번째에 다시 알림). 데몬이 뜨면(`Launch`) 열려 있던 알림은 닫힌다. 종료 코드 4(다른 데몬이 잠금을 쥠)와 브라우저 종료에는 알림이 없다. 다시 시작 버튼에는 확인 창의 1초 잠금이 없다(누르면 데몬이 다시 뜰 뿐이다).
+- 계획의 정적 함수(`DaemonNotice::Show`, `CloseIfShown`) 대신 `DaemonLauncher`가 알림 객체를 쥔다(`notice_`, 지우면 닫힘). 수명이 실행기와 같아 종료 때(`PostMainMessageLoopRun`) 함께 닫힌다.
+- 시험 훅 기록: 띄우고 200ms 뒤 `{"kind":"daemon_stopped","profile","keyWindowProfile{Before,At0,At200ms}","appActive{Before,At0,At200ms}","attention"}`, 닫힐 때 `{"kind":"daemon_notice_closed","pressed","by","closed"}`. 답하는 훅은 `PEGBOARD_TEST_DIALOG_ANSWER`의 `*=restart`/`*=close`.
+- 사람이 알림이 떠 있는 창을 닫으면 알림도 닫히고 다시 뜨지 않는다(데몬은 없는 채로. 남는 위험).
+
+시험 결과 (두 번째 기기 GUI 세션, `--test-threads=1`): `e2e_bootstrap` 12 passed(기존 9 + `giving_up_shows_a_notice_without_taking_focus`, `restart_from_the_notice_starts_a_daemon`, `a_held_lock_shows_no_notice`). 알림 기록: 키 창 `Default`가 띄우기 전·직후·200ms 뒤 그대로, 앱 활성 그대로, Dock 튕김 없음(앱이 앞).
+
+변형 [확인]:
+
+| 변형 | 실패한 시험 |
+|---|---|
+| 포기 분기의 알림 만들기 제거 | `giving_up_shows_a_notice_without_taking_focus`(기록 없음) |
+| 다시 시작이 `restarts_`를 비우지 않음 | `restart_from_the_notice_starts_a_daemon`(첫 죽음마다 알림, 다섯 줄) |
+| `kExitLockHeld` 분기에 알림 | `a_held_lock_shows_no_notice` |
+
+#### 작업 8~10 뒤 퇴행 확인 (두 번째 기기 GUI 세션, `--test-threads=1`)
+
+마지막 Chromium 빌드에 이 브랜치의 `pegboard`를 넣은 앱으로:
+
+| 구성 | 시험 | 결과 |
+|---|---|---|
+| 포크 | `e2e_bootstrap` | 12 passed |
+| 포크 | `e2e_branding` | 6 passed |
+| 포크 | `e2e_confirm` | 21 passed |
+| 포크 | `e2e_domain` | 34 passed |
+| 포크 | `e2e_session` | 15 passed |
+| 순정 | `e2e_confirm` | 21 passed |
+
+- 처음 전체 실행에서 `e2e_domain`의 작업 7 시험 둘(`confirmation_methods_are_only_on_the_claiming_session`, `domain_refuses_confirmations_for_human_contexts`)이 "확인 창 기록이 비어 있다"를 기록 전체로 단언해서, 작업 8의 `window` 줄 때문에 실패했다. 확인 창 줄만 보게 고친 뒤 통과(`DialogLog::dialogs`).
+- 작업 8의 처음 판(실행 중 `profile.last_used` 되돌리기)은 포크의 세션 만들기를 깨뜨렸다(위 작업 8). `e2e_bootstrap`이 잡았다.

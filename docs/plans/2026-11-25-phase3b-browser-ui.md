@@ -602,6 +602,10 @@ class DaemonNotice { public: static void Show(base::OnceClosure restart); static
 
 시험 훅 기록: `{"kind":"daemon_stopped","profile","keyWindowProfileAt0","keyWindowProfileAt200ms","pressed"}`. `PEGBOARD_TEST_DIALOG_ANSWER`의 `*=restart` 또는 `*=close`.
 
+- **구현에서 정한 것** (처음 제안은 위 정적 `Show`/`CloseIfShown`, 아무 프로필의 마지막 창, 브라우저 모달):
+  - `DaemonLauncher`가 `std::unique_ptr<DaemonNotice>`를 쥔다(만들면 뜨고 지우면 닫힌다). 창은 확인 창처럼 모달이 아닌 자식 창(시트는 키 창을 가져간다), 자리는 설계 B16대로 사람 프로필의 가장 최근 일반 창.
+  - 기록은 두 줄: `daemon_stopped`(띄우고 200ms 뒤, 키 창과 앱 활성), `daemon_notice_closed`(`pressed`, `by`, `closed`).
+
 - [ ] **Step 1: 시험을 쓴다** (`e2e_bootstrap.rs`, `#[ignore]`, `PEGBOARD_TEST_APP`):
 
 ```rust
