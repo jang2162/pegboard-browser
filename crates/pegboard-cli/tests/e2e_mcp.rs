@@ -96,6 +96,77 @@ fn bad_options_exit_2_before_anything_starts() {
     assert!(!home.path().join("daemon.pid").exists());
 }
 
+/// Answering confirmations is a person's: no tool of the server (in any tool set) answers,
+/// lists or subscribes to them.
+#[test]
+fn mcp_has_no_confirmation_tool() {
+    let home = Home::new();
+    for args in [&[][..], &["--tools", "all"][..], &["--operator"][..]] {
+        let mut mcp = Mcp::start(&home, args);
+        let tools = mcp.request("tools/list", json!({}));
+        let names = tools["result"]["tools"].as_array().unwrap();
+        assert!(!names.is_empty(), "{tools}");
+        let text = tools.to_string().to_lowercase();
+        assert!(!text.contains("confirm"), "{args:?}: {text}");
+        // Called by name anyway: no such tool.
+        for name in [
+            "pegboard_confirm",
+            "pegboard_confirm_respond",
+            "confirm.respond",
+        ] {
+            let r = mcp.request("tools/call", json!({ "name": name, "arguments": {} }));
+            let refused = r["error"].is_object() || r["result"]["isError"] == true;
+            assert!(refused, "{name}: {r}");
+        }
+        mcp.close_stdin();
+        assert_eq!(mcp.wait_exit(20), 0);
+    }
+    // Listing tools started no daemon.
+    assert!(!home.path().join("daemon.pid").exists());
+}
+
+/// An MCP agent's state command waits while a person (a `confirm.subscribe` client here) is
+/// asked; approved, the tool result is a success and the write happened.
+#[test]
+#[ignore]
+fn mcp_state_waits_for_a_person() {
+    let origin = fixture();
+    let home = shared_home();
+    let mut mcp = Mcp::start(home, &["--tools", "all"]);
+    let id = mcp.create(json!({ "url": format!("{origin}/counter") }));
+    let mut person = Confirmer::subscribe(home);
+    let answering = std::thread::spawn(move || {
+        let asked = person.next("confirm.required");
+        let r = person.respond(asked["confirmId"].as_str().unwrap(), "approve");
+        (asked, r)
+    });
+    let (err, text) = mcp.call(
+        "pegboard_storage",
+        json!({ "sessionId": id, "command": "local set", "key": "pegmcp", "value": "yes" }),
+    );
+    let (asked, r) = answering.join().unwrap();
+    assert_eq!(r["result"], json!({}), "{r}");
+    assert_eq!(asked["sessionId"], id, "{asked}");
+    assert!(!err, "{text}");
+    let (err, text) = mcp.call(
+        "pegboard_eval",
+        json!({ "sessionId": id, "expression": "localStorage.getItem('pegmcp')" }),
+    );
+    assert!(!err && text.contains("yes"), "{text}");
+    let _ = mcp.call(
+        "pegboard_eval",
+        json!({ "sessionId": id, "expression": "localStorage.removeItem('pegmcp')" }),
+    );
+    let log = entries(home, &id);
+    let storage = log
+        .iter()
+        .find(|e| e["command"] == "storage")
+        .unwrap_or_else(|| panic!("{log:?}"));
+    assert_eq!(storage["confirm"]["outcome"], "approved", "{storage}");
+    mcp.close_stdin();
+    assert_eq!(mcp.wait_exit(20), 0);
+}
+
 #[test]
 #[ignore]
 fn mcp_starts_the_daemon_and_creates_a_session() {
@@ -1077,6 +1148,10 @@ fn the_session_policy_applies_to_mcp_actions() {
             err && text.starts_with("policy_denied: "),
             "{tool} {args}: {text}"
         );
+        // The asking ones say why they were denied.
+        if tool == "pegboard_cookies" || tool == "pegboard_storage" {
+            assert!(text.ends_with("(reason: no_responder)"), "{tool}: {text}");
+        }
     }
     // Allowed classes run.
     let (err, text) = mcp.call("pegboard_cookies", json!({}));

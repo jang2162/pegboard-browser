@@ -7,6 +7,8 @@
 //! `confirm_not_found`. A confirmation also ends when its time is up, when its session
 //! closes or the daemon stops, and when nobody is left who could answer it.
 
+pub mod details;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -201,6 +203,8 @@ fn rfc3339_in(after: Duration) -> String {
 pub struct ConfirmBroker {
     timeout: Duration,
     table: Mutex<Table>,
+    /// Woken when a session begins to close or the daemon stops (`until_closing`).
+    closing_changed: tokio::sync::Notify,
     me: Weak<ConfirmBroker>,
 }
 
@@ -292,8 +296,33 @@ impl ConfirmBroker {
                 lookup: None,
                 notices,
             }),
+            closing_changed: tokio::sync::Notify::new(),
             me: me.clone(),
         })
+    }
+
+    /// How long a person has to answer.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Ends once the session has begun to close (`cancel_session`) or the daemon stops
+    /// (`cancel_all`); at once if that already happened. A command preparing a question
+    /// races this, so a close never waits for the preparation.
+    pub async fn until_closing(&self, id: &SessionId) {
+        loop {
+            let notified = self.closing_changed.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so a wake between the two is not lost.
+            notified.as_mut().enable();
+            {
+                let t = self.table.lock().unwrap();
+                if t.closed || t.closing.contains(id) {
+                    return;
+                }
+            }
+            notified.await;
+        }
     }
 
     /// Tells the broker the policies of the open sessions (what may be granted for a
@@ -499,6 +528,8 @@ impl ConfirmBroker {
         for cid in ids {
             t.end(&cid, ConfirmOutcome::Cancelled, None);
         }
+        drop(t);
+        self.closing_changed.notify_waiters();
     }
 
     /// The daemon is stopping: every waiting confirmation is cancelled, and so is every
@@ -510,6 +541,8 @@ impl ConfirmBroker {
         for cid in ids {
             t.end(&cid, ConfirmOutcome::Cancelled, None);
         }
+        drop(t);
+        self.closing_changed.notify_waiters();
     }
 
     /// The session has closed: what a person allowed for it, and its closing mark, go.

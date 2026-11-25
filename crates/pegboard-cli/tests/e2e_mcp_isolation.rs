@@ -631,6 +631,10 @@ fn mcp_agent_cannot_widen_its_policy() {
                 err && text.starts_with("policy_denied: "),
                 "{tool} {args}: {text}"
             );
+            // State still asks a person (nobody here answers): no key above granted it.
+            if tool == "pegboard_cookies" || tool == "pegboard_storage" {
+                assert!(text.ends_with("(reason: no_responder)"), "{tool}: {text}");
+            }
         }
     }
     for s in cli_sessions(&home) {

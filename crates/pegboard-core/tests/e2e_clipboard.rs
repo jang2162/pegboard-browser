@@ -520,6 +520,7 @@ async fn command(
         &h.manager,
         &h.runner,
         &h.env.paths,
+        &pegboard_core::confirm::ConfirmBroker::new(pegboard_core::confirm::CONFIRM_TIMEOUT),
         log,
         &info.id,
         &common::s(argv),

@@ -418,7 +418,7 @@ impl Server {
         let outcome = self.registry.call(&mut ctx, name, args);
         Ok(match outcome {
             Some(Ok(reply)) => reply_result(reply),
-            Some(Err(e)) => tool_result(format!("{}: {}", e.code, e.message), true),
+            Some(Err(e)) => tool_result(crate::error_line(&e), true),
             None => tool_result(format!("{}: unknown tool", codes::INVALID_PARAMS), true),
         })
     }

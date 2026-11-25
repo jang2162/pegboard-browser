@@ -5,11 +5,11 @@ pub mod mcp;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_pegboard")
@@ -1083,5 +1083,66 @@ impl Human {
                 None,
             ))
             .unwrap();
+    }
+}
+
+/// A client of `confirm.subscribe` on a home's daemon: it plays the person who answers
+/// confirmations (stock mode has no confirmation window).
+pub struct Confirmer {
+    socket: PathBuf,
+    notices: std::io::BufReader<std::os::unix::net::UnixStream>,
+}
+
+impl Confirmer {
+    /// Subscribes (the daemon must be running).
+    pub fn subscribe(home: &Home) -> Confirmer {
+        use std::io::BufRead;
+        let socket = home.path().join("pegboardd.sock");
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"confirm.subscribe\",\"params\":{}}\n",
+            )
+            .unwrap();
+        let mut notices = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        notices.read_line(&mut line).unwrap();
+        let ok: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ok["result"], json!({}), "{line}");
+        Confirmer { socket, notices }
+    }
+
+    /// The next notice of `method` (`confirm.required`, `confirm.resolved`), within 30 s.
+    pub fn next(&mut self, method: &str) -> Value {
+        use std::io::BufRead;
+        loop {
+            let mut line = String::new();
+            let n = self
+                .notices
+                .read_line(&mut line)
+                .unwrap_or_else(|e| panic!("no {method} notice: {e}"));
+            assert!(n > 0, "the notice channel closed before {method}");
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["method"] == method {
+                return v["params"].clone();
+            }
+        }
+    }
+
+    /// Answers a confirmation (`approve`, `deny`, `allowForSession`); the daemon's reply.
+    pub fn respond(&self, confirm_id: &str, answer: &str) -> Value {
+        use std::io::BufRead;
+        let mut stream = std::os::unix::net::UnixStream::connect(&self.socket).unwrap();
+        let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "confirm.respond",
+                          "params": { "confirmId": confirm_id, "answer": answer } });
+        stream.write_all(format!("{req}\n").as_bytes()).unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
     }
 }

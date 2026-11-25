@@ -285,8 +285,17 @@ fn main() {
 
 /// Prints the error and returns the exit code it stands for.
 fn report(e: &RpcError) -> i32 {
-    eprintln!("pegboard: {}: {}", e.code, e.message);
+    eprintln!("pegboard: {}", error_line(e));
     exit_code(&e.code)
+}
+
+/// `<code>: <message>`, and for a denied command why (`(reason: denied)`: a person denied
+/// it, `timed_out`, `no_responder`, `cancelled`, `stale`).
+fn error_line(e: &RpcError) -> String {
+    match e.reason().filter(|_| e.code == codes::POLICY_DENIED) {
+        Some(reason) => format!("{}: {} (reason: {reason})", e.code, e.message),
+        None => format!("{}: {}", e.code, e.message),
+    }
 }
 
 fn exit_code(code: &str) -> i32 {
@@ -1789,6 +1798,35 @@ mod tests {
             describe_grants(&[ActionClass::State, ActionClass::Upload]).as_deref(),
             Some("allowed for this session by a person: state,upload")
         );
+    }
+
+    #[test]
+    fn error_line_shows_why_a_command_was_denied() {
+        let denied = RpcError {
+            code: codes::POLICY_DENIED.into(),
+            message: "a person denied this state command".into(),
+            data: Some(serde_json::json!({ "reason": "denied", "confirmId": "c" })),
+        };
+        assert_eq!(
+            error_line(&denied),
+            "policy_denied: a person denied this state command (reason: denied)"
+        );
+        // No reason, or not a denial: as it was.
+        let plain = RpcError {
+            code: codes::POLICY_DENIED.into(),
+            message: "eval is not allowed in this session".into(),
+            data: None,
+        };
+        assert_eq!(
+            error_line(&plain),
+            "policy_denied: eval is not allowed in this session"
+        );
+        let other = RpcError {
+            code: codes::INTERNAL.into(),
+            message: "m".into(),
+            data: Some(serde_json::json!({ "reason": "x" })),
+        };
+        assert_eq!(error_line(&other), "internal: m");
     }
 
     #[test]

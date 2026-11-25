@@ -4,14 +4,19 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use pegboard_protocol::{codes, ActionClass, CommandExecResult, RpcError, SessionId};
+use pegboard_protocol::{
+    codes, ActionClass, CommandExecResult, ConfirmBy, ConfirmOutcome, RpcError, SessionId,
+    SessionPolicy,
+};
 use serde_json::Value;
 
 use crate::actionlog::{
     attrs_are_sensitive, logged_args, rejected_args, rejected_command, truncate_chars, url_for_log,
-    ActionEntry, ActionLog, MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
+    ActionEntry, ActionLog, ConfirmLog, MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
 };
 use crate::argv::{self, rejected, Checked, TextDestination};
+use crate::confirm::details::{display_text, origin_of, state_details, StatePin, NAME_CHARS};
+use crate::confirm::{ConfirmAsk, ConfirmBroker, ConfirmDecision};
 use crate::downloads::Report;
 use crate::paths::Paths;
 use crate::policy;
@@ -105,10 +110,17 @@ async fn probe(sessions: &SessionManager, id: &SessionId) -> Probe {
 ///   focus, 5 s at most for a `get attr`) or cannot run hides the text.
 /// - A redacted entry carries no error text but its code; otherwise `error` is the CLI's
 ///   own `error` string or pegboard's own error, never output.
+///
+/// A command the policy leaves to a person (`Verdict::Ask`) waits for an answer through
+/// `confirm` (design 4.2): denied, it is refused with `policy_denied` and `data.reason`;
+/// approved, it runs held to what the person was shown (`StatePin`), and its result says
+/// `"confirmed": {"by": …}`. Either way its log entry carries `confirm`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_command(
     sessions: &SessionManager,
     runner: &Runner,
     paths: &Paths,
+    confirm: &ConfirmBroker,
     log: &mut ActionLog,
     id: &SessionId,
     argv: &[String],
@@ -118,6 +130,7 @@ pub async fn run_command(
         sessions,
         runner,
         paths,
+        confirm,
         log,
         id,
         argv,
@@ -135,6 +148,7 @@ pub async fn run_command_with_hook(
     sessions: &SessionManager,
     runner: &Runner,
     paths: &Paths,
+    confirm: &ConfirmBroker,
     log: &mut ActionLog,
     id: &SessionId,
     argv: &[String],
@@ -165,37 +179,23 @@ pub async fn run_command_with_hook(
     };
     // The policy judges every command before anything runs for it. (The selector checks
     // below are pegboard's own and are not judged.) A session that cannot be found has no
-    // policy to read: refused too.
+    // policy to read: refused too. What a person allowed for the rest of the session turns
+    // a question into an allow.
     let judged = argv::class_of(argv)
         .ok_or_else(|| RpcError {
             code: codes::INTERNAL.to_string(),
             message: "a checked command line has no action class".into(),
             data: None,
         })
-        .and_then(|class| match judged_verdict(&sessions.policy(id)?, class) {
-            policy::Verdict::Allow => Ok(()),
-            policy::Verdict::Ask => Err(no_confirmation_yet(class)),
-            policy::Verdict::Deny(e) => Err(e),
+        .and_then(|class| {
+            let verdict = judged_verdict(&sessions.policy(id)?, &confirm.granted(id), class);
+            Ok((class, verdict))
         });
-    if let Err(e) = judged {
-        return refuse(log, entry, argv, e, started);
-    }
-    // Without the request guard the browser checks no request of the session: nothing runs.
-    if let Err(e) = sessions.require_guard() {
-        return refuse(log, entry, argv, e, started);
-    }
-    // Without its download policy the profile's downloads land in the user's ~/Downloads.
-    if let Err(e) = sessions.require_downloads(id) {
-        return refuse(log, entry, argv, e, started);
-    }
-    // Without its clipboard denial a page of the profile can read and write the system
-    // clipboard through `navigator.clipboard`.
-    if let Err(e) = sessions.require_clipboard(id) {
-        return refuse(log, entry, argv, e, started);
-    }
-    // Tabs that were there when the guard reconnected may not be set up yet (shielded,
-    // judged): every session of the profile waits for them.
-    if let Err(e) = sessions.require_tabs_set_up(id) {
+    let (class, judged) = match judged {
+        Ok((_, Judged::Deny(e))) | Err(e) => return refuse(log, entry, argv, e, started),
+        Ok(judged) => judged,
+    };
+    if let Err(e) = require_protections(sessions, id) {
         return refuse(log, entry, argv, e, started);
     }
     let is_tab_new = matches!(checked, Checked::TabNew { .. });
@@ -208,12 +208,35 @@ pub async fn run_command_with_hook(
     if let Err(e) = judge_navigation_urls(sessions, id, argv, &run_argv).await {
         return refuse(log, entry, argv, e, started);
     }
+    // An upload that would ask a person waits for the copy of what was asked about
+    // (staging), which is not there yet.
+    if class == ActionClass::Upload && matches!(judged, Judged::Ask) {
+        return refuse(log, entry, argv, no_confirmation_yet(class), started);
+    }
     // An upload names its files; they become paths only now that the policy allows it.
     let mut path_names = Vec::new();
     if run_argv.first().map(String::as_str) == Some("upload") {
         match resolve_upload(sessions, paths, id, &run_argv) {
             Ok((words, names)) => (run_argv, path_names) = (words, names),
             Err(e) => return refuse(log, entry, argv, e, started),
+        }
+    }
+    // A person is asked, when the policy says so; the question shows the tab the command
+    // would act on, read now.
+    let prepare = prepare_question(sessions, runner, id, class, &run_argv);
+    let cleared = match clear_command(confirm, judged, class, id, prepare).await {
+        Ok(cleared) => cleared,
+        Err(refused) => {
+            entry.confirm = refused.confirm;
+            return refuse(log, entry, argv, refused.error, started);
+        }
+    };
+    entry.confirm = cleared.confirm.clone();
+    // A person may have taken up to the time limit: what was in place before is checked
+    // again.
+    if cleared.confirm_id.is_some() {
+        if let Err(e) = require_protections(sessions, id) {
+            return refuse(log, entry, argv, e, started);
         }
     }
 
@@ -246,6 +269,20 @@ pub async fn run_command_with_hook(
         }
     };
 
+    // Held to what the person was shown, right before it runs.
+    if !apply_pin(&cleared.pin, &mut run_argv, tab_url(sessions, runner, id)).await {
+        if let Some(c) = entry.confirm.as_mut() {
+            c.outcome = ConfirmOutcome::Stale;
+        }
+        let e = denial(
+            class,
+            ConfirmOutcome::Stale,
+            cleared.confirm_id.as_deref(),
+            confirm.timeout(),
+        );
+        return refuse(log, entry, argv, e, started);
+    }
+
     let had_no_tab = sessions.info(id).is_ok_and(|i| i.targets.is_empty());
     let exec_started = Instant::now();
     let mut outcome = match &endpoint {
@@ -253,6 +290,16 @@ pub async fn run_command_with_hook(
         Err(e) => Err(e.clone()),
     };
     hide_paths(&mut outcome, &path_names);
+    if let (
+        Some(c),
+        Ok(CommandExecResult {
+            output: Value::Object(output),
+            ..
+        }),
+    ) = (&cleared.confirm, &mut outcome)
+    {
+        output.insert("confirmed".to_string(), serde_json::json!({ "by": c.by }));
+    }
     // A session without a tab: agent-browser opens a blank tab of its own, then `tab new`
     // opens the requested one. Only the tab it ends up bound to stays.
     if is_tab_new && had_no_tab && matches!(&outcome, Ok(r) if succeeded(r)) {
@@ -315,6 +362,20 @@ pub async fn run_command_with_hook(
     report_downloads(sessions, log, id, &mut outcome)?;
     sessions.touch(id);
     outcome
+}
+
+/// What must be in place before any command of the session runs.
+fn require_protections(sessions: &SessionManager, id: &SessionId) -> Result<(), RpcError> {
+    // Without the request guard the browser checks no request of the session: nothing runs.
+    sessions.require_guard()?;
+    // Without its download policy the profile's downloads land in the user's ~/Downloads.
+    sessions.require_downloads(id)?;
+    // Without its clipboard denial a page of the profile can read and write the system
+    // clipboard through `navigator.clipboard`.
+    sessions.require_clipboard(id)?;
+    // Tabs that were there when the guard reconnected may not be set up yet (shielded,
+    // judged): every session of the profile waits for them.
+    sessions.require_tabs_set_up(id)
 }
 
 /// `f` and how long it took.
@@ -477,16 +538,40 @@ fn hide_paths(outcome: &mut Result<CommandExecResult, RpcError>, names: &[(Strin
     }
 }
 
-/// The verdict for a command of the session. No class is allowed for the session by a
-/// person yet: nothing can ask one.
-fn judged_verdict(
-    policy: &pegboard_protocol::SessionPolicy,
-    class: ActionClass,
-) -> policy::Verdict {
-    policy::judge_action(policy, &[], class)
+/// The policy's verdict for a command of the session, given what a person allowed for the
+/// rest of it.
+#[derive(Debug)]
+enum Judged {
+    Allow,
+    /// Asking, but a person allowed the class for the rest of the session.
+    AllowedForSession,
+    Ask,
+    Deny(RpcError),
 }
 
-/// A command that would ask a person, while nothing can ask one: denied at once.
+fn judged_verdict(policy: &SessionPolicy, granted: &[ActionClass], class: ActionClass) -> Judged {
+    match policy::judge_action(policy, granted, class) {
+        policy::Verdict::Allow
+            if matches!(
+                policy::judge_action(policy, &[], class),
+                policy::Verdict::Ask
+            ) =>
+        {
+            // An upload grant opens the session's upload directory, so one without a
+            // directory still asks (the broker never grants it; this does not rely on that).
+            if class == ActionClass::Upload && policy.upload_dir.is_none() {
+                Judged::Ask
+            } else {
+                Judged::AllowedForSession
+            }
+        }
+        policy::Verdict::Allow => Judged::Allow,
+        policy::Verdict::Ask => Judged::Ask,
+        policy::Verdict::Deny(e) => Judged::Deny(e),
+    }
+}
+
+/// An upload that would ask a person: denied at once until staging is in place.
 fn no_confirmation_yet(class: ActionClass) -> RpcError {
     let name = class.as_str();
     let with = if class == ActionClass::Upload {
@@ -502,6 +587,224 @@ fn no_confirmation_yet(class: ActionClass) -> RpcError {
              {name}{with}"
         ),
         data: Some(serde_json::json!({ "reason": "no_responder" })),
+    }
+}
+
+/// How a command was cleared to run.
+#[derive(Debug, Default)]
+struct Cleared {
+    /// What the log keeps of the question; none when nobody was asked.
+    confirm: Option<ConfirmLog>,
+    confirm_id: Option<String>,
+    /// What it is held to when it runs.
+    pin: StatePin,
+}
+
+/// A refused command and what the log keeps of its question.
+#[derive(Debug)]
+struct Refused {
+    error: RpcError,
+    confirm: Option<ConfirmLog>,
+}
+
+/// Runs the policy's verdict: an allowed command is cleared; an asking one waits for a
+/// person (`prepare` builds the question). The session's close ends the wait whenever it
+/// comes: while the question is prepared (the race below) and while it waits (the broker
+/// cancels it).
+async fn clear_command(
+    confirm: &ConfirmBroker,
+    judged: Judged,
+    class: ActionClass,
+    id: &SessionId,
+    prepare: impl Future<Output = Result<(ConfirmAsk, StatePin), RpcError>>,
+) -> Result<Cleared, Refused> {
+    match judged {
+        Judged::Allow => Ok(Cleared::default()),
+        Judged::AllowedForSession => Ok(Cleared {
+            confirm: Some(ConfirmLog {
+                outcome: ConfirmOutcome::Approved,
+                by: Some(ConfirmBy::Session),
+                wait_ms: 0,
+            }),
+            ..Cleared::default()
+        }),
+        Judged::Deny(error) => Err(Refused {
+            error,
+            confirm: None,
+        }),
+        Judged::Ask => {
+            let started = Instant::now();
+            let prepared = tokio::select! {
+                biased;
+                () = confirm.until_closing(id) => {
+                    let log = ConfirmLog {
+                        outcome: ConfirmOutcome::Cancelled,
+                        by: None,
+                        wait_ms: elapsed_ms(started),
+                    };
+                    return Err(Refused {
+                        error: denial(class, ConfirmOutcome::Cancelled, None, confirm.timeout()),
+                        confirm: Some(log),
+                    });
+                }
+                prepared = prepare => prepared,
+            };
+            let (ask, pin) = prepared.map_err(|error| Refused {
+                error,
+                confirm: None,
+            })?;
+            let decision = confirm.ask(ask).await;
+            let log = confirm_log(&decision);
+            match decision.outcome {
+                ConfirmOutcome::Approved | ConfirmOutcome::ApprovedForSession => Ok(Cleared {
+                    confirm: Some(log),
+                    confirm_id: Some(decision.confirm_id),
+                    pin,
+                }),
+                outcome => Err(Refused {
+                    error: denial(
+                        class,
+                        outcome,
+                        Some(&decision.confirm_id),
+                        confirm.timeout(),
+                    ),
+                    confirm: Some(log),
+                }),
+            }
+        }
+    }
+}
+
+fn confirm_log(d: &ConfirmDecision) -> ConfirmLog {
+    ConfirmLog {
+        outcome: d.outcome,
+        by: d.by,
+        wait_ms: u64::try_from(d.waited.as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+/// `data.reason` of a denial: the outcome in snake case.
+fn reason_of(outcome: ConfirmOutcome) -> &'static str {
+    match outcome {
+        ConfirmOutcome::Approved => "approved",
+        ConfirmOutcome::ApprovedForSession => "approved_for_session",
+        ConfirmOutcome::Denied => "denied",
+        ConfirmOutcome::TimedOut => "timed_out",
+        ConfirmOutcome::NoResponder => "no_responder",
+        ConfirmOutcome::Cancelled => "cancelled",
+        ConfirmOutcome::Stale => "stale",
+    }
+}
+
+/// `n s` for the time limit (`1.5 s` when it is not whole seconds).
+fn seconds(d: Duration) -> String {
+    if d.subsec_millis() == 0 {
+        format!("{} s", d.as_secs())
+    } else {
+        format!("{:.1} s", d.as_secs_f64())
+    }
+}
+
+/// `policy_denied` for how a question ended, with `data = {reason, confirmId}` (no id when
+/// no question was asked). `timeout` is the time a person had.
+fn denial(
+    class: ActionClass,
+    outcome: ConfirmOutcome,
+    confirm_id: Option<&str>,
+    timeout: Duration,
+) -> RpcError {
+    let name = class.as_str();
+    let message = match outcome {
+        ConfirmOutcome::Denied => format!("a person denied this {name} command"),
+        ConfirmOutcome::TimedOut => format!(
+            "no answer within {}; the {name} command was denied",
+            seconds(timeout)
+        ),
+        ConfirmOutcome::NoResponder => format!(
+            "the {name} command needs a person's confirmation; confirmation needs the Pegboard \
+             browser (or a client of confirm.subscribe); a person can allow it without asking \
+             when creating the session with --allow {name}"
+        ),
+        ConfirmOutcome::Cancelled => format!(
+            "the session closed (or the daemon stopped) while the {name} command waited for a \
+             person"
+        ),
+        ConfirmOutcome::Stale => {
+            format!("the page changed after a person approved; the {name} command was not run")
+        }
+        ConfirmOutcome::Approved | ConfirmOutcome::ApprovedForSession => {
+            format!("the {name} command was not run")
+        }
+    };
+    let mut data = serde_json::json!({ "reason": reason_of(outcome) });
+    if let Some(cid) = confirm_id {
+        data["confirmId"] = Value::String(cid.to_string());
+    }
+    RpcError {
+        code: codes::POLICY_DENIED.to_string(),
+        message,
+        data: Some(data),
+    }
+}
+
+/// The question for an asking command: the session, and for `state` what it would write
+/// where (the tab it would act on, read now) and what pins it there.
+async fn prepare_question(
+    sessions: &SessionManager,
+    runner: &Runner,
+    id: &SessionId,
+    class: ActionClass,
+    run_argv: &[String],
+) -> Result<(ConfirmAsk, StatePin), RpcError> {
+    let info = sessions.info(id)?;
+    let url = tab_url(sessions, runner, id).await;
+    let (details, pin) = state_details(run_argv, url.as_deref());
+    Ok((
+        ConfirmAsk {
+            session_id: id.clone(),
+            session_name: display_text(&info.name, NAME_CHARS),
+            profile: display_text(&info.profile, NAME_CHARS),
+            class,
+            details,
+            offer_allow_for_session: true,
+            // The browser as a responder comes with the fork's domain.
+            place: None,
+        },
+        pin,
+    ))
+}
+
+/// The address of the tab a command acts on (the one agent-browser is bound to, else the
+/// session's only tab); `None` when there is none or it cannot be read in time.
+async fn tab_url(sessions: &SessionManager, runner: &Runner, id: &SessionId) -> Option<String> {
+    let target = screen_target(sessions, runner, id)?;
+    let results = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        sessions.evaluate_in_targets(id, "location.href"),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let (_, result) = results.into_iter().find(|(t, _)| *t == target)?;
+    result.ok()?.as_str().map(String::from)
+}
+
+/// Holds an approved command to what the person was shown: a cookie set without an
+/// address gets the asked tab's (`--url`); a storage write runs only while the tab is
+/// still at the asked origin (`now` reads its address). False: it must not run (`stale`).
+async fn apply_pin(
+    pin: &StatePin,
+    run_argv: &mut Vec<String>,
+    now: impl Future<Output = Option<String>>,
+) -> bool {
+    match pin {
+        StatePin::None => true,
+        StatePin::CookieUrl(url) => {
+            run_argv.push("--url".to_string());
+            run_argv.push(url.clone());
+            true
+        }
+        StatePin::Origin(origin) => now.await.is_some_and(|url| origin_of(&url) == *origin),
     }
 }
 
@@ -711,9 +1014,8 @@ mod tests {
     }
 
     #[test]
-    fn a_denied_command_is_logged_like_a_rejected_one() {
+    fn a_denied_command_logs_its_outcome_without_args() {
         use crate::actionlog::{read, Manifest, REDACTED};
-        use pegboard_protocol::{ActionClass, SessionPolicy};
 
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::paths_in(tmp.path());
@@ -726,22 +1028,25 @@ mod tests {
         let class = argv::class_of(&argv).unwrap();
         assert_eq!(class, ActionClass::State);
         assert!(matches!(
-            judged_verdict(&SessionPolicy::default(), class),
-            policy::Verdict::Ask
+            judged_verdict(&SessionPolicy::default(), &[], class),
+            Judged::Ask
         ));
-        let denied = no_confirmation_yet(class);
+        let denied = denial(
+            class,
+            ConfirmOutcome::Denied,
+            Some("0123456789abcdef0123456789abcdef"),
+            Duration::from_secs(60),
+        );
         let entry = ActionEntry {
             seq: 0,
             ts: now(),
             session_id: "s_abcdefgh".into(),
-            target_id: None,
-            url: None,
             command: argv[0].clone(),
-            args: Vec::new(),
-            ok: false,
-            error: None,
-            duration_ms: 0,
-            redacted: false,
+            confirm: Some(ConfirmLog {
+                outcome: ConfirmOutcome::Denied,
+                by: Some(ConfirmBy::Api),
+                wait_ms: 1234,
+            }),
             ..ActionEntry::default()
         };
         let e = refuse(&mut log, entry, &argv, denied, Instant::now()).unwrap_err();
@@ -767,6 +1072,303 @@ mod tests {
             !text.contains("hunter2-secret") && !text.contains("sid"),
             "{text}"
         );
+        let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            line["confirm"],
+            json!({ "outcome": "denied", "by": "api", "waitMs": 1234 }),
+            "{line}"
+        );
+        // A command that asked nobody has no `confirm`.
+        let plain = serde_json::to_value(ActionEntry::default()).unwrap();
+        assert!(plain.get("confirm").is_none(), "{plain}");
+    }
+
+    #[test]
+    fn denial_reasons_are_in_error_data() {
+        let cid = "0123456789abcdef0123456789abcdef";
+        for (outcome, reason, says) in [
+            (
+                ConfirmOutcome::Denied,
+                "denied",
+                "a person denied this state command",
+            ),
+            (
+                ConfirmOutcome::TimedOut,
+                "timed_out",
+                "no answer within 60 s; the state command was denied",
+            ),
+            (
+                ConfirmOutcome::NoResponder,
+                "no_responder",
+                "confirmation needs the Pegboard browser (or a client of confirm.subscribe)",
+            ),
+            (
+                ConfirmOutcome::Cancelled,
+                "cancelled",
+                "the session closed (or the daemon stopped) while the state command waited",
+            ),
+            (
+                ConfirmOutcome::Stale,
+                "stale",
+                "the page changed after a person approved; the state command was not run",
+            ),
+        ] {
+            let e = denial(
+                ActionClass::State,
+                outcome,
+                Some(cid),
+                Duration::from_secs(60),
+            );
+            assert_eq!(e.code, codes::POLICY_DENIED);
+            assert_eq!(e.data, Some(json!({ "reason": reason, "confirmId": cid })));
+            assert_eq!(e.reason(), Some(reason));
+            assert!(e.message.contains(says), "{}", e.message);
+        }
+        // No question was asked (the session closed first): no id.
+        let e = denial(
+            ActionClass::State,
+            ConfirmOutcome::Cancelled,
+            None,
+            Duration::from_secs(60),
+        );
+        assert_eq!(e.data, Some(json!({ "reason": "cancelled" })));
+        // The limit as it is (a test hook shortens it).
+        let e = denial(
+            ActionClass::Upload,
+            ConfirmOutcome::TimedOut,
+            None,
+            Duration::from_millis(2500),
+        );
+        assert!(
+            e.message.starts_with("no answer within 2.5 s; the upload"),
+            "{}",
+            e.message
+        );
+        // The no-responder hint still names the way around asking.
+        let e = denial(
+            ActionClass::State,
+            ConfirmOutcome::NoResponder,
+            None,
+            Duration::from_secs(60),
+        );
+        assert!(e.message.contains("--allow state"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn storage_write_after_navigation_is_stale() {
+        let pin = StatePin::Origin("https://a.test".into());
+        let mut run = words(&["storage", "local", "set", "k", "v"]);
+        // Same origin, another page: it runs, unchanged.
+        let now = async { Some("https://a.test/other?x".to_string()) };
+        assert!(apply_pin(&pin, &mut run, now).await);
+        assert_eq!(run, words(&["storage", "local", "set", "k", "v"]));
+        // Another origin, or no readable tab: it must not run.
+        for now in [Some("https://b.test/".to_string()), None] {
+            assert!(!apply_pin(&pin, &mut run, async { now }).await);
+        }
+        let e = denial(
+            ActionClass::State,
+            ConfirmOutcome::Stale,
+            Some("c"),
+            Duration::from_secs(60),
+        );
+        assert_eq!(e.reason(), Some("stale"));
+    }
+
+    #[tokio::test]
+    async fn a_cookie_runs_at_the_address_it_was_asked_about() {
+        let pin = StatePin::CookieUrl("https://a.test/x".into());
+        let mut run = words(&["cookies", "set", "n", "v"]);
+        // The tab has moved on meanwhile: what runs is still the asked address.
+        let moved = async { Some("https://evil.test/".to_string()) };
+        assert!(apply_pin(&pin, &mut run, moved).await);
+        assert_eq!(
+            run,
+            words(&["cookies", "set", "n", "v", "--url", "https://a.test/x"])
+        );
+        let mut run = words(&["cookies", "set", "n", "v"]);
+        assert!(apply_pin(&StatePin::None, &mut run, async { None }).await);
+        assert_eq!(run, words(&["cookies", "set", "n", "v"]));
+    }
+
+    fn question(session: &SessionId) -> ConfirmAsk {
+        ConfirmAsk {
+            session_id: session.clone(),
+            session_name: "n".into(),
+            profile: "default".into(),
+            class: ActionClass::State,
+            details: Vec::new(),
+            offer_allow_for_session: true,
+            place: None,
+        }
+    }
+
+    fn prepared(
+        session: &SessionId,
+    ) -> impl Future<Output = Result<(ConfirmAsk, StatePin), RpcError>> {
+        std::future::ready(Ok((
+            question(session),
+            StatePin::Origin("https://a.test".into()),
+        )))
+    }
+
+    /// Answers the next confirmation that shows up with `answer`.
+    async fn answer_next(broker: &ConfirmBroker, answer: pegboard_protocol::ConfirmAnswer) {
+        loop {
+            if let Some(r) = broker.pending().pop() {
+                broker
+                    .respond(
+                        &pegboard_protocol::ConfirmRespondParams {
+                            confirm_id: r.confirm_id,
+                            answer,
+                        },
+                        ConfirmBy::Api,
+                    )
+                    .unwrap();
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_asking_command_waits_for_a_person() {
+        use pegboard_protocol::ConfirmAnswer;
+        let broker = ConfirmBroker::new(crate::confirm::CONFIRM_TIMEOUT);
+        let id = SessionId("s_abcdefgh".into());
+        // Nobody to ask: refused at once, never cleared.
+        let r = clear_command(&broker, Judged::Ask, ActionClass::State, &id, prepared(&id)).await;
+        let refused = r.expect_err("an asking command with nobody to ask must not run");
+        assert_eq!(refused.error.reason(), Some("no_responder"));
+        assert_eq!(
+            refused.confirm.map(|c| c.outcome),
+            Some(ConfirmOutcome::NoResponder)
+        );
+
+        let _sub = broker.subscribe().unwrap();
+        // A person denies.
+        let (r, ()) = tokio::join!(
+            clear_command(&broker, Judged::Ask, ActionClass::State, &id, prepared(&id)),
+            answer_next(&broker, ConfirmAnswer::Deny)
+        );
+        let refused = r.expect_err("denied");
+        assert_eq!(refused.error.code, codes::POLICY_DENIED);
+        assert_eq!(refused.error.reason(), Some("denied"));
+        assert!(refused.error.data.as_ref().unwrap()["confirmId"].is_string());
+        let c = refused.confirm.unwrap();
+        assert_eq!(
+            (c.outcome, c.by),
+            (ConfirmOutcome::Denied, Some(ConfirmBy::Api))
+        );
+        // A person approves: cleared, held to what was asked.
+        let (r, ()) = tokio::join!(
+            clear_command(&broker, Judged::Ask, ActionClass::State, &id, prepared(&id)),
+            answer_next(&broker, ConfirmAnswer::Approve)
+        );
+        let cleared = r.expect("approved");
+        assert_eq!(cleared.pin, StatePin::Origin("https://a.test".into()));
+        assert_eq!(cleared.confirm_id.map(|c| c.len()), Some(32));
+        let c = cleared.confirm.unwrap();
+        assert_eq!(
+            (c.outcome, c.by),
+            (ConfirmOutcome::Approved, Some(ConfirmBy::Api))
+        );
+        // Allowed without asking, and allowed by an earlier grant (logged as such).
+        let cleared = clear_command(
+            &broker,
+            Judged::Allow,
+            ActionClass::State,
+            &id,
+            prepared(&id),
+        )
+        .await
+        .unwrap();
+        assert!(cleared.confirm.is_none() && cleared.pin == StatePin::None);
+        let cleared = clear_command(
+            &broker,
+            Judged::AllowedForSession,
+            ActionClass::State,
+            &id,
+            prepared(&id),
+        )
+        .await
+        .unwrap();
+        let c = cleared.confirm.unwrap();
+        assert_eq!(
+            (c.outcome, c.by),
+            (ConfirmOutcome::Approved, Some(ConfirmBy::Session))
+        );
+        assert!(broker.pending().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_session_ends_a_command_still_preparing_its_question() {
+        let broker = ConfirmBroker::new(crate::confirm::CONFIRM_TIMEOUT);
+        let _sub = broker.subscribe().unwrap();
+        let id = SessionId("s_abcdefgh".into());
+        // Reading the tab never finishes.
+        let stuck = std::future::pending::<Result<(ConfirmAsk, StatePin), RpcError>>();
+        let both = async {
+            tokio::join!(
+                clear_command(&broker, Judged::Ask, ActionClass::State, &id, stuck),
+                async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    broker.cancel_session(&id);
+                }
+            )
+        };
+        let (r, ()) = tokio::time::timeout(Duration::from_secs(5), both)
+            .await
+            .expect("the close must end the command, not wait for its question");
+        let refused = r.expect_err("cancelled");
+        assert_eq!(refused.error.reason(), Some("cancelled"));
+        assert!(broker.pending().is_empty());
+        // And one that starts while the session closes ends at once too.
+        let r = clear_command(&broker, Judged::Ask, ActionClass::State, &id, prepared(&id)).await;
+        assert_eq!(r.unwrap_err().error.reason(), Some("cancelled"));
+    }
+
+    #[test]
+    fn grants_from_the_broker_turn_asking_into_allowed() {
+        let state = SessionPolicy::default();
+        assert!(matches!(
+            judged_verdict(&state, &[ActionClass::State], ActionClass::State),
+            Judged::AllowedForSession
+        ));
+        assert!(matches!(
+            judged_verdict(&state, &[ActionClass::State], ActionClass::Upload),
+            Judged::Ask
+        ));
+        // An upload grant without the session's upload directory still asks.
+        assert!(matches!(
+            judged_verdict(&state, &[ActionClass::Upload], ActionClass::Upload),
+            Judged::Ask
+        ));
+        let with_dir = SessionPolicy {
+            upload_dir: Some("/tmp".into()),
+            ..SessionPolicy::default()
+        };
+        assert!(matches!(
+            judged_verdict(&with_dir, &[ActionClass::Upload], ActionClass::Upload),
+            Judged::AllowedForSession
+        ));
+        // A grant never beats a denial, and --allow is no grant.
+        let denied = SessionPolicy {
+            deny: vec![ActionClass::State],
+            ..SessionPolicy::default()
+        };
+        assert!(matches!(
+            judged_verdict(&denied, &[ActionClass::State], ActionClass::State),
+            Judged::Deny(_)
+        ));
+        let allowed = SessionPolicy {
+            allow: vec![ActionClass::State],
+            ..SessionPolicy::default()
+        };
+        assert!(matches!(
+            judged_verdict(&allowed, &[], ActionClass::State),
+            Judged::Allow
+        ));
     }
 
     fn words(v: &[&str]) -> Vec<String> {
@@ -823,31 +1425,28 @@ mod tests {
         assert_eq!(logged_args(&argv, false), argv);
         let class = argv::class_of(&argv).unwrap();
         assert!(matches!(
-            judged_verdict(&Default::default(), class),
-            policy::Verdict::Ask
+            judged_verdict(&Default::default(), &[], class),
+            Judged::Ask
         ));
     }
 
     #[test]
-    fn an_asking_command_is_denied_until_a_person_can_be_asked() {
-        for (class, hint) in [
-            (ActionClass::State, "--allow state"),
-            (
-                ActionClass::Upload,
-                "--allow upload and --upload-dir <directory>",
-            ),
-        ] {
-            let e = no_confirmation_yet(class);
-            assert_eq!(e.code, codes::POLICY_DENIED);
-            assert!(
-                e.message
-                    .contains("needs a person's confirmation, which is not available yet"),
-                "{}",
-                e.message
-            );
-            assert!(e.message.contains(hint), "{}", e.message);
-            assert_eq!(e.data, Some(json!({ "reason": "no_responder" })));
-        }
+    fn an_upload_that_would_ask_is_denied_until_staging() {
+        let e = no_confirmation_yet(ActionClass::Upload);
+        assert_eq!(e.code, codes::POLICY_DENIED);
+        assert!(
+            e.message
+                .contains("needs a person's confirmation, which is not available yet"),
+            "{}",
+            e.message
+        );
+        assert!(
+            e.message
+                .contains("--allow upload and --upload-dir <directory>"),
+            "{}",
+            e.message
+        );
+        assert_eq!(e.data, Some(json!({ "reason": "no_responder" })));
     }
 
     #[test]

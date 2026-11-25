@@ -8,7 +8,7 @@
 mod common;
 
 use common::*;
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn create(args: &[&str]) -> String {
     let home = shared_home();
@@ -23,20 +23,34 @@ fn close(handle: &str) {
     assert_eq!(shared_home().run(&["session", "close", handle]).0, 0);
 }
 
+/// State asks a person by default; with nobody to ask (no confirmation client, stock mode)
+/// it is denied at once, saying why. `--allow state` runs it without asking.
 #[test]
 #[ignore]
-fn state_commands_need_allow_state() {
+fn state_commands_ask_and_with_nobody_to_ask_are_denied() {
     let origin = fixture();
     let home = shared_home();
     let url = format!("{origin}/counter");
     let plain = create(&["--url", &url]);
+    let started = std::time::Instant::now();
     let (code, _, err) = home.run(&["--session", &plain, "cookies", "set", "pegpolicyck", "1"]);
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("policy_denied"), "{err}");
+    assert!(err.contains("(reason: no_responder)"), "{err}");
+    assert!(
+        err.contains("confirmation needs the Pegboard browser"),
+        "{err}"
+    );
     assert!(err.contains("--allow state"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "nobody to ask must not wait: {:?}",
+        started.elapsed()
+    );
     let (code, _, err) = home.run(&["--session", &plain, "storage", "local", "set", "k", "v"]);
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("policy_denied"), "{err}");
+    assert!(err.contains("(reason: no_responder)"), "{err}");
     // Reading is not state.
     let (code, _, err) = home.run(&["--session", &plain, "cookies"]);
     assert_eq!(code, 0, "{err}");
@@ -60,6 +74,7 @@ fn state_commands_need_allow_state() {
     );
     let error = denied["error"].as_str().unwrap();
     assert_eq!(error, "policy_denied: details withheld (entry redacted)");
+    assert_eq!(denied["confirm"]["outcome"], "noResponder", "{denied}");
     assert!(!out.contains("pegpolicyck"), "{out}");
     close(&plain);
 
@@ -76,6 +91,101 @@ fn state_commands_need_allow_state() {
         "document.cookie = 'pegpolicyck=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/'; localStorage.removeItem('k')",
     ]);
     close(&allowed);
+}
+
+/// A person answering through `confirm.subscribe` (stock mode): the CLI says who denied, and
+/// the log keeps who answered. An approval runs the command and the result says so.
+#[test]
+#[ignore]
+fn cli_state_shows_who_denied() {
+    let origin = fixture();
+    let home = shared_home();
+    let url = format!("{origin}/counter");
+    let handle = create(&["--url", &url]);
+    let mut person = Confirmer::subscribe(home);
+
+    let h = handle.clone();
+    let run = std::thread::spawn(move || {
+        shared_home().run(&[
+            "--session",
+            &h,
+            "storage",
+            "local",
+            "set",
+            "pegwho",
+            "denied-v",
+        ])
+    });
+    let asked = person.next("confirm.required");
+    assert_eq!(asked["sessionId"], id_of(&handle), "{asked}");
+    assert_eq!(asked["class"], "state", "{asked}");
+    let details = asked["details"].to_string();
+    assert!(details.contains(&origin), "{details}");
+    assert!(details.contains("pegwho"), "{details}");
+    let cid = asked["confirmId"].as_str().unwrap().to_string();
+    let r = person.respond(&cid, "deny");
+    assert_eq!(r["result"], json!({}), "{r}");
+    let (code, _, err) = run.join().unwrap();
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("a person denied this state command"), "{err}");
+    assert!(err.contains("(reason: denied)"), "{err}");
+    // Answered already: a second answer finds nothing.
+    let r = person.respond(&cid, "approve");
+    assert_eq!(r["error"]["code"], "confirm_not_found", "{r}");
+
+    // Approved: it runs, and says it was confirmed.
+    let h = handle.clone();
+    let run = std::thread::spawn(move || {
+        shared_home().run(&[
+            "--session",
+            &h,
+            "--json",
+            "storage",
+            "local",
+            "set",
+            "pegwho",
+            "approved-v",
+        ])
+    });
+    let asked = person.next("confirm.required");
+    let r = person.respond(asked["confirmId"].as_str().unwrap(), "approve");
+    assert_eq!(r["result"], json!({}), "{r}");
+    let (code, out, err) = run.join().unwrap();
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(json(&out)["confirmed"], json!({ "by": "api" }), "{out}");
+    let (code, out, err) = home.run(&[
+        "--session",
+        &handle,
+        "eval",
+        "localStorage.getItem('pegwho')",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("approved-v"), "{out}");
+
+    let rid = format!("r_{}", &id_of(&handle)[2..]);
+    let (code, out, _) = home.run(&["recording", "show", &rid, "--json"]);
+    assert_eq!(code, 0);
+    let actions = json(&out)["actions"].as_array().unwrap().clone();
+    let storage: Vec<&Value> = actions
+        .iter()
+        .filter(|a| a["command"] == "storage")
+        .collect();
+    assert_eq!(storage.len(), 2, "{actions:?}");
+    assert_eq!(storage[0]["confirm"]["outcome"], "denied", "{actions:?}");
+    assert_eq!(storage[0]["confirm"]["by"], "api", "{actions:?}");
+    assert_eq!(storage[1]["confirm"]["outcome"], "approved", "{actions:?}");
+    assert!(storage[1]["ok"] == true, "{actions:?}");
+    assert!(
+        !out.contains("denied-v") && !out.contains("approved-v"),
+        "{out}"
+    );
+    let _ = home.run(&[
+        "--session",
+        &handle,
+        "eval",
+        "localStorage.removeItem('pegwho')",
+    ]);
+    close(&handle);
 }
 
 #[test]

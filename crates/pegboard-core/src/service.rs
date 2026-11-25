@@ -1146,6 +1146,7 @@ impl Daemon {
             &self.sessions,
             &self.runner,
             &self.paths,
+            &self.confirm,
             &mut log,
             &id,
             &p.argv,

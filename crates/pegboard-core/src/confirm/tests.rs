@@ -656,3 +656,32 @@ fn the_timeout_hook_needs_test_hooks() {
         assert_eq!(timeout_with(true, Some(bad)), CONFIRM_TIMEOUT, "{bad}");
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn until_closing_ends_when_that_session_closes_or_the_daemon_stops() {
+    let b = broker();
+    let wait_a = {
+        let b = b.clone();
+        tokio::spawn(async move { b.until_closing(&sid(A)).await })
+    };
+    let wait_b = {
+        let b = b.clone();
+        tokio::spawn(async move { b.until_closing(&sid(B)).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!wait_a.is_finished() && !wait_b.is_finished());
+    // Another session's close wakes nothing of A.
+    b.cancel_session(&sid(B));
+    wait_b.await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(!wait_a.is_finished());
+    // Already closing: ends at once.
+    tokio::time::timeout(Duration::from_millis(1), b.until_closing(&sid(B)))
+        .await
+        .expect("a closing session ends the wait at once");
+    b.cancel_all();
+    tokio::time::timeout(Duration::from_millis(1), wait_a)
+        .await
+        .expect("the daemon stopping ends every wait")
+        .unwrap();
+}

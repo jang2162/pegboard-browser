@@ -1556,6 +1556,18 @@ fn the_daemons_refusals_and_failures_keep_their_codes() {
     let (err, text) = h.call("pegboard_eval", json!({ "expression": "1" }));
     assert!(err, "{text}");
     assert_eq!(text, "policy_denied: eval is not allowed in this session");
+    // A person's answer (or its absence) is told apart in the tool result.
+    h.stub.state.lock().unwrap().exec_reply = Some(Err(RpcError {
+        code: codes::POLICY_DENIED.into(),
+        message: "no answer within 60 s; the state command was denied".into(),
+        data: Some(json!({ "reason": "timed_out", "confirmId": "c" })),
+    }));
+    let (err, text) = h.call("pegboard_eval", json!({ "expression": "2" }));
+    assert!(err, "{text}");
+    assert_eq!(
+        text,
+        "policy_denied: no answer within 60 s; the state command was denied (reason: timed_out)"
+    );
     // Ran and failed: as the CLI says it.
     h.stub.state.lock().unwrap().exec_reply =
         Some(Ok(json!({ "success": false, "error": "no element #x" })));

@@ -57,6 +57,14 @@ pub struct RpcError {
     pub data: Option<serde_json::Value>,
 }
 
+impl RpcError {
+    /// Why a command was denied (`data.reason` of `policy_denied`: `denied`, `timed_out`,
+    /// `no_responder`, `cancelled`, `stale`), if the error says.
+    pub fn reason(&self) -> Option<&str> {
+        self.data.as_ref()?.get("reason")?.as_str()
+    }
+}
+
 const ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
 const ID_BODY_LEN: usize = 8;
 

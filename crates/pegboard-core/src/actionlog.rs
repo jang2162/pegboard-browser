@@ -17,7 +17,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use pegboard_protocol::{RecordExtra, SessionId};
+use pegboard_protocol::{ConfirmBy, ConfirmOutcome, RecordExtra, SessionId};
 use serde::{Deserialize, Serialize};
 
 use crate::argv;
@@ -88,6 +88,19 @@ pub struct ActionEntry {
     /// Whether it was certainly a person (`EntryKind::Human` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certain: Option<bool>,
+    /// How a person's confirmation of the command ended; none for a command that asked
+    /// nobody. What the confirmation showed is not kept (it can hold secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<ConfirmLog>,
+}
+
+/// The confirmation of one command, as the log keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmLog {
+    pub outcome: ConfirmOutcome,
+    pub by: Option<ConfirmBy>,
+    pub wait_ms: u64,
 }
 
 impl ActionEntry {
