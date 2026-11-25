@@ -1232,4 +1232,4 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 - **맥미니 GUI 세션, `e2e_branding`** (`PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<앱>`): 2 passed. 영어 `chrome://settings/help`에 "About Pegboard", 한국어에 "Pegboard 정보", 둘 다 제품 이름 "Chromium" 없음. macOS에서는 `--lang`이 UI 언어를 바꾸지 않아 시험은 `-AppleLanguages (ko)`를 준다.
 - **변형** [확인]: `.grd`는 바꾸고 `.xtb`는 그대로 둔(ID를 안 바꾼) 빌드에서 `about_page_says_pegboard_in_korean`이 실패했다. 한국어 화면이 "설정 - About Pegboard"로 영어로 돌아갔다. 영어 시험은 통과.
 - **아이콘**: 주황색 둥근 판, 구멍 격자, 페그 하나. 맥미니의 앱 `Contents/Resources/app.icns`가 저장소 파일과 같다(SHA-1). Finder·Dock 화면은 SSH로 찍을 수 없어(배경만 찍힌다) 보지 못했다. 16·32px 렌더는 개발 기기에서 확대해 봤다.
-- 남은 것: 설정 About 화면의 로고 그림, `chrome://version`의 로고는 Chromium 트리의 그림 그대로다. 오류 페이지 등의 "Google Chrome 도움말" 같은 문구는 두 대상 `.grd` 밖(`generated_resources.grd`)이라 그대로다.
+- 남은 것: 설정 About 화면의 로고 그림, `chrome://version`의 로고는 Chromium 트리의 그림 그대로다. 설정 검색의 "Go to Google Chrome help" 같은 문구는 두 대상 `.grd` 밖(`settings_strings.grdp`, `generated_resources.grd` 소속)이라 그대로다.
