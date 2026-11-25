@@ -44,6 +44,13 @@ impl Fork {
     fn launch(binary: &Path, env: common::Env, extra: &[String]) -> Fork {
         let exe = fork_executable(binary);
         let udd = env.paths.chrome_udd.clone();
+        // chrome://profile-internals is an internal debugging page, off unless Local State
+        // turns those on (the toggle of chrome://chrome-urls).
+        let local_state = udd.join("Local State");
+        if !local_state.exists() {
+            std::fs::create_dir_all(&udd).unwrap();
+            std::fs::write(&local_state, r#"{"internal_only_uis_enabled": true}"#).unwrap();
+        }
         let pipes = DevToolsPipes::new().unwrap();
         let mut cmd = Command::new(&exe);
         cmd.arg(format!("--user-data-dir={}", udd.display()))
