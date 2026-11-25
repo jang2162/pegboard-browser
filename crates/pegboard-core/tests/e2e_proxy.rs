@@ -1381,6 +1381,85 @@ fn an_approved_upload_goes_only_into_the_top_document() {
     });
 }
 
+/// The proxy's upload-check world (security review of the upload window): after an approved
+/// upload's check ran, a raw client that has `Runtime.enable` was never told of the world's
+/// context, and trying every context id it could guess either lands in a context it was told
+/// of or is refused as pegboard's own (at least once: the world is there). Without the
+/// refusal (filter rule 5b) a guessed id evaluates in the proxy's world.
+#[test]
+#[ignore]
+fn a_client_cannot_reach_the_upload_check_world() {
+    use pegboard_core::proxy::filter::UploadWindow;
+    use pegboard_protocol::SessionPolicy;
+    common::run(async {
+        let h = common::Harness::start();
+        let (info, ep) = h
+            .session_with_policy("/upload", SessionPolicy::default())
+            .await;
+        let target = h.manager.info(&info.id).unwrap().targets[0].clone();
+        let c = common::client(&ep).await;
+        let sid = c.attach(&target).await.unwrap();
+        let mut events = c.events();
+        c.send("Runtime.enable", json!({}), Some(&sid))
+            .await
+            .unwrap();
+        c.evaluate(&sid, "window.__mainWorld = 1").await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().canonicalize().unwrap().join("ok.txt");
+        std::fs::write(&file, "ok").unwrap();
+        h.manager.set_upload_window(
+            &info.id,
+            Some(UploadWindow {
+                files: vec![file.clone()],
+                target: target.clone(),
+                origin: h.fixture.origin.clone(),
+            }),
+        );
+        set_file(&c, &sid, &file).await.unwrap();
+        assert_eq!(chosen_names(&c, &sid).await, json!(["ok.txt"]));
+        h.manager.set_upload_window(&info.id, None);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut told = std::collections::HashSet::new();
+        while let Ok(e) = events.try_recv() {
+            if e.method == "Runtime.executionContextCreated" {
+                let ctx = &e.params["context"];
+                assert!(
+                    !ctx["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("pegboard-upload-check"),
+                    "the client was told of the check's world: {ctx}"
+                );
+                told.insert(ctx["id"].as_i64().unwrap());
+            }
+        }
+        let mut refused = 0;
+        for id in 1..=400i64 {
+            match c
+                .send(
+                    "Runtime.evaluate",
+                    json!({ "expression": "typeof window.__mainWorld", "contextId": id,
+                            "returnByValue": true }),
+                    Some(&sid),
+                )
+                .await
+            {
+                Ok(_) => assert!(
+                    told.contains(&id),
+                    "evaluated in context {id}, not the client's"
+                ),
+                Err(e) if format!("{e:#}").contains("pegboard's own") => refused += 1,
+                Err(_) => {}
+            }
+        }
+        assert!(
+            refused >= 1,
+            "the check's world was not found among ids 1..=400"
+        );
+        h.close_session(&info.id).await;
+    });
+}
+
 /// The screen stream is the recorder's: an agent can neither start, stop nor acknowledge one
 /// on its own session (refused by the proxy), and the recording's stream goes on.
 #[test]

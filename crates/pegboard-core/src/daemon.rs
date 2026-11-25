@@ -252,6 +252,8 @@ pub async fn run_command_with_hook(
     // the copies' real paths and sizes, and the copies are what uploads.
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let mut staged: Option<Staged> = None;
+    // The tab the person is asked about: an approved upload goes there and nowhere else.
+    let mut asked_target: Option<String> = None;
     let prepare = async {
         let mut shown = Vec::new();
         if !asked_sources.is_empty() {
@@ -267,7 +269,16 @@ pub async fn run_command_with_hook(
                 .collect();
             staged = Some(copies);
         }
-        prepare_question(sessions, runner, id, class, &run_argv, &shown).await
+        asked_target = screen_target(sessions, runner, id);
+        prepare_question(
+            sessions,
+            id,
+            asked_target.as_deref(),
+            class,
+            &run_argv,
+            &shown,
+        )
+        .await
     };
     let cleared = clear_command(confirm, judged, class, id, prepare).await;
     // A command that waited for a person is logged at the answer: its time and duration
@@ -304,7 +315,9 @@ pub async fn run_command_with_hook(
         }
     }
     // An approved upload sends the copies the person was shown, under the files' names.
+    // Now that a person approved it, the session's oldest kept copies make room for it.
     if let Some(copies) = &staged {
+        confirm.copies().make_room(id);
         run_argv.truncate(2);
         for f in &copies.files {
             run_argv.push(f.staged.display().to_string());
@@ -343,8 +356,15 @@ pub async fn run_command_with_hook(
         }
     };
 
-    // Held to what the person was shown, right before it runs.
-    let now = tab_url(sessions, runner, id);
+    // Held to what the person was shown, right before it runs: an upload's tab is the asked
+    // one (its window names it), a storage write's the one it acts on now.
+    let now = async {
+        match (&staged, &asked_target) {
+            (Some(_), Some(t)) => target_url(sessions, id, t).await,
+            (Some(_), None) => None,
+            _ => tab_url(sessions, runner, id).await,
+        }
+    };
     if !apply_pin(&cleared.pin, &mut run_argv, now).await {
         if let Some(c) = entry.confirm.as_mut() {
             c.outcome = ConfirmOutcome::Stale;
@@ -368,7 +388,7 @@ pub async fn run_command_with_hook(
         };
         Some(UploadWindow {
             files: copies.copies(),
-            target: screen_target(sessions, runner, id)?,
+            target: asked_target.clone()?,
             origin: origin.clone(),
         })
     });
@@ -1095,14 +1115,17 @@ fn frame_selected(class: ActionClass) -> RpcError {
 /// refused (`unknown_origin`).
 async fn prepare_question(
     sessions: &SessionManager,
-    runner: &Runner,
     id: &SessionId,
+    target: Option<&str>,
     class: ActionClass,
     run_argv: &[String],
     files: &[ShownFile],
 ) -> Result<(ConfirmAsk, StatePin), RpcError> {
     let info = sessions.info(id)?;
-    let page = tab_url(sessions, runner, id).await;
+    let page = match target {
+        Some(t) => target_url(sessions, id, t).await,
+        None => None,
+    };
     let at = Where {
         page_url: page.as_deref(),
     };
@@ -1127,7 +1150,7 @@ async fn prepare_question(
             class,
             details,
             offer_allow_for_session: offers_allow_for_session(class, &info.policy),
-            place: question_place(sessions, runner, id),
+            place: sessions.confirm_place(id, target),
         },
         pin,
     ))
@@ -1144,7 +1167,12 @@ fn offers_allow_for_session(class: ActionClass, policy: &SessionPolicy) -> bool 
 /// session's only tab); `None` when there is none or it cannot be read in time.
 async fn tab_url(sessions: &SessionManager, runner: &Runner, id: &SessionId) -> Option<String> {
     let target = screen_target(sessions, runner, id)?;
-    tokio::time::timeout(PROBE_TIMEOUT, sessions.target_url(id, &target))
+    target_url(sessions, id, &target).await
+}
+
+/// The address of the session's tab `target`; `None` when it cannot be read in time.
+async fn target_url(sessions: &SessionManager, id: &SessionId, target: &str) -> Option<String> {
+    tokio::time::timeout(PROBE_TIMEOUT, sessions.target_url(id, target))
         .await
         .ok()?
 }

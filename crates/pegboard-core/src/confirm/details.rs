@@ -305,6 +305,16 @@ pub fn upload_details(
         details.push(detail("파일", shown));
         details.push(detail("크기", human_size(f.size)));
     }
+    // What approving gives away (security review): once set into the page, the files can be
+    // read by the agent (through the page) and by the page's origin. The origin pin decides
+    // where the browser puts them, not who may read them.
+    details.push(detail(
+        "읽을 수 있는 쪽",
+        format!(
+            "허용하면 이 파일의 내용을 에이전트와 {} 페이지가 읽을 수 있습니다",
+            display_text(&origin, DETAIL_VALUE_CHARS)
+        ),
+    ));
     Ok((details, StatePin::Origin(origin)))
 }
 
@@ -831,6 +841,10 @@ mod tests {
                 ("크기", "12 B"),
                 ("파일", "/tmp/r/b.bin"),
                 ("크기", "1.5 KiB (1536 B)"),
+                (
+                    "읽을 수 있는 쪽",
+                    "허용하면 이 파일의 내용을 에이전트와 https://a.test 페이지가 읽을 수 있습니다"
+                ),
             ]
         );
         assert_eq!(pin, StatePin::Origin("https://a.test".into()));

@@ -139,53 +139,63 @@ impl CopyStore {
         })
     }
 
-    /// Room for `bytes` more of the session's copies: its oldest kept copies make way when
-    /// the session's budget needs it; then both budgets must hold.
+    /// Counts `bytes` more of the session's copies, when they fit once the session's kept
+    /// copies made way. Nothing is evicted here: a question may still be denied, and the
+    /// kept copies may still be read by a page. Only an approved upload makes the room
+    /// (`make_room`).
     fn admit(&self, session: &SessionId, bytes: u64) -> Result<Account, String> {
+        let mut t = self.inner.lock().unwrap();
+        let mine = t.bytes.get(session).copied().unwrap_or(0);
+        let kept: u64 = t
+            .kept
+            .get(session)
+            .map_or(0, |k| k.iter().map(Staged::bytes).sum());
+        let fits = (mine.saturating_sub(kept) + bytes) <= SESSION_COPY_BYTES
+            && (t.total.saturating_sub(kept) + bytes) <= DAEMON_COPY_BYTES;
+        if !fits {
+            return Err(
+                "pegboard holds as many copies for uploads as it may; close a session (or                  wait for its copies to go) and try again"
+                    .to_string(),
+            );
+        }
+        *t.bytes.entry(session.clone()).or_insert(0) += bytes;
+        t.total += bytes;
+        Ok(Account {
+            store: self.me.clone(),
+            session: session.clone(),
+            bytes,
+        })
+    }
+
+    /// A person approved an upload of the session: its oldest kept copies go until both
+    /// budgets hold again (`admit` counted on them making way).
+    pub fn make_room(&self, session: &SessionId) {
         let mut evicted = Vec::new();
-        let result = {
+        {
             let mut t = self.inner.lock().unwrap();
             loop {
                 let mine = t.bytes.get(session).copied().unwrap_or(0);
-                let fits =
-                    mine + bytes <= SESSION_COPY_BYTES && t.total + bytes <= DAEMON_COPY_BYTES;
-                if fits {
-                    break Ok(());
+                if mine <= SESSION_COPY_BYTES && t.total <= DAEMON_COPY_BYTES {
+                    break;
                 }
                 // Dropped below, out of the lock (a copy gives its bytes back when dropped).
-                match t.kept.get_mut(session).and_then(VecDeque::pop_front) {
-                    Some(old) => {
-                        let n = old.bytes();
-                        if let Some(b) = t.bytes.get_mut(session) {
-                            *b = b.saturating_sub(n);
-                        }
-                        t.total = t.total.saturating_sub(n);
-                        evicted.push(old);
-                    }
-                    None => break Err(()),
+                let Some(old) = t.kept.get_mut(session).and_then(VecDeque::pop_front) else {
+                    break;
+                };
+                let n = old.bytes();
+                if let Some(b) = t.bytes.get_mut(session) {
+                    *b = b.saturating_sub(n);
                 }
+                t.total = t.total.saturating_sub(n);
+                evicted.push(old);
             }
-            .map(|()| {
-                *t.bytes.entry(session.clone()).or_insert(0) += bytes;
-                t.total += bytes;
-            })
-        };
+        }
         // Their bytes were taken off above: dropping them must not take them off again.
         for mut old in evicted {
             if let Some(a) = old.account.as_mut() {
                 a.bytes = 0;
             }
         }
-        result.map_err(|()| {
-            "pegboard holds as many copies for uploads as it may; close a session (or wait \
-             for its copies to go) and try again"
-                .to_string()
-        })?;
-        Ok(Account {
-            store: self.me.clone(),
-            session: session.clone(),
-            bytes,
-        })
     }
 
     /// Keeps the copies of an upload that ran until the session closes (the page may read
@@ -353,7 +363,7 @@ pub fn stage(
     }
     let bytes: u64 = opened.iter().map(|(o, _)| o.size).sum();
     let root = root.canonicalize().map_err(StageError::Io)?;
-    let account = store.admit(session, bytes).map_err(StageError::NoRoom)?;
+    // The disk first: a refusal there leaves the budgets untouched.
     let free = free_bytes(&root).map_err(StageError::Io)?;
     if free < bytes.saturating_add(FREE_SPACE_MARGIN) {
         return Err(StageError::NoRoom(
@@ -361,6 +371,7 @@ pub fn stage(
                 .to_string(),
         ));
     }
+    let account = store.admit(session, bytes).map_err(StageError::NoRoom)?;
     let dir = root.join(random_name());
     private_dir(&dir).map_err(StageError::Io)?;
     // From here on a failure deletes what was made.
@@ -611,8 +622,14 @@ mod tests {
         assert_eq!(store.bytes_of(&s1), 10);
         drop(b);
         assert_eq!(store.bytes_of(&s1), 5);
-        // Room for more is made from the session's oldest kept copies.
+        // Room for more is made from the session's oldest kept copies, but only once a
+        // person approved: asking alone (which may be denied) evicts nothing.
         let account = store.admit(&s1, SESSION_COPY_BYTES - 2).unwrap();
+        assert!(
+            dir.is_dir(),
+            "a kept copy went before the upload was approved"
+        );
+        store.make_room(&s1);
         assert!(!dir.exists(), "the oldest kept copy made way");
         assert_eq!(store.bytes_of(&s1), SESSION_COPY_BYTES - 2);
         // Nothing left to make way: refused.

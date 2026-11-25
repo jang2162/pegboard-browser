@@ -5,7 +5,7 @@
 //! targets and CDP sessions are visible. Rule tables are ordered; the first
 //! matching row wins.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -27,6 +27,155 @@ pub struct Scope {
     /// (`PAGE_SCRIPT_METHODS`): only when the session's policy allows the clipboard. Such a
     /// script could disarm the clipboard shield if it ran first (spike C12a).
     pub page_scripts_allowed: bool,
+    /// The proxy's own upload-check worlds, which the client may neither see nor reach.
+    pub upload_checks: UploadChecks,
+}
+
+/// The start of the name of every isolated world the proxy makes to check an upload's node
+/// (`Page.createIsolatedWorld`); each check's world has a new random rest.
+pub const UPLOAD_WORLD_PREFIX: &str = "pegboard-upload-check-";
+
+/// Execution contexts remembered as the proxy's (old ones are never used again, so the
+/// oldest may be forgotten).
+const MAX_PROXY_CONTEXTS: usize = 256;
+
+/// The proxy's upload-check worlds of a session (security review of the upload window): the
+/// node check runs in a fresh isolated world of a random name, so a client can neither make
+/// that world first nor find it by name; its contexts' events are not passed on, and a
+/// client call that names one of them (or any context or object, while a check runs) is
+/// refused, so the client cannot change what the check's script sees.
+#[derive(Debug, Default)]
+pub struct UploadChecks {
+    /// Checks under way (counted by the connection running each).
+    pub in_flight: usize,
+    /// Bumped whenever the daemon opens or closes an upload window: a check begun under one
+    /// window does not forward under another, or after it closed.
+    pub generation: u64,
+    ids: VecDeque<i64>,
+    unique_ids: VecDeque<String>,
+}
+
+impl UploadChecks {
+    /// Remembers a context of the proxy's world (its `executionContextId` or `uniqueId`).
+    pub fn remember(&mut self, id: Option<i64>, unique_id: Option<&str>) {
+        if let Some(id) = id.filter(|i| !self.ids.contains(i)) {
+            if self.ids.len() == MAX_PROXY_CONTEXTS {
+                self.ids.pop_front();
+            }
+            self.ids.push_back(id);
+        }
+        if let Some(u) = unique_id.filter(|u| !self.unique_ids.iter().any(|x| x == u)) {
+            if self.unique_ids.len() == MAX_PROXY_CONTEXTS {
+                self.unique_ids.pop_front();
+            }
+            self.unique_ids.push_back(u.to_string());
+        }
+    }
+
+    fn is_proxy_context(&self, id: i64) -> bool {
+        self.ids.contains(&id)
+    }
+
+    fn is_proxy_unique_id(&self, u: &str) -> bool {
+        self.unique_ids.iter().any(|x| x == u)
+    }
+}
+
+/// The execution context of a remote object id (`<isolate>.<context>.<n>`, V8's
+/// `RemoteObjectId`).
+fn object_context(object_id: &str) -> Option<i64> {
+    let mut parts = object_id.split('.');
+    let (_, ctx, _, rest) = (parts.next()?, parts.next()?, parts.next()?, parts.next());
+    if rest.is_some() {
+        return None;
+    }
+    ctx.parse().ok()
+}
+
+/// Whether a client call reaches into the proxy's upload-check world: it makes a world of
+/// that name, or names one of its contexts (by id or unique id) or an object in one, or
+/// names any context or object while a check runs (a context the proxy has not heard of
+/// yet may be its new one).
+fn reaches_upload_world(
+    method: &str,
+    params: Option<&serde_json::Map<String, Value>>,
+    checks: &UploadChecks,
+) -> bool {
+    let Some(p) = params else {
+        return false;
+    };
+    if method == "Page.createIsolatedWorld"
+        && p.get("worldName")
+            .and_then(Value::as_str)
+            .is_some_and(|n| n.starts_with(UPLOAD_WORLD_PREFIX))
+    {
+        return true;
+    }
+    let mut ids: Vec<&Value> = ["contextId", "executionContextId"]
+        .iter()
+        .filter_map(|k| p.get(*k))
+        .collect();
+    let mut uniques: Vec<&Value> = ["uniqueContextId"]
+        .iter()
+        .filter_map(|k| p.get(*k))
+        .collect();
+    let mut objects: Vec<&Value> = ["objectId", "prototypeObjectId"]
+        .iter()
+        .filter_map(|k| p.get(*k))
+        .collect();
+    if let Some(args) = p.get("arguments").and_then(Value::as_array) {
+        objects.extend(args.iter().filter_map(|a| a.get("objectId")));
+    }
+    if ids.is_empty() && uniques.is_empty() && objects.is_empty() {
+        return false;
+    }
+    if checks.in_flight > 0 {
+        return true;
+    }
+    // A value that is not what it should be is not judged here: the browser refuses it.
+    ids.drain(..)
+        .filter_map(Value::as_i64)
+        .any(|i| checks.is_proxy_context(i))
+        || uniques
+            .drain(..)
+            .filter_map(Value::as_str)
+            .any(|u| checks.is_proxy_unique_id(u))
+        || objects
+            .drain(..)
+            .filter_map(Value::as_str)
+            .filter_map(object_context)
+            .any(|i| checks.is_proxy_context(i))
+}
+
+/// A browser event about the proxy's upload-check world, which the client is not told of:
+/// the creation of one of its contexts (remembered here), and any event naming one.
+pub fn hides_upload_world(msg: &Value, checks: &mut UploadChecks) -> bool {
+    let Some(method) = msg.get("method").and_then(Value::as_str) else {
+        return false;
+    };
+    if !method.starts_with("Runtime.") {
+        return false;
+    }
+    let params = msg.get("params").unwrap_or(&Value::Null);
+    if method == "Runtime.executionContextCreated" {
+        let ctx = &params["context"];
+        if ctx["name"]
+            .as_str()
+            .is_some_and(|n| n.starts_with(UPLOAD_WORLD_PREFIX))
+        {
+            checks.remember(ctx["id"].as_i64(), ctx["uniqueId"].as_str());
+            return true;
+        }
+        return ctx["id"]
+            .as_i64()
+            .is_some_and(|i| checks.is_proxy_context(i));
+    }
+    params["executionContextId"]
+        .as_i64()
+        .is_some_and(|i| checks.is_proxy_context(i))
+        || params["executionContextUniqueId"]
+            .as_str()
+            .is_some_and(|u| checks.is_proxy_unique_id(u))
 }
 
 /// What one approved upload may do through the session's endpoint (design 4.3, security
@@ -348,6 +497,15 @@ pub fn client_message(msg: &Value, scope: &Scope) -> ClientDecision {
         return error(
             -32000,
             "browser-level call is not allowed; use a page session",
+        );
+    }
+
+    // 5b. The proxy's upload-check world is not the client's to reach (security review).
+    if reaches_upload_world(method, params, &scope.upload_checks) {
+        return error(
+            -32000,
+            "this execution context or object is pegboard's own (an upload check); not \
+             allowed in a pegboard session",
         );
     }
 
@@ -678,6 +836,7 @@ mod tests {
             upload_dirs: Vec::new(),
             upload_window: None,
             page_scripts_allowed: false,
+            upload_checks: UploadChecks::default(),
         }
     }
 
@@ -1478,5 +1637,140 @@ mod tests {
         }
         // Allow-listed methods are not caught by the guard rule.
         assert!(ALLOWED_METHODS.iter().all(|m| !is_guard_method(m)));
+    }
+
+    /// The proxy's upload-check world (security review of the upload window): no client
+    /// call may make a world of its name, or name its contexts or objects; while a check
+    /// runs, no call may name any context or object.
+    #[test]
+    fn the_upload_check_world_is_out_of_reach() {
+        let mut sc = scope();
+        sc.upload_checks.remember(Some(7), Some("u-7"));
+        let call = |method: &str, params: Value| json!({ "id": 1, "method": method, "params": params, "sessionId": "S1" });
+        let refused = |sc: &Scope, m: &Value| {
+            matches!(client_message(m, sc), ClientDecision::Error { code: -32000, ref message }
+                if message.contains("pegboard's own"))
+        };
+        for m in [
+            call(
+                "Runtime.evaluate",
+                json!({ "expression": "1", "contextId": 7 }),
+            ),
+            call(
+                "Runtime.evaluate",
+                json!({ "expression": "1", "uniqueContextId": "u-7" }),
+            ),
+            call(
+                "Runtime.callFunctionOn",
+                json!({ "functionDeclaration": "f", "executionContextId": 7 }),
+            ),
+            call(
+                "Runtime.callFunctionOn",
+                json!({ "functionDeclaration": "f", "uniqueContextId": "u-7" }),
+            ),
+            call(
+                "Runtime.callFunctionOn",
+                json!({ "functionDeclaration": "f", "objectId": "-123.7.4" }),
+            ),
+            call(
+                "Runtime.callFunctionOn",
+                json!({ "functionDeclaration": "f", "objectId": "-123.1.4",
+                        "arguments": [{ "objectId": "-123.7.2" }] }),
+            ),
+            call("Runtime.getProperties", json!({ "objectId": "55.7.1" })),
+            call(
+                "DOM.resolveNode",
+                json!({ "backendNodeId": 3, "executionContextId": 7 }),
+            ),
+            call(
+                "DOM.setFileInputFiles",
+                json!({ "objectId": "55.7.1", "files": [] }),
+            ),
+            call(
+                "Page.createIsolatedWorld",
+                json!({ "frameId": "T1", "worldName": format!("{UPLOAD_WORLD_PREFIX}x") }),
+            ),
+        ] {
+            assert!(refused(&sc, &m), "{m}");
+        }
+        // Other contexts and objects, and other worlds, are the client's.
+        for m in [
+            call(
+                "Runtime.evaluate",
+                json!({ "expression": "1", "contextId": 8 }),
+            ),
+            call("Runtime.evaluate", json!({ "expression": "1" })),
+            call(
+                "Runtime.callFunctionOn",
+                json!({ "functionDeclaration": "f", "objectId": "-123.8.7" }),
+            ),
+            call("DOM.resolveNode", json!({ "backendNodeId": 3 })),
+            call(
+                "Page.createIsolatedWorld",
+                json!({ "frameId": "T1", "worldName": "agent-browser" }),
+            ),
+        ] {
+            assert_eq!(client_message(&m, &sc), ClientDecision::Forward, "{m}");
+        }
+        // While a check runs, any context or object reference waits for it to end.
+        sc.upload_checks.in_flight = 1;
+        for m in [
+            call(
+                "Runtime.evaluate",
+                json!({ "expression": "1", "contextId": 8 }),
+            ),
+            call(
+                "Runtime.callFunctionOn",
+                json!({ "functionDeclaration": "f", "objectId": "-123.8.7" }),
+            ),
+        ] {
+            assert!(refused(&sc, &m), "{m}");
+        }
+        assert_eq!(
+            client_message(&call("Runtime.evaluate", json!({ "expression": "1" })), &sc),
+            ClientDecision::Forward
+        );
+    }
+
+    #[test]
+    fn upload_world_events_are_hidden_and_its_contexts_remembered() {
+        let mut checks = UploadChecks::default();
+        let created = |id: i64, name: &str| {
+            json!({ "method": "Runtime.executionContextCreated", "sessionId": "S1",
+                    "params": { "context": { "id": id, "uniqueId": format!("u-{id}"),
+                                             "name": name, "origin": "https://a.test" } } })
+        };
+        assert!(hides_upload_world(
+            &created(9, &format!("{UPLOAD_WORLD_PREFIX}abc")),
+            &mut checks
+        ));
+        assert!(checks.is_proxy_context(9) && checks.is_proxy_unique_id("u-9"));
+        assert!(!hides_upload_world(&created(10, ""), &mut checks));
+        assert!(!hides_upload_world(
+            &created(11, "agent-browser"),
+            &mut checks
+        ));
+        for e in [
+            json!({ "method": "Runtime.executionContextDestroyed",
+                    "params": { "executionContextId": 9 } }),
+            json!({ "method": "Runtime.executionContextDestroyed",
+                    "params": { "executionContextUniqueId": "u-9" } }),
+            json!({ "method": "Runtime.consoleAPICalled",
+                    "params": { "type": "log", "args": [], "executionContextId": 9 } }),
+        ] {
+            assert!(hides_upload_world(&e, &mut checks), "{e}");
+        }
+        assert!(!hides_upload_world(
+            &json!({ "method": "Runtime.executionContextDestroyed",
+                     "params": { "executionContextId": 10 } }),
+            &mut checks
+        ));
+        assert!(!hides_upload_world(
+            &json!({ "method": "Page.frameNavigated", "params": { "executionContextId": 9 } }),
+            &mut checks
+        ));
+        assert_eq!(object_context("-1.9.3"), Some(9));
+        assert_eq!(object_context("9"), None);
+        assert_eq!(object_context("1.2.3.4"), None);
     }
 }

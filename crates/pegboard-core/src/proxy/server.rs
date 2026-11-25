@@ -156,6 +156,7 @@ impl SessionEntry {
                 upload_dirs: Vec::new(),
                 upload_window: None,
                 page_scripts_allowed: false,
+                upload_checks: filter::UploadChecks::default(),
             }),
             closed: watch::channel(false).0,
             kick: watch::channel(0).0,
@@ -290,7 +291,10 @@ impl ProxyServer {
         window: Option<crate::proxy::filter::UploadWindow>,
     ) {
         if let Some(entry) = self.shared.entry(id) {
-            entry.scope.lock().unwrap().upload_window = window;
+            let mut scope = entry.scope.lock().unwrap();
+            scope.upload_window = window;
+            // A check begun under the window before does not forward any more.
+            scope.upload_checks.generation += 1;
         }
     }
 
@@ -751,6 +755,7 @@ enum Pending {
         msg: Value,
         origin: String,
         step: UploadStep,
+        check: UploadCheckRun,
     },
     /// Context check of a tab the bridge created for a client `Target.createTarget`.
     VerifyTab {
@@ -766,14 +771,69 @@ enum Pending {
 }
 
 /// Where an upload node check is: the proxy's isolated world of the asked tab's top frame
-/// was made (`World`), the node's `backendNodeId` was looked up (`Describe`, with that
-/// world), the node was resolved in that world (`Resolve`), its document and origin were
-/// checked (`Verify`, with the node's object there).
+/// was made (`World`), the node was described (`Describe`, with that world: it must be an
+/// `<input type=file>`, read from the DOM, not from script), the node was resolved in that
+/// world (`Resolve`), its document and origin were checked (`Verify`, with the node's
+/// object there).
 enum UploadStep {
     World,
     Describe { context: i64 },
     Resolve,
     Verify { object_id: String },
+}
+
+/// One node check under way: its world's random name (also the object group its node
+/// object is in, released at the end), the upload window's generation it began under, and
+/// its count in `UploadChecks::in_flight` (given back when the check ends or its connection
+/// goes).
+struct UploadCheckRun {
+    world: String,
+    generation: u64,
+    _in_flight: InFlight,
+}
+
+struct InFlight(Arc<SessionEntry>);
+
+impl InFlight {
+    fn begin(entry: &Arc<SessionEntry>, scope: &mut Scope) -> InFlight {
+        scope.upload_checks.in_flight += 1;
+        InFlight(entry.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut scope = self.0.scope.lock().unwrap();
+        scope.upload_checks.in_flight = scope.upload_checks.in_flight.saturating_sub(1);
+    }
+}
+
+/// A new world name for one upload check: `filter::UPLOAD_WORLD_PREFIX` and 128 random bits.
+fn upload_world_name() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!(
+        "{}{}",
+        filter::UPLOAD_WORLD_PREFIX,
+        data_encoding::HEXLOWER.encode(&bytes)
+    )
+}
+
+/// Whether a `DOM.describeNode` node is an `<input>` whose `type` attribute is `file`
+/// (ASCII case-insensitive, as HTML reads it).
+fn is_file_input(node: &Value) -> bool {
+    let input = node["localName"].as_str() == Some("input") && node["nodeType"].as_i64() == Some(1);
+    let attrs = node["attributes"].as_array();
+    let file = attrs.is_some_and(|a| {
+        a.chunks(2).any(|kv| {
+            kv.len() == 2
+                && kv[0].as_str() == Some("type")
+                && kv[1]
+                    .as_str()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("file"))
+        })
+    });
+    input && file
 }
 
 /// Run in the proxy's isolated world of the asked tab's top frame, with the node as `this`:
@@ -1082,14 +1142,20 @@ impl ClientConn {
             );
             return self.send_client(&reply(&client, Err(err)));
         }
-        let decision = {
+        let (decision, check) = {
             let mut scope = self.entry.scope.lock().unwrap();
             let decision = filter::client_message(&msg, &scope);
-            // An approved upload's window is used once, whatever the check finds.
-            if matches!(decision, ClientDecision::CheckUploadNode { .. }) {
+            // An approved upload's window is used once, whatever the check finds. Counted
+            // as under way from here, so no client call names a context until it is done.
+            let check = matches!(decision, ClientDecision::CheckUploadNode { .. }).then(|| {
                 scope.upload_window = None;
-            }
-            decision
+                UploadCheckRun {
+                    world: upload_world_name(),
+                    generation: scope.upload_checks.generation,
+                    _in_flight: InFlight::begin(&self.entry, &mut scope),
+                }
+            });
+            (decision, check)
         };
         // The browser receives the value the decision was made on, re-serialized; never the
         // client's original bytes.
@@ -1102,14 +1168,18 @@ impl ClientConn {
                 target,
                 origin,
             } => {
+                let Some(check) = check else {
+                    return Ok(());
+                };
                 let mut world = json!({ "method": "Page.createIsolatedWorld",
-                    "params": { "frameId": target, "worldName": "pegboard-upload-check" } });
+                    "params": { "frameId": target, "worldName": check.world } });
                 world["sessionId"] = msg["sessionId"].clone();
                 let pending = Pending::UploadCheck {
                     client,
                     msg,
                     origin,
                     step: UploadStep::World,
+                    check,
                 };
                 return self.send_upstream(world, pending).await.map(drop);
             }
@@ -1180,8 +1250,9 @@ impl ClientConn {
                 msg: request,
                 origin,
                 step,
+                check,
             } => {
-                self.on_upload_check(&msg, client, request, origin, step)
+                self.on_upload_check(&msg, client, request, origin, step, check)
                     .await
             }
             Pending::VerifyTab { client, target_id } => {
@@ -1201,6 +1272,7 @@ impl ClientConn {
         request: Value,
         origin: String,
         step: UploadStep,
+        check: UploadCheckRun,
     ) -> Result<()> {
         let refuse = |me: &Self, client: &ClientRef| {
             me.send_client(&reply(
@@ -1212,10 +1284,6 @@ impl ClientConn {
                 )),
             ))
         };
-        if reply_msg.get("error").is_some() {
-            return refuse(self, &client);
-        }
-        let result = &reply_msg["result"];
         let params = &request["params"];
         let session = request["sessionId"].clone();
         let call = |method: &str, p: Value| {
@@ -1223,41 +1291,61 @@ impl ClientConn {
             v["sessionId"] = session.clone();
             v
         };
-        let resolve = |context: i64, backend: &Value| {
-            call(
-                "DOM.resolveNode",
-                json!({ "backendNodeId": backend, "executionContextId": context }),
-            )
-        };
+        // From `Resolve` on, the node's object is in the check's group: it goes at the end,
+        // after the call that uses it (the session handles its calls in order).
+        let release = call(
+            "Runtime.releaseObjectGroup",
+            json!({ "objectGroup": check.world }),
+        );
+        if reply_msg.get("error").is_some() {
+            if matches!(step, UploadStep::Verify { .. }) {
+                self.send_upstream(release, Pending::Internal).await?;
+            }
+            return refuse(self, &client);
+        }
+        let result = &reply_msg["result"];
         let (next, step) = match step {
             UploadStep::World => {
                 let Some(context) = result["executionContextId"].as_i64() else {
                     return refuse(self, &client);
                 };
-                if let Some(b) = params.get("backendNodeId").filter(|b| b.is_u64()) {
-                    (resolve(context, b), UploadStep::Resolve)
-                } else {
-                    let mut by = json!({});
-                    for k in ["nodeId", "objectId"] {
-                        if let Some(v) = params.get(k) {
-                            by[k] = v.clone();
-                        }
+                // Its event may not have come (the client has no Runtime.enable) or come
+                // already; either way it is known as the proxy's now.
+                self.entry
+                    .scope
+                    .lock()
+                    .unwrap()
+                    .upload_checks
+                    .remember(Some(context), None);
+                let mut by = json!({});
+                for k in ["nodeId", "backendNodeId", "objectId"] {
+                    if let Some(v) = params.get(k) {
+                        by[k] = v.clone();
                     }
-                    if by.as_object().is_some_and(serde_json::Map::is_empty) {
-                        return refuse(self, &client);
-                    }
-                    (
-                        call("DOM.describeNode", by),
-                        UploadStep::Describe { context },
-                    )
                 }
-            }
-            UploadStep::Describe { context } => {
-                let backend = &result["node"]["backendNodeId"];
-                if !backend.is_u64() {
+                if by.as_object().is_some_and(serde_json::Map::is_empty) {
                     return refuse(self, &client);
                 }
-                (resolve(context, backend), UploadStep::Resolve)
+                (
+                    call("DOM.describeNode", by),
+                    UploadStep::Describe { context },
+                )
+            }
+            UploadStep::Describe { context } => {
+                let node = &result["node"];
+                let backend = &node["backendNodeId"];
+                // Read from the DOM, whatever any script makes `type` or `instanceof` say.
+                if !backend.is_u64() || !is_file_input(node) {
+                    return refuse(self, &client);
+                }
+                (
+                    call(
+                        "DOM.resolveNode",
+                        json!({ "backendNodeId": backend, "executionContextId": context,
+                                "objectGroup": check.world }),
+                    ),
+                    UploadStep::Resolve,
+                )
             }
             UploadStep::Resolve => {
                 let Some(object_id) = result["object"]["objectId"].as_str() else {
@@ -1275,9 +1363,14 @@ impl ClientConn {
                 )
             }
             UploadStep::Verify { object_id } => {
+                // The window it began under is still the one open (the command did not end
+                // and no other window opened meanwhile).
+                let current = self.entry.scope.lock().unwrap().upload_checks.generation;
                 if result["result"]["value"] != json!(true)
                     || result.get("exceptionDetails").is_some()
+                    || current != check.generation
                 {
+                    self.send_upstream(release, Pending::Internal).await?;
                     return refuse(self, &client);
                 }
                 // The node the check was made on, as an object of the proxy's world: the
@@ -1293,7 +1386,11 @@ impl ClientConn {
                     method: "DOM.setFileInputFiles".to_string(),
                     target: None,
                 };
-                return self.send_upstream(forward, pending).await.map(drop);
+                self.send_upstream(forward, pending).await?;
+                return self
+                    .send_upstream(release, Pending::Internal)
+                    .await
+                    .map(drop);
             }
         };
         let pending = Pending::UploadCheck {
@@ -1301,6 +1398,7 @@ impl ClientConn {
             msg: request,
             origin,
             step,
+            check,
         };
         self.send_upstream(next, pending).await.map(drop)
     }
@@ -1366,6 +1464,10 @@ impl ClientConn {
             .then(|| msg.clone());
         let (decision, own_context, adopted) = {
             let mut scope = self.entry.scope.lock().unwrap();
+            // The proxy's upload-check world is not the client's to know of.
+            if filter::hides_upload_world(&msg, &mut scope.upload_checks) {
+                return Ok(());
+            }
             let own_context = event_context.as_deref() == Some(scope.context.as_str());
             let decision =
                 filter::browser_message_told(msg, None, &scope, &self.told.lock().unwrap());
@@ -1995,5 +2097,334 @@ mod tests {
             took < Duration::from_millis(1500),
             "the upstream was still open {took:?} after unregister"
         );
+    }
+
+    /// A browser connection the test plays: what the proxy sends comes out of `sent`, what
+    /// the test puts in `inject` is what the browser says.
+    struct ScriptedUpstream {
+        conns: Mutex<
+            Vec<(
+                mpsc::UnboundedSender<Value>,
+                mpsc::UnboundedReceiver<String>,
+            )>,
+        >,
+    }
+
+    struct ScriptedConn {
+        sent: mpsc::UnboundedSender<Value>,
+        inject: mpsc::UnboundedReceiver<String>,
+    }
+
+    #[async_trait]
+    impl Upstream for ScriptedUpstream {
+        async fn open(&self) -> Result<Box<dyn UpstreamConn>> {
+            let (sent, inject) = self.conns.lock().unwrap().pop().expect("one connection");
+            Ok(Box::new(ScriptedConn { sent, inject }))
+        }
+    }
+
+    #[async_trait]
+    impl UpstreamConn for ScriptedConn {
+        async fn send(&mut self, text: String) -> Result<()> {
+            let _ = self.sent.send(serde_json::from_str(&text)?);
+            Ok(())
+        }
+        async fn recv(&mut self) -> Option<String> {
+            self.inject.recv().await
+        }
+    }
+
+    type Ws = WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+    struct CheckRig {
+        proxy: ProxyServer,
+        id: SessionId,
+        ws: Ws,
+        sent: mpsc::UnboundedReceiver<Value>,
+        inject: mpsc::UnboundedSender<String>,
+        file: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl CheckRig {
+        async fn start() -> CheckRig {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let (sent_tx, sent) = mpsc::unbounded_channel();
+            let (inject, inject_rx) = mpsc::unbounded_channel();
+            let upstream = ScriptedUpstream {
+                conns: Mutex::new(vec![(sent_tx, inject_rx)]),
+            };
+            let proxy = ProxyServer::start(Arc::new(upstream)).await.unwrap();
+            let id = SessionId("s_uploadck".into());
+            let endpoint =
+                proxy.register(&id, "C1", GroupId(1), Arc::new(NoTabs), vec!["T1".into()]);
+            let mut req = endpoint.url.as_str().into_client_request().unwrap();
+            let auth = format!("Bearer {}", endpoint.token);
+            req.headers_mut()
+                .insert("Authorization", auth.parse().unwrap());
+            let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().canonicalize().unwrap().join("ok.txt");
+            std::fs::write(&file, "ok").unwrap();
+            let mut rig = CheckRig {
+                proxy,
+                id,
+                ws,
+                sent,
+                inject,
+                file,
+                _dir: dir,
+            };
+            // The client's own session on the tab.
+            rig.client(json!({ "id": 1, "method": "Target.attachToTarget",
+                               "params": { "targetId": "T1", "flatten": true } }))
+                .await;
+            let m = rig.browser_gets("Target.attachToTarget").await;
+            rig.answer(&m, json!({ "sessionId": "S1" }));
+            assert_eq!(rig.client_gets().await["result"]["sessionId"], "S1");
+            rig
+        }
+
+        fn open_window(&self) {
+            self.proxy.set_upload_window(
+                &self.id,
+                Some(filter::UploadWindow {
+                    files: vec![self.file.clone()],
+                    target: "T1".into(),
+                    origin: "https://a.test".into(),
+                }),
+            );
+        }
+
+        async fn client(&mut self, v: Value) {
+            self.ws.send(Message::text(v.to_string())).await.unwrap();
+        }
+
+        async fn client_gets(&mut self) -> Value {
+            loop {
+                let m = tokio::time::timeout(Duration::from_secs(3), self.ws.next())
+                    .await
+                    .expect("the client got nothing within 3 s")
+                    .unwrap()
+                    .unwrap();
+                if let Message::Text(t) = m {
+                    return serde_json::from_str(&t).unwrap();
+                }
+            }
+        }
+
+        /// Nothing reaches the client for a moment.
+        async fn client_quiet(&mut self) {
+            if let Ok(Some(Ok(Message::Text(t)))) =
+                tokio::time::timeout(Duration::from_millis(200), self.ws.next()).await
+            {
+                panic!("the client got {t}");
+            }
+        }
+
+        async fn browser_gets(&mut self, method: &str) -> Value {
+            let m = tokio::time::timeout(Duration::from_secs(3), self.sent.recv())
+                .await
+                .expect("the browser got nothing within 3 s")
+                .unwrap();
+            assert_eq!(m["method"], method, "{m}");
+            m
+        }
+
+        fn answer(&self, request: &Value, result: Value) {
+            let mut r = json!({ "id": request["id"], "result": result });
+            if let Some(s) = request.get("sessionId") {
+                r["sessionId"] = s.clone();
+            }
+            self.inject.send(r.to_string()).unwrap();
+        }
+
+        fn event(&self, v: Value) {
+            self.inject.send(v.to_string()).unwrap();
+        }
+
+        async fn set_files(&mut self, id: u64) {
+            let file = self.file.display().to_string();
+            self.client(
+                json!({ "id": id, "method": "DOM.setFileInputFiles", "sessionId": "S1",
+                                "params": { "nodeId": 5, "files": [file] } }),
+            )
+            .await;
+        }
+
+        /// Up to the node's description: the world (its creation event is not the
+        /// client's), then `describeNode`. The world's name and the describe request.
+        async fn until_describe(&mut self, context: i64) -> (String, Value) {
+            let w = self.browser_gets("Page.createIsolatedWorld").await;
+            let world = w["params"]["worldName"].as_str().unwrap().to_string();
+            assert!(
+                world.starts_with(filter::UPLOAD_WORLD_PREFIX)
+                    && world.len() == filter::UPLOAD_WORLD_PREFIX.len() + 32,
+                "{world}"
+            );
+            self.event(
+                json!({ "method": "Runtime.executionContextCreated", "sessionId": "S1",
+                "params": { "context": { "id": context, "uniqueId": "u-x", "name": world,
+                                         "origin": "https://a.test" } } }),
+            );
+            self.answer(&w, json!({ "executionContextId": context }));
+            let d = self.browser_gets("DOM.describeNode").await;
+            assert_eq!(d["params"], json!({ "nodeId": 5 }));
+            (world, d)
+        }
+    }
+
+    fn file_input(kind: &str) -> Value {
+        json!({ "node": { "nodeId": 5, "backendNodeId": 77, "nodeType": 1, "nodeName": "INPUT",
+                          "localName": "input", "attributes": ["id", "f", "type", kind] } })
+    }
+
+    /// The proxy's upload check (security review of the upload window): a fresh world of a
+    /// random name, whose context the client neither hears of nor reaches, before or after;
+    /// the node must be an `<input type=file>` by the DOM; the node object's group is
+    /// released after the call that uses it.
+    #[tokio::test]
+    async fn the_upload_check_world_is_hidden_and_out_of_reach() {
+        let mut r = CheckRig::start().await;
+        r.open_window();
+        r.set_files(2).await;
+        let (world, d) = r.until_describe(42).await;
+        // While the check runs, no call naming a context or object goes through.
+        r.client(
+            json!({ "id": 3, "method": "Runtime.evaluate", "sessionId": "S1",
+                         "params": { "expression": "1", "contextId": 42 } }),
+        )
+        .await;
+        let e = r.client_gets().await;
+        assert_eq!(e["id"], 3);
+        assert!(
+            e["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("pegboard's own"),
+            "{e}"
+        );
+        r.answer(&d, file_input("File"));
+        let resolve = r.browser_gets("DOM.resolveNode").await;
+        assert_eq!(
+            resolve["params"],
+            json!({ "backendNodeId": 77, "executionContextId": 42, "objectGroup": world })
+        );
+        r.answer(&resolve, json!({ "object": { "objectId": "-9.42.1" } }));
+        let check = r.browser_gets("Runtime.callFunctionOn").await;
+        r.answer(
+            &check,
+            json!({ "result": { "type": "boolean", "value": true } }),
+        );
+        let set = r.browser_gets("DOM.setFileInputFiles").await;
+        assert_eq!(set["params"]["objectId"], "-9.42.1");
+        let release = r.browser_gets("Runtime.releaseObjectGroup").await;
+        assert_eq!(release["params"], json!({ "objectGroup": world }));
+        r.answer(&set, json!({}));
+        let ok = r.client_gets().await;
+        assert_eq!(
+            (ok["id"].clone(), ok["result"].clone()),
+            (json!(2), json!({}))
+        );
+        // Afterwards the world's context and objects stay the proxy's; its events are not
+        // the client's.
+        for (n, params) in [
+            json!({ "expression": "1", "contextId": 42 }),
+            json!({ "expression": "1", "uniqueContextId": "u-x" }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = 10 + n as u64;
+            r.client(
+                json!({ "id": id, "method": "Runtime.evaluate", "sessionId": "S1",
+                             "params": params }),
+            )
+            .await;
+            let e = r.client_gets().await;
+            assert!(
+                e["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("pegboard's own"),
+                "{e}"
+            );
+        }
+        r.client(
+            json!({ "id": 12, "method": "Runtime.callFunctionOn", "sessionId": "S1",
+                         "params": { "functionDeclaration": "f", "objectId": "-9.42.3" } }),
+        )
+        .await;
+        assert!(r.client_gets().await["error"].is_object());
+        r.event(json!({ "method": "Runtime.executionContextDestroyed", "sessionId": "S1",
+                        "params": { "executionContextId": 42, "executionContextUniqueId": "u-x" } }));
+        r.client_quiet().await;
+        // The main world's context is the client's.
+        r.client(
+            json!({ "id": 13, "method": "Runtime.evaluate", "sessionId": "S1",
+                         "params": { "expression": "1", "contextId": 1 } }),
+        )
+        .await;
+        r.browser_gets("Runtime.evaluate").await;
+    }
+
+    /// A node that is not an `<input type=file>` by the DOM is refused, whatever a script
+    /// in any world would answer.
+    #[tokio::test]
+    async fn the_upload_check_reads_the_node_from_the_dom() {
+        let mut r = CheckRig::start().await;
+        r.open_window();
+        r.set_files(2).await;
+        let (_, d) = r.until_describe(42).await;
+        r.answer(&d, file_input("text"));
+        let e = r.client_gets().await;
+        assert_eq!(e["id"], 2);
+        assert!(
+            e["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not in the page"),
+            "{e}"
+        );
+        // The check is over: the client's other calls go again.
+        r.client(
+            json!({ "id": 3, "method": "Runtime.evaluate", "sessionId": "S1",
+                         "params": { "expression": "1", "contextId": 1 } }),
+        )
+        .await;
+        r.browser_gets("Runtime.evaluate").await;
+    }
+
+    /// A check begun under a window does not forward once that window closed (the command
+    /// ended): the window generation.
+    #[tokio::test]
+    async fn the_upload_check_does_not_outlive_its_window() {
+        let mut r = CheckRig::start().await;
+        r.open_window();
+        r.set_files(2).await;
+        let (world, d) = r.until_describe(42).await;
+        r.answer(&d, file_input("file"));
+        let resolve = r.browser_gets("DOM.resolveNode").await;
+        r.answer(&resolve, json!({ "object": { "objectId": "-9.42.1" } }));
+        let check = r.browser_gets("Runtime.callFunctionOn").await;
+        // The command ends while the check runs.
+        r.proxy.set_upload_window(&r.id, None);
+        r.answer(
+            &check,
+            json!({ "result": { "type": "boolean", "value": true } }),
+        );
+        let release = r.browser_gets("Runtime.releaseObjectGroup").await;
+        assert_eq!(release["params"], json!({ "objectGroup": world }));
+        let e = r.client_gets().await;
+        assert!(
+            e["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not in the page"),
+            "{e}"
+        );
+        tokio::time::timeout(Duration::from_millis(200), r.sent.recv())
+            .await
+            .expect_err("nothing more reaches the browser");
     }
 }
