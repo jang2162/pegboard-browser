@@ -273,8 +273,10 @@ impl SessionManager {
                 let table = inner.table.lock().unwrap();
                 let r = table.records.get(id)?;
                 Some(SessionView {
-                    allows_downloads: policy::judge_action(&r.info.policy, ActionClass::Download)
-                        .is_ok(),
+                    allows_downloads: matches!(
+                        policy::judge_action(&r.info.policy, &[], ActionClass::Download),
+                        policy::Verdict::Allow
+                    ),
                     context: r.context.clone(),
                 })
             }));
@@ -434,6 +436,7 @@ impl SessionManager {
             last_activity_at: created_at,
             token: None,
             policy: session_policy,
+            allowed_for_session: Vec::new(),
         };
         inner.table.lock().unwrap().records.insert(
             id.clone(),

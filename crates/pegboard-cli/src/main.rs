@@ -17,7 +17,7 @@ use pegboard_core::daemon::Daemon;
 use pegboard_core::link::BrowserLink;
 use pegboard_core::lock::{DaemonLock, EXIT_LOCK_HELD};
 use pegboard_core::paths::{ensure_home, paths, socket_path_fits, Paths};
-use pegboard_core::policy;
+use pegboard_core::policy::{self, ClassDefault};
 use pegboard_core::recording::config::RecordingConfig;
 use pegboard_core::recording::screen::valid_frame_name;
 use pegboard_core::runner::succeeded;
@@ -141,10 +141,11 @@ enum ProfileCmd {
 /// The session policy options, the same for `session create` and `mcp`.
 #[derive(clap::Args, Debug, Default)]
 pub(crate) struct PolicyArgs {
-    /// Open command classes that are denied by default (upload, state, clipboard).
+    /// Run these command classes without asking a person (upload, state) or open one that is
+    /// denied by default (clipboard). Without it, upload and state ask a person each time.
     #[arg(long, value_delimiter = ',', value_name = "CLASS,...")]
     allow: Vec<ActionClass>,
-    /// Close command classes that are allowed by default (e.g. eval, download).
+    /// Deny these command classes without asking (e.g. eval, download, upload, state).
     #[arg(long, value_delimiter = ',', value_name = "CLASS,...")]
     deny: Vec<ActionClass>,
     /// Only these hosts (and their subdomains) can be reached.
@@ -156,7 +157,8 @@ pub(crate) struct PolicyArgs {
     /// Do not allow localhost.
     #[arg(long)]
     no_localhost: bool,
-    /// Directory the session may upload files from (needs --allow upload).
+    /// Directory the session uploads files from (needed by --allow upload; without --allow,
+    /// each upload from it still asks a person).
     #[arg(long, value_name = "DIR")]
     upload_dir: Option<String>,
     /// Do not expire the session after it has been idle.
@@ -536,11 +538,21 @@ fn describe_policy(p: &SessionPolicy) -> String {
             RecordExtra::Console => "console",
         })
         .collect();
+    // Classes that ask a person: asking by default and neither allowed nor denied.
+    let ask: Vec<ActionClass> = ActionClass::ALL
+        .into_iter()
+        .filter(|c| {
+            policy::class_default(*c) == ClassDefault::Ask
+                && !p.allow.contains(c)
+                && !p.deny.contains(c)
+        })
+        .collect();
     format!(
-        "policy: allow {}; deny {}; allow-domain {}; localhost {localhost}; \
+        "policy: allow {}; deny {}; ask {}; allow-domain {}; localhost {localhost}; \
          private network {private}; upload-dir {}; expires {}; record {}",
         names(&p.allow),
         names(&p.deny),
+        names(&ask),
         if p.allow_domains.is_empty() {
             "-".to_string()
         } else {
@@ -1751,6 +1763,33 @@ mod tests {
         });
         assert!(line.ends_with("; record network,console"), "{line}");
         assert!(describe_policy(&SessionPolicy::default()).ends_with("; record -"));
+    }
+
+    #[test]
+    fn policy_line_shows_what_asks() {
+        let line = describe_policy(&SessionPolicy::default());
+        assert!(
+            line.starts_with("policy: allow -; deny -; ask upload,state; "),
+            "{line}"
+        );
+        let line = describe_policy(&SessionPolicy {
+            deny: vec![ActionClass::State],
+            ..SessionPolicy::default()
+        });
+        assert!(
+            line.starts_with("policy: allow -; deny state; ask upload; "),
+            "{line}"
+        );
+        let line = describe_policy(&SessionPolicy {
+            allow: vec![ActionClass::Upload],
+            deny: vec![ActionClass::State],
+            upload_dir: Some("/up".into()),
+            ..SessionPolicy::default()
+        });
+        assert!(
+            line.starts_with("policy: allow upload; deny state; ask -; "),
+            "{line}"
+        );
     }
 
     #[test]

@@ -415,7 +415,7 @@ fn bad_policy_options_exit_2() {
     let cases: Vec<Vec<&str>> = vec![
         vec!["--allow", "state", "--deny", "state"],
         vec!["--allow", "navigate"],
-        vec!["--deny", "upload"],
+        vec!["--deny", "clipboard"],
         vec!["--allow", "nonsense"],
         vec!["--allow", "State"],
         vec!["--allow-domain", "https://a.test"],
@@ -423,7 +423,7 @@ fn bad_policy_options_exit_2() {
         vec!["--allow-domain", "*.a.test"],
         vec!["--allow-domain", "a.test:80"],
         vec!["--allow-domain", ""],
-        vec!["--upload-dir", &dir],
+        vec!["--upload-dir", &dir, "--deny", "upload"],
         vec!["--allow", "upload"],
         vec!["--allow", "upload", "--upload-dir", "relative"],
         vec!["--allow", "upload", "--upload-dir", "/no/such/pegboard-dir"],
@@ -437,9 +437,19 @@ fn bad_policy_options_exit_2() {
         assert_eq!(code, 2, "{extra:?}: {out} {err}");
         assert!(!err.contains("not_running"), "{extra:?}: {err}");
     }
-    // A good policy gets past the options and reaches the missing daemon.
-    let (code, _, err) = home.run(&["session", "create", "--allow", "state", "--deny", "eval"]);
-    assert_eq!(code, 3, "{err}");
+    // A good policy gets past the options and reaches the missing daemon. Denying an asking
+    // class, and an upload folder without --allow upload (asking, bound to the folder), are
+    // good policies now.
+    for good in [
+        vec!["--allow", "state", "--deny", "eval"],
+        vec!["--deny", "upload,state"],
+        vec!["--upload-dir", &dir],
+    ] {
+        let mut args = vec!["session", "create"];
+        args.extend(&good);
+        let (code, _, err) = home.run(&args);
+        assert_eq!(code, 3, "{good:?}: {err}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

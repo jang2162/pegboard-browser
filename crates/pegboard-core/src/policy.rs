@@ -20,42 +20,64 @@ fn invalid(message: impl Into<String>) -> RpcError {
     error(codes::INVALID_PARAMS, message)
 }
 
-/// Classes a session may run without being given them: all but `upload`, `state` and
-/// `clipboard`.
-pub fn default_allowed(class: ActionClass) -> bool {
-    !matches!(
-        class,
-        ActionClass::Upload | ActionClass::State | ActionClass::Clipboard
-    )
+/// What a class of command gets when the policy says nothing about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassDefault {
+    Allow,
+    /// A person is asked, command by command.
+    Ask,
+    Deny,
 }
 
-/// Whether the policy lets the session run a command of `class`. `allow` opens a class that
-/// is closed by default, `deny` closes one that is open by default; nothing else matters.
-pub fn judge_action(policy: &SessionPolicy, class: ActionClass) -> Result<(), RpcError> {
+/// `upload` and `state` ask a person, `clipboard` is denied (it is set per profile, so one
+/// command cannot be asked about), everything else is allowed.
+pub fn class_default(class: ActionClass) -> ClassDefault {
+    match class {
+        ActionClass::Upload | ActionClass::State => ClassDefault::Ask,
+        ActionClass::Clipboard => ClassDefault::Deny,
+        _ => ClassDefault::Allow,
+    }
+}
+
+/// What the policy says about one command.
+#[derive(Debug)]
+pub enum Verdict {
+    Allow,
+    /// Run it only if a person says yes.
+    Ask,
+    Deny(RpcError),
+}
+
+/// Judges a command of `class`. `deny` wins; then `allow`; then `granted` (the classes a
+/// person allowed for the rest of the session, which only answer a question: they never
+/// open a class that is denied by default); then the class's default.
+pub fn judge_action(
+    policy: &SessionPolicy,
+    granted: &[ActionClass],
+    class: ActionClass,
+) -> Verdict {
     let name = class.as_str();
-    if default_allowed(class) {
-        if policy.deny.contains(&class) {
-            return Err(error(
-                codes::POLICY_DENIED,
-                format!("the session's policy denies {name} commands (--deny {name})"),
-            ));
-        }
-    } else if !policy.allow.contains(&class) {
-        // Uploading also needs the folder the files come from.
-        let with = if class == ActionClass::Upload {
-            " and --upload-dir <directory>"
-        } else {
-            ""
-        };
-        return Err(error(
+    if policy.deny.contains(&class) {
+        return Verdict::Deny(error(
+            codes::POLICY_DENIED,
+            format!("the session's policy denies {name} commands (--deny {name})"),
+        ));
+    }
+    if policy.allow.contains(&class) {
+        return Verdict::Allow;
+    }
+    match class_default(class) {
+        ClassDefault::Allow => Verdict::Allow,
+        ClassDefault::Ask if granted.contains(&class) => Verdict::Allow,
+        ClassDefault::Ask => Verdict::Ask,
+        ClassDefault::Deny => Verdict::Deny(error(
             codes::POLICY_DENIED,
             format!(
                 "the session's policy does not allow {name} commands; a person can allow it \
-                 when creating the session with --allow {name}{with}"
+                 when creating the session with --allow {name}"
             ),
-        ));
+        )),
     }
-    Ok(())
 }
 
 /// Refuses a policy that contradicts itself or cannot mean what it says (`invalid_params`).
@@ -65,7 +87,7 @@ pub fn validate(policy: &SessionPolicy) -> Result<(), RpcError> {
         if policy.deny.contains(class) {
             return Err(invalid(format!("{name} is both allowed and denied")));
         }
-        if default_allowed(*class) {
+        if class_default(*class) == ClassDefault::Allow {
             return Err(invalid(format!(
                 "--allow {name} has no effect: {name} commands are allowed by default \
                  (did you mean --deny?)"
@@ -74,7 +96,7 @@ pub fn validate(policy: &SessionPolicy) -> Result<(), RpcError> {
     }
     for class in &policy.deny {
         let name = class.as_str();
-        if !default_allowed(*class) {
+        if class_default(*class) == ClassDefault::Deny {
             return Err(invalid(format!(
                 "--deny {name} has no effect: {name} commands are denied by default \
                  (did you mean --allow?)"
@@ -89,9 +111,13 @@ pub fn validate(policy: &SessionPolicy) -> Result<(), RpcError> {
             )));
         }
     }
-    let upload_allowed = policy.allow.contains(&ActionClass::Upload);
-    match (&policy.upload_dir, upload_allowed) {
-        (Some(dir), true) => {
+    match &policy.upload_dir {
+        Some(_) if policy.deny.contains(&ActionClass::Upload) => {
+            return Err(invalid(
+                "--upload-dir has no use with --deny upload: the session uploads nothing",
+            ));
+        }
+        Some(dir) => {
             let path = Path::new(dir);
             if !path.is_absolute() {
                 return Err(invalid(format!(
@@ -104,13 +130,13 @@ pub fn validate(policy: &SessionPolicy) -> Result<(), RpcError> {
                 )));
             }
         }
-        (Some(_), false) => {
-            return Err(invalid("--upload-dir needs --allow upload"));
+        // An upload that asks nobody is bound to a folder.
+        None if policy.allow.contains(&ActionClass::Upload) => {
+            return Err(invalid(
+                "--allow upload needs --upload-dir (without --allow, an upload asks a person)",
+            ));
         }
-        (None, true) => {
-            return Err(invalid("--allow upload needs --upload-dir"));
-        }
-        (None, false) => {}
+        None => {}
     }
     Ok(())
 }
@@ -360,58 +386,184 @@ mod tests {
         }
     }
 
+    fn ask(v: Verdict) -> bool {
+        matches!(v, Verdict::Ask)
+    }
+
+    fn allowed(v: Verdict) -> bool {
+        matches!(v, Verdict::Allow)
+    }
+
+    fn denial(v: Verdict) -> RpcError {
+        match v {
+            Verdict::Deny(e) => e,
+            other => panic!("expected a denial, got {other:?}"),
+        }
+    }
+
+    fn with_dir(allow: &[ActionClass], deny: &[ActionClass]) -> SessionPolicy {
+        SessionPolicy {
+            upload_dir: Some(std::env::temp_dir().display().to_string()),
+            ..policy(allow, deny)
+        }
+    }
+
     #[test]
     fn defaults() {
         for c in ActionClass::ALL {
-            let closed = matches!(
-                c,
-                ActionClass::Upload | ActionClass::State | ActionClass::Clipboard
-            );
-            assert_eq!(default_allowed(c), !closed, "{c:?}");
-            assert_eq!(
-                judge_action(&SessionPolicy::default(), c).is_ok(),
-                !closed,
-                "{c:?}"
-            );
+            let expect = match c {
+                ActionClass::Upload | ActionClass::State => ClassDefault::Ask,
+                ActionClass::Clipboard => ClassDefault::Deny,
+                _ => ClassDefault::Allow,
+            };
+            assert_eq!(class_default(c), expect, "{c:?}");
         }
+    }
+
+    #[test]
+    fn upload_and_state_ask_by_default() {
+        let p = SessionPolicy::default();
+        assert!(ask(judge_action(&p, &[], ActionClass::Upload)));
+        assert!(ask(judge_action(&p, &[], ActionClass::State)));
+        let e = denial(judge_action(&p, &[], ActionClass::Clipboard));
+        assert_eq!(e.code, codes::POLICY_DENIED);
+        assert!(allowed(judge_action(&p, &[], ActionClass::Eval)));
+        assert!(allowed(judge_action(&p, &[], ActionClass::Navigate)));
+    }
+
+    #[test]
+    fn allow_and_deny_skip_the_question() {
+        let p = policy(&[ActionClass::State], &[ActionClass::Upload]);
+        assert!(allowed(judge_action(&p, &[], ActionClass::State)));
+        let e = denial(judge_action(&p, &[], ActionClass::Upload));
+        assert_eq!(e.code, codes::POLICY_DENIED);
+        assert_eq!(
+            e.message,
+            "the session's policy denies upload commands (--deny upload)"
+        );
     }
 
     #[test]
     fn allow_and_deny_change_one_class_only() {
         let p = policy(&[ActionClass::State], &[ActionClass::Eval]);
         for c in ActionClass::ALL {
-            let expect = match c {
-                ActionClass::State => true,
-                ActionClass::Eval => false,
-                other => default_allowed(other),
-            };
-            assert_eq!(judge_action(&p, c).is_ok(), expect, "{c:?}");
+            let v = judge_action(&p, &[], c);
+            match c {
+                ActionClass::State => assert!(allowed(v), "{c:?}"),
+                ActionClass::Eval => assert!(matches!(v, Verdict::Deny(_)), "{c:?}"),
+                ActionClass::Upload => assert!(ask(v), "{c:?}"),
+                ActionClass::Clipboard => assert!(matches!(v, Verdict::Deny(_)), "{c:?}"),
+                _ => assert!(allowed(v), "{c:?}"),
+            }
         }
     }
 
     #[test]
+    fn a_grant_turns_ask_into_allow_for_that_class_only() {
+        let p = SessionPolicy::default();
+        let granted = [ActionClass::State];
+        assert!(allowed(judge_action(&p, &granted, ActionClass::State)));
+        assert!(ask(judge_action(&p, &granted, ActionClass::Upload)));
+        // Only a question can be answered for the session: a grant does not open a class
+        // that is denied by default (the clipboard is pinned per profile).
+        let e = denial(judge_action(
+            &p,
+            &[ActionClass::Clipboard],
+            ActionClass::Clipboard,
+        ));
+        assert_eq!(e.code, codes::POLICY_DENIED);
+    }
+
+    #[test]
+    fn a_grant_does_not_beat_deny() {
+        let p = policy(&[], &[ActionClass::State]);
+        let e = denial(judge_action(&p, &[ActionClass::State], ActionClass::State));
+        assert_eq!(e.code, codes::POLICY_DENIED);
+    }
+
+    #[test]
     fn denial_messages() {
-        let e = judge_action(&SessionPolicy::default(), ActionClass::State).unwrap_err();
+        let e = denial(judge_action(
+            &SessionPolicy::default(),
+            &[],
+            ActionClass::Clipboard,
+        ));
         assert_eq!(e.code, codes::POLICY_DENIED);
         assert_eq!(
             e.message,
-            "the session's policy does not allow state commands; a person can allow it when \
-             creating the session with --allow state"
+            "the session's policy does not allow clipboard commands; a person can allow it \
+             when creating the session with --allow clipboard"
         );
-        let e = judge_action(&SessionPolicy::default(), ActionClass::Upload).unwrap_err();
-        assert_eq!(e.code, codes::POLICY_DENIED);
-        assert!(
-            e.message
-                .contains("--allow upload and --upload-dir <directory>"),
-            "{}",
-            e.message
-        );
-        let e = judge_action(&policy(&[], &[ActionClass::Eval]), ActionClass::Eval).unwrap_err();
+        let e = denial(judge_action(
+            &policy(&[], &[ActionClass::Eval]),
+            &[],
+            ActionClass::Eval,
+        ));
         assert_eq!(e.code, codes::POLICY_DENIED);
         assert_eq!(
             e.message,
             "the session's policy denies eval commands (--deny eval)"
         );
+    }
+
+    #[test]
+    fn deny_upload_and_deny_state_are_valid_now() {
+        assert!(validate(&policy(&[], &[ActionClass::Upload])).is_ok());
+        assert!(validate(&policy(&[], &[ActionClass::State])).is_ok());
+        assert!(validate(&policy(&[], &[ActionClass::Upload, ActionClass::State])).is_ok());
+    }
+
+    #[test]
+    fn deny_clipboard_and_allow_eval_still_have_no_effect() {
+        let e = validate(&policy(&[], &[ActionClass::Clipboard])).unwrap_err();
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        assert_eq!(
+            e.message,
+            "--deny clipboard has no effect: clipboard commands are denied by default \
+             (did you mean --allow?)"
+        );
+        let e = validate(&policy(&[ActionClass::Eval], &[])).unwrap_err();
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        assert_eq!(
+            e.message,
+            "--allow eval has no effect: eval commands are allowed by default \
+             (did you mean --deny?)"
+        );
+    }
+
+    #[test]
+    fn upload_dir_without_allow_upload_is_valid() {
+        // Asking, bound to the folder.
+        assert!(validate(&with_dir(&[], &[])).is_ok());
+        assert!(validate(&with_dir(&[], &[ActionClass::State])).is_ok());
+        // It is still checked.
+        for d in ["relative/dir", "/no/such/pegboard-dir", "/etc/hosts"] {
+            let p = SessionPolicy {
+                upload_dir: Some(d.into()),
+                ..SessionPolicy::default()
+            };
+            let e = validate(&p).unwrap_err();
+            assert_eq!(e.code, codes::INVALID_PARAMS, "{d}");
+        }
+    }
+
+    #[test]
+    fn allow_upload_still_needs_upload_dir() {
+        let e = validate(&policy(&[ActionClass::Upload], &[])).unwrap_err();
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        assert_eq!(
+            e.message,
+            "--allow upload needs --upload-dir (without --allow, an upload asks a person)"
+        );
+        assert!(validate(&with_dir(&[ActionClass::Upload], &[])).is_ok());
+    }
+
+    #[test]
+    fn upload_dir_with_deny_upload_is_refused() {
+        let e = validate(&with_dir(&[], &[ActionClass::Upload])).unwrap_err();
+        assert_eq!(e.code, codes::INVALID_PARAMS);
+        assert!(e.message.contains("--deny upload"), "{}", e.message);
+        assert!(e.message.contains("--upload-dir"), "{}", e.message);
     }
 
     #[test]
@@ -471,15 +623,10 @@ mod tests {
         };
         bad(policy(&[ActionClass::State], &[ActionClass::State]));
         bad(policy(&[ActionClass::Navigate], &[]));
-        bad(policy(&[], &[ActionClass::Upload]));
-        bad(policy(&[], &[ActionClass::State]));
-        // upload_dir without allow upload, and the reverse
-        let dir = std::env::temp_dir().display().to_string();
-        bad(SessionPolicy {
-            upload_dir: Some(dir),
-            ..SessionPolicy::default()
-        });
+        bad(policy(&[], &[ActionClass::Clipboard]));
+        // allow upload without upload_dir; upload_dir with deny upload
         bad(policy(&[ActionClass::Upload], &[]));
+        bad(with_dir(&[], &[ActionClass::Upload]));
         // upload_dir must be an absolute, existing directory
         for d in ["relative/dir", "/no/such/pegboard-dir", "/etc/hosts"] {
             bad(SessionPolicy {

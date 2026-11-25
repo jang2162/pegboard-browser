@@ -666,7 +666,9 @@ fn clipboard_keys_reach_only_their_own_tab() {
             }
         }
         // Distinct texts: the digit after the prefix tells the two sessions apart.
-        let select = |n: u8| format!("(()=>{{const t=document.getElementById('t');t.value='SELECTED-{n}'+Date.now();t.focus();t.select();return t.value}})()");
+        let select = |n: u8| {
+            format!("(()=>{{const t=document.getElementById('t');t.value='SELECTED-{n}'+Date.now();t.focus();t.select();return t.value}})()")
+        };
         for (name, key, code, vk, modifiers, command) in [
             ("Meta+v", "v", "KeyV", 86, META, "paste"),
             ("Control+v", "v", "KeyV", 86, CONTROL, "paste"),
@@ -692,7 +694,10 @@ fn clipboard_keys_reach_only_their_own_tab() {
             settle().await;
             let now = clip.get();
             let a_events = ta.eval("JSON.stringify(window.__keys)", false).await;
-            assert!(a_events.contains(command), "{name}: A had no {command} event: {a_events}");
+            assert!(
+                a_events.contains(command),
+                "{name}: A had no {command} event: {a_events}"
+            );
             for (who, t) in &others {
                 let got = t.eval("JSON.stringify(window.__keys)", false).await;
                 assert!(
@@ -700,7 +705,11 @@ fn clipboard_keys_reach_only_their_own_tab() {
                     "{name} of session A reached {who}: {got}"
                 );
             }
-            assert_eq!(others[0].1.textarea().await, b_text, "{name} changed B's text field");
+            assert_eq!(
+                others[0].1.textarea().await,
+                b_text,
+                "{name} changed B's text field"
+            );
             match command {
                 "paste" => assert_eq!(ta.textarea().await, marker, "{name} did not paste into A"),
                 _ => assert_eq!(now.trim(), a_text, "{name} did not copy A's selection"),

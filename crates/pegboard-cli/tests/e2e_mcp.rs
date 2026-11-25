@@ -76,8 +76,9 @@ fn bad_options_exit_2_before_anything_starts() {
     for args in [
         vec!["mcp", "--bogus"],
         vec!["mcp", "--allow", "eval"],
-        vec!["mcp", "--deny", "upload"],
-        vec!["mcp", "--upload-dir", "/tmp"],
+        vec!["mcp", "--deny", "clipboard"],
+        vec!["mcp", "--allow", "upload"],
+        vec!["mcp", "--upload-dir", "/tmp", "--deny", "upload"],
         vec!["mcp", "--tools", "nonsense"],
         vec!["mcp", "--allow-domain", "http://a.test/"],
     ] {

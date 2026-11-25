@@ -172,7 +172,11 @@ pub async fn run_command_with_hook(
             message: "a checked command line has no action class".into(),
             data: None,
         })
-        .and_then(|class| policy::judge_action(&sessions.policy(id)?, class));
+        .and_then(|class| match judged_verdict(&sessions.policy(id)?, class) {
+            policy::Verdict::Allow => Ok(()),
+            policy::Verdict::Ask => Err(no_confirmation_yet(class)),
+            policy::Verdict::Deny(e) => Err(e),
+        });
     if let Err(e) = judged {
         return refuse(log, entry, argv, e, started);
     }
@@ -476,6 +480,34 @@ fn hide_paths(outcome: &mut Result<CommandExecResult, RpcError>, names: &[(Strin
 /// Logs a command refused before it ran (its line, or the policy) and returns the error.
 /// The command word is shown when the grammar knows it; every later word is hidden, since
 /// the error message may name one and they may be typed text.
+/// The verdict for a command of the session. No class is allowed for the session by a
+/// person yet: nothing can ask one.
+fn judged_verdict(
+    policy: &pegboard_protocol::SessionPolicy,
+    class: ActionClass,
+) -> policy::Verdict {
+    policy::judge_action(policy, &[], class)
+}
+
+/// A command that would ask a person, while nothing can ask one: denied at once.
+fn no_confirmation_yet(class: ActionClass) -> RpcError {
+    let name = class.as_str();
+    let with = if class == ActionClass::Upload {
+        " and --upload-dir <directory>"
+    } else {
+        ""
+    };
+    RpcError {
+        code: codes::POLICY_DENIED.to_string(),
+        message: format!(
+            "the {name} command needs a person's confirmation, which is not available yet; a \
+             person can allow it without asking when creating the session with --allow \
+             {name}{with}"
+        ),
+        data: Some(serde_json::json!({ "reason": "no_responder" })),
+    }
+}
+
 fn refuse(
     log: &mut ActionLog,
     mut entry: ActionEntry,
@@ -693,7 +725,11 @@ mod tests {
             .collect();
         let class = argv::class_of(&argv).unwrap();
         assert_eq!(class, ActionClass::State);
-        let denied = policy::judge_action(&SessionPolicy::default(), class).unwrap_err();
+        assert!(matches!(
+            judged_verdict(&SessionPolicy::default(), class),
+            policy::Verdict::Ask
+        ));
+        let denied = no_confirmation_yet(class);
         let entry = ActionEntry {
             seq: 0,
             ts: now(),
@@ -782,12 +818,36 @@ mod tests {
     }
 
     #[test]
-    fn an_upload_is_logged_by_file_name_and_is_denied_by_default() {
+    fn an_upload_is_logged_by_file_name_and_asks_by_default() {
         let argv = words(&["upload", "#f", "a.txt"]);
         assert_eq!(logged_args(&argv, false), argv);
         let class = argv::class_of(&argv).unwrap();
-        let e = policy::judge_action(&Default::default(), class).unwrap_err();
-        assert_eq!(e.code, codes::POLICY_DENIED);
+        assert!(matches!(
+            judged_verdict(&Default::default(), class),
+            policy::Verdict::Ask
+        ));
+    }
+
+    #[test]
+    fn an_asking_command_is_denied_until_a_person_can_be_asked() {
+        for (class, hint) in [
+            (ActionClass::State, "--allow state"),
+            (
+                ActionClass::Upload,
+                "--allow upload and --upload-dir <directory>",
+            ),
+        ] {
+            let e = no_confirmation_yet(class);
+            assert_eq!(e.code, codes::POLICY_DENIED);
+            assert!(
+                e.message
+                    .contains("needs a person's confirmation, which is not available yet"),
+                "{}",
+                e.message
+            );
+            assert!(e.message.contains(hint), "{}", e.message);
+            assert_eq!(e.data, Some(json!({ "reason": "no_responder" })));
+        }
     }
 
     #[test]

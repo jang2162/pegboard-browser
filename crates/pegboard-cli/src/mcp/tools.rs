@@ -127,14 +127,14 @@ fn policy_schema() -> Value {
                         Without it the session gets the policy pegboard mcp was started with.",
         "properties": {
             "allow": { "type": "array", "items": { "enum": classes },
-                       "description": "Open classes that are denied by default (upload, state, clipboard)." },
+                       "description": "Run these classes without asking a person (upload, state) or open one that is denied by default (clipboard). Without it, upload and state ask a person each time." },
             "deny": { "type": "array", "items": { "enum": classes },
-                      "description": "Close classes that are allowed by default (e.g. eval, download)." },
+                      "description": "Deny these classes without asking (e.g. eval, download, upload, state)." },
             "allowDomains": { "type": "array", "items": { "type": "string" },
                               "description": "Only these hosts (and their subdomains) can be reached." },
             "allowPrivateNetwork": { "type": "boolean" },
             "noLocalhost": { "type": "boolean" },
-            "uploadDir": { "type": "string", "description": "Absolute path; needs allow upload." },
+            "uploadDir": { "type": "string", "description": "Absolute path the session uploads files from; needed by allow upload. Without allow upload, each upload from it still asks a person." },
             "noExpire": { "type": "boolean" },
             "record": { "type": "array", "items": { "enum": ["network", "console"] },
                         "description": "Also record network requests (metadata only) and/or console messages." }

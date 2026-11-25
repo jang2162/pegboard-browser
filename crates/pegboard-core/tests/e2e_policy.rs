@@ -25,7 +25,7 @@ fn the_server_rejects_invalid_policies_and_keeps_nothing() {
         let dir = std::env::temp_dir().display().to_string();
         let bad = [
             SessionPolicy {
-                deny: vec![ActionClass::Upload],
+                deny: vec![ActionClass::Clipboard],
                 ..SessionPolicy::default()
             },
             SessionPolicy {
@@ -33,7 +33,12 @@ fn the_server_rejects_invalid_policies_and_keeps_nothing() {
                 ..SessionPolicy::default()
             },
             SessionPolicy {
+                deny: vec![ActionClass::Upload],
                 upload_dir: Some(dir),
+                ..SessionPolicy::default()
+            },
+            SessionPolicy {
+                allow: vec![ActionClass::Upload],
                 ..SessionPolicy::default()
             },
             SessionPolicy {

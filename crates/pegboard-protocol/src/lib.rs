@@ -28,6 +28,8 @@ pub mod codes {
     pub const LIMIT_EXCEEDED: &str = "limit_exceeded";
     /// The recording is still being written (its session is open).
     pub const RECORDING_RUNNING: &str = "recording_running";
+    /// No confirmation with that id is waiting (it was answered, timed out or never was).
+    pub const CONFIRM_NOT_FOUND: &str = "confirm_not_found";
     pub const INTERNAL: &str = "internal";
 }
 
@@ -200,6 +202,10 @@ pub struct SessionInfo {
     pub token: Option<String>,
     #[serde(default)]
     pub policy: SessionPolicy,
+    /// Classes a person allowed for the rest of the session, answering a confirmation. Not
+    /// part of the policy, which stays as the session was created.
+    #[serde(default)]
+    pub allowed_for_session: Vec<ActionClass>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,7 +347,22 @@ mod tests {
             last_activity_at: "2026-01-01T00:00:00Z".into(),
             token: None,
             policy: SessionPolicy::default(),
+            allowed_for_session: Vec::new(),
         }
+    }
+
+    #[test]
+    fn allowed_for_session_is_camel_case_and_optional_on_the_wire() {
+        let mut info = sample_session_info();
+        info.allowed_for_session = vec![ActionClass::State];
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["allowedForSession"], serde_json::json!(["state"]));
+        // An older daemon's answer has no such field: nothing was allowed.
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("allowedForSession");
+        let back: SessionInfo = serde_json::from_value(old).unwrap();
+        assert!(back.allowed_for_session.is_empty());
+        assert_eq!(codes::CONFIRM_NOT_FOUND, "confirm_not_found");
     }
 
     #[test]
