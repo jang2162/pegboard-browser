@@ -44,6 +44,7 @@
 #include "content/public/browser/devtools_agent_host_client.h"
 #include "content/public/browser/devtools_agent_host_client_channel.h"
 #include "content/public/browser/web_contents.h"
+#include "pegboard/common/agent_profile.h"
 #include "pegboard/ui/confirm_dialog.h"
 #include "pegboard/ui/display_text.h"
 #include "ui/base/page_transition_types.h"
@@ -60,15 +61,6 @@ using protocol::Response;
 
 // The session that owns the domain, if any (Pegboard.claim).
 PegboardHandler* g_owner = nullptr;
-
-constexpr std::string_view kAgentDirectory = "PegboardAgent";
-constexpr std::string_view kAgentDirectoryPrefix = "PegboardAgent-";
-
-// The agent profile rule: a directory named exactly "PegboardAgent" or
-// starting with "PegboardAgent-". Every other profile is a person's.
-bool IsAgentDirectoryName(std::string_view dir) {
-  return dir == kAgentDirectory || base::StartsWith(dir, kAgentDirectoryPrefix);
-}
 
 // The names openProfileWindow makes a directory of: "PegboardAgent", or
 // "PegboardAgent-" and lowercase ASCII letters, digits, '-' and '_' (no

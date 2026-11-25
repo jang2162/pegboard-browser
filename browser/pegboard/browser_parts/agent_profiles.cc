@@ -1,0 +1,219 @@
+// Copyright 2026 The Pegboard Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "pegboard/browser_parts/agent_profiles.h"
+
+#include <utility>
+
+#include "base/functional/bind.h"
+#include "base/task/single_thread_task_runner.h"
+#include "base/values.h"
+#include "chrome/browser/browser_process.h"
+#include "chrome/browser/profiles/profile.h"
+#include "chrome/browser/profiles/profile_attributes_entry.h"
+#include "chrome/browser/profiles/profile_manager.h"
+#include "chrome/browser/themes/theme_service.h"
+#include "chrome/browser/themes/theme_service_factory.h"
+#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+#include "chrome/browser/ui/profiles/profile_picker.h"
+#include "chrome/browser/ui/window_metadata/window_metadata_controller.h"
+#include "chrome/common/pref_names.h"
+#include "components/prefs/pref_service.h"
+#include "components/prefs/scoped_user_pref_update.h"
+#include "pegboard/common/agent_profile.h"
+#include "pegboard/ui/test_hooks.h"
+#include "ui/base/mojom/themes.mojom.h"
+
+namespace pegboard {
+
+namespace {
+
+constexpr ui::mojom::BrowserColorVariant kAgentColorVariant =
+    ui::mojom::BrowserColorVariant::kVibrant;
+
+ProfileAttributesStorage* Storage() {
+  ProfileManager* manager = g_browser_process->profile_manager();
+  return manager ? &manager->GetProfileAttributesStorage() : nullptr;
+}
+
+}  // namespace
+
+AgentProfiles::AgentProfiles() = default;
+
+AgentProfiles::~AgentProfiles() = default;
+
+void AgentProfiles::Start() {
+  ProfileManager* manager = g_browser_process->profile_manager();
+  PrefService* local_state = g_browser_process->local_state();
+  if (!manager || !local_state) {
+    return;
+  }
+  user_data_dir_ = manager->user_data_dir();
+  ProfileAttributesStorage& storage = manager->GetProfileAttributesStorage();
+  for (ProfileAttributesEntry* entry : storage.GetAllProfilesAttributes()) {
+    OmitIfAgent(entry->GetPath());
+  }
+  storage_observation_.Observe(&storage);
+  UpdatePickerDefault();
+
+  // The profiles the next launch restores (with "continue where you left
+  // off", or after a crash): no agent profile among them. The daemon closes
+  // agent windows anyway (F11); they would only flash.
+  if (local_state->HasPrefPath(prefs::kProfilesLastActive)) {
+    ScopedListPrefUpdate update(local_state, prefs::kProfilesLastActive);
+    update->EraseIf([](const base::Value& name) {
+      return name.is_string() && IsAgentDirectoryName(name.GetString());
+    });
+  }
+  KeepLastUsedHuman();
+  local_state_registrar_.Init(local_state);
+  local_state_registrar_.Add(
+      prefs::kProfileLastUsed,
+      base::BindRepeating(&AgentProfiles::OnLastUsedChanged,
+                          base::Unretained(this)));
+
+  browsers_observation_.Observe(GlobalBrowserCollection::GetInstance());
+}
+
+void AgentProfiles::Stop() {
+  weak_factory_.InvalidateWeakPtrs();
+  browsers_observation_.Reset();
+  local_state_registrar_.RemoveAll();
+  storage_observation_.Reset();
+}
+
+void AgentProfiles::OmitIfAgent(const base::FilePath& path) {
+  if (path.DirName() != user_data_dir_ ||
+      !IsAgentDirectoryName(path.BaseName().AsUTF8Unsafe())) {
+    return;
+  }
+  ProfileAttributesStorage* storage = Storage();
+  ProfileAttributesEntry* entry =
+      storage ? storage->GetProfileAttributesWithPath(path) : nullptr;
+  if (entry && !entry->IsOmitted()) {
+    entry->SetIsOmitted(true);
+  }
+}
+
+void AgentProfiles::UpdatePickerDefault() {
+  ProfileAttributesStorage* storage = Storage();
+  PrefService* local_state = g_browser_process->local_state();
+  if (!storage || !local_state) {
+    return;
+  }
+  size_t people = 0;
+  for (ProfileAttributesEntry* entry : storage->GetAllProfilesAttributes()) {
+    if (!IsAgentDirectoryName(entry->GetPath().BaseName().AsUTF8Unsafe())) {
+      ++people;
+    }
+  }
+  // Upstream's rule with the agent profiles left out: no picker at launch
+  // with at most one profile.
+  const ProfilePicker::AvailabilityOnStartup availability =
+      people > 1 ? ProfilePicker::AvailabilityOnStartup::kEnabled
+                 : ProfilePicker::AvailabilityOnStartup::kDisabled;
+  local_state->SetDefaultPrefValue(
+      prefs::kBrowserProfilePickerAvailabilityOnStartup,
+      base::Value(static_cast<int>(availability)));
+}
+
+void AgentProfiles::KeepLastUsedHuman() {
+  PrefService* local_state = g_browser_process->local_state();
+  ProfileAttributesStorage* storage = Storage();
+  if (!local_state || !storage) {
+    return;
+  }
+  const std::string last = local_state->GetString(prefs::kProfileLastUsed);
+  if (!IsAgentDirectoryName(last)) {
+    last_human_ = last;
+    return;
+  }
+  // Back to the person's profile used before, if it is still there; else the
+  // person's profile active most recently; else the default.
+  auto is_person = [this, storage](const std::string& dir) {
+    if (dir.empty() || IsAgentDirectoryName(dir)) {
+      return false;
+    }
+    return storage->GetProfileAttributesWithPath(
+               user_data_dir_.AppendASCII(dir)) != nullptr;
+  };
+  std::string human = is_person(last_human_) ? last_human_ : std::string();
+  if (human.empty()) {
+    base::Time latest;
+    for (ProfileAttributesEntry* entry : storage->GetAllProfilesAttributes()) {
+      const std::string dir = entry->GetPath().BaseName().AsUTF8Unsafe();
+      if (is_person(dir) && (human.empty() || entry->GetActiveTime() > latest)) {
+        human = dir;
+        latest = entry->GetActiveTime();
+      }
+    }
+  }
+  if (human.empty()) {
+    local_state->ClearPref(prefs::kProfileLastUsed);
+  } else {
+    local_state->SetString(prefs::kProfileLastUsed, human);
+  }
+  last_human_ = human;
+}
+
+void AgentProfiles::OnLastUsedChanged() {
+  // Not from inside the profile manager's update.
+  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+      FROM_HERE, base::BindOnce(&AgentProfiles::KeepLastUsedHuman,
+                                weak_factory_.GetWeakPtr()));
+}
+
+void AgentProfiles::OnProfileAdded(const base::FilePath& profile_path) {
+  OmitIfAgent(profile_path);
+  UpdatePickerDefault();
+}
+
+void AgentProfiles::OnProfileWasRemoved(const base::FilePath& profile_path,
+                                        const std::u16string& profile_name) {
+  UpdatePickerDefault();
+}
+
+void AgentProfiles::OnProfileInit(Profile* profile) {
+  if (!profile || profile->IsOffTheRecord() || profile->IsSystemProfile() ||
+      profile->IsGuestSession() ||
+      profile->GetPath().DirName() != user_data_dir_ ||
+      !IsAgentDirectoryName(profile->GetBaseName().AsUTF8Unsafe())) {
+    return;
+  }
+  ThemeService* theme = ThemeServiceFactory::GetForProfile(profile);
+  if (!theme) {
+    return;
+  }
+  if (theme->GetUserColor() != kAgentThemeColor ||
+      theme->GetBrowserColorVariant() != kAgentColorVariant) {
+    theme->SetUserColorAndBrowserColorVariant(kAgentThemeColor,
+                                              kAgentColorVariant);
+  }
+}
+
+void AgentProfiles::OnBrowserCreated(BrowserWindowInterface* browser) {
+  if (!browser || browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
+    return;
+  }
+  Profile* profile = browser->GetProfile();
+  const std::string dir =
+      profile ? profile->GetBaseName().AsUTF8Unsafe() : std::string();
+  const bool agent = profile && !profile->IsOffTheRecord() &&
+                     profile->GetPath().DirName() == user_data_dir_ &&
+                     IsAgentDirectoryName(dir);
+  WindowMetadataController* metadata = WindowMetadataController::From(browser);
+  if (agent && metadata) {
+    metadata->SetWindowUserTitle(kAgentWindowTitle);
+  }
+  if (test_hooks::Enabled()) {
+    base::DictValue entry;
+    entry.Set("kind", "window");
+    entry.Set("profile", dir);
+    entry.Set("userTitle", metadata ? metadata->user_title() : std::string());
+    test_hooks::LogDialog(entry);
+  }
+}
+
+}  // namespace pegboard

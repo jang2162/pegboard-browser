@@ -11,7 +11,11 @@ buildflag_header("buildflags") {
 }
 
 source_set("ui") {
-  visibility = [ "//pegboard/devtools:*" ]
+  visibility = [
+    "//pegboard/bootstrap:*",
+    "//pegboard/browser_parts:*",
+    "//pegboard/devtools:*",
+  ]
   sources = [
     "confirm_dialog.cc",
     "confirm_dialog.h",

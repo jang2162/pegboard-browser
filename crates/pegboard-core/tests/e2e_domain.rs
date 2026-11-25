@@ -37,8 +37,12 @@ impl Fork {
             eprintln!("skipped: needs PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>");
             return None;
         };
-        let env = common::env();
-        let exe = fork_executable(&binary);
+        Some(Fork::launch(&binary, common::env(), extra))
+    }
+
+    /// The fork of `binary` on the user data directory of `env`.
+    fn launch(binary: &Path, env: common::Env, extra: &[String]) -> Fork {
+        let exe = fork_executable(binary);
         let udd = env.paths.chrome_udd.clone();
         let pipes = DevToolsPipes::new().unwrap();
         let mut cmd = Command::new(&exe);
@@ -58,13 +62,32 @@ impl Fork {
         unsafe { cmd.pre_exec(pipes.child_setup()) };
         let child = cmd.spawn().unwrap();
         let (read, write) = pipes.into_parent_ends();
-        Some(Fork {
+        Fork {
             link: BrowserLink::pipe(read, write).unwrap(),
             exe,
             udd,
             _child: child,
             _env: env,
-        })
+        }
+    }
+
+    /// Quits the browser as a person does (`Browser.close`: the profile list and the
+    /// preferences are written out) and starts it again on the same user data directory,
+    /// with the dialog log `log` if given.
+    async fn quit_and_start_again(self, log: Option<&common::DialogLog>) -> Fork {
+        let c = self.session().await;
+        let _ = c.send("Browser.close", json!({}), None).await;
+        let Fork {
+            mut _child, _env, ..
+        } = self;
+        let status = tokio::time::timeout(Duration::from_secs(30), _child.wait())
+            .await
+            .expect("the browser did not quit")
+            .unwrap();
+        eprintln!("quit: {status}");
+        let _log =
+            log.map(|l| common::EnvVar::set("PEGBOARD_TEST_DIALOG_LOG", l.path.to_str().unwrap()));
+        Fork::launch(&test_fork_binary().unwrap(), _env, &[])
     }
 
     /// The fork with its confirmation dialogs' test hooks: the dialog log, and the answer
@@ -1934,4 +1957,332 @@ async fn the_session_name_cannot_pass_for_the_header() {
         lines[2],
         "에이전트가 붙인 세션 이름: «x\\u{bb} \\u{28}s_deadbeef\\u{29} \\u{b7} 프로필 Default \\u{ab}y»"
     );
+}
+
+// Phase 3b task 8: agent windows stand out, agent profiles stay out of the profile list. The
+// browser does it by the agent profile rule from its start (//pegboard/browser_parts), with
+// or without a daemon.
+
+/// The agent theme's user color (`AgentProfiles::kAgentThemeColor`, ARGB, as the preference
+/// stores it: a signed integer) and its color variant (`ui.mojom.BrowserColorVariant.kVibrant`).
+const AGENT_COLOR: i64 = 0xFFB4_5309_u32 as i32 as i64;
+const AGENT_VARIANT: i64 = 3;
+const AGENT_TITLE: &str = "Pegboard 에이전트";
+
+/// Navigates the page `target` to `url` and returns what `script` gives there, once it gives
+/// something other than null (within 15 s).
+async fn eval_at(c: &CdpConn, target: &str, url: &str, script: &str) -> Value {
+    let session = c
+        .send(
+            "Target.attachToTarget",
+            json!({ "targetId": target, "flatten": true }),
+            None,
+        )
+        .await
+        .unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send("Page.navigate", json!({ "url": url }), Some(&session))
+        .await
+        .unwrap();
+    let mut got = Value::Null;
+    for _ in 0..75 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let r = c
+            .send(
+                "Runtime.evaluate",
+                json!({ "expression": script, "returnByValue": true }),
+                Some(&session),
+            )
+            .await;
+        if let Ok(r) = r {
+            got = r["result"]["value"].clone();
+            if !got.is_null() {
+                break;
+            }
+        }
+    }
+    let _ = c
+        .send(
+            "Target.detachFromTarget",
+            json!({ "sessionId": session }),
+            None,
+        )
+        .await;
+    assert!(!got.is_null(), "nothing from {url}");
+    got
+}
+
+/// The value of the preference `name` of the profile that `target` (a page of it) belongs
+/// to (`chrome://prefs-internals/<name>`).
+async fn pref_of(c: &CdpConn, target: &str, name: &str) -> Value {
+    let text = eval_at(
+        c,
+        target,
+        &format!("chrome://prefs-internals/{name}"),
+        "document.body && document.body.innerText.trim() !== '' ? document.body.innerText : null",
+    )
+    .await;
+    let text = text.as_str().unwrap();
+    serde_json::from_str(text).unwrap_or_else(|_| panic!("{name}: {text}"))
+}
+
+/// The profile list as `chrome://profile-internals` shows it: for each profile directory,
+/// its row labels and values ("Omitted": "true"/"false").
+async fn profile_list(c: &CdpConn, target: &str) -> std::collections::HashMap<String, Value> {
+    const ROWS: &str = r#"(() => {
+      const out = [];
+      const walk = (n) => {
+        if (n.nodeType === 1 && n.matches('table.profile')) {
+          const o = {};
+          for (const tr of n.rows) {
+            if (tr.cells.length >= 2) o[tr.cells[0].textContent.trim()] = tr.cells[1].textContent.trim();
+          }
+          out.push(o);
+        }
+        if (n.shadowRoot) walk(n.shadowRoot);
+        for (const c of n.childNodes) walk(c);
+      };
+      walk(document);
+      return out.length ? JSON.stringify(out) : null;
+    })()"#;
+    let text = eval_at(c, target, "chrome://profile-internals", ROWS).await;
+    let rows: Vec<Value> = serde_json::from_str(text.as_str().unwrap()).unwrap();
+    rows.into_iter()
+        .map(|r| {
+            let path = r["Profile Path"].as_str().unwrap_or_default().to_string();
+            let dir = Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(path);
+            (dir, r)
+        })
+        .collect()
+}
+
+/// A page of the context `ctx`, within 15 s.
+async fn a_page_in(c: &CdpConn, ctx: &str) -> String {
+    for _ in 0..75 {
+        if let Some(t) = pages_in(c, ctx).await.into_iter().next() {
+            return t;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("no page of {ctx}");
+}
+
+/// The context of the person's `Default` profile once it is loaded (within 15 s).
+async fn default_context(c: &CdpConn) -> Option<String> {
+    for _ in 0..75 {
+        if let Some(p) = profile(c, "Default").await {
+            return Some(p["browserContextId"].as_str().unwrap().to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    None
+}
+
+/// Every target's URL (pages and the rest: the profile picker is a window of its own).
+async fn target_urls(c: &CdpConn) -> Vec<String> {
+    c.send("Target.getTargets", json!({}), None).await.unwrap()["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["url"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The `window` entries of the dialog log (one for each normal window the browser opened):
+/// (profile, user title).
+fn windows_logged(log: &common::DialogLog) -> Vec<(String, String)> {
+    log.entries()
+        .into_iter()
+        .filter(|e| e["kind"] == "window")
+        .map(|e| {
+            (
+                e["profile"].as_str().unwrap().to_string(),
+                e["userTitle"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// B12: an agent profile wears the agent theme (a user color) and its windows the title
+/// "Pegboard 에이전트", from the moment the profile is made and its first window opens.
+#[tokio::test]
+#[ignore]
+async fn agent_profiles_get_the_agent_theme_and_title() {
+    let Some((f, log)) = Fork::with_dialogs("", None).await else {
+        return;
+    };
+    let c = f.control().await;
+    let (_, tab) = agent_tab(&c, AGENT).await;
+    let (_, tab2) = agent_tab(&c, "PegboardAgent-t8").await;
+    for t in [&tab, &tab2] {
+        assert_eq!(
+            pref_of(&c, t, "browser.theme.user_color2").await,
+            AGENT_COLOR
+        );
+        assert_eq!(
+            pref_of(&c, t, "browser.theme.color_variant2").await,
+            AGENT_VARIANT
+        );
+    }
+    let windows = windows_logged(&log);
+    eprintln!("windows: {windows:?}");
+    for dir in [AGENT, "PegboardAgent-t8"] {
+        let of: Vec<_> = windows.iter().filter(|(p, _)| p == dir).collect();
+        assert!(!of.is_empty(), "no window of {dir} logged: {windows:?}");
+        assert!(
+            of.iter().all(|(_, title)| title == AGENT_TITLE),
+            "{windows:?}"
+        );
+    }
+}
+
+/// B17: agent profiles are omitted from the profile list (the profile menu, the picker); the
+/// person's are not.
+#[tokio::test]
+#[ignore]
+async fn agent_profiles_are_omitted_from_the_profile_list() {
+    let Some(f) = Fork::start(&[]).await else {
+        return;
+    };
+    let c = f.control().await;
+    agent_tab(&c, AGENT).await;
+    agent_tab(&c, "PegboardAgent-t8").await;
+    let default = default_context(&c).await.expect("no Default profile");
+    let list = profile_list(&c, &a_page_in(&c, &default).await).await;
+    eprintln!("profiles: {list:?}");
+    for dir in [AGENT, "PegboardAgent-t8"] {
+        assert_eq!(list[dir]["Omitted"], "true", "{dir}: {:?}", list[dir]);
+    }
+    assert_eq!(list["Default"]["Omitted"], "false", "{:?}", list["Default"]);
+}
+
+/// The person's profiles (`Default` and a second one) keep the default theme, their windows
+/// no title of their own, and they stay in the profile list, next to agent profiles.
+#[tokio::test]
+#[ignore]
+async fn human_profiles_are_not_marked_or_hidden() {
+    let Some((f, log)) = Fork::with_dialogs("", None).await else {
+        return;
+    };
+    let c = f.control().await;
+    agent_tab(&c, AGENT).await;
+    let second = f.open_human_profile(&c, "Profile 1").await;
+    let default = default_context(&c).await.expect("no Default profile");
+    for ctx in [&default, &second] {
+        let page = a_page_in(&c, ctx).await;
+        // SK_ColorTRANSPARENT: no user color.
+        assert_eq!(pref_of(&c, &page, "browser.theme.user_color2").await, 0);
+    }
+    let list = profile_list(&c, &a_page_in(&c, &default).await).await;
+    for dir in ["Default", "Profile 1"] {
+        assert_eq!(list[dir]["Omitted"], "false", "{dir}: {:?}", list[dir]);
+    }
+    let windows = windows_logged(&log);
+    eprintln!("windows: {windows:?}");
+    for dir in ["Default", "Profile 1"] {
+        let of: Vec<_> = windows.iter().filter(|(p, _)| p == dir).collect();
+        assert!(!of.is_empty(), "no window of {dir} logged: {windows:?}");
+        assert!(of.iter().all(|(_, title)| title.is_empty()), "{windows:?}");
+    }
+}
+
+/// The browser quit with two agent profiles and the person's `Default`: started again, it
+/// opens the person's window and no profile picker (Chrome counts every profile in the
+/// list, omitted ones too), and the agent profiles, not loaded now, are still omitted.
+#[tokio::test]
+#[ignore]
+async fn no_profile_picker_at_launch_with_agent_profiles() {
+    let Some(f) = Fork::start(&[]).await else {
+        return;
+    };
+    let c = f.control().await;
+    agent_tab(&c, AGENT).await;
+    agent_tab(&c, "PegboardAgent-t8").await;
+    drop(c);
+    let f = f.quit_and_start_again(None).await;
+    let c = f.control().await;
+    let Some(default) = default_context(&c).await else {
+        panic!("no Default window; targets: {:?}", target_urls(&c).await);
+    };
+    a_page_in(&c, &default).await;
+    let urls = target_urls(&c).await;
+    eprintln!("targets after the restart: {urls:?}");
+    assert!(
+        !urls
+            .iter()
+            .any(|u| u.starts_with("chrome://profile-picker")),
+        "{urls:?}"
+    );
+    let list = profile_list(&c, &a_page_in(&c, &default).await).await;
+    for dir in [AGENT, "PegboardAgent-t8"] {
+        assert_eq!(list[dir]["Omitted"], "true", "{dir}: {:?}", list[dir]);
+    }
+}
+
+/// Upstream's picker rule still holds for the person: with a second person's profile (and
+/// an agent one) the browser starts with the profile picker.
+#[tokio::test]
+#[ignore]
+async fn a_second_persons_profile_still_brings_the_picker() {
+    let Some(f) = Fork::start(&[]).await else {
+        return;
+    };
+    let c = f.control().await;
+    agent_tab(&c, AGENT).await;
+    f.open_human_profile(&c, "Profile 1").await;
+    drop(c);
+    let f = f.quit_and_start_again(None).await;
+    let c = f.control().await;
+    let mut urls = Vec::new();
+    for _ in 0..75 {
+        urls = target_urls(&c).await;
+        if urls
+            .iter()
+            .any(|u| u.starts_with("chrome://profile-picker"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    eprintln!("targets after the restart: {urls:?}");
+    assert!(
+        urls.iter()
+            .any(|u| u.starts_with("chrome://profile-picker")),
+        "{urls:?}"
+    );
+}
+
+/// An agent window was the last active one when the browser quit: the next start opens the
+/// person's profile, not the agent's (the last used profile goes back to a person's).
+#[tokio::test]
+#[ignore]
+async fn agent_windows_from_the_last_run() {
+    let Some(f) = Fork::start(&[]).await else {
+        return;
+    };
+    let c = f.control().await;
+    let (_, tab) = agent_tab(&c, AGENT).await;
+    // The agent's window becomes the active one (as a person clicking it).
+    c.send("Target.activateTarget", json!({ "targetId": tab }), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    drop(c);
+    let f = f.quit_and_start_again(None).await;
+    let c = f.control().await;
+    let default = default_context(&c).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let loaded: Vec<String> = profiles(&c)
+        .await
+        .iter()
+        .map(|p| p["profileDirectory"].as_str().unwrap().to_string())
+        .collect();
+    eprintln!("OBSERVED loaded after the restart: {loaded:?}");
+    assert!(default.is_some(), "no Default window: {loaded:?}");
+    assert!(!loaded.iter().any(|d| d == AGENT), "{loaded:?}");
 }

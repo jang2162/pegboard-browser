@@ -1,0 +1,10 @@
+# What the other //pegboard parts share: the agent profile rule.
+
+source_set("common") {
+  visibility = [ "//pegboard/*" ]
+  sources = [
+    "agent_profile.cc",
+    "agent_profile.h",
+  ]
+  deps = [ "//base" ]
+}

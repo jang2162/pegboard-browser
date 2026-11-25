@@ -1,7 +1,9 @@
 # Pegboard's own sources (//pegboard in the Chromium tree). //chrome targets
 # depend on its parts directly, each through its patch: //pegboard/devtools
 # (the Pegboard CDP domain) from //chrome/browser/devtools
-# (pegboard-cdp-domain.patch), //pegboard/bootstrap (starts pegboardd with the
-# DevTools pipe) from //chrome/browser (pegboard-bootstrap.patch).
+# (pegboard-cdp-domain.patch), //pegboard/browser_parts (the browser-wide parts:
+# agent profiles' marks, and //pegboard/bootstrap, which starts pegboardd with
+# the DevTools pipe) from //chrome/browser (pegboard-bootstrap.patch). They
+# share //pegboard/common and //pegboard/ui.
 group("pegboard") {
 }

@@ -51,8 +51,9 @@ namespace pegboard {
 //   and, unless the browser itself has PEGBOARD_TEST_HOOKS, without any
 //   PEGBOARD_TEST_* variable.
 //
-// Lives on the UI thread; added to Chrome's main parts by
-// pegboard-bootstrap.patch.
+// Lives on the UI thread; MainParts (//pegboard/browser_parts, which
+// pegboard-bootstrap.patch adds to Chrome's main parts) owns it and passes it
+// the stages below.
 class DaemonLauncher : public ChromeBrowserMainExtraParts {
  public:
   // The daemon's exit code when another daemon holds the lock
