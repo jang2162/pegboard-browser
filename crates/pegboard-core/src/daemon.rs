@@ -913,9 +913,13 @@ async fn apply_pin(
 ) -> bool {
     match pin {
         StatePin::None => true,
-        StatePin::CookieUrl(url) => {
-            run_argv.push("--url".to_string());
-            run_argv.push(url.clone());
+        StatePin::Cookie { url, path } => {
+            for (flag, value) in [("--url", url), ("--path", path)] {
+                if let Some(v) = value {
+                    run_argv.push(flag.to_string());
+                    run_argv.push(v.clone());
+                }
+            }
             true
         }
         StatePin::Origin { acting, page } => {
@@ -1314,14 +1318,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_cookie_runs_at_the_address_it_was_asked_about() {
-        let pin = StatePin::CookieUrl("https://a.test/x".into());
+        let pin = StatePin::Cookie {
+            url: Some("https://a.test/a/x".into()),
+            path: Some("/a".into()),
+        };
         let mut run = words(&["cookies", "set", "n", "v"]);
-        // The tab has moved on meanwhile: what runs is still the asked address.
+        // The tab has moved on meanwhile: what runs is still the asked address, with the
+        // path that was shown.
         let moved = async { (None, Some("https://evil.test/".to_string())) };
         assert!(apply_pin(&pin, &mut run, moved).await);
         assert_eq!(
             run,
-            words(&["cookies", "set", "n", "v", "--url", "https://a.test/x"])
+            words(&[
+                "cookies",
+                "set",
+                "n",
+                "v",
+                "--url",
+                "https://a.test/a/x",
+                "--path",
+                "/a"
+            ])
         );
         let mut run = words(&["cookies", "set", "n", "v"]);
         assert!(apply_pin(&StatePin::None, &mut run, async { (None, None) }).await);

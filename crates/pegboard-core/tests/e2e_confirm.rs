@@ -613,13 +613,20 @@ async fn an_answer_for_session_a_does_not_release_session_b() {
 #[ignore]
 async fn a_write_inside_a_frame_shows_the_frames_origin() {
     let rig = rig(None).await;
-    // The page (127.0.0.1) frames a page of localhost: another origin.
-    let s = rig.session_at("/xsite/counter").await;
-    let port = rig.fixture.origin.rsplit(':').next().unwrap().to_string();
-    let frame_origin = format!("http://localhost:{port}");
-    rig.ok(&s, &["wait", "#fr"]).await;
-    rig.ok(&s, &["wait", "1000"]).await;
+    // The page frames a page of another fixture: another origin (its port) of the same site,
+    // so the frame is in the page's process, where agent-browser's `frame` finds it (a
+    // cross-site frame, such as one of localhost, is a target of its own: "Frame not found").
+    let other = common::fixture().await;
+    let port = other.origin.rsplit(':').next().unwrap().to_string();
+    let s = rig.session_at(&format!("/xorigin/{port}")).await;
+    let frame_origin = other.origin.clone();
+    assert_ne!(frame_origin, rig.fixture.origin);
+    rig.ok(&s, &["wait", "--fn", "window.__frLoaded === true"])
+        .await;
     rig.ok(&s, &["frame", "#fr"]).await;
+    // Premise: commands now act in the frame.
+    let inside = rig.ok(&s, &["eval", "location.origin"]).await;
+    assert_eq!(inside["data"]["result"], frame_origin.as_str(), "{inside}");
     let mut person = rig.subscribe().await;
     let run = rig.exec(&s, &["storage", "local", "set", "pegframe", "f1"]);
     let asked = person.next("confirm.required").await;

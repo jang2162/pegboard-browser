@@ -584,10 +584,11 @@ fn mcp_agent_cannot_widen_its_policy() {
         }
     }
     // Keys outside `arguments` are not read at all: a session made that way gets the server's
-    // policy, and a state write made that way is still refused.
+    // policy, and a state write made that way is still refused. (At an http page, so that a
+    // state write below is refused for the policy's reason, not for an unknown origin.)
     let r = mcp.request(
         "tools/call",
-        json!({ "name": "pegboard_session_create", "arguments": { "name": "extra" },
+        json!({ "name": "pegboard_session_create", "arguments": { "name": "extra", "url": counter },
                 "policy": { "allow": ["state"] }, "allow": ["state"], "noExpire": true }),
     );
     let text = r["result"]["content"][0]["text"].as_str().unwrap_or("");

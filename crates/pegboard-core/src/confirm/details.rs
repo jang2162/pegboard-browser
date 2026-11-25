@@ -17,13 +17,18 @@ pub const NAME_CHARS: usize = 60;
 /// What a confirmed `state` command is held to when it runs.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StatePin {
-    /// A cookie set without `--url` or `--domain`: it runs with `--url <this>`, the address
-    /// of the tab when the person was asked.
-    CookieUrl(String),
+    /// A cookie set: it runs with these added, so that it is set where it was shown. `url`:
+    /// a cookie without `--url` or `--domain` gets the address of the tab when the person
+    /// was asked. `path`: a cookie without `--path` gets the path it was shown with (the
+    /// browser would otherwise pick its own, `/`, not the RFC 6265 default shown).
+    Cookie {
+        url: Option<String>,
+        path: Option<String>,
+    },
     /// A storage write: when it runs, the frame agent-browser acts in must still be at
     /// `acting` and its tab at `page` (origins), else `stale`.
     Origin { acting: String, page: String },
-    /// Nothing to hold it to (the command names where it writes).
+    /// Nothing to hold it to.
     #[default]
     None,
 }
@@ -323,7 +328,7 @@ fn cookie_details(
             display_text(positional.get(1).copied().unwrap_or(""), SHOWN_VALUE_CHARS),
         ),
     ];
-    let mut pin = StatePin::None;
+    let mut pinned_url = None;
     // The address the cookie is set for: the one given, else the tab's (pinned, so a
     // navigation meanwhile changes nothing). No address and no tab: unknown.
     let effective_url = match (url, domain) {
@@ -331,7 +336,7 @@ fn cookie_details(
         (None, Some(_)) => None,
         (None, None) => {
             let u = tab_url.ok_or(NotShown::UnknownOrigin)?;
-            pin = StatePin::CookieUrl(u.to_string());
+            pinned_url = Some(u.to_string());
             Some(u.to_string())
         }
     };
@@ -360,6 +365,11 @@ fn cookie_details(
     if !flags.is_empty() {
         details.push(detail("플래그", shown(&flags.join(", "))));
     }
+    // What was shown is what runs: the path is passed whenever it was not given.
+    let pin = StatePin::Cookie {
+        url: pinned_url,
+        path: path.is_none().then_some(effective_path),
+    };
     Ok((details, pin))
 }
 
@@ -473,12 +483,60 @@ mod tests {
             tab("https://a.test/x"),
         )
         .unwrap();
-        assert_eq!(pin, StatePin::CookieUrl("https://a.test/x".into()));
+        assert_eq!(
+            pin,
+            StatePin::Cookie {
+                url: Some("https://a.test/x".into()),
+                path: None
+            }
+        );
         assert_eq!(value_of(&details, "이름"), "n");
         assert_eq!(value_of(&details, "값"), "v");
         assert_eq!(value_of(&details, "URL"), "https://a.test/x");
         assert_eq!(value_of(&details, "경로"), "/p");
         assert_eq!(value_of(&details, "플래그"), "Secure");
+    }
+
+    #[test]
+    fn the_cookie_path_shown_is_passed_when_not_given() {
+        let pin = |argv: &[&str], url: &str| state_details(&s(argv), tab(url)).unwrap().1;
+        assert_eq!(
+            pin(&["cookies", "set", "n", "v"], "https://a.test/a/b/c"),
+            StatePin::Cookie {
+                url: Some("https://a.test/a/b/c".into()),
+                path: Some("/a/b".into())
+            }
+        );
+        assert_eq!(
+            pin(
+                &["cookies", "set", "n", "v", "--domain", "b.test"],
+                "https://a.test/a/b"
+            ),
+            StatePin::Cookie {
+                url: None,
+                path: Some("/".into())
+            }
+        );
+        assert_eq!(
+            pin(
+                &["cookies", "set", "n", "v", "--url", "https://c.test/d/e"],
+                "https://a.test/"
+            ),
+            StatePin::Cookie {
+                url: None,
+                path: Some("/d".into())
+            }
+        );
+        assert_eq!(
+            pin(
+                &["cookies", "set", "n", "v", "--path", "/z"],
+                "https://a.test/a/b"
+            ),
+            StatePin::Cookie {
+                url: Some("https://a.test/a/b".into()),
+                path: None
+            }
+        );
     }
 
     #[test]
@@ -524,7 +582,10 @@ mod tests {
             tab("https://a.test/x"),
         )
         .unwrap();
-        assert_eq!(pin, StatePin::None);
+        assert!(
+            matches!(&pin, StatePin::Cookie { url: None, .. }),
+            "not repinned: {pin:?}"
+        );
         assert_eq!(value_of(&details, "도메인"), "b.test");
         assert!(details.iter().all(|d| d.label != "URL"), "{details:?}");
         // Given an address or a domain, no tab is needed.
@@ -543,7 +604,13 @@ mod tests {
             Where::default(),
         )
         .unwrap();
-        assert_eq!(pin, StatePin::None);
+        assert_eq!(
+            pin,
+            StatePin::Cookie {
+                url: None,
+                path: Some("/".into())
+            }
+        );
         assert_eq!(value_of(&details, "URL"), "https://c.test/");
         assert_eq!(value_of(&details, "이름"), "n");
         assert_eq!(value_of(&details, "플래그"), "SameSite=Lax, HttpOnly");
