@@ -1146,7 +1146,7 @@ async fn confirmation_methods_are_only_on_the_claiming_session() {
         assert!(message(&r).contains("wasn't found"), "{}", message(&r));
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(log.entries().is_empty(), "{:?}", log.entries());
+    assert!(log.dialogs().is_empty(), "{:?}", log.entries());
     // The owner can.
     request(&c, &ask(&id, &ctx, AGENT, &[&tab], "n"))
         .await
@@ -1203,7 +1203,7 @@ async fn domain_refuses_confirmations_for_human_contexts() {
         assert_eq!(code(&r), -32000, "{p}: {}", message(&r));
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(log.entries().is_empty(), "{:?}", log.entries());
+    assert!(log.dialogs().is_empty(), "{:?}", log.entries());
     // In its own profile it shows, there.
     request(&c, &ask(&cid(11), &ctx, AGENT, &[&tab], "n"))
         .await

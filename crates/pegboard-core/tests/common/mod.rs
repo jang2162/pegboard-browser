@@ -1446,6 +1446,15 @@ impl DialogLog {
             .collect()
     }
 
+    /// The confirmation dialogs' entries (`confirm_shown`, `confirm`), without the other
+    /// windows' lines the log also has (`window`, the daemon notice's).
+    pub fn dialogs(&self) -> Vec<serde_json::Value> {
+        self.entries()
+            .into_iter()
+            .filter(|e| e["kind"] == "confirm" || e["kind"] == "confirm_shown")
+            .collect()
+    }
+
     /// The entries of `kind` (`confirm_shown`, `confirm`) for `confirm_id`.
     pub fn of(&self, kind: &str, confirm_id: &str) -> Vec<serde_json::Value> {
         self.entries()
