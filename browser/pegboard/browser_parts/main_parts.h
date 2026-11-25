@@ -14,6 +14,8 @@ namespace pegboard {
 // The one ChromeBrowserMainExtraParts pegboard-bootstrap.patch adds to
 // Chrome's main parts (macOS): Pegboard's browser-wide parts, each given the
 // stages of the browser's start and end it needs.
+// - ProfileDefaults: sign-in and the password manager off by default in every
+//   profile (registered in PreProfileInit, before the first profile).
 // - AgentProfiles: agent profiles hidden and marked (from PreProfileInit, so
 //   that the startup profile picker decision already leaves them out).
 // - DaemonLauncher: pegboardd with the DevTools pipe (PostBrowserStart to

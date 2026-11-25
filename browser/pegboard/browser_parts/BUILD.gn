@@ -1,6 +1,7 @@
 # Pegboard's browser-wide parts (main_parts.h): the one
 # ChromeBrowserMainExtraParts that Chrome's main parts create
-# (pegboard-bootstrap.patch), and what it runs: the agent profiles' marks
+# (pegboard-bootstrap.patch), and what it runs: the profiles' default
+# preferences (profile_defaults.h), the agent profiles' marks
 # (agent_profiles.h) and the daemon launcher (//pegboard/bootstrap).
 
 source_set("browser_parts") {
@@ -10,6 +11,8 @@ source_set("browser_parts") {
     "agent_profiles.h",
     "main_parts.cc",
     "main_parts.h",
+    "profile_defaults.cc",
+    "profile_defaults.h",
   ]
 
   # Like //pegboard/devtools, this uses //chrome/browser headers without
@@ -21,11 +24,16 @@ source_set("browser_parts") {
     "//chrome/browser/profiles:profile",
     "//chrome/browser/profiles:profile_manager",
     "//chrome/browser/profiles:profile_util",
+    "//chrome/browser/signin",
     "//chrome/browser/themes",
     "//chrome/browser/ui/browser_window",
     "//chrome/browser/ui/window_metadata",
     "//chrome/common:constants",
+    "//components/keyed_service/core",
+    "//components/password_manager/core/common",
+    "//components/pref_registry",
     "//components/prefs",
+    "//components/signin/public/base",
     "//pegboard/bootstrap",
     "//pegboard/common",
     "//pegboard/ui",

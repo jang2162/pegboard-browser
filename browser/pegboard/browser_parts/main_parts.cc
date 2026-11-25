@@ -4,6 +4,8 @@
 
 #include "pegboard/browser_parts/main_parts.h"
 
+#include "pegboard/browser_parts/profile_defaults.h"
+
 namespace pegboard {
 
 MainParts::MainParts() = default;
@@ -11,6 +13,7 @@ MainParts::MainParts() = default;
 MainParts::~MainParts() = default;
 
 void MainParts::PreProfileInit() {
+  ProfileDefaults::Register();
   agent_profiles_.Start();
 }
 
