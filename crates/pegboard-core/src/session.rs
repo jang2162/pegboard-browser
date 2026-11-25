@@ -918,6 +918,25 @@ impl SessionManager {
         })
     }
 
+    /// The address of the session's tab `target` (its top frame), as the browser reports it
+    /// (`Target.getTargetInfo`: a page cannot change it without navigating). `None` for a
+    /// tab not of the session or one that cannot be read.
+    pub async fn target_url(&self, id: &SessionId, target: &str) -> Option<String> {
+        if !self.inner.proxy.targets(id).iter().any(|t| t == target) {
+            return None;
+        }
+        let r = self
+            .inner
+            .browser
+            .conn
+            .send("Target.getTargetInfo", json!({ "targetId": target }), None)
+            .await
+            .ok()?;
+        r.pointer("/targetInfo/url")
+            .and_then(Value::as_str)
+            .map(String::from)
+    }
+
     /// Evaluates `expression` in every tab of the session on the daemon's own CDP
     /// connection (the focus-emulation session of the tab, never the proxy). One entry per
     /// tab, with its evaluation result or the reason it failed. Fails when the session is

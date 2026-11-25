@@ -106,7 +106,8 @@ pw.addEventListener('input', () => { if (pw.value.length >= 8) pw.form.submit();
 }
 
 /// `/dl/<name>` is served as an attachment named `<name>`, `/zip/<name>` as a plain zip.
-/// `/linkto/<rest>` is a page whose `#go` links to `/<rest>`. `/xsite/<rest>` frames
+/// `/linkto/<rest>` is a page whose `#go` links to `/<rest>`. `/hop/<ms>` goes to
+/// `localhost`'s `/counter` `<ms>` after it loads. `/xsite/<rest>` frames
 /// `/inner/<rest>` from `localhost` (another site than the page's 127.0.0.1, so a separate
 /// frame target), whose `#go` links to `/<rest>`.
 fn download_route(path: &str) -> Option<(String, String)> {
@@ -121,6 +122,18 @@ fn download_route(path: &str) -> Option<(String, String)> {
         return html(page(
             "inner",
             &format!(r#"<a id="go" href="/{rest}">go</a>"#),
+        ));
+    }
+    // `/hop/<ms>`: goes to `/counter` on `localhost` (another origin) `<ms>` after load.
+    if let Some(ms) = path.strip_prefix("/hop/") {
+        let ms: u64 = ms.parse().unwrap_or(1000);
+        return html(page(
+            "hop",
+            &format!(
+                r#"<p>hop</p><script>
+setTimeout(() => {{ location.href = 'http://localhost:' + location.port + '/counter'; }}, {ms});
+</script>"#
+            ),
         ));
     }
     if let Some(rest) = path.strip_prefix("/xsite/") {

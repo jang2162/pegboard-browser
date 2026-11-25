@@ -38,9 +38,22 @@ pub struct Where<'a> {
     pub acting_url: Option<&'a str>,
 }
 
-/// Where the command would write cannot be told: it is neither asked about nor run.
+/// Why a state command cannot be shown to a person. Either way it is neither asked about
+/// nor run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnknownOrigin;
+pub enum NotShown {
+    /// Where it would write cannot be told, or not shown truthfully: no tab or frame
+    /// address, an opaque origin (`about:blank`, `about:srcdoc`, `data:`), a host with a user
+    /// name before it or longer than a host can be.
+    UnknownOrigin,
+    /// Not a command line these rules know (or one the grammar should have refused, such as
+    /// a flag given twice).
+    Unexpected,
+}
+
+/// The most of a host a line shows; a longer one is cut from the left, so its registrable
+/// domain (the end) stays in sight.
+pub const HOST_SHOWN_CHARS: usize = 80;
 
 /// Format characters (Unicode category Cf) and the line and paragraph separators: they
 /// change how the text around them looks (bidirectional overrides and isolates, marks,
@@ -72,17 +85,35 @@ fn is_format(c: char) -> bool {
     )
 }
 
-/// Control, format and bidi characters become `\u{…}` (lowercase hex); at most `max_chars`
-/// characters are kept (an escape is kept whole or not at all), then '…'.
+/// Characters that show nothing although they are not format characters: Hangul fillers,
+/// the combining grapheme joiner and the variation selectors.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x034F | 0x115F | 0x1160 | 0x3164 | 0xFFA0 | 0xFE00..=0xFE0F | 0xE0100..=0xE01EF
+    )
+}
+
+/// One character as shown: `\\` for a backslash (so an escape cannot be faked), `\u{…}`
+/// for one that shows nothing or changes how the rest looks, else itself.
+fn shown_char(c: char) -> String {
+    if c == '\\' {
+        "\\\\".to_string()
+    } else if c.is_control() || is_format(c) || is_invisible(c) {
+        format!("\\u{{{:x}}}", c as u32)
+    } else {
+        c.to_string()
+    }
+}
+
+/// Control, format, bidi and invisible characters become `\u{…}` (lowercase hex) and a
+/// backslash `\\`; at most `max_chars` characters are kept (an escape is kept whole or not
+/// at all), then '…'.
 pub fn display_text(s: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut kept = 0;
     for c in s.chars() {
-        let piece = if c.is_control() || is_format(c) {
-            format!("\\u{{{:x}}}", c as u32)
-        } else {
-            c.to_string()
-        };
+        let piece = shown_char(c);
         let n = piece.chars().count();
         if kept + n > max_chars {
             out.push('…');
@@ -92,6 +123,51 @@ pub fn display_text(s: &str, max_chars: usize) -> String {
         kept += n;
     }
     out
+}
+
+/// `display_text`, cut from the left: the end is kept (a host's registrable domain).
+pub fn display_tail(s: &str, max_chars: usize) -> String {
+    let pieces: Vec<String> = s.chars().map(shown_char).collect();
+    let mut kept = 0;
+    let mut start = pieces.len();
+    while start > 0 {
+        let n = pieces[start - 1].chars().count();
+        if kept + n > max_chars {
+            return format!("…{}", pieces[start..].concat());
+        }
+        kept += n;
+        start -= 1;
+    }
+    pieces.concat()
+}
+
+/// The host of an address a cookie is set for, when it can be shown truthfully: an
+/// http(s) address with a host of at most 253 characters and no user name or password.
+fn cookie_host(url: &str) -> Result<String, NotShown> {
+    let u = url::Url::parse(url).map_err(|_| NotShown::UnknownOrigin)?;
+    if !matches!(u.scheme(), "http" | "https") || !u.username().is_empty() || u.password().is_some()
+    {
+        return Err(NotShown::UnknownOrigin);
+    }
+    match u.host_str() {
+        Some(h) if !h.is_empty() && h.len() <= crate::argv::MAX_HOST_CHARS => Ok(h.to_string()),
+        _ => Err(NotShown::UnknownOrigin),
+    }
+}
+
+/// The origin of a frame a storage write lands in, when it is a real one: an opaque origin
+/// (`about:blank`, `about:srcdoc`, `data:`) cannot be shown (`about:` frames inherit
+/// their parent's), nor a host longer than a host can be.
+fn storage_origin(url: &str) -> Result<String, NotShown> {
+    let u = url::Url::parse(url).map_err(|_| NotShown::UnknownOrigin)?;
+    match u.origin() {
+        o @ url::Origin::Tuple(..)
+            if u.host_str().map_or(0, str::len) <= crate::argv::MAX_HOST_CHARS =>
+        {
+            Ok(o.ascii_serialization())
+        }
+        _ => Err(NotShown::UnknownOrigin),
+    }
 }
 
 /// The origin a storage write lands in for `url`. An opaque origin (`about:blank`,
@@ -131,7 +207,7 @@ pub fn default_cookie_path(url: &str) -> String {
 pub fn state_details(
     argv: &[String],
     at: Where<'_>,
-) -> Result<(Vec<ConfirmDetail>, StatePin), UnknownOrigin> {
+) -> Result<(Vec<ConfirmDetail>, StatePin), NotShown> {
     let words: Vec<&str> = argv.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["cookies", "set", rest @ ..] => cookie_details(rest, at.page_url),
@@ -142,9 +218,9 @@ pub fn state_details(
                 "sessionStorage"
             };
             let (Some(acting), Some(page)) = (at.acting_url, at.page_url) else {
-                return Err(UnknownOrigin);
+                return Err(NotShown::UnknownOrigin);
             };
-            let (acting, page) = (origin_of(acting), origin_of(page));
+            let (acting, page) = (storage_origin(acting)?, storage_origin(page)?);
             let mut details = vec![detail("출처", display_text(&acting, DETAIL_VALUE_CHARS))];
             // Inside a frame of another origin: the tab's origin too, so the person sees
             // the write does not go to the page they see.
@@ -169,7 +245,19 @@ pub fn state_details(
             }
             Ok((details, StatePin::Origin { acting, page }))
         }
-        _ => Ok((Vec::new(), StatePin::None)),
+        // Fail closed: nothing is asked about that these rules do not know.
+        _ => Err(NotShown::Unexpected),
+    }
+}
+
+/// Sets a flag's value once; a second one (or none) is `Unexpected`.
+fn once<'a>(slot: &mut Option<&'a str>, value: Option<&'a str>) -> Result<(), NotShown> {
+    match (slot.is_some(), value) {
+        (false, Some(v)) => {
+            *slot = Some(v);
+            Ok(())
+        }
+        _ => Err(NotShown::Unexpected),
     }
 }
 
@@ -178,19 +266,28 @@ pub fn state_details(
 fn cookie_details(
     rest: &[&str],
     tab_url: Option<&str>,
-) -> Result<(Vec<ConfirmDetail>, StatePin), UnknownOrigin> {
+) -> Result<(Vec<ConfirmDetail>, StatePin), NotShown> {
     let mut positional = Vec::new();
     let (mut url, mut domain, mut path) = (None, None, None);
     let mut flags = Vec::new();
     let mut i = 0;
+    // A value flag given twice was refused by the grammar; seen here all the same, the
+    // command is not shown (what runs could be the other value).
+    let (mut same_site, mut expires) = (None, None);
     while i < rest.len() {
         let value = rest.get(i + 1).copied();
         match rest[i] {
-            "--url" => url = value,
-            "--domain" => domain = value,
-            "--path" => path = value,
-            "--same-site" => flags.push(format!("SameSite={}", value.unwrap_or(""))),
-            "--expires" => flags.push(format!("expires={}", value.unwrap_or(""))),
+            "--url" => once(&mut url, value)?,
+            "--domain" => once(&mut domain, value)?,
+            "--path" => once(&mut path, value)?,
+            "--same-site" => {
+                once(&mut same_site, value)?;
+                flags.push(format!("SameSite={}", value.unwrap_or("")));
+            }
+            "--expires" => {
+                once(&mut expires, value)?;
+                flags.push(format!("expires={}", value.unwrap_or("")));
+            }
             "--http-only" => {
                 flags.push("HttpOnly".to_string());
                 i += 1;
@@ -208,6 +305,9 @@ fn cookie_details(
             }
         }
         i += 2;
+    }
+    if positional.len() != 2 {
+        return Err(NotShown::Unexpected);
     }
     let shown = |v: &str| display_text(v, DETAIL_VALUE_CHARS);
     let mut details = vec![
@@ -230,11 +330,19 @@ fn cookie_details(
         (Some(u), _) => Some(u.to_string()),
         (None, Some(_)) => None,
         (None, None) => {
-            let u = tab_url.ok_or(UnknownOrigin)?;
+            let u = tab_url.ok_or(NotShown::UnknownOrigin)?;
             pin = StatePin::CookieUrl(u.to_string());
             Some(u.to_string())
         }
     };
+    // The host first, parsed (an address can put a misleading name before `@`), cut from
+    // the left when long.
+    let host = match (&effective_url, domain) {
+        (Some(u), _) => cookie_host(u)?,
+        (None, Some(d)) if !d.is_empty() && d.len() <= crate::argv::MAX_HOST_CHARS => d.to_string(),
+        _ => return Err(NotShown::UnknownOrigin),
+    };
+    details.insert(0, detail("호스트", display_tail(&host, HOST_SHOWN_CHARS)));
     if let Some(u) = &effective_url {
         details.push(detail("URL", shown(u)));
     }
@@ -299,6 +407,37 @@ mod tests {
         }
         // Ordinary text of any script stays as it is.
         assert_eq!(display_text("세션 one é 日本", 100), "세션 one é 日本");
+        // Invisible characters that are not format characters.
+        for c in [
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{034F}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{E0100}',
+            '\u{E01EF}',
+        ] {
+            let shown = display_text(&format!("x{c}y"), 100);
+            assert_eq!(shown, format!("x\\u{{{:x}}}y", c as u32), "{:x}", c as u32);
+        }
+        // A backslash cannot fake an escape.
+        assert_eq!(display_text("a\\u{202e}b", 100), "a\\\\u{202e}b");
+    }
+
+    #[test]
+    fn a_long_host_is_cut_from_the_left() {
+        let host = format!("{}.bank.test", "x".repeat(100));
+        let shown = display_tail(&host, HOST_SHOWN_CHARS);
+        assert!(
+            shown.starts_with('…') && shown.ends_with("x.bank.test"),
+            "{shown}"
+        );
+        assert_eq!(shown.chars().count(), HOST_SHOWN_CHARS + 1);
+        assert_eq!(display_tail("a.test", HOST_SHOWN_CHARS), "a.test");
+        // An escape is kept whole or not at all.
+        assert_eq!(display_tail("a\u{202E}b", 3), "…b");
     }
 
     fn tab(url: &str) -> Where<'_> {
@@ -485,16 +624,112 @@ mod tests {
                 acting_url: Some("https://a.test/"),
             },
         ] {
-            assert_eq!(state_details(&storage, at), Err(UnknownOrigin), "{at:?}");
+            assert_eq!(
+                state_details(&storage, at),
+                Err(NotShown::UnknownOrigin),
+                "{at:?}"
+            );
             assert_eq!(
                 state_details(&s(&["storage", "session", "clear"]), at),
-                Err(UnknownOrigin)
+                Err(NotShown::UnknownOrigin)
             );
         }
         // A cookie without an address needs the tab's.
         assert_eq!(
             state_details(&s(&["cookies", "set", "n", "v"]), Where::default()),
-            Err(UnknownOrigin)
+            Err(NotShown::UnknownOrigin)
         );
+    }
+
+    #[test]
+    fn a_cookie_shows_its_parsed_host_first() {
+        let (details, _) = state_details(
+            &s(&["cookies", "set", "n", "v"]),
+            tab("https://www.bank.test/a/b"),
+        )
+        .unwrap();
+        assert_eq!(details[0].label, "호스트");
+        assert_eq!(details[0].value, "www.bank.test");
+        let (details, _) = state_details(
+            &s(&["cookies", "set", "n", "v", "--domain", ".b.test"]),
+            Where::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (details[0].label.as_str(), details[0].value.as_str()),
+            ("호스트", ".b.test")
+        );
+        // An IDN host is shown as the browser resolves it (punycode), not as its look-alike.
+        let (details, _) = state_details(
+            &s(&["cookies", "set", "n", "v", "--url", "https://bаnk.test/"]),
+            Where::default(),
+        )
+        .unwrap();
+        assert!(details[0].value.starts_with("xn--"), "{details:?}");
+        // A pinned tab address that would mislead or cannot be shown is refused.
+        for url in [
+            "https://bank.test@evil.test/",
+            "https://u:p@evil.test/",
+            "about:blank",
+            "data:text/html,x",
+        ] {
+            assert_eq!(
+                state_details(&s(&["cookies", "set", "n", "v"]), tab(url)),
+                Err(NotShown::UnknownOrigin),
+                "{url}"
+            );
+        }
+        let long = format!("https://{}.test/", "a".repeat(250));
+        assert_eq!(
+            state_details(&s(&["cookies", "set", "n", "v"]), tab(&long)),
+            Err(NotShown::UnknownOrigin)
+        );
+    }
+
+    #[test]
+    fn a_storage_write_in_an_opaque_frame_is_refused() {
+        let storage = s(&["storage", "local", "set", "k", "v"]);
+        for acting in ["about:blank", "about:srcdoc", "data:text/html,x"] {
+            let at = Where {
+                page_url: Some("https://a.test/"),
+                acting_url: Some(acting),
+            };
+            assert_eq!(
+                state_details(&storage, at),
+                Err(NotShown::UnknownOrigin),
+                "{acting}"
+            );
+        }
+        assert_eq!(
+            state_details(&storage, tab("about:blank")),
+            Err(NotShown::UnknownOrigin)
+        );
+    }
+
+    #[test]
+    fn what_these_rules_do_not_know_is_not_shown() {
+        for argv in [
+            &["storage", "local", "get", "k"][..],
+            &["cookies", "get"],
+            &["eval", "1"],
+            &[
+                "cookies",
+                "set",
+                "n",
+                "v",
+                "--url",
+                "https://a.test/",
+                "--url",
+                "https://b.test/",
+            ],
+            &["cookies", "set", "n", "v", "--path", "/a", "--path", "/b"],
+            &["cookies", "set", "n"],
+        ] {
+            assert_eq!(
+                state_details(&s(argv), tab("https://a.test/")),
+                Err(NotShown::Unexpected),
+                "{argv:?}"
+            );
+        }
     }
 }

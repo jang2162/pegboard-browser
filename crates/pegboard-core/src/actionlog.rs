@@ -89,7 +89,9 @@ pub struct ActionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certain: Option<bool>,
     /// How a person's confirmation of the command ended; none for a command that asked
-    /// nobody. What the confirmation showed is not kept (it can hold secrets).
+    /// nobody. What the confirmation showed is not kept (it can hold secrets). An entry
+    /// with one has `ts` at the answer and `duration_ms` from then: the wait is `wait_ms`,
+    /// not part of the command's time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm: Option<ConfirmLog>,
 }

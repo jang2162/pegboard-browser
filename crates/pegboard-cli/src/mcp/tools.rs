@@ -1513,6 +1513,10 @@ fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Resul
             Shot::Missing => {}
         }
     }
+    if let Some(line) = confirmed_note(&r.output) {
+        text.push('\n');
+        text.push_str(&line);
+    }
     // Each download is told once, in whatever result comes next: it must reach the agent.
     for line in download_notes(&r.output) {
         text.push('\n');
@@ -1522,6 +1526,18 @@ fn action(ctx: &mut Ctx, word: &'static str, args: &Map<String, Value>) -> Resul
         text,
         is_error: !ok,
         image,
+    })
+}
+
+/// Who let a command that asks a person run (`"confirmed": {"by": …}` of the result):
+/// pegboard's own words.
+fn confirmed_note(output: &Value) -> Option<String> {
+    let by = output.pointer("/confirmed/by")?.as_str()?;
+    Some(match by {
+        "session" => "confirmed by a person earlier (allowed for the rest of this session)".into(),
+        "browser" => "confirmed by a person in the Pegboard browser".into(),
+        "api" => "confirmed by a person (confirmation client)".into(),
+        _ => "confirmed by a person".into(),
     })
 }
 

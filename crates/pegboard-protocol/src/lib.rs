@@ -58,8 +58,11 @@ pub struct RpcError {
 }
 
 impl RpcError {
-    /// Why a command was denied (`data.reason` of `policy_denied`: `denied`, `timed_out`,
-    /// `no_responder`, `cancelled`, `stale`), if the error says.
+    /// Why a command was denied (`data.reason` of `policy_denied`), if the error says. The
+    /// reasons are snake case: `denied`, `timed_out`, `no_responder`, `cancelled`, `stale`
+    /// (a confirmation's ending; the same endings are camelCase as `ConfirmOutcome`, in
+    /// notices and the action log) and `unknown_origin` (where the command would write
+    /// cannot be told or shown truthfully, so nobody was asked).
     pub fn reason(&self) -> Option<&str> {
         self.data.as_ref()?.get("reason")?.as_str()
     }

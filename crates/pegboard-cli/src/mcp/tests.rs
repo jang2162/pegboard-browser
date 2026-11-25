@@ -1556,6 +1556,16 @@ fn the_daemons_refusals_and_failures_keep_their_codes() {
     let (err, text) = h.call("pegboard_eval", json!({ "expression": "1" }));
     assert!(err, "{text}");
     assert_eq!(text, "policy_denied: eval is not allowed in this session");
+    // A command a person confirmed says so, outside the page-content markers.
+    h.stub.state.lock().unwrap().exec_reply = Some(Ok(
+        json!({ "success": true, "data": null, "confirmed": { "by": "api" } }),
+    ));
+    let (err, text) = h.call("pegboard_eval", json!({ "expression": "3" }));
+    assert!(!err, "{text}");
+    assert!(
+        text.ends_with("\nconfirmed by a person (confirmation client)"),
+        "{text}"
+    );
     // A person's answer (or its absence) is told apart in the tool result.
     h.stub.state.lock().unwrap().exec_reply = Some(Err(RpcError {
         code: codes::POLICY_DENIED.into(),

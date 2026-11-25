@@ -960,6 +960,9 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Parsed, RpcE
     let mut file_given = false;
     let mut rest = 0;
     let mut literal = false;
+    // Value flags already given: agent-browser keeps the last of a repeated one, so a
+    // check of the first would judge another value than the one that runs.
+    let mut given: Vec<&'static str> = Vec::new();
     let mut i = 0;
     while i < words.len() {
         let word = &words[i];
@@ -1000,6 +1003,12 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Parsed, RpcE
                     }
                 }
                 Arity::Value(kind) => {
+                    if given.contains(&flag.names[0]) {
+                        return Err(rejected(format!(
+                            "'{word}' is given more than once in `{name}`"
+                        )));
+                    }
+                    given.push(flag.names[0]);
                     let Some(v) = words.get(i) else {
                         return Err(rejected(format!("'{word}' needs a value in `{name}`")));
                     };
@@ -1010,11 +1019,18 @@ fn parse(form: &Form, words: &[String], files_dir: &Path) -> Result<Parsed, RpcE
                             "invalid value {v:?} for '{word}' in `{name}`: must not start with '-'"
                         )));
                     }
-                    let v = accept(kind, v, files_dir).map_err(|why| {
-                        rejected(format!(
-                            "invalid value {v:?} for '{word}' in `{name}`: {why}"
-                        ))
-                    })?;
+                    let v = accept(kind, v, files_dir)
+                        .and_then(|v| {
+                            if form.words == ["cookies", "set"] && word == "--url" {
+                                cookie_url(&v)?;
+                            }
+                            Ok(v)
+                        })
+                        .map_err(|why| {
+                            rejected(format!(
+                                "invalid value {v:?} for '{word}' in `{name}`: {why}"
+                            ))
+                        })?;
                     match kind {
                         Url => urls.push(out.len()),
                         Expr => expr.push(out.len()),
@@ -1123,6 +1139,26 @@ fn kind_name(kind: Kind) -> &'static str {
         TabRef => "tab",
         File(_) | UploadFile => "file name",
         Choice(_) => "choice",
+    }
+}
+
+/// The longest host name (RFC 1035): a longer one cannot be shown whole.
+pub const MAX_HOST_CHARS: usize = 253;
+
+/// An address a cookie may be set for, so that a person shown it sees its host: no user
+/// name or password before the host (`https://bank.test@evil.test/` is evil.test), and a
+/// host of at most `MAX_HOST_CHARS`.
+pub fn cookie_url(url: &str) -> Result<(), String> {
+    let u = url::Url::parse(url).map_err(|e| format!("not a URL: {e}"))?;
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err("a user name or password before the host is not accepted".into());
+    }
+    match u.host_str() {
+        Some(h) if h.len() <= MAX_HOST_CHARS => Ok(()),
+        Some(_) => Err(format!(
+            "the host is longer than {MAX_HOST_CHARS} characters"
+        )),
+        None => Err("the address has no host".into()),
     }
 }
 
@@ -1706,6 +1742,71 @@ mod tests {
         );
         refused(&["tab", "new", "--label", "docs", "https://a.test"]);
         refused(&["cookies", "set", "n", "v", "--url", "file:///x"]);
+    }
+
+    #[test]
+    fn a_cookie_url_shows_its_real_host() {
+        refused(&[
+            "cookies",
+            "set",
+            "n",
+            "v",
+            "--url",
+            "https://bank.test@evil.test/",
+        ]);
+        refused(&[
+            "cookies",
+            "set",
+            "n",
+            "v",
+            "--url",
+            "https://u:p@evil.test/",
+        ]);
+        let long = format!("https://{}.test/", "a".repeat(250));
+        refused(&["cookies", "set", "n", "v", "--url", &long]);
+        assert!(check(
+            &s(&["cookies", "set", "n", "v", "--url", "https://a.test/x"]),
+            Path::new(FILES)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_value_flag_given_twice_is_refused() {
+        for a in [
+            &[
+                "cookies",
+                "set",
+                "n",
+                "v",
+                "--url",
+                "https://a.test",
+                "--url",
+                "https://b.test",
+            ][..],
+            &[
+                "cookies", "set", "n", "v", "--domain", "a.test", "--domain", "b.test",
+            ],
+            &["cookies", "set", "n", "v", "--path", "/a", "--path", "/b"],
+            &[
+                "cookies",
+                "set",
+                "n",
+                "v",
+                "--same-site",
+                "Lax",
+                "--same-site",
+                "None",
+            ],
+        ] {
+            refused(a);
+        }
+        // Distinct flags are fine.
+        assert!(check(
+            &s(&["cookies", "set", "n", "v", "--domain", "a.test", "--path", "/a"]),
+            Path::new(FILES)
+        )
+        .is_ok());
     }
 
     #[test]

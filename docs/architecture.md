@@ -610,8 +610,14 @@ JSON-RPC 2.0, 한 줄에 메시지 하나.
 | `session.info_any`, `session.close_any` | 운영자용, 토큰 없이 세션 보기와 닫기(2a) |
 | `files.list` | 세션 파일 디렉터리의 파일(2a) |
 | `recording.list`, `recording.get`, `recording.open`, `recording.keep`, `recording.delete`, `recording.prune` | 녹화(2b. 토큰 없이 소켓 소유자 검사만) |
-| `confirm.respond` | 확인이 필요한 동작에 대한 승인·거부 |
-| 알림: `session.changed`, `confirm.required` | 서버에서 클라이언트로 |
+| `confirm.subscribe`, `confirm.list`, `confirm.respond` | 확인이 필요한 동작(`upload`, `state`)의 알림 통로, 기다리는 확인 목록, 승인·거부(3b) |
+| 알림: `session.changed`, `confirm.required`, `confirm.resolved` | 서버에서 클라이언트로 |
+
+확인을 거친 명령의 결과(3b):
+- 거부되면 `policy_denied`이고 `data = {"reason": …, "confirmId": …}`이다(묻기 전에 끝났으면 `confirmId`가 없다). `reason`은 **snake_case**: `denied`(사람이 거부), `timed_out`(60초 안에 답 없음), `no_responder`(답할 곳 없음), `cancelled`(세션 닫힘이나 데몬 종료), `stale`(승인 뒤 탭이나 프레임의 출처가 바뀜), `unknown_origin`(쓸 곳의 출처를 알 수 없거나 사실대로 보일 수 없어 **묻지 않고** 거부: 여러 탭 중 고른 탭이 없음, 주소를 읽지 못함, `about:`·`data:` 같은 불투명 출처, 호스트 앞의 사용자 이름). CLI와 MCP는 메시지 끝에 `(reason: …)`를 붙인다.
+- 확인 알림(`confirm.resolved`)과 동작 기록의 `confirm.outcome`은 프로토콜 형식 그대로 **camelCase**다(`approved`, `approvedForSession`, `denied`, `timedOut`, `noResponder`, `cancelled`, `stale`). 같은 결과가 오류의 `reason`에서는 snake_case(`timed_out`)이고 기록에서는 camelCase(`timedOut`)다. `unknown_origin`은 아무에게도 묻지 않았으므로 기록에 `confirm`이 없다.
+- 허용된 명령의 결과 출력에는 `"confirmed": {"by": "api" | "browser" | "session"}`이 붙는다(MCP는 "confirmed by …" 한 줄).
+- 확인을 기다린 명령의 기록 줄은 답이 온 때를 `ts`로 삼고 `durationMs`는 그때부터 잰다. 기다린 시간은 `confirm.waitMs`에 따로 있다(녹화에서 명령이 대기 시간만큼 늘어나 보이지 않게).
 
 ---
 

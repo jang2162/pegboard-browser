@@ -649,3 +649,118 @@ async fn a_write_inside_a_frame_shows_the_frames_origin() {
     assert_eq!(reason(&run.await.unwrap()), "denied");
     rig.finish().await;
 }
+
+/// Every object in `v` (at any depth) whose `name` is `name`: the cookies `cookies get`
+/// lists, whatever its exact shape.
+fn cookies_named<'a>(v: &'a Value, name: &str, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Object(o) => {
+            if o.get("name").and_then(Value::as_str) == Some(name) {
+                out.push(v);
+            }
+            o.values().for_each(|x| cookies_named(x, name, out));
+        }
+        Value::Array(a) => a.iter().for_each(|x| cookies_named(x, name, out)),
+        _ => {}
+    }
+}
+
+/// A session warmed up (agent-browser's daemon running) at `/hop/<ms>`, which goes to
+/// another origin (localhost) `ms` after it loads.
+async fn hopping_session(rig: &Rig, ms: u64) -> Session {
+    let s = rig.session().await;
+    rig.ok(&s, &["get", "url"]).await;
+    rig.ok(&s, &["open", &format!("{}/hop/{ms}", rig.fixture.origin)])
+        .await;
+    s
+}
+
+/// Approved after the tab went to another origin: a storage write does not run (`stale`),
+/// and the log says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn a_storage_write_approved_after_the_tab_left_is_stale() {
+    let rig = rig(None).await;
+    let s = hopping_session(&rig, 2500).await;
+    let mut person = rig.subscribe().await;
+    let run = rig.exec(&s, &["storage", "local", "set", "peghop", "v"]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(
+        shown(&asked, "출처"),
+        rig.fixture.origin,
+        "asked before the hop: {asked}"
+    );
+    // The tab goes to localhost meanwhile.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "approve")
+        .await;
+    let r = run.await.unwrap();
+    assert_eq!(reason(&r), "stale");
+    assert_eq!(
+        r.error.unwrap().data.unwrap()["confirmId"],
+        asked["confirmId"]
+    );
+    // Not written where the tab is now, nor where it was.
+    let out = rig.ok(&s, &["get", "url"]).await;
+    assert!(out.to_string().contains("localhost"), "{out}");
+    assert_eq!(rig.local_storage(&s, "peghop").await, Value::Null);
+    rig.ok(&s, &["open", &format!("{}/counter", rig.fixture.origin)])
+        .await;
+    assert_eq!(rig.local_storage(&s, "peghop").await, Value::Null);
+    let entry = rig
+        .entries(&s)
+        .into_iter()
+        .find(|e| e.command == "storage")
+        .unwrap();
+    assert!(!entry.ok, "{entry:?}");
+    assert_eq!(
+        entry.confirm.map(|c| c.outcome),
+        Some(pegboard_protocol::ConfirmOutcome::Stale)
+    );
+    rig.finish().await;
+}
+
+/// Approved after the tab went to another origin: a cookie lands on the host the person was
+/// shown, with the path they were shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn a_cookie_approved_after_the_tab_left_lands_on_the_asked_host() {
+    let rig = rig(None).await;
+    let s = hopping_session(&rig, 2500).await;
+    let mut person = rig.subscribe().await;
+    let run = rig.exec(&s, &["cookies", "set", "peghopck", "v1"]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(asked["details"][0]["label"], "호스트", "{asked}");
+    assert_eq!(shown(&asked, "호스트"), "127.0.0.1", "{asked}");
+    let shown_path = shown(&asked, "경로");
+    assert_eq!(shown_path, "/hop", "{asked}");
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "approve")
+        .await;
+    let r = run.await.unwrap();
+    let result = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
+    assert_eq!(result["exitCode"], 0, "{result}");
+    // Now at localhost: no such cookie there (one listed is the 127.0.0.1 one).
+    let out = rig.ok(&s, &["get", "url"]).await;
+    assert!(out.to_string().contains("localhost"), "{out}");
+    let here = rig.ok(&s, &["cookies", "get"]).await;
+    let mut found = Vec::new();
+    cookies_named(&here, "peghopck", &mut found);
+    assert!(
+        found.iter().all(|c| c["domain"] == "127.0.0.1"),
+        "set on another host: {here}"
+    );
+    // Back on the asked host, under the shown path: there, with that path.
+    rig.ok(&s, &["open", &format!("{}/hop/600000", rig.fixture.origin)])
+        .await;
+    let there = rig.ok(&s, &["cookies", "get"]).await;
+    let mut found = Vec::new();
+    cookies_named(&there, "peghopck", &mut found);
+    assert_eq!(found.len(), 1, "{there}");
+    assert_eq!(found[0]["domain"], "127.0.0.1", "{there}");
+    assert_eq!(found[0]["path"], shown_path.as_str(), "{there}");
+    assert_eq!(found[0]["value"], "v1", "{there}");
+    rig.finish().await;
+}

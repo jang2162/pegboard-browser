@@ -16,7 +16,7 @@ use crate::actionlog::{
 };
 use crate::argv::{self, rejected, Checked, TextDestination};
 use crate::confirm::details::{
-    display_text, origin_of, state_details, StatePin, Where, NAME_CHARS,
+    display_text, origin_of, state_details, NotShown, StatePin, Where, NAME_CHARS,
 };
 use crate::confirm::{ConfirmAsk, ConfirmBroker, ConfirmDecision};
 use crate::downloads::Report;
@@ -225,10 +225,30 @@ pub async fn run_command_with_hook(
     }
     // A person is asked, when the policy says so; the question shows the tab the command
     // would act on, read now.
-    let prepare = prepare_question(sessions, runner, id, class, &run_argv);
-    let cleared = match clear_command(confirm, judged, class, id, prepare).await {
-        Ok(cleared) => cleared,
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    let prepare = prepare_question(sessions, runner, id, class, &run_argv, timeout_ms);
+    let cleared = clear_command(confirm, judged, class, id, prepare).await;
+    // A command that waited for a person is logged at the answer: its time and duration
+    // are its own, not the wait's (which is `confirm.waitMs`), so a recording does not
+    // stretch it over the wait.
+    let (cleared, started) = match cleared {
+        Ok(cleared) => {
+            let waited = cleared.confirm_id.is_some();
+            (
+                cleared,
+                if waited {
+                    answered(&mut entry)
+                } else {
+                    started
+                },
+            )
+        }
         Err(refused) => {
+            let started = if refused.confirm.is_some() {
+                answered(&mut entry)
+            } else {
+                started
+            };
             entry.confirm = refused.confirm;
             return refuse(log, entry, argv, refused.error, started);
         }
@@ -250,7 +270,6 @@ pub async fn run_command_with_hook(
     let frame_before = recorder.before_command(id, screen_target(sessions, runner, id).as_deref());
 
     runner.set_session_targets_provider(sessions.targets_fn());
-    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let endpoint = sessions.endpoint(id);
     let at = argv::text_at(argv);
     let types_text = !at.typed.is_empty();
@@ -272,7 +291,7 @@ pub async fn run_command_with_hook(
     };
 
     // Held to what the person was shown, right before it runs.
-    let now = where_it_acts(sessions, runner, id, is_storage(&run_argv));
+    let now = where_it_acts(sessions, runner, id, is_storage(&run_argv), timeout_ms);
     if !apply_pin(&cleared.pin, &mut run_argv, now).await {
         if let Some(c) = entry.confirm.as_mut() {
             c.outcome = ConfirmOutcome::Stale;
@@ -365,6 +384,13 @@ pub async fn run_command_with_hook(
     report_downloads(sessions, log, id, &mut outcome)?;
     sessions.touch(id);
     outcome
+}
+
+/// The command's entry restarts at the answer to its question: `ts` now, and the instant its
+/// duration counts from.
+fn answered(entry: &mut ActionEntry) -> Instant {
+    entry.ts = now();
+    Instant::now()
 }
 
 /// What must be in place before any command of the session runs.
@@ -758,8 +784,9 @@ fn unknown_origin(class: ActionClass) -> RpcError {
         code: codes::POLICY_DENIED.to_string(),
         message: format!(
             "the {name} command was not run: pegboard cannot tell which origin it would \
-             write to (no tab is selected among several, or the address could not be read \
-             within 2 s); select a tab (`tab <id>`) and run it again"
+             write to, or cannot show it truthfully (no tab is selected among several, its \
+             address could not be read, or it is an about:, data: or otherwise opaque \
+             origin); select a tab (`tab <id>`) at an http(s) page and run it again"
         ),
         data: Some(serde_json::json!({ "reason": "unknown_origin" })),
     }
@@ -779,9 +806,11 @@ async fn prepare_question(
     id: &SessionId,
     class: ActionClass,
     run_argv: &[String],
+    timeout_ms: u64,
 ) -> Result<(ConfirmAsk, StatePin), RpcError> {
     let info = sessions.info(id)?;
-    let (acting, page) = where_it_acts(sessions, runner, id, is_storage(run_argv)).await;
+    let (acting, page) =
+        where_it_acts(sessions, runner, id, is_storage(run_argv), timeout_ms).await;
     let (details, pin) = state_details(
         run_argv,
         Where {
@@ -789,7 +818,14 @@ async fn prepare_question(
             acting_url: acting.as_deref(),
         },
     )
-    .map_err(|_| unknown_origin(class))?;
+    .map_err(|e| match e {
+        NotShown::UnknownOrigin => unknown_origin(class),
+        NotShown::Unexpected => RpcError {
+            code: codes::INTERNAL.to_string(),
+            message: format!("the {} command cannot be shown to a person", class.as_str()),
+            data: None,
+        },
+    })?;
     Ok((
         ConfirmAsk {
             session_id: id.clone(),
@@ -813,9 +849,10 @@ async fn where_it_acts(
     runner: &Runner,
     id: &SessionId,
     storage: bool,
+    timeout_ms: u64,
 ) -> (Option<String>, Option<String>) {
     let acting = if storage {
-        acting_url(sessions, runner, id).await
+        acting_url(sessions, runner, id, timeout_ms).await
     } else {
         None
     };
@@ -824,17 +861,29 @@ async fn where_it_acts(
 
 /// The address of the frame agent-browser acts in: after `frame <sel>` that frame, else the
 /// tab's top frame. agent-browser alone knows which frame it selected, so it is asked
-/// (`eval location.href`, pegboard's own call: not judged, not logged). `None` when it
-/// cannot answer within `PROBE_TIMEOUT`.
-async fn acting_url(sessions: &SessionManager, runner: &Runner, id: &SessionId) -> Option<String> {
+/// (`eval location.href`, pegboard's own call: not judged, not logged). It gets the
+/// command's own time limit, which covers starting agent-browser's daemon (the first
+/// command of a session); the runner keeps that limit itself, so the call is never cut
+/// from outside half way through a daemon start, and a daemon that did not answer in time
+/// is stopped (the next command starts a fresh one). `None` when it did not answer.
+async fn acting_url(
+    sessions: &SessionManager,
+    runner: &Runner,
+    id: &SessionId,
+    timeout_ms: u64,
+) -> Option<String> {
     let endpoint = sessions.endpoint(id).ok()?;
     runner.set_session_targets_provider(sessions.targets_fn());
     let argv = ["eval", "location.href"].map(String::from);
-    let ms = u64::try_from(PROBE_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
-    let r = tokio::time::timeout(PROBE_TIMEOUT, runner.exec(id, &endpoint, &argv, ms))
-        .await
-        .ok()?
-        .ok()?;
+    let r = match runner.exec(id, &endpoint, &argv, timeout_ms).await {
+        Ok(r) => r,
+        Err(e) => {
+            if e.code == codes::TIMEOUT {
+                runner.kill_daemon(id);
+            }
+            return None;
+        }
+    };
     if !succeeded(&r) {
         return None;
     }
@@ -848,15 +897,9 @@ async fn acting_url(sessions: &SessionManager, runner: &Runner, id: &SessionId) 
 /// session's only tab); `None` when there is none or it cannot be read in time.
 async fn tab_url(sessions: &SessionManager, runner: &Runner, id: &SessionId) -> Option<String> {
     let target = screen_target(sessions, runner, id)?;
-    let results = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        sessions.evaluate_in_targets(id, "location.href"),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let (_, result) = results.into_iter().find(|(t, _)| *t == target)?;
-    result.ok()?.as_str().map(String::from)
+    tokio::time::timeout(PROBE_TIMEOUT, sessions.target_url(id, &target))
+        .await
+        .ok()?
 }
 
 /// Holds an approved command to what the person was shown: a cookie set without an
