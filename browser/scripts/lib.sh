@@ -9,6 +9,8 @@ REPO_ROOT="$(cd "$BROWSER_DIR/.." && pwd)"
 WORK_BRANCH="pegboard-work"
 # The commit subject of the //pegboard copy (every other commit's subject is a patch file name).
 PEGBOARD_SUBJECT="pegboard"
+# The commit subject of the generated string change (rebrand-strings.py), the last commit.
+GENERATED_SUBJECT="rebrand-strings (generated)"
 # The build directory under the Chromium tree.
 OUT_DIR="out/Pegboard"
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # export.sh <src-dir>: writes the pegboard-work branch back into browser/.
-#   - Each commit after the tag except the "pegboard" one becomes patches/<subject>
+#   - Each commit after the tag except the "pegboard" one and the generated
+#     "rebrand-strings (generated)" one (apply.sh makes it again) becomes patches/<subject>
 #     (git format-patch), in commit order, and patches/series lists them in that order.
 #     Patch files no longer on the branch are removed.
 #   - The committed //pegboard is copied back: pegboard/branding to browser/branding/, the rest
@@ -31,6 +32,15 @@ for c in $(git -C "$src" rev-list --reverse "$tag_commit..HEAD"); do
     if echo "$files" | grep -qv '^pegboard/'; then
       die "commit $c ($PEGBOARD_SUBJECT) touches files outside pegboard/"
     fi
+    continue
+  fi
+  if [ "$subject" = "$GENERATED_SUBJECT" ]; then
+    if echo "$files" | grep -Evq '\.(grd|grdp|xtb)$'; then
+      die "commit $c ($GENERATED_SUBJECT) touches files other than strings"
+    fi
+    [ "$c" = "$(git -C "$src" rev-parse HEAD)" ] ||
+      die "commit $c ($GENERATED_SUBJECT) is not the last commit (move patches below it)"
+    echo "== skipped $GENERATED_SUBJECT"
     continue
   fi
   echo "$subject" | grep -Eq '^[A-Za-z0-9._-]+\.patch$' ||

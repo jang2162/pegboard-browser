@@ -4,6 +4,8 @@
 #      <src>/pegboard/branding/, one commit (subject "pegboard").
 #   2. Each patch in patches/series, in order, goes in with `git apply --3way`, one commit per
 #      patch whose subject is the patch file name and whose body and author are the patch's.
+#   3. scripts/rebrand-strings.py changes the product name in the strings, one commit (subject
+#      "rebrand-strings (generated)"). export.sh does not turn it into a patch.
 # An existing pegboard-work branch is not replaced unless PEGBOARD_APPLY_FORCE=1; the old one
 # is kept as pegboard-work-prev.
 # After a conflict: resolve it in <src>, commit it with the patch name as subject, then run
@@ -93,4 +95,14 @@ for i in "${!names[@]}"; do
     GIT_AUTHOR_DATE="${date:-}" g commit -q --cleanup=strip -F "$tmp/commit-msg"
   echo "== applied $name"
 done
+
+python3 "$BROWSER_DIR/scripts/rebrand-strings.py" "$src"
+g add -A -- chrome/app components
+if g diff --cached --quiet; then
+  die "rebrand-strings.py changed nothing"
+fi
+GIT_AUTHOR_NAME=Pegboard GIT_AUTHOR_EMAIL=noreply@pegboard.invalid \
+  g commit -q -m "$GENERATED_SUBJECT" \
+  -m "Made by browser/scripts/rebrand-strings.py; apply.sh makes it again, export.sh skips it."
+echo "== $GENERATED_SUBJECT"
 echo "== done: $(git -C "$src" rev-list --count "$tag_commit..HEAD") commits on $WORK_BRANCH"

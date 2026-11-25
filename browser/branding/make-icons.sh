@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the temporary app icon (mac/app.icns, mac/Assets.car) from icon.swift.
+# Regenerates the app icon (mac/app.icns, mac/Assets.car) from icon.swift.
 # Needs Xcode (swift, actool) and iconutil. The outputs are committed; run this only to
 # change the icon.
 set -euo pipefail
