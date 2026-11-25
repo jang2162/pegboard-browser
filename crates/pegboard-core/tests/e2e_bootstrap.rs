@@ -836,8 +836,16 @@ fn restart_from_the_notice_starts_a_daemon() {
     assert_eq!(a.wait_for_daemon(Some(last), SETTLE), restarted);
     a.kill_four_times(Some(last));
     assert!(
-        eventually(SETTLE, || a.notices("daemon_stopped").len() == 2),
+        eventually(SETTLE, || a.notices("daemon_stopped").len() >= 2),
         "no second notice; dialog log: {:?}",
+        std::fs::read_to_string(a.notice_log())
+    );
+    // Only after the fourth end: the three before it were restarted as usual.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        a.notices("daemon_stopped").len(),
+        2,
+        "{:?}",
         std::fs::read_to_string(a.notice_log())
     );
 }
