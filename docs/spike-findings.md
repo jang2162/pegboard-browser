@@ -1150,7 +1150,7 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 - **`e2e_link`의 두 시험이 포크에서 늘 실패했다(고침, d76ab9d).** `the_daemon_opens_one_browser_connection`과 `an_oversized_eval_does_not_cut_other_sessions`가 연결 수를 세려고 DevTools TCP 포트(`DevToolsActivePort`)를 읽어, 포트가 없는 포크에서 단언에 닿기 전에 끝났다. 포트가 없으면 파이프 하나를 연결로 세고, 브라우저가 TCP로 듣는 포트가 있으면 더하게 했다. 두 구성 모두 10 passed. 두 번째 시험의 본뜻(한 가상 연결의 너무 큰 응답이 그 연결만 끝내고 물리 연결은 산다)이 파이프 위에서도 맞다.
 - **"알려진 실패" 둘은 시험 기기의 응답 없는 동의 창 때문이었다(고침, d9507fc).** `e2e_policy`의 `frontmost()`가 `osascript`로 System Events에 앞 앱을 물었다. GUI 세션의 터미널에서는 이것이 자동화 동의 창을 띄우고(`UserNotificationCenter`), 아무도 답하지 않으니 창이 앞에 남는다. 그 뒤로 브라우저가 프로필을 기본 컨텍스트로 만들지 못해(`the profile did not become the default context`) 클립보드와 정책 시험 대부분이 실패했다. 3a 전 기준선(716d1d6)부터 실패로 알던 `pegboard-cli` `e2e_policy::second_session_cannot_widen_a_pinned_profile`과 `e2e_isolation::unattributed_download_is_deleted`도 같은 원인이었다: 동의 창을 닫자 둘 다 통과했고, `pegboard-cli` `e2e_policy` 전체가 29 passed였다. `frontmost()`를 동의가 필요 없는 `lsappinfo`로 바꿨다. 그 뒤 전체 실행에서 동의 창은 다시 뜨지 않았다.
-- **포크에서만 실패하는 것 하나: `allow_clipboard_opens_it`의 `Meta+v` 붙여넣기** [확인: 다섯 번 모두 포크만 실패, 순정은 통과]. 클립보드를 허용한 세션에서 `press`가 보내는 `Meta+v`(`commands: ["paste"]`)가 텍스트 칸에 아무것도 붙이지 않는다. `Control+v`(같은 `paste` 명령), `Shift+Insert`, 쓰기 경로 전부는 된다. 원인 가설 [미확인]: 맥에서 Cmd 조합은 렌더러로 가기 전에 브라우저 단축키(`PreHandleKeyboardEvent` → `IDC_PASTE` → `BrowserView::CutCopyPaste`)로 처리되고, 그 명령은 창의 첫 응답자, 곧 그 창의 **활성 탭**으로 간다. 포크의 도메인은 에이전트 창과 탭을 뒤에 연다(`kShowWindowInactive`, 백그라운드 탭). 그래서 붙여넣기가 대상 탭이 아니라 그 창의 활성 탭(창의 첫 빈 탭 또는 다른 세션의 탭)에 갔을 수 있다. 맞다면 격리 문제다: 한 세션의 `Meta+v`/`Meta+c`가 같은 에이전트 창의 다른 세션 탭에 붙이거나 그 선택을 복사할 수 있다(사람 프로필 창은 다른 창이라 닿지 않는다). 순정에서도 창의 활성 탭이 대상과 다르면 같을 수 있다. 3b에서 실측한다(열린 항목).
+- **포크에서만 실패하는 것 하나: `allow_clipboard_opens_it`의 `Meta+v` 붙여넣기** [확인: 다섯 번 모두 포크만 실패, 순정은 통과]. 클립보드를 허용한 세션에서 `Meta+v`(`commands: ["paste"]`)가 텍스트 칸에 아무것도 붙이지 않았다. 처음에는 Cmd 조합이 창의 활성 탭으로 가는 격리 문제로 의심했으나 아니었다. 원인은 Chromium 156의 맥 클립보드 버그였고, 157의 수정을 패치로 들여와 고쳤다(아래 "3a 작업 10 후속").
 - **포크에서만 실패하는 것 둘: 새 탭의 첫 탐색이 탐색 기록에 `navigated` 줄 없이 남는다** (`pegboard-cli` `e2e_recording::navigation_log_follows_tabs_and_popups`) [확인: 세 번 모두 포크만]. 확장 판은 탭을 `about:blank`로 만든 뒤 주소로 보내지만(`sw.js`), 도메인 판 `Pegboard.createTab`은 주소로 바로 연다. 녹화기가 붙을 때는 첫 페이지가 이미 들어와 있어 `created` 줄이 그 주소를 갖고 `navigated` 줄은 없다. 화면 기록은 영향이 없다: 녹화기는 붙을 때 `Page.getFrameTree`로 지금 문서를 보고, 화면을 끄는 도메인 판정도 그 값으로 한다(2b의 늦게 붙는 경우 처리). 다만 첫 페이지가 다시 보내기를 거쳤으면 중간 주소가 기록에 없다. 시험을 고칠지, 도메인 판도 `about:blank` 뒤 탐색으로 맞출지는 정하지 않았다(열린 항목).
 - **`pegboard-cli` 시험 하네스는 포크 구성을 지원하지 않는다.** 사람 쪽 조작(`Human::attach`, `Person::connect`, `activate`, `own_ports`)이 순정 Chrome의 디버깅 포트(`chrome/DevToolsActivePort`)로 브라우저에 직접 붙는다. 포크 구성으로 돌리면 그 시험들(첫 실행에서 35개)이 `DevToolsActivePort`가 없다고 실패하고, 포트가 필요 없는 시험은 통과한다(`e2e_cli` 14, `e2e_mcp` 21, `e2e_mcp_isolation` 9, `e2e_policy` 27, `e2e_recording` 28 passed). 위의 `navigation_log_follows_tabs_and_popups` 말고는 포트 없이 도는 시험 중 포크에서만 실패하는 것이 없다. 포크용 사람 쪽 통로(예: 시험 전용 두 번째 파이프 연결)는 3b 이후.
 - **시험이 agent-browser 데몬을 남긴다** (두 구성 모두). agent-browser는 스스로 데몬이 되어(`ppid` 1) 세션이 끝나도 일부가 남는다. `pegboard-core` 전체 실행 한 번에 포크 18개, 순정 19개가 남았다(`e2e_clipboard`만 따로 돌리면 3개, `e2e_policy`는 1~4개). 3a 전에도 같았을 것으로 보지만 기준선에서 세지 않았다. 매 실행 뒤 시험이 띄운 것만 지웠다.
@@ -1184,3 +1184,26 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 - 0단계 A6의 예상(파이프 패치 "파일 2개, 십여 줄")과 설계의 예상(부트스트랩 "중간")에 비해 업스트림 쪽은 작다. 무게는 `//pegboard/` 새 파일에 있다.
 - 디스크는 작업 7에 적은 11GB(소스와 합쳐 74GB)보다 작게 나왔다. 왜 다른지는 보지 않았다.
+
+### 3a 작업 10 후속. 포크에서만 실패하던 `Meta+v` 붙여넣기 (2026-11-25)
+
+`allow_clipboard_opens_it`의 `Meta+v` 실패 원인을 두 번째 기기의 GUI 세션에서 실측했다. 임시 진단 시험(세션 둘, 같은 에이전트 프로필)으로, 키를 보낸 탭과 다른 모든 페이지 타깃(다른 세션의 탭, 사람의 탭, 창의 빈 탭)에 `keydown`/`copy`/`cut`/`paste`/`beforeinput`/`input` 기록기를 심었다.
+
+**세션 사이 누출: 없다** [확인: 포크, 순정]. 한 세션이 보낸 `Meta+v`, `Control+v`, `Meta+c`, `Control+c`, `Meta+x`는 그 세션의 탭에서만 이벤트를 냈다. 다른 세션의 탭(포커스된 텍스트 칸과 선택을 둔 상태), 사람의 탭, 창의 다른 탭에는 이벤트가 하나도 없었다. 다른 세션의 텍스트 칸도 그대로였고, `Meta+c`는 보낸 탭의 선택을 복사했다. 이것을 `clipboard_keys_reach_only_their_own_tab`으로 고정했다. 수정 전 포크 앱과 순정 모두 통과한다.
+
+- **"활성 탭으로 간다" 가설이 틀린 이유** [확인: 코드]: `Input.dispatchKeyEvent`는 `nativeVirtualKeyCode`가 없으면 `skip_if_unhandled`를 켠다(`input_handler.cc`). 그런 키는 `PreHandleKeyboardEvent`(브라우저 단축키, 메뉴)를 거치지 않고 대상 타깃의 위젯으로만 간다(`RenderWidgetHostImpl::ForwardKeyboardEventWithCommands`). 붙여넣기는 그 렌더러가 `commands`를 실행해서 한다. 실제 키보드의 Cmd 조합과는 길이 다르다. 진단에서 포크의 에이전트 탭은 `visibilityState`가 `visible`, `hasFocus()`가 참이었다.
+- **`Meta`와 상관없다** [확인]: 실패는 "페이지가 클립보드에 쓴 뒤의 첫 붙여넣기"였다. 시험에서는 쓰기 단계 다음의 첫 붙여넣기가 `Meta+v`라 그것만 실패했다. 순서를 바꾸면 `Control+v`가 같은 모양으로 실패하고 `Meta+v`는 통과했다. 쓰기 단계를 빼면 통과했고, 쓰기 단계 아무 하나(`writeText`, `execCommand('copy')`, `Meta+c`)만 넣어도 실패했다. `readText` 확인 창은 상관없다(빼도 실패).
+- **무엇이 실패했나** [확인]: 실패한 붙여넣기에서도 `paste` 이벤트는 왔고 그 `clipboardData`에는 표식이 있었다. 그런데 이어지는 `beforeinput`(`insertFromPaste`)의 `data`가 `null`이었고 `input`은 없었다. Blink의 `ClipboardCommands::Paste`는 시작할 때 클립보드 순서 번호를 받아 두고, `beforeinput` 데이터를 만들 때와 넣기 직전에 다시 물어 다르면 조용히 그만둔다. 그동안 시스템 클립보드의 `changeCount`는 바뀌지 않았다(10ms 간격으로 지켜봄).
+- **원인** [확인: 157의 수정과 같은 자리, 들여온 뒤 통과]: Chromium 156의 `ClipboardMac::ClipboardChanged()`는 비동기로 오는 페이스트보드 변경 알림을 받으면, 같은 `changeCount`에 대해 `GetSequenceNumber()`가 이미 토큰을 만들었어도 새 토큰을 만든다. 붙여넣기 도중에 알림이 오면 순서 번호가 바뀐 것처럼 보여 Blink가 붙여넣기를 버린다. 157은 이 경우 토큰을 다시 만들지 않는다(crbug.com/568453825, `ui/base/clipboard/clipboard_mac.{h,mm}`). 순정 구성의 Chrome for Testing은 `157.0.8103.78`이라 통과했다. 페이지가 쓴 뒤 어떤 관찰자가 알림 구독을 켜는지는 보지 않았다 [미확인]. 페이지가 `clipboardchange`를 들을 때는 알림이 표식을 쓴 뒤 18ms 안에 와서 경쟁이 생기지 않았다.
+- **수정**: 157의 두 파일 변경을 그대로 들여온 `clipboard-mac-seqno.patch`(업스트림 파일 2개, +33 −12)를 더했다. 156용 임시 패치이고, 157 이상으로 올리면 지운다. 증분 빌드 34초. 데몬의 초점 흉내나 도메인의 탭 활성화와는 상관없으므로 거기는 바꾸지 않았다(사람의 창에서 초점을 가져가지 않는다는 조건도 그대로다).
+- 패치 예산은 업스트림 파일 15개, +96 −24, 120줄이 되었다(3a 끝 기준선 75줄 + 이 패치 45줄).
+
+시험 결과 (두 번째 기기 GUI 세션, `--test-threads=1`, 원격 데스크톱은 서비스만 떠 있고 연결 없음):
+
+| 시험 | 결과 |
+|---|---|
+| 수정 전 포크: `allow_clipboard_opens_it`, `clipboard_keys_reach_only_their_own_tab` | 1 passed, 1 failed (`allow_clipboard_opens_it`의 `Meta+v`, 재현) |
+| 순정: `clipboard_keys_reach_only_their_own_tab` | 1 passed |
+| 수정 후 포크: `e2e_session` | 15 passed |
+| 수정 후 포크: `e2e_domain` | 11 passed |
+| 수정 후 포크·순정: `e2e_clipboard` 전체 | 확인 못 함. 실행 도중 기기 화면이 잠겨(`CGSSessionScreenIsLocked`, 앞 앱 `loginwindow`) 두 구성 모두 같은 11개가 `the profile did not become the default context`로 실패했다(9 passed, 11 failed). 화면을 푼 뒤 다시 돌려야 한다 |
