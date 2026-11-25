@@ -153,7 +153,8 @@ impl App {
     }
 
     /// Kills each daemon the browser starts, four times within the minute (F8: the fourth
-    /// end is not followed by a restart). The last daemon's pid.
+    /// end is not followed by a restart), the first being the one answering that is not
+    /// `after` (a daemon already gone). The last daemon's pid.
     fn kill_four_times(&mut self, after: Option<i32>) -> i32 {
         let start = Instant::now();
         let mut last = after;
@@ -831,8 +832,9 @@ fn restart_from_the_notice_starts_a_daemon() {
     let s = a.create_session("/after-restart");
     let (code, _, err) = a.cli(&["get", "url"], Some(&s));
     assert_eq!(code, 0, "{err}");
-    // Three restarts again, then the notice again.
-    a.kill_four_times(Some(restarted));
+    // Three restarts again, then the notice again (starting with the daemon of the restart).
+    assert_eq!(a.wait_for_daemon(Some(last), SETTLE), restarted);
+    a.kill_four_times(Some(last));
     assert!(
         eventually(SETTLE, || a.notices("daemon_stopped").len() == 2),
         "no second notice; dialog log: {:?}",
