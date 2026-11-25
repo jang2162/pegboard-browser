@@ -359,7 +359,7 @@ async fn the_first_window_sees_the_defaults() {
 }
 
 /// The people page offers no sign-in (its profile and Google account rows are those of a
-/// browser where sign-in is not allowed), and nothing says the browser is managed.
+/// browser where sign-in is not allowed), and the browser is not managed.
 #[tokio::test]
 #[ignore]
 async fn the_people_page_offers_no_sign_in() {
@@ -394,8 +394,20 @@ async fn the_people_page_offers_no_sign_in() {
         .as_str()
         .unwrap_or_default()
         .to_string();
+    let management = link
+        .eval_at(
+            &s,
+            "chrome://management",
+            &DEEP_TEXT.replace(
+                "return out.join(' ')",
+                "if (!out.join(' ').includes('managed')) return null; return out.join(' ')",
+            ),
+        )
+        .await;
+    let management = management.as_str().unwrap_or_default().to_string();
     let _ = link.call(None, "Browser.close", json!({})).await;
     println!("OBSERVED people page: {}", head(&text));
+    println!("OBSERVED management page: {}", head(&management));
     for hidden in [
         "settings-sync-account-control",
         "#edit-profile",
@@ -407,7 +419,12 @@ async fn the_people_page_offers_no_sign_in() {
         );
     }
     assert!(!text.contains("Turn on sync"), "{text}");
-    assert!(!text.to_lowercase().contains("managed by"), "{text}");
+    // Defaults, not policies: chrome://management says so. (The people page's own text holds
+    // hidden "managed by your administrator" notes of the sync settings either way.)
+    assert!(
+        management.contains("Your browser is not managed"),
+        "{management}"
+    );
 }
 
 /// A value the person chose wins over pegboard's default: saved before the browser starts
@@ -443,8 +460,8 @@ async fn a_chosen_value_wins_over_the_default() {
         json!(true),
         "{values:?}"
     );
-    // Chosen for this start: sign-in is allowed again.
-    assert_eq!(value("signin.allowed"), json!(true), "{values:?}");
+    // (signin.allowed follows it only in a build with a Google OAuth client: this one has
+    // none, so upstream never allows sign-in here, CanEnableDiceForBuild.)
     // The rest keep pegboard's default.
     assert_eq!(
         value("credentials_enable_autosignin"),
