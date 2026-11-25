@@ -367,6 +367,11 @@ pub fn confirmation_answer(e: &CdpEvent) -> Option<ConfirmRespondParams>;
 - 포크(`ForkLaunched`, `Hosted`)에서 데몬은 시작 때 `broker.set_browser(Some(DomainResponder))`, 제어 연결의 이벤트 감시(`follow_profiles`와 같은 수신기 또는 하나 더)에서 `confirmationAnswered`를 넘긴다. 물리 연결이 끝나면 `set_browser(None)`. 순정은 `None` 그대로.
 - `place`: 세션의 컨텍스트(`AgentContexts::context_of(profile)`)와 세션의 타깃 목록. 컨텍스트를 모르면 `place = None`(브라우저는 응답자가 아니다).
 - 늦은 답(`confirm_not_found`)과 모양이 틀린 이벤트는 `tracing::debug`로만 남긴다.
+- **구현에서 정한 것** (처음 제안은 위 표와 `tracing::debug`):
+  - `ConfirmPlace`에 `profile_directory`를 더했다(`requestConfirmation`의 `profileDirectory`는 세션 이름이 아닌 실제 디렉터리 `PegboardAgent` / `PegboardAgent-<이름>`). `targetIds`는 세션의 탭이고, agent-browser가 붙은 탭(명령이 닿는 탭)이 세션 탭이면 맨 앞이다. 세션 탭이 아닌 것은 넣지 않는다. 탭이 없어도 컨텍스트를 알면 자리는 있다(그 프로필의 창).
+  - 함수: `domain::confirm_place(agents, profile_dir, acted_on, targets) -> Option<ConfirmPlace>`, `SessionManager::confirm_place(id, acted_on)`(순정이면 `None`), `domain::serve_confirmations(broker, conn, link) -> JoinHandle`(이벤트 수신기를 먼저 만들고 `set_browser(Some)`, 링크가 끝나면 `set_browser(None)`), `Browser::serve_confirmations(broker) -> Option<JoinHandle>`(순정 `None`). `Daemon::assemble`이 부른다.
+  - 이벤트는 제어 연결 자신의 세션(`sessionId` 없음) 것만, `params`는 정확히 `{confirmId, answer}`(다른 필드가 있으면 버린다). 답은 `broker.respond(.., ConfirmBy::Browser)`이고, 브라우저가 받지 않은(또는 이미 빠진) 확인은 중개자가 `confirm_not_found`로 거절한다.
+  - 워크스페이스에 `tracing`이 없어 늦은 답과 틀린 이벤트는 기록 없이 버린다. 이벤트 큐가 넘쳐(`Lagged`) 잃은 답은 그 확인을 시간 초과(거부)로 끝낸다(닫힌 쪽으로 실패).
 
 - [ ] **Step 1: 실패하는 시험을 쓴다.**
 
@@ -457,6 +462,8 @@ base::TimeDelta AnswerAfter();                      // PEGBOARD_TEST_DIALOG_ANSW
 규칙(설계 4.5):
 - 핸들러: `requestConfirmation`은 주인 세션만(아니면 `-32601`), 컨텍스트·탭이 에이전트 것이 아니면 `-32000`, `confirmId`는 32자리 소문자 16진수이고 열린 것과 겹치지 않음, `actionClass` ∈ {`upload`, `state`}, `details` ≤ 40, 값 ≤ 1,000자, 열린 창 ≤ 16. 창은 `targetIds` 중 처음 찾은 탭의 창, 없으면 그 컨텍스트의 가장 최근 일반 창, 없으면 `-32000 "no window"`. `cancelConfirmation`은 없으면 성공. 답과 창 닫힘은 주인 세션에만 `confirmationAnswered`. 주인이 떨어지거나 바뀌면 열린 창을 모두 `Close()`(이벤트 없음). 창마다 75초 안전 시간(`Close()`).
 - 창: 웹 콘텐츠 밖의 브라우저 모달(156의 `ui::DialogModel` + `constrained_window` 브라우저 모달 함수, 정확한 이름은 트리에서 찾는다), `ShowInactive`, 기본 버튼·Esc·닫기 = 거부, 버튼 1초 잠금(잠긴 동안의 누름은 무시하고 훅 기록에 `"ignored": "locked"`), 문구는 설계 4.5. 앱이 활성이 아니면 `[NSApp requestUserAttention:NSInformationalRequest]` 한 번.
+- 작업 5가 보내는 모양 그대로(`crates/pegboard-core/src/bridge/domain.rs` `request_params`와 시험 `request_sends_the_shape_the_domain_expects`): `details`는 데몬이 정한 순서다. 업로드는 `호스트`(맨 앞, 왼쪽을 자른 호스트), `대상 페이지`(출처), 파일마다 `파일`(실제 경로 전체)과 `크기`; 쿠키는 `호스트`(맨 앞), `URL`·`도메인`(있을 때), `경로`, `플래그` 줄이 있다. 창은 `details`의 순서를 바꾸지 않고 하나도 빼지 않는다. `offerAllowForSession`이 거짓이면 셋째 버튼이 없다. `sessionName`은 이미 데몬이 거른 글이다(브라우저가 한 번 더 거른다).
+- **경로 표시**: `파일` 값(그리고 쿠키의 `경로`)은 **LTR로 격리해서**(`base::i18n::WrapStringWithLTRFormatting` 또는 라벨의 방향을 LTR로 고정. 격리 문자는 `DisplayText`로 거른 **뒤에** 창이 붙인다) **자르지 않고** 보인다: 줄 바꿈(`SetMultiLine`)으로 다 보이고 가운데·끝 생략(`ELIDE_*`)은 쓰지 않는다. 데몬은 1,000자를 넘거나 거르면 달라지는 경로는 묻기 전에 거부하므로, `DisplayText(value, 1000)`은 경로를 바꾸지 않아야 한다. 오른쪽에서 왼쪽 글자(히브리어 등)가 든 경로도 사람 창이 RTL 언어여도 디렉터리 순서가 뒤집혀 보이지 않아야 한다.
 - 시험 훅: `Enabled()`가 거짓이면 다른 훅 함수는 아무것도 하지 않는다. 기록 한 줄: `{"kind":"confirm","confirmId","profile","lines":[창에 보인 글 전부],"buttons":[…],"keyWindowProfileBefore","keyWindowProfileAt0","keyWindowProfileAt200ms","appActiveBefore","appActiveAt200ms","pressed","ignored"?}`. `PEGBOARD_TEST_DIALOG_ANSWER` = `<세션 이름>=<답>` 쉼표 목록, `*`는 나머지(답: `approve`, `deny`, `allowForSession`, `none`). 훅은 진짜 버튼 처리 함수를 부른다.
 
 - [ ] **Step 1: 시험을 쓴다** (`e2e_confirm.rs`의 포크 판, `#[ignore]`, `PEGBOARD_TEST_BROWSER=fork:…`일 때만. 데몬이 포크를 `ForkLaunched`로 띄우고 브라우저 환경에 `PEGBOARD_TEST_HOOKS=1`, `PEGBOARD_TEST_DIALOG_LOG`, `PEGBOARD_TEST_DIALOG_ANSWER`를 준다. 사람 창은 시험이 먼저 연 `Default` 창).

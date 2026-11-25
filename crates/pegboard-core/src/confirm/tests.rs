@@ -43,6 +43,7 @@ const B: &str = "bbbbbbbb";
 fn place() -> ConfirmPlace {
     ConfirmPlace {
         browser_context_id: "C1".into(),
+        profile_directory: "PegboardAgent".into(),
         target_ids: vec!["T1".into()],
     }
 }

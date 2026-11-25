@@ -23,6 +23,7 @@ use crate::address::Verdict;
 use crate::bridge::{GroupId, TabBridge};
 use crate::browser::Browser;
 use crate::cdp::{page_targets, CdpConn, CdpEvent};
+use crate::confirm::ConfirmPlace;
 use crate::downloads::{PolicyLost, Report, SessionView};
 use crate::guard::{judge_request, Guard, Resolver};
 use crate::paths::Paths;
@@ -733,6 +734,23 @@ impl SessionManager {
     pub fn context_of(&self, id: &SessionId) -> Result<String, RpcError> {
         let table = self.inner.table.lock().unwrap();
         Ok(ready(&table, id)?.context.clone())
+    }
+
+    /// Where the browser would show a question of the session (`domain::confirm_place`):
+    /// its profile's context now and its tabs, `acted_on` first. `None` on stock Chrome (no
+    /// dialog), and for a session or profile context that is not known.
+    pub fn confirm_place(&self, id: &SessionId, acted_on: Option<&str>) -> Option<ConfirmPlace> {
+        let browser = &self.inner.browser;
+        if !browser.is_fork() {
+            return None;
+        }
+        let info = self.info(id).ok()?;
+        crate::bridge::domain::confirm_place(
+            &browser.agents,
+            &profile_dir(&info.profile),
+            acted_on,
+            &info.targets,
+        )
     }
 
     /// The session's download reports since the last call (see `downloads::Report`).

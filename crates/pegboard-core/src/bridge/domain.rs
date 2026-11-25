@@ -9,16 +9,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
+use pegboard_protocol::{ConfirmBy, ConfirmRequired, ConfirmRespondParams};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 use super::{lock, ActivityFn, GroupId, TabBridge, CLOSE_QUIET};
 use crate::cdp::{CdpConn, CdpEvent};
-use crate::contexts::is_agent_profile_dir;
+use crate::confirm::{BrowserResponder, ConfirmBroker, ConfirmPlace};
+use crate::contexts::{is_agent_profile_dir, AgentContexts};
+use crate::link::BrowserLink;
 
 const TAB_ACTIVATED: &str = "Pegboard.tabActivated";
 const PROFILE_LOADED: &str = "Pegboard.profileLoaded";
 const PROFILE_UNLOADED: &str = "Pegboard.profileUnloaded";
+const CONFIRMATION_ANSWERED: &str = "Pegboard.confirmationAnswered";
 
 pub struct DomainBridge {
     conn: CdpConn,
@@ -296,6 +301,145 @@ fn names(v: &Value) -> Option<(String, String)> {
     let dir = v["profileDirectory"].as_str().filter(|s| !s.is_empty())?;
     let context = v["browserContextId"].as_str().filter(|s| !s.is_empty())?;
     Some((dir.to_string(), context.to_string()))
+}
+
+/// The browser as a responder of the confirmation broker (design 4.5): the domain shows a
+/// confirmation as a dialog in the window of the session's tab (`requestConfirmation`) and
+/// closes it again (`cancelConfirmation`); a person's answer comes back as the event
+/// `Pegboard.confirmationAnswered` (`serve_confirmations`). The domain sends the event only
+/// to the session that claimed it: the control connection.
+pub struct DomainResponder {
+    conn: CdpConn,
+}
+
+impl DomainResponder {
+    /// The responder on `control`, the connection that claimed the domain.
+    pub fn new(control: CdpConn) -> DomainResponder {
+        DomainResponder { conn: control }
+    }
+}
+
+/// The params of `Pegboard.requestConfirmation` for `req`, shown at `place`.
+fn request_params(req: &ConfirmRequired, place: &ConfirmPlace) -> Value {
+    json!({
+        "confirmId": req.confirm_id,
+        "browserContextId": place.browser_context_id,
+        "targetIds": place.target_ids,
+        "sessionId": req.session_id.0,
+        "sessionName": req.session_name,
+        "profileDirectory": place.profile_directory,
+        "actionClass": req.class.as_str(),
+        "details": req.details,
+        "offerAllowForSession": req.offer_allow_for_session,
+    })
+}
+
+#[async_trait]
+impl BrowserResponder for DomainResponder {
+    /// `Pegboard.requestConfirmation`; the domain answers `{}` once the dialog is up, and an
+    /// error when it cannot show one (no window of the profile, a limit).
+    async fn show(&self, req: &ConfirmRequired, place: &ConfirmPlace) -> Result<()> {
+        self.conn
+            .send(
+                "Pegboard.requestConfirmation",
+                request_params(req, place),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `Pegboard.cancelConfirmation`, which succeeds for a dialog that is gone. A failure
+    /// (the link is gone) leaves nothing to do: the domain closes its dialogs when its owner
+    /// goes, and each after its own safety time.
+    async fn cancel(&self, confirm_id: &str) {
+        let _ = self
+            .conn
+            .send(
+                "Pegboard.cancelConfirmation",
+                json!({ "confirmId": confirm_id }),
+                None,
+            )
+            .await;
+    }
+}
+
+/// The answer a `Pegboard.confirmationAnswered` of the control connection's own session
+/// carries: exactly `{confirmId, answer}`. `None` for any other event and a malformed one.
+pub fn confirmation_answer(e: &CdpEvent) -> Option<ConfirmRespondParams> {
+    if e.method != CONFIRMATION_ANSWERED || e.session_id.is_some() {
+        return None;
+    }
+    serde_json::from_value(e.params.clone()).ok()
+}
+
+/// Makes the browser a responder of `broker` (`set_browser`) while `link` lives, and hands
+/// the domain's answers on `conn` to it as `ConfirmBy::Browser` (the broker takes them only
+/// for confirmations the browser was asked and still shows). When the link ends the browser
+/// is no responder any more: what only it could answer ends as `NoResponder`. An answer
+/// that does not count (late, for an id the browser was not shown, malformed) is dropped:
+/// a late one is ordinary (the dialog raced the time limit or an API answer).
+pub fn serve_confirmations(
+    broker: &Arc<ConfirmBroker>,
+    conn: CdpConn,
+    link: BrowserLink,
+) -> JoinHandle<()> {
+    // Before the browser is a responder: no answer can come before the watch.
+    let mut events = conn.events();
+    broker.set_browser(Some(Arc::new(DomainResponder::new(conn))));
+    let broker = Arc::downgrade(broker);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = link.closed() => break,
+                e = events.recv() => match e {
+                    Ok(e) => {
+                        let Some(answer) = confirmation_answer(&e) else {
+                            continue;
+                        };
+                        let Some(b) = broker.upgrade() else {
+                            return;
+                        };
+                        let _ = b.respond(&answer, ConfirmBy::Browser);
+                    }
+                    // An answer lost here leaves its command waiting until its time is up
+                    // (denied): fail closed.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+        if let Some(b) = broker.upgrade() {
+            b.set_browser(None);
+        }
+    })
+}
+
+/// Where the browser shows a question of a session in the agent profile `profile_dir`: the
+/// profile's context now, and the session's tabs (`targets`), the one agent-browser acts on
+/// (`acted_on`) first. `None` when the profile has no known context (the browser is then no
+/// responder for the question).
+pub fn confirm_place(
+    agents: &AgentContexts,
+    profile_dir: &str,
+    acted_on: Option<&str>,
+    targets: &[String],
+) -> Option<ConfirmPlace> {
+    let browser_context_id = agents.context_of(profile_dir)?;
+    let mut target_ids: Vec<String> = Vec::with_capacity(targets.len());
+    if let Some(first) = acted_on.filter(|t| targets.iter().any(|s| s == t)) {
+        target_ids.push(first.to_string());
+    }
+    for t in targets {
+        if !target_ids.contains(t) {
+            target_ids.push(t.clone());
+        }
+    }
+    Some(ConfirmPlace {
+        browser_context_id,
+        profile_directory: profile_dir.to_string(),
+        target_ids,
+    })
 }
 
 #[cfg(test)]
@@ -711,5 +855,325 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+
+    use std::time::Duration;
+
+    use pegboard_protocol::{ActionClass, ConfirmAnswer, ConfirmDetail, ConfirmOutcome, SessionId};
+    use serde_json::{json, Value};
+
+    use crate::confirm::{ConfirmAsk, ConfirmDecision};
+    use crate::link::fake::FakeBrowser;
+
+    const LONG: Duration = Duration::from_secs(20);
+
+    fn place() -> ConfirmPlace {
+        ConfirmPlace {
+            browser_context_id: "C1".into(),
+            profile_directory: "PegboardAgent-work".into(),
+            target_ids: vec!["T2".into(), "T1".into()],
+        }
+    }
+
+    fn question(place: Option<ConfirmPlace>) -> ConfirmAsk {
+        ConfirmAsk {
+            session_id: SessionId("s_aaaaaaaa".into()),
+            session_name: "build".into(),
+            profile: "work".into(),
+            class: ActionClass::Upload,
+            details: vec![
+                ConfirmDetail {
+                    label: "host".into(),
+                    value: "https://a.test".into(),
+                },
+                ConfirmDetail {
+                    label: "file".into(),
+                    value: "/tmp/report.pdf (12 bytes)".into(),
+                },
+            ],
+            offer_allow_for_session: false,
+            place,
+        }
+    }
+
+    /// A broker whose browser responder is the domain on a fake browser.
+    async fn served() -> (Arc<ConfirmBroker>, FakeBrowser, JoinHandle<()>) {
+        let (link, fake) = FakeBrowser::start();
+        let conn = CdpConn::over(&link).await.unwrap();
+        let broker = ConfirmBroker::new(LONG);
+        let serving = serve_confirmations(&broker, conn, link);
+        (broker, fake, serving)
+    }
+
+    fn ask(
+        broker: &Arc<ConfirmBroker>,
+        place: Option<ConfirmPlace>,
+    ) -> JoinHandle<ConfirmDecision> {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.ask(question(place)).await })
+    }
+
+    /// The next request, which must be `method` on the control connection's own session.
+    async fn expect(fake: &mut FakeBrowser, method: &str) -> Value {
+        let m = fake.next().await;
+        assert_eq!(m["method"], method, "{m}");
+        assert_eq!(m["sessionId"], "B1", "{m}");
+        m
+    }
+
+    fn answered(id: &Value, answer: &str) -> Value {
+        json!({ "method": "Pegboard.confirmationAnswered", "sessionId": "B1",
+                "params": { "confirmId": id, "answer": answer } })
+    }
+
+    async fn decided(h: JoinHandle<ConfirmDecision>) -> ConfirmDecision {
+        tokio::time::timeout(Duration::from_secs(3), h)
+            .await
+            .expect("the confirmation did not end within 3 s")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_sends_the_shape_the_domain_expects() {
+        let (broker, mut fake, _serving) = served().await;
+        let waiting = ask(&broker, Some(place()));
+        let m = expect(&mut fake, "Pegboard.requestConfirmation").await;
+        let id = broker.pending()[0].confirm_id.clone();
+        assert_eq!(
+            m["params"],
+            json!({
+                "confirmId": id,
+                "browserContextId": "C1",
+                "targetIds": ["T2", "T1"],
+                "sessionId": "s_aaaaaaaa",
+                "sessionName": "build",
+                "profileDirectory": "PegboardAgent-work",
+                "actionClass": "upload",
+                "details": [
+                    { "label": "host", "value": "https://a.test" },
+                    { "label": "file", "value": "/tmp/report.pdf (12 bytes)" },
+                ],
+                "offerAllowForSession": false,
+            })
+        );
+        fake.answer(&m, json!({}));
+        // Ending it another way (here: the daemon stops) closes the dialog.
+        broker.cancel_all();
+        let m = expect(&mut fake, "Pegboard.cancelConfirmation").await;
+        assert_eq!(m["params"], json!({ "confirmId": id }));
+        fake.answer(&m, json!({}));
+        assert_eq!(decided(waiting).await.outcome, ConfirmOutcome::Cancelled);
+        fake.quiet().await;
+    }
+
+    #[tokio::test]
+    async fn an_answer_event_reaches_the_broker_as_by_browser() {
+        let (broker, mut fake, _serving) = served().await;
+        for (answer, outcome) in [
+            ("approve", ConfirmOutcome::Approved),
+            ("deny", ConfirmOutcome::Denied),
+        ] {
+            let waiting = ask(&broker, Some(place()));
+            let m = expect(&mut fake, "Pegboard.requestConfirmation").await;
+            fake.answer(&m, json!({}));
+            fake.send(answered(&m["params"]["confirmId"], answer));
+            // The broker closes the window it answered from (the domain: no such window
+            // any more, which is a success).
+            let c = expect(&mut fake, "Pegboard.cancelConfirmation").await;
+            assert_eq!(c["params"]["confirmId"], m["params"]["confirmId"]);
+            fake.answer(&c, json!({}));
+            let d = decided(waiting).await;
+            assert_eq!(d.outcome, outcome);
+            assert_eq!(d.by, Some(ConfirmBy::Browser));
+            assert_eq!(json!(d.confirm_id), m["params"]["confirmId"]);
+        }
+        fake.quiet().await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_drops_the_browser_out() {
+        let (broker, mut fake, _serving) = served().await;
+        // Nobody else can answer: it ends at once.
+        let waiting = ask(&broker, Some(place()));
+        let m = expect(&mut fake, "Pegboard.requestConfirmation").await;
+        fake.send(json!({ "id": m["id"], "sessionId": "B1",
+            "error": { "code": -32000, "message": "no window" } }));
+        assert_eq!(decided(waiting).await.outcome, ConfirmOutcome::NoResponder);
+        // It may have shown a window all the same: it is closed.
+        let c = expect(&mut fake, "Pegboard.cancelConfirmation").await;
+        fake.answer(&c, json!({}));
+
+        // With a subscriber it waits on, and the browser's answer no longer counts.
+        let _sub = broker.subscribe().unwrap();
+        let waiting = ask(&broker, Some(place()));
+        let m = expect(&mut fake, "Pegboard.requestConfirmation").await;
+        fake.send(json!({ "id": m["id"], "sessionId": "B1",
+            "error": { "code": -32000, "message": "no window" } }));
+        let c = expect(&mut fake, "Pegboard.cancelConfirmation").await;
+        fake.answer(&c, json!({}));
+        let id = m["params"]["confirmId"].as_str().unwrap().to_string();
+        fake.send(answered(&json!(id), "approve"));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(broker.pending().len(), 1, "the browser's answer counted");
+        broker
+            .respond(
+                &ConfirmRespondParams {
+                    confirm_id: id,
+                    answer: ConfirmAnswer::Deny,
+                },
+                ConfirmBy::Api,
+            )
+            .unwrap();
+        let d = decided(waiting).await;
+        assert_eq!(
+            (d.outcome, d.by),
+            (ConfirmOutcome::Denied, Some(ConfirmBy::Api))
+        );
+        fake.quiet().await;
+    }
+
+    #[tokio::test]
+    async fn losing_the_control_link_unregisters_the_browser() {
+        let (broker, mut fake, serving) = served().await;
+        assert!(broker.has_responder(true));
+        let waiting = ask(&broker, Some(place()));
+        let m = expect(&mut fake, "Pegboard.requestConfirmation").await;
+        fake.answer(&m, json!({}));
+        fake.disconnect();
+        assert_eq!(decided(waiting).await.outcome, ConfirmOutcome::NoResponder);
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .expect("the watch did not end with the link")
+            .unwrap();
+        assert!(!broker.has_responder(true));
+        // A later question has nobody to ask.
+        assert_eq!(
+            broker.ask(question(Some(place()))).await.outcome,
+            ConfirmOutcome::NoResponder
+        );
+    }
+
+    #[tokio::test]
+    async fn answers_for_unknown_ids_are_ignored() {
+        let (broker, mut fake, _serving) = served().await;
+        let _sub = broker.subscribe().unwrap();
+        // Asked of the API subscriber only (no place): the browser was not shown it.
+        let api_only = ask(&broker, None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while broker.pending().is_empty() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let api_id = broker.pending()[0].confirm_id.clone();
+        let shown = ask(&broker, Some(place()));
+        let m = expect(&mut fake, "Pegboard.requestConfirmation").await;
+        fake.answer(&m, json!({}));
+        let shown_id = m["params"]["confirmId"].clone();
+
+        fake.send(answered(&json!(api_id), "approve"));
+        fake.send(answered(&json!("0".repeat(32)), "approve"));
+        // Malformed, or not the control connection's own session's.
+        for params in [
+            json!({ "confirmId": shown_id }),
+            json!({ "answer": "approve" }),
+            json!({ "confirmId": shown_id, "answer": "yes" }),
+            json!({ "confirmId": shown_id, "answer": "approve", "sessionId": "s_bbbbbbbb" }),
+        ] {
+            fake.send(
+                json!({ "method": "Pegboard.confirmationAnswered", "sessionId": "B1",
+                              "params": params }),
+            );
+        }
+        fake.send(
+            json!({ "method": "Pegboard.confirmationAnswered", "sessionId": "S-TAB",
+                          "params": { "confirmId": shown_id, "answer": "approve" } }),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            broker.pending().len(),
+            2,
+            "an answer that does not count counted"
+        );
+
+        // The watch is still there for a real one.
+        fake.send(answered(&shown_id, "deny"));
+        let c = expect(&mut fake, "Pegboard.cancelConfirmation").await;
+        assert_eq!(c["params"]["confirmId"], shown_id);
+        fake.answer(&c, json!({}));
+        let d = decided(shown).await;
+        assert_eq!(
+            (d.outcome, d.by),
+            (ConfirmOutcome::Denied, Some(ConfirmBy::Browser))
+        );
+        broker.cancel_all();
+        assert_eq!(decided(api_only).await.outcome, ConfirmOutcome::Cancelled);
+        // The browser never had it: no window to close.
+        fake.quiet().await;
+    }
+
+    #[test]
+    fn confirmation_answer_reads_only_the_domain_event() {
+        let ev = |method: &str, session: Option<&str>, params: Value| CdpEvent {
+            method: method.into(),
+            params,
+            session_id: session.map(String::from),
+        };
+        let p = json!({ "confirmId": "ab", "answer": "allowForSession" });
+        assert_eq!(
+            confirmation_answer(&ev(CONFIRMATION_ANSWERED, None, p.clone())),
+            Some(ConfirmRespondParams {
+                confirm_id: "ab".into(),
+                answer: ConfirmAnswer::AllowForSession
+            })
+        );
+        assert_eq!(
+            confirmation_answer(&ev(CONFIRMATION_ANSWERED, Some("S1"), p.clone())),
+            None
+        );
+        assert_eq!(
+            confirmation_answer(&ev("Pegboard.tabActivated", None, p)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_context_gives_no_place() {
+        let agents = AgentContexts::default();
+        let tabs = vec!["T1".to_string(), "T2".to_string()];
+        assert_eq!(confirm_place(&agents, "PegboardAgent", None, &tabs), None);
+        agents.set("PegboardAgent", "C1");
+        // Another profile's context is not this one's.
+        assert_eq!(
+            confirm_place(&agents, "PegboardAgent-work", None, &tabs),
+            None
+        );
+        // A person's profile never has a place.
+        assert_eq!(confirm_place(&agents, "Default", None, &tabs), None);
+        assert_eq!(
+            confirm_place(&agents, "PegboardAgent", Some("T2"), &tabs),
+            Some(ConfirmPlace {
+                browser_context_id: "C1".into(),
+                profile_directory: "PegboardAgent".into(),
+                target_ids: vec!["T2".into(), "T1".into()],
+            })
+        );
+        // A tab agent-browser acts on that is not the session's is not shown first (or at
+        // all); no tab at all still has the profile's window.
+        assert_eq!(
+            confirm_place(&agents, "PegboardAgent", Some("T9"), &tabs).map(|p| p.target_ids),
+            Some(tabs.clone())
+        );
+        assert_eq!(
+            confirm_place(&agents, "PegboardAgent", None, &[]).map(|p| p.target_ids),
+            Some(vec![])
+        );
+        // The profile unloaded: nowhere.
+        agents.forget_context("C1");
+        assert_eq!(confirm_place(&agents, "PegboardAgent", None, &tabs), None);
     }
 }

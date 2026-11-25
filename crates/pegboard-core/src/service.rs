@@ -518,6 +518,9 @@ impl Daemon {
             .set_policy_lookup(Arc::new(move |id: &SessionId| {
                 weak.upgrade()?.sessions.policy(id).ok()
             }));
+        // The fork's domain shows questions in the agent windows while the link lives;
+        // stock Chrome has no dialog (only API subscribers answer).
+        let _ = daemon.browser.serve_confirmations(&daemon.confirm);
         // A profile whose download policy could not be set again in time loses its sessions.
         let weak = Arc::downgrade(&daemon);
         daemon

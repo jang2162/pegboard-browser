@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use crate::bridge::domain::{self, ProfileEvent};
 use crate::bridge::{DomainBridge, ExtensionBridge, TabBridge};
 use crate::cdp::{page_targets, CdpConn, CdpEvent};
+use crate::confirm::ConfirmBroker;
 use crate::contexts::{is_agent_profile_dir, AgentContexts};
 use crate::downloads::Downloads;
 use crate::link::BrowserLink;
@@ -401,6 +402,19 @@ impl Browser {
                     .await
             }
             Mode::Fork => self.open_profile_window_by_domain(profile_dir).await,
+        }
+    }
+
+    /// Makes the browser a responder of `broker` while the link lives (the fork's domain:
+    /// `domain::serve_confirmations`). Stock Chrome has no way to ask a person: `None`.
+    pub fn serve_confirmations(&self, broker: &Arc<ConfirmBroker>) -> Option<JoinHandle<()>> {
+        match self.mode {
+            Mode::Stock { .. } => None,
+            Mode::Fork => Some(domain::serve_confirmations(
+                broker,
+                self.conn.clone(),
+                self.link.clone(),
+            )),
         }
     }
 
@@ -959,6 +973,64 @@ mod fork_tests {
             .await
             .expect("quit returns when the connection ends")
             .unwrap();
+    }
+
+    /// Stock Chrome has no `Pegboard` domain: the browser is never a responder, so a
+    /// question there has only API subscribers (and with none is `no_responder`).
+    #[tokio::test]
+    async fn stock_has_no_browser_responder() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(home.path());
+        let (link, mut fake) = FakeBrowser::start();
+        let conn = CdpConn::over(&link).await.unwrap();
+        let agents = AgentContexts::default();
+        let downloads = Downloads::new(&link, agents.clone(), conn.clone(), &paths).unwrap();
+        let stock = Browser {
+            pid: 0,
+            ws_url: None,
+            link,
+            conn,
+            agents,
+            child: None,
+            mode: Mode::Stock {
+                chrome: PathBuf::from("/nonexistent/chrome"),
+                user_data_dir: paths.chrome_udd.clone(),
+                launch_context: "H0".into(),
+            },
+            profiles: Mutex::new(HashMap::new()),
+            downloads,
+            profile_watch: None,
+        };
+        let broker = crate::confirm::ConfirmBroker::new(Duration::from_secs(20));
+        assert!(stock.serve_confirmations(&broker).is_none());
+        assert!(!broker.has_responder(true));
+        fake.quiet().await;
+    }
+
+    /// The fork's domain is: from the start until its link ends.
+    #[tokio::test]
+    async fn the_fork_serves_confirmations_while_its_link_lives() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(home.path());
+        let (link, mut fake) = FakeBrowser::start();
+        let start = tokio::spawn(async move { Browser::hosted(&paths, link).await });
+        let m = expect(&mut fake, "Pegboard.claim").await;
+        fake.answer(&m, json!({}));
+        let m = expect(&mut fake, "Pegboard.getProfiles").await;
+        fake.answer(&m, json!({ "profiles": [] }));
+        let m = expect(&mut fake, "Target.getTargets").await;
+        fake.answer(&m, json!({ "targetInfos": [] }));
+        let b = start.await.unwrap().unwrap();
+        let broker = crate::confirm::ConfirmBroker::new(Duration::from_secs(20));
+        let serving = b.serve_confirmations(&broker).expect("the fork answers");
+        assert!(broker.has_responder(true));
+        assert!(!broker.has_responder(false));
+        fake.disconnect();
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!broker.has_responder(true));
     }
 
     #[test]

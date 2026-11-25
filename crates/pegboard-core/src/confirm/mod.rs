@@ -64,10 +64,12 @@ fn new_confirm_id() -> String {
     data_encoding::HEXLOWER.encode(&bytes)
 }
 
-/// Where the browser shows a confirmation: the session's browser context and tabs.
+/// Where the browser shows a confirmation: the session's agent profile (its directory and
+/// browser context) and its tabs, the one the command acts on first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmPlace {
     pub browser_context_id: String,
+    pub profile_directory: String,
     pub target_ids: Vec<String>,
 }
 

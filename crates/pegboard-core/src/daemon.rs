@@ -227,7 +227,7 @@ pub async fn run_command_with_hook(
     let mut asked_sources = Vec::new();
     if is_upload && matches!(judged, Judged::Ask) {
         // Nobody to answer: denied before any file is looked at or copied.
-        if !confirm.has_responder(question_place().is_some()) {
+        if !confirm.has_responder(question_place(sessions, runner, id).is_some()) {
             entry.confirm = Some(ConfirmLog {
                 outcome: ConfirmOutcome::NoResponder,
                 by: None,
@@ -709,10 +709,15 @@ fn judged_verdict(policy: &SessionPolicy, granted: &[ActionClass], class: Action
     }
 }
 
-/// Where the browser would show a question of the session: nowhere yet (the browser as a
-/// responder comes with the fork's domain), so only API subscribers answer.
-fn question_place() -> Option<ConfirmPlace> {
-    None
+/// Where the browser would show a question of the session: the window of the tab the
+/// command acts on (else of another of its tabs, else of its profile). `None` (only API
+/// subscribers answer) on stock Chrome and when the profile's context is not known.
+fn question_place(
+    sessions: &SessionManager,
+    runner: &Runner,
+    id: &SessionId,
+) -> Option<ConfirmPlace> {
+    sessions.confirm_place(id, screen_target(sessions, runner, id).as_deref())
 }
 
 /// The files of an upload that asks a person (`upload <selector> <file>...`), each with
@@ -1122,7 +1127,7 @@ async fn prepare_question(
             class,
             details,
             offer_allow_for_session: offers_allow_for_session(class, &info.policy),
-            place: question_place(),
+            place: question_place(sessions, runner, id),
         },
         pin,
     ))
