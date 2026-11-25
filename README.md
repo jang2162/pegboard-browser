@@ -10,6 +10,8 @@ AI 에이전트가 브라우저를 쓰되, 사람이 쓰는 브라우저 데이�
 
 **2b단계(녹화와 재생).** 세션 탭의 화면, 탐색 기록, 사람 개입 가능성, 선택 기록(네트워크, 콘솔)을 남기고, 보존 정리와 `pegboard recording open`(재생 화면)을 더했다(아래 "녹화"). 자동 시험은 끝났다(2026-11-18). 손으로 하는 확인은 [docs/phase2b-manual-checks.md](docs/phase2b-manual-checks.md)에 있다(아직 수행하지 않았다).
 
+**3a단계(Chromium 포크 뼈대).** Chromium `156.0.8078.109`에 패치 넷을 얹은 `Pegboard.app`을 빌드할 수 있다(`browser/`). 앱을 켜면 앱이 `pegboard` 데몬을 자식으로 띄우고 DevTools를 파이프로 넘긴다. TCP 디버깅 포트는 열리지 않는다. 탭그룹과 에이전트 프로필은 확장 프로그램 대신 브라우저 안의 `Pegboard` CDP 도메인이 다룬다. 1~2단계의 실제 브라우저 시험 전체가 포크 구성과 순정 구성 양쪽에서 통과했다(2026-11-24, 알려진 실패 둘 제외: 아래 "시험"). 아직 개발용 빌드다: 임시 서명이고 설치 패키지, 자동 업데이트, 에이전트 탭 표시, 확인 창이 없다(3b, 3c). 순정 Chrome 구성은 개발·시험용으로 남는다.
+
 ## 준비
 
 - Rust (stable). `cargo build --release`로 `target/release/pegboard`를 만든다.
@@ -23,6 +25,27 @@ export PATH="$PWD/target/release:$PATH"
 ```
 
 데이터는 `~/Library/Application Support/Pegboard`에 쌓인다. 다른 곳을 쓰려면 `PEGBOARD_HOME`을 지정한다(소켓 경로 길이 때문에 짧아야 한다).
+
+## 포크 모드 (Pegboard.app)
+
+Chromium을 받아 패치를 얹고 빌드하는 방법은 [browser/README.md](browser/README.md). 디스크 100GB 이상, Xcode와 Metal 도구 모음이 있어야 하고, 빈 상태 빌드는 동시 작업 8개로 2시간 반 안팎이다.
+
+```bash
+browser/scripts/fetch.sh <src>                            # Chromium 소스 받기 (<src>는 .../chromium/src)
+browser/scripts/apply.sh <src>                            # 패치 얹기
+browser/scripts/build.sh <src>                            # <src>/out/Pegboard/Pegboard.app
+browser/scripts/package-dev.sh <src> ~/Applications/Pegboard.app   # pegboard와 agent-browser를 넣고 임시 서명
+```
+
+- `package-dev.sh`는 이 저장소의 `pegboard`를 배포용으로 빌드해 `Contents/Helpers/pegboard`에, agent-browser를 `Contents/Helpers/agent-browser`에 넣는다. Rust만 고쳤으면 Chromium을 다시 빌드하지 않고 이것만 다시 돌린다.
+- 켜기: Dock이나 Finder, `open -a Pegboard`, 또는 `pegboard browser start`(앱이 `/Applications`나 `~/Applications`에 있으면 기본이 포크다. 아래 "설정"의 `[browser] kind`). 브라우저 데이터는 `~/Library/Application Support/Pegboard`에 있다.
+- 앱이 켜지면 데몬(`pegboard daemon --cdp-pipe`)이 따라 뜬다. CLI와 MCP는 순정 모드와 똑같이 쓴다. CLI는 앱 안의 `Contents/Helpers/pegboard`를 쓰거나 같은 판으로 빌드한 것을 쓴다(데몬과 판이 다르면 세션 만들기가 거부될 수 있다).
+- 데몬이 죽으면 앱이 1초 뒤 다시 띄운다. 1분 안에 3번까지이고, 넘으면 그 브라우저 프로세스가 끝날 때까지 데몬 없이 간다(알림 화면은 없다. 브라우저를 다시 켠다). 다른 데몬(순정 모드 데몬 등)이 이미 같은 홈을 쥐고 있으면 앱의 데몬은 종료 코드 4로 끝나고 다시 띄우지 않는다.
+- 새 데몬은 시작할 때 에이전트 프로필에 남은 탭을 닫고 이전 세션의 녹화를 마감한다. 세션은 이어지지 않으므로 에이전트는 세션을 다시 만든다.
+- 브라우저를 끄면(Cmd-Q, `pegboard browser stop`) 데몬은 파이프가 끝난 것을 보고 세션을 정리한 뒤 끝난다. 5초 안에 끝나지 않으면 브라우저가 `SIGTERM`을, 다시 3초 뒤 `SIGKILL`을 보낸다.
+- 에이전트 프로필은 디렉터리 이름이 `PegboardAgent` 또는 `PegboardAgent-`로 시작하는 프로필이다. 그 밖의 모든 프로필(사람이 더 만든 프로필 포함)은 사람 것이고, 브라우저의 `Pegboard` 도메인이 그 컨텍스트와 탭을 거부한다.
+- **처음 켤 때 키체인 확인**: 새로 빌드(또는 다시 서명)한 앱은 쿠키 저장소를 처음 열 때 키체인 항목 `Pegboard Safe Storage`를 만들며 묻는다. 답할 때까지 모든 HTTP 요청이 멈춘다(에이전트 세션의 탐색도). 처음 한 번은 사람이 화면 앞에서 켜서 "항상 허용"으로 답한다. 시험은 `--use-mock-keychain`으로 피한다.
+- 시험·개발용으로 데몬이 포크를 직접 띄우는 구성도 있다: `PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>`(아래 "시험").
 
 ## 빠른 시작
 
@@ -92,7 +115,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 ## 세션과 프로필
 
 - 세션은 에이전트 프로필의 창에 만든 탭그룹 하나다. 세션의 명령은 그 탭그룹의 탭에만 닿는다. 다른 세션의 탭과 사람 프로필의 탭은 목록에도 나타나지 않고 타깃 ID로 지정해도 닿지 않는다.
-- 사람의 프로필(`Default`)과 에이전트 프로필은 쿠키, 저장소, 설정이 나뉜다. 에이전트가 만든 탭은 항상 에이전트 프로필에 열린다.
+- 사람의 프로필(순정 모드는 `Default`, 포크는 에이전트 프로필이 아닌 모든 프로필)과 에이전트 프로필은 쿠키, 저장소, 설정이 나뉜다. 에이전트가 만든 탭은 항상 에이전트 프로필에 열린다.
 - 같은 프로필의 세션끼리는 쿠키와 저장소를 공유한다(의도한 동작). 세션 사이는 탭 수준 격리다. 데이터까지 나누려면 프로필을 나눈다.
 
 ```bash
@@ -231,11 +254,12 @@ pegboard recording open <기록 id>      # 사람의 기본 브라우저에서 �
 - 에이전트에 대한 정책 강제는 MCP 기본 모드에서만 성립한다. CLI(`pegboard`)를 쓸 수 있는 에이전트는 사람과 같은 권한을 가진다: 더 넓은 정책의 세션을 만들고, `browser stop`, `profile delete`, 운영자용 메서드를 부를 수 있다. 에이전트에게는 CLI가 아니라 MCP 서버(`pegboard mcp`, `--operator` 없이)를 준다.
 - MCP 기본 모드의 에이전트는 `pegboard_session_create`의 `profile`로 이미 있는 에이전트 프로필을 이름으로 아무것이나 고를 수 있다(로그인해 둔 프로필 포함). 사람 프로필은 고를 수 없다. 로그인해 둔 프로필이 있으면 그 계정은 에이전트가 쓸 수 있는 것으로 본다.
 - 세션 정책(`SessionPolicy`)은 모르는 필드를 거부한다. CLI(또는 MCP 서버)와 데몬은 같은 버전이어야 하고, 버전이 다르면 세션 만들기가 `invalid_params`로 거부될 수 있다. 바꾼 뒤에는 `pegboard browser stop`으로 옛 데몬을 끈다.
-- 1~2단계는 루프백 디버깅 포트를 쓴다. 같은 사용자로 도는 로컬 프로세스는 브라우저 전체에 붙을 수 있다. 격리가 막는 것은 제공된 도구(CLI, MCP)를 통해 조종당한 에이전트이고, 셸을 가진 악의적 프로세스가 아니다. 이 브라우저의 데이터 디렉터리에는 실제 계정을 넣지 않는다.
+- 순정 모드는 루프백 디버깅 포트를 쓴다. 같은 사용자로 도는 로컬 프로세스는 브라우저 전체에 붙을 수 있다. 격리가 막는 것은 제공된 도구(CLI, MCP)를 통해 조종당한 에이전트이고, 셸을 가진 악의적 프로세스가 아니다. 순정 모드 브라우저의 데이터 디렉터리에는 실제 계정을 넣지 않는다.
+- 포크 모드는 TCP 포트를 열지 않고 DevTools는 앱이 띄운 데몬의 파이프로만 간다. 다만 사람이 `--remote-debugging-port`를 직접 주고 켜면 크롬이 그 포트로 듣는다(그 포트에는 `Pegboard` 도메인이 없다. 기본 사용자 데이터 디렉터리에서는 크롬 자체가 이 플래그를 거부한다). 데몬의 유닉스 소켓은 순정 모드와 같다: 같은 사용자의 로컬 프로세스는 데몬에 말할 수 있다.
 - `--session`으로 넘긴 핸들은 프로세스 목록에 보인다. `PEGBOARD_SESSION`을 쓴다.
 - `session list`, 기록 조회(가려진 로그), 녹화의 `recording.keep`/`delete`/`prune`/`open`(재생 링크 만들기), `profile delete`, `browser stop`, 운영자용 `session.info_any`/`session.close_any`는 토큰이 필요 없다. 소켓에 닿는 로컬 클라이언트는 누구나 다른 세션을 닫거나, 그 (가려진) 기록과 정책(업로드 폴더, 허용 도메인 포함)을 읽거나, 녹화를 지우거나 화면을 열어 보거나, 브라우저를 끌 수 있다. MCP 기본 모드는 이 메서드들을 자기 세션에만 쓰고, keep·delete·prune·open은 쓰지 않는다.
 - Chrome을 `--remote-allow-origins`로 띄우지 않는다. 열면 웹 페이지가 브라우저의 디버깅 포트에 붙을 수 있다.
-- 데몬이 강제로 죽으면(`kill -9` 등) 브라우저는 그대로 떠 있을 것으로 보인다(코드를 읽고 한 판단이다). 같은 데이터 디렉터리로 다시 `browser start`를 하기 전에 그 Chrome을 직접 닫아야 한다.
+- 순정 모드에서 데몬이 강제로 죽으면(`kill -9` 등) 브라우저는 그대로 떠 있을 것으로 보인다(코드를 읽고 한 판단이다). 같은 데이터 디렉터리로 다시 `browser start`를 하기 전에 그 Chrome을 직접 닫아야 한다. 포크 모드에서는 앱이 데몬을 다시 띄운다(위 "포크 모드").
 - `pegboard browser start`가 `pegboard browser stop`과 겹치면 브라우저가 다시 살아날 수 있다.
 
 ### MCP
@@ -335,7 +359,11 @@ cargo test -p pegboard-core --test e2e_clipboard -- --ignored --test-threads=1  
 cargo test -p pegboard-cli --test e2e_recording -- --ignored --test-threads=1 --skip diag_   # 녹화 시험 (2b)
 cargo test -p pegboard-core --test e2e_replay -- --ignored --test-threads=1     # 재생 화면 시험 (2b)
 cargo test -p pegboard-cli --release --test e2e_recording recording_overhead_meets_the_targets -- --ignored --nocapture   # 녹화가 명령에 더하는 시간 (배포용 빌드)
+PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<Pegboard.app> PEGBOARD_TEST_APP=<Pegboard.app> \
+  cargo test --workspace -- --ignored --test-threads=1 --skip diag_    # 같은 시험을 포크 구성으로 (데몬이 포크를 파이프로 띄운다)
 ```
+
+포크 구성(`PEGBOARD_TEST_BROWSER=fork:<앱>`)에서는 데몬이 포크를 `--remote-debugging-pipe --pegboard-no-daemon --use-mock-keychain`으로 띄우고 브리지는 `Pegboard` 도메인 판을 쓴다. 포크에서만 도는 시험이 있다: `e2e_domain`(도메인), `e2e_bootstrap`(앱이 데몬을 띄우고 다시 띄우고 끈다. `package-dev.sh`로 만든 앱을 `PEGBOARD_TEST_APP`에 준다), `e2e_browser`의 `hosted_start_closes_leftover_agent_tabs`. 순정 구성에서는 건너뛴다. 알려진 실패 둘은 3a 전부터 두 구성 모두에서 실패한다: `e2e_isolation::unattributed_download_is_deleted`, `e2e_policy::second_session_cannot_widen_a_pinned_profile`(둘 다 `pegboard-cli`).
 
 클립보드 시험과 MCP 격리 시험 묶음의 `mcp_agent_cannot_write_the_clipboard`는 시스템 클립보드를 저장하고 표식을 넣었다가 되돌린다(비어 있었으면 다시 비운다). 텍스트가 아닌 내용(그림, 서식 있는 글)이 있으면 돌지 않는다. 돌리기 전에 `printf x | pbcopy`처럼 클립보드를 일반 텍스트로 바꿔 둔다.
 

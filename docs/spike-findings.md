@@ -1103,3 +1103,84 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 - 1분 창 자체(1분이 지나면 다시 세 번 띄울 수 있다)는 시험이 고정하지 않는다. 시험은 1분 안의 네 번째만 본다.
 - `TerminateIfRunning`은 기다리는 스레드가 아직 거두지 않았는지 확인한 뒤 `kill`한다. 그 사이에 데몬이 끝나고 pid가 다른 프로세스에 다시 쓰일 틈은 무시할 만하다.
 - 핸들러를 바깥에서 멈추면(다른 코드가 `StopRemoteDebuggingPipeHandler`를 부르면) 부트스트랩이 fd를 쥐고 있어서 데몬은 EOF를 받지 못하고 남는다. 지금은 종료 중의 `RemoteDebuggingServer` 소멸자만 부르고, 그 서버는 `--remote-debugging-port`/`--remote-debugging-pipe`를 줄 때만 생긴다.
+
+### 3a 작업 10. 포크 모드 전체 확인, 측정, 정리 (2026-11-24)
+
+포크 구성과 순정 구성의 실제 브라우저 시험 전체를 두 번째 기기의 GUI 세션에서 `--test-threads=1`로 돌렸다. 포크 구성은 `PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<앱> PEGBOARD_TEST_APP=<앱>`, 앱은 작업 9의 마지막 Chromium 빌드에 이 커밋 시점의 `pegboard`를 `package-dev.sh`로 넣은 것이다.
+
+#### 시험 결과 (마지막 전체 실행, 18:36~)
+
+| 시험 묶음 | 포크 구성 | 순정 구성 |
+|---|---|---|
+| `pegboard-core` `e2e_actionlog` | 17 passed | 17 passed |
+| `e2e_bootstrap` | 9 passed | 건너뜀(포크 전용, 9개가 바로 끝난다) |
+| `e2e_bridge` | 8 passed | 8 passed |
+| `e2e_browser` | 6 passed | 6 passed |
+| `e2e_clipboard` | 16 passed, 3 failed (아래) | 19 passed |
+| `e2e_domain` | 11 passed | 건너뜀(포크 전용) |
+| `e2e_isolated_world` | 1 passed | 1 passed |
+| `e2e_link` | 10 passed | 10 passed |
+| `e2e_policy` | 17 passed | 17 passed |
+| `e2e_proxy` | 24 passed | 24 passed |
+| `e2e_replay` | 4 passed | 4 passed |
+| `e2e_runner` | 17 passed | 17 passed |
+| `e2e_session` | 15 passed | 15 passed |
+| `pegboard-cli` 전체(`--skip diag_`) | 하네스가 포크를 지원하지 않는다(아래) | 마지막 실행은 `e2e_cli` 15 passed까지 확인하고 기기 연결이 끊겼다. 그 전 실행들: `e2e_cli` 15, `e2e_isolation` 16(동의 창을 닫은 뒤 `unattributed_download_is_deleted` 단독 통과), `e2e_mcp` 22, `e2e_mcp_isolation` 17(`mcp_agent_cannot_write_the_clipboard`는 클립보드에 서식 있는 내용이 남아 거부, 단독 통과), `e2e_policy` 29, `e2e_recording` 37 passed |
+
+- **녹화가 명령에 더하는 시간, 포크·파이프 위** (`recording_overhead_meets_the_targets`, 배포용 빌드, 20쌍): 명령별 중앙값 27~48ms(가장 큰 것 `fill`, `type` 48ms), 가장 큰 단일 값 75ms. 기준(중앙값 60ms 이하, 최대 1초) 안이다. 같은 날 순정 구성은 28~49ms, 최대 74ms로 차이가 없다. 디버그 빌드 포크는 24~44ms. 물리 연결 하나에 모든 가상 연결을 실어도(설계 5절 위험 4) 지연이 늘지 않았다.
+
+| 명령 | 포크 추가 중앙값 | 순정 추가 중앙값 |
+|---|---|---|
+| open | 44 | 46 |
+| snapshot -i | 28 | 28 |
+| click | 36 | 45 |
+| fill | 48 | 44 |
+| type | 48 | 49 |
+| press Enter | 32 | 28 |
+| get url | 31 | 29 |
+| get text | 32 | 28 |
+| eval | 32 | 33 |
+| scroll down 200 | 34 | 34 |
+| wait 100 | 28 | 30 |
+| screenshot | 40 | 41 |
+| tab new | 46 | 45 |
+| tab list | 27 | 30 |
+
+#### 찾은 것과 한 일
+
+- **`e2e_link`의 두 시험이 포크에서 늘 실패했다(고침, d76ab9d).** `the_daemon_opens_one_browser_connection`과 `an_oversized_eval_does_not_cut_other_sessions`가 연결 수를 세려고 DevTools TCP 포트(`DevToolsActivePort`)를 읽어, 포트가 없는 포크에서 단언에 닿기 전에 끝났다. 포트가 없으면 파이프 하나를 연결로 세고, 브라우저가 TCP로 듣는 포트가 있으면 더하게 했다. 두 구성 모두 10 passed. 두 번째 시험의 본뜻(한 가상 연결의 너무 큰 응답이 그 연결만 끝내고 물리 연결은 산다)이 파이프 위에서도 맞다.
+- **"알려진 실패" 둘은 시험 기기의 응답 없는 동의 창 때문이었다(고침, d9507fc).** `e2e_policy`의 `frontmost()`가 `osascript`로 System Events에 앞 앱을 물었다. GUI 세션의 터미널에서는 이것이 자동화 동의 창을 띄우고(`UserNotificationCenter`), 아무도 답하지 않으니 창이 앞에 남는다. 그 뒤로 브라우저가 프로필을 기본 컨텍스트로 만들지 못해(`the profile did not become the default context`) 클립보드와 정책 시험 대부분이 실패했다. 3a 전 기준선(716d1d6)부터 실패로 알던 `pegboard-cli` `e2e_policy::second_session_cannot_widen_a_pinned_profile`과 `e2e_isolation::unattributed_download_is_deleted`도 같은 원인이었다: 동의 창을 닫자 둘 다 통과했고, `pegboard-cli` `e2e_policy` 전체가 29 passed였다. `frontmost()`를 동의가 필요 없는 `lsappinfo`로 바꿨다. 그 뒤 전체 실행에서 동의 창은 다시 뜨지 않았다.
+- **포크에서만 실패하는 것 하나: `allow_clipboard_opens_it`의 `Meta+v` 붙여넣기** [확인: 다섯 번 모두 포크만 실패, 순정은 통과]. 클립보드를 허용한 세션에서 `press`가 보내는 `Meta+v`(`commands: ["paste"]`)가 텍스트 칸에 아무것도 붙이지 않는다. `Control+v`(같은 `paste` 명령), `Shift+Insert`, 쓰기 경로 전부는 된다. 원인 가설 [미확인]: 맥에서 Cmd 조합은 렌더러로 가기 전에 브라우저 단축키(`PreHandleKeyboardEvent` → `IDC_PASTE` → `BrowserView::CutCopyPaste`)로 처리되고, 그 명령은 창의 첫 응답자, 곧 그 창의 **활성 탭**으로 간다. 포크의 도메인은 에이전트 창과 탭을 뒤에 연다(`kShowWindowInactive`, 백그라운드 탭). 그래서 붙여넣기가 대상 탭이 아니라 그 창의 활성 탭(창의 첫 빈 탭 또는 다른 세션의 탭)에 갔을 수 있다. 맞다면 격리 문제다: 한 세션의 `Meta+v`/`Meta+c`가 같은 에이전트 창의 다른 세션 탭에 붙이거나 그 선택을 복사할 수 있다(사람 프로필 창은 다른 창이라 닿지 않는다). 순정에서도 창의 활성 탭이 대상과 다르면 같을 수 있다. 3b에서 실측한다(열린 항목).
+- **포크에서만 실패하는 것 둘: 새 탭의 첫 탐색이 탐색 기록에 `navigated` 줄 없이 남는다** (`pegboard-cli` `e2e_recording::navigation_log_follows_tabs_and_popups`) [확인: 세 번 모두 포크만]. 확장 판은 탭을 `about:blank`로 만든 뒤 주소로 보내지만(`sw.js`), 도메인 판 `Pegboard.createTab`은 주소로 바로 연다. 녹화기가 붙을 때는 첫 페이지가 이미 들어와 있어 `created` 줄이 그 주소를 갖고 `navigated` 줄은 없다. 화면 기록은 영향이 없다: 녹화기는 붙을 때 `Page.getFrameTree`로 지금 문서를 보고, 화면을 끄는 도메인 판정도 그 값으로 한다(2b의 늦게 붙는 경우 처리). 다만 첫 페이지가 다시 보내기를 거쳤으면 중간 주소가 기록에 없다. 시험을 고칠지, 도메인 판도 `about:blank` 뒤 탐색으로 맞출지는 정하지 않았다(열린 항목).
+- **`pegboard-cli` 시험 하네스는 포크 구성을 지원하지 않는다.** 사람 쪽 조작(`Human::attach`, `Person::connect`, `activate`, `own_ports`)이 순정 Chrome의 디버깅 포트(`chrome/DevToolsActivePort`)로 브라우저에 직접 붙는다. 포크 구성으로 돌리면 그 시험들(첫 실행에서 35개)이 `DevToolsActivePort`가 없다고 실패하고, 포트가 필요 없는 시험은 통과한다(`e2e_cli` 14, `e2e_mcp` 21, `e2e_mcp_isolation` 9, `e2e_policy` 27, `e2e_recording` 28 passed). 위의 `navigation_log_follows_tabs_and_popups` 말고는 포트 없이 도는 시험 중 포크에서만 실패하는 것이 없다. 포크용 사람 쪽 통로(예: 시험 전용 두 번째 파이프 연결)는 3b 이후.
+- **시험이 agent-browser 데몬을 남긴다** (두 구성 모두). agent-browser는 스스로 데몬이 되어(`ppid` 1) 세션이 끝나도 일부가 남는다. `pegboard-core` 전체 실행 한 번에 포크 18개, 순정 19개가 남았다(`e2e_clipboard`만 따로 돌리면 3개, `e2e_policy`는 1~4개). 3a 전에도 같았을 것으로 보지만 기준선에서 세지 않았다. 매 실행 뒤 시험이 띄운 것만 지웠다.
+- **시험 기기의 원격 데스크톱이 시스템 클립보드를 바꾼다.** 마지막 포크 실행의 `e2e_clipboard`에서 `zz_the_clipboard_is_as_it_was_before_the_run`이 "앞 시험의 복원 뒤 클립보드가 바뀌었다"(`"35330"`, 시험 표식이 아닌 값)로 실패했고, 같은 실행의 `new_tabs_popups_and_frames_are_covered`가 "거부된 세션의 새 탭이 클립보드를 바꿨다"로 실패했다. 그때 기기에는 원격 데스크톱(RustDesk) 연결이 열려 있었고 이것은 클립보드를 동기화한다. 이 시험은 "클립보드가 표식과 다른가"로 판정하므로 밖에서 쓴 값도 실패로 센다.
+  `new_tabs_popups_and_frames_are_covered`는 첫 포크 전체 실행에서는 통과했다. 원격 연결이 없는 상태로 단독으로 다시 돌려 확인하는 것이 남았다(작업 기기와 두 번째 기기의 SSH 연결이 호스트 키 변경 경고로 막혀 더 돌리지 못했다).
+- 포크 구성의 녹화기는 `Page.stopScreencast` 뒤에 프레임이 하나 더 와도 견딘다(작업 7의 후속) [확인: 코드]. 멈춤(`test.setScreen`, 상한)은 `paused`/`streaming`을 먼저 바꾸고 그 뒤 프레임은 버린다(`screencastFrame`의 "a frame still on its way after the stream stopped"). 세션 끝은 탭을 표에서 먼저 빼므로 늦은 프레임은 주인이 없어 버려진다. 이 경우를 고정하는 시험은 없다.
+- 포크를 띄우는 모든 곳(`BrowserConfig::ForkLaunched`, `e2e_link`, `e2e_domain`, `e2e_browser`, `e2e_bootstrap`)이 `--use-mock-keychain`을 준다 [확인: 코드]. 제품 실행 경로에는 없다. 키체인 확인 창이 HTTP를 막는 문제는 제품에서 아직 다루지 않았다(설계 9절 열린 항목).
+
+#### 측정 정리 (빌드는 작업 기기: Apple M5 Pro 15코어, 48GB, 동시 작업 8개)
+
+| 항목 | 값 | 출처 |
+|---|---|---|
+| 빈 상태 빌드(패치 없음, `156.0.8078.109`) | 2시간 23분(앞 시도가 기기 멈춤으로 끊긴 뒤 이어서 잼. 빈 상태부터는 2시간 반~3시간으로 본다) | 작업 7 |
+| 모든 컴파일 인자가 바뀐 다시 빌드(`dcheck_always_on = false`, 55,323단계) | 2시간 44분 | 작업 8 |
+| 한 줄 증분(리소스·설정) | 42초~1분 58초 (0단계: 89초) | 작업 7 |
+| 헤더 수정 증분 | 36초(`chrome_devtools_session.h`, `pegboard_handler.h`) ~ 2분 42초(`content/public/browser/devtools_agent_host.h`와 새 소스) | 작업 8, 9 |
+| `//pegboard`만 고친 증분 | 31~32초(`bootstrap`), 37초(`devtools` `.cc`) | 작업 8, 9 |
+| 디스크(2026-11-24) | `out/Pegboard` 9.4GB(앱 539MB), 소스 트리 전체 72GB(`.git` 1.8GB, 산출물 포함) | `du -sh` |
+| 패치 예산 합계(`budget.sh`) | 업스트림 파일 13개, +63 −12, 75줄 | 아래 |
+| 새 소스(`//pegboard`) | 약 1,730줄: `devtools` 1,251(핸들러 1,098, `.pdl` 116), `bootstrap` 471 | `wc -l` |
+
+패치별 업스트림 줄 수(3a 기준선, 태그 대비):
+
+| 패치 | 파일 | 추가 | 삭제 | 합계 |
+|---|---|---|---|---|
+| `branding.patch` | 4 (`chrome/BUILD.gn`, `chromium_strings.grd`, `BRANDING`, `chrome_paths_mac.mm`) | 8 | 8 | 16 |
+| `pegboard-cdp-domain.patch` | 5 (`chrome/browser/devtools/BUILD.gn`, `chrome_devtools_session.{h,cc}`, `inspector_protocol_config.json`, `content/.../target_handler.cc`) | 34 | 3 | 37 |
+| `devtools-pipe-fds.patch` | 2 (`devtools_agent_host.h`, `devtools_agent_host_impl.cc`) | 15 | 0 | 15 |
+| `pegboard-bootstrap.patch` | 2 (`chrome/browser/BUILD.gn`, `chrome_browser_main.cc`) | 6 | 1 | 7 |
+| 합계 | 13 | 63 | 12 | 75 |
+
+- 0단계 A6의 예상(파이프 패치 "파일 2개, 십여 줄")과 설계의 예상(부트스트랩 "중간")에 비해 업스트림 쪽은 작다. 무게는 `//pegboard/` 새 파일에 있다.
+- 디스크는 작업 7에 적은 11GB(소스와 합쳐 74GB)보다 작게 나왔다. 왜 다른지는 보지 않았다.
