@@ -87,11 +87,6 @@ impl Fork {
         Some((f, log))
     }
 
-    /// The browser's process ID.
-    fn pid(&self) -> u32 {
-        self._child.id().unwrap()
-    }
-
     /// A new virtual connection (browser session).
     async fn session(&self) -> CdpConn {
         CdpConn::over(&self.link).await.unwrap()
@@ -1674,13 +1669,6 @@ async fn the_dialog_does_not_take_focus() {
     for (n, front) in [(1, true), (2, false)] {
         if front {
             // The person's window to the front and key, the app active.
-            common::activate_any_target_in(&c, &default).await;
-            osascript(format!(
-                "tell application \"System Events\" to set frontmost of (first process \
-                 whose unix id is {}) to true",
-                f.pid()
-            ))
-            .await;
             common::activate_any_target_in(&c, &default).await;
         } else {
             // Another app in front.
