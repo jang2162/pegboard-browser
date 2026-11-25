@@ -9,6 +9,8 @@ use super::*;
 #[derive(Default)]
 struct FakeBrowser {
     fail: bool,
+    /// `cancel` takes this long.
+    slow_cancel: Option<Duration>,
     shown: StdMutex<Vec<String>>,
     cancelled: StdMutex<Vec<String>>,
 }
@@ -25,6 +27,9 @@ impl BrowserResponder for FakeBrowser {
 
     async fn cancel(&self, confirm_id: &str) {
         self.cancelled.lock().unwrap().push(confirm_id.to_string());
+        if let Some(d) = self.slow_cancel {
+            tokio::time::sleep(d).await;
+        }
     }
 }
 
@@ -117,7 +122,7 @@ async fn no_responder_denies_at_once() {
 #[tokio::test(start_paused = true)]
 async fn first_answer_wins_and_a_late_one_is_not_found() {
     let b = broker();
-    let _sub = b.subscribe();
+    let _sub = b.subscribe().unwrap();
     let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
     b.respond(&answer(&id, ConfirmAnswer::Approve), ConfirmBy::Api)
         .unwrap();
@@ -139,7 +144,7 @@ async fn first_answer_wins_and_a_late_one_is_not_found() {
 #[tokio::test(start_paused = true)]
 async fn an_answer_only_resolves_its_own_confirmation() {
     let b = broker();
-    let _sub = b.subscribe();
+    let _sub = b.subscribe().unwrap();
     let (a, ha) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
     let (bid, hb) = ask_in_background(&b, asking(B, ActionClass::State, false)).await;
     b.respond(&answer(&a, ConfirmAnswer::Approve), ConfirmBy::Api)
@@ -158,7 +163,7 @@ async fn an_answer_only_resolves_its_own_confirmation() {
 #[tokio::test(start_paused = true)]
 async fn allow_for_session_grants_that_session_and_class_only() {
     let b = broker();
-    let _sub = b.subscribe();
+    let _sub = b.subscribe().unwrap();
     let (a, ha) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
     let (bid, hb) = ask_in_background(&b, asking(B, ActionClass::State, false)).await;
     b.respond(&answer(&a, ConfirmAnswer::AllowForSession), ConfirmBy::Api)
@@ -187,7 +192,7 @@ async fn allow_for_session_grants_that_session_and_class_only() {
 #[tokio::test(start_paused = true)]
 async fn allow_for_session_needs_the_offer() {
     let b = broker();
-    let _sub = b.subscribe();
+    let _sub = b.subscribe().unwrap();
     let ask = ConfirmAsk {
         offer_allow_for_session: false,
         ..asking(A, ActionClass::State, false)
@@ -211,7 +216,7 @@ async fn allow_for_session_needs_the_offer() {
 #[tokio::test(start_paused = true)]
 async fn an_upload_grant_needs_the_sessions_upload_dir() {
     let b = broker();
-    let _sub = b.subscribe();
+    let _sub = b.subscribe().unwrap();
     let dirs: Arc<StdMutex<HashMap<SessionId, Option<String>>>> = Default::default();
     {
         let dirs = dirs.clone();
@@ -273,7 +278,7 @@ async fn an_upload_grant_needs_the_sessions_upload_dir() {
 #[tokio::test(start_paused = true)]
 async fn an_upload_grant_is_refused_without_a_policy_lookup() {
     let b = broker();
-    let _sub = b.subscribe();
+    let _sub = b.subscribe().unwrap();
     let (id, handle) = ask_in_background(&b, asking(A, ActionClass::Upload, false)).await;
     assert!(!b.pending()[0].offer_allow_for_session);
     let e = b
@@ -289,7 +294,7 @@ async fn timeout_denies() {
     let b = broker();
     let browser = Arc::new(FakeBrowser::default());
     b.set_browser(Some(browser.clone()));
-    let mut sub = b.subscribe();
+    let mut sub = b.subscribe().unwrap();
     let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, true)).await;
     tokio::time::advance(Duration::from_secs(59)).await;
     tokio::task::yield_now().await;
@@ -314,7 +319,7 @@ async fn timeout_denies() {
 #[tokio::test(start_paused = true)]
 async fn cancel_session_ends_its_wait_and_no_other() {
     let b = broker();
-    let _sub = b.subscribe();
+    let _sub = b.subscribe().unwrap();
     let (_, ha) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
     let (bid, hb) = ask_in_background(&b, asking(B, ActionClass::Upload, false)).await;
     b.cancel_session(&sid(A));
@@ -322,7 +327,14 @@ async fn cancel_session_ends_its_wait_and_no_other() {
     assert_eq!(b.pending().len(), 1);
     assert_eq!(b.pending()[0].confirm_id, bid);
     assert!(!hb.is_finished());
-    // The session can still be asked later (its close may fail and be retried).
+    // While it closes, a question of the session ends at once: nothing of a closing
+    // session waits, or is approved.
+    let d = b.ask(asking(A, ActionClass::State, false)).await;
+    assert_eq!(d.outcome, ConfirmOutcome::Cancelled);
+    assert_eq!(d.waited, Duration::ZERO);
+    assert_eq!(b.pending().len(), 1);
+    // Its close failed and it stays open: it can be asked again.
+    b.reopen_session(&sid(A));
     let (a2, ha2) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
     b.respond(&answer(&a2, ConfirmAnswer::Approve), ConfirmBy::Api)
         .unwrap();
@@ -330,12 +342,20 @@ async fn cancel_session_ends_its_wait_and_no_other() {
     b.respond(&answer(&bid, ConfirmAnswer::Approve), ConfirmBy::Api)
         .unwrap();
     hb.await.unwrap();
+    // A session that closed for good: the mark goes with it (ids are not reused, but the
+    // table does not grow).
+    b.cancel_session(&sid(B));
+    b.forget_session(&sid(B));
+    let (bid, hb) = ask_in_background(&b, asking(B, ActionClass::State, false)).await;
+    b.respond(&answer(&bid, ConfirmAnswer::Deny), ConfirmBy::Api)
+        .unwrap();
+    assert_eq!(hb.await.unwrap().outcome, ConfirmOutcome::Denied);
 }
 
 #[tokio::test(start_paused = true)]
 async fn cancel_all_ends_every_wait() {
     let b = broker();
-    let _sub = b.subscribe();
+    let _sub = b.subscribe().unwrap();
     let (_, ha) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
     let (_, hb) = ask_in_background(&b, asking(B, ActionClass::Upload, false)).await;
     b.cancel_all();
@@ -359,20 +379,146 @@ async fn a_browser_that_cannot_show_drops_out() {
     let d = b.ask(asking(A, ActionClass::State, true)).await;
     assert_eq!(d.outcome, ConfirmOutcome::NoResponder);
     assert_eq!(browser.shown.lock().unwrap().len(), 1);
-    // No window was shown, so there is none to close.
-    assert!(browser.cancelled.lock().unwrap().is_empty());
+    // It may have shown one all the same: it is told to close it, once.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(browser.cancelled.lock().unwrap().len(), 1);
     // With a subscriber, the confirmation waits for it.
-    let _sub = b.subscribe();
+    let _sub = b.subscribe().unwrap();
     let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, true)).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
     assert!(!handle.is_finished());
     assert_eq!(b.pending()[0].confirm_id, id);
+    // The browser dropped out of it: an answer from it is not taken.
+    let e = b
+        .respond(&answer(&id, ConfirmAnswer::Approve), ConfirmBy::Browser)
+        .unwrap_err();
+    assert_eq!(e.code, codes::CONFIRM_NOT_FOUND);
     b.respond(&answer(&id, ConfirmAnswer::Approve), ConfirmBy::Api)
         .unwrap();
     assert_eq!(handle.await.unwrap().outcome, ConfirmOutcome::Approved);
-    assert!(browser.cancelled.lock().unwrap().is_empty());
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        browser.cancelled.lock().unwrap().len(),
+        2,
+        "once per failed show, not again when it ends"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_browser_answers_only_what_it_was_asked() {
+    let b = broker();
+    let _sub = b.subscribe().unwrap();
+    b.set_browser(Some(Arc::new(FakeBrowser::default())));
+    // No place: the browser was never asked.
+    let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
+    let e = b
+        .respond(&answer(&id, ConfirmAnswer::Approve), ConfirmBy::Browser)
+        .unwrap_err();
+    assert_eq!(e.code, codes::CONFIRM_NOT_FOUND);
+    assert_eq!(b.pending().len(), 1, "still waiting");
+    b.respond(&answer(&id, ConfirmAnswer::Deny), ConfirmBy::Api)
+        .unwrap();
+    assert_eq!(handle.await.unwrap().outcome, ConfirmOutcome::Denied);
+}
+
+#[tokio::test(start_paused = true)]
+async fn replacing_the_browser_closes_the_old_windows() {
+    let b = broker();
+    let _sub = b.subscribe().unwrap();
+    let old = Arc::new(FakeBrowser::default());
+    let new = Arc::new(FakeBrowser::default());
+    b.set_browser(Some(old.clone()));
+    let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, true)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*old.shown.lock().unwrap(), vec![id.clone()]);
+    b.set_browser(Some(new.clone()));
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*old.cancelled.lock().unwrap(), vec![id.clone()]);
+    // The confirmation waits on for the subscriber; no browser answers it now.
+    assert!(!handle.is_finished());
+    let e = b
+        .respond(&answer(&id, ConfirmAnswer::Approve), ConfirmBy::Browser)
+        .unwrap_err();
+    assert_eq!(e.code, codes::CONFIRM_NOT_FOUND);
+    b.respond(&answer(&id, ConfirmAnswer::Approve), ConfirmBy::Api)
+        .unwrap();
+    handle.await.unwrap();
+    assert_eq!(old.cancelled.lock().unwrap().len(), 1, "closed once");
+    assert!(new.shown.lock().unwrap().is_empty());
+    assert!(new.cancelled.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn subscribers_are_told_before_the_window_closes() {
+    let b = broker();
+    let browser = Arc::new(FakeBrowser {
+        slow_cancel: Some(Duration::from_secs(4)),
+        ..FakeBrowser::default()
+    });
+    b.set_browser(Some(browser.clone()));
+    let mut sub = b.subscribe().unwrap();
+    let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, true)).await;
+    b.respond(&answer(&id, ConfirmAnswer::Approve), ConfirmBy::Api)
+        .unwrap();
+    // Told at once, while the window is still closing.
+    let notices = drain(&mut sub);
+    assert!(
+        matches!(notices.last(), Some(ConfirmNotice::Resolved(r)) if r.confirm_id == id),
+        "{notices:?}"
+    );
+    assert!(!handle.is_finished());
+    handle.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_question_ends_and_is_announced() {
+    let b = broker();
+    let browser = Arc::new(FakeBrowser::default());
+    b.set_browser(Some(browser.clone()));
+    let mut sub = b.subscribe().unwrap();
+    let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, true)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    handle.abort();
+    assert!(handle.await.unwrap_err().is_cancelled());
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(b.pending().is_empty());
+    let notices = drain(&mut sub);
+    assert!(
+        matches!(notices.last(), Some(ConfirmNotice::Resolved(r))
+            if r.confirm_id == id && r.outcome == ConfirmOutcome::Cancelled && r.by.is_none()),
+        "{notices:?}"
+    );
+    assert_eq!(*browser.cancelled.lock().unwrap(), vec![id.clone()]);
+    let e = b
+        .respond(&answer(&id, ConfirmAnswer::Approve), ConfirmBy::Api)
+        .unwrap_err();
+    assert_eq!(e.code, codes::CONFIRM_NOT_FOUND);
+}
+
+#[tokio::test(start_paused = true)]
+async fn subscribers_are_capped() {
+    let b = broker();
+    let subs: Vec<ConfirmSubscription> = (0..MAX_SUBSCRIBERS)
+        .map(|_| b.subscribe().unwrap())
+        .collect();
+    let e = b.subscribe().err().expect("over the cap");
+    assert_eq!(e.code, codes::LIMIT_EXCEEDED);
+    drop(subs);
+    assert!(b.subscribe().is_ok());
 }
 
 #[tokio::test(start_paused = true)]
@@ -385,12 +531,12 @@ async fn losing_every_responder_ends_the_wait() {
     assert_eq!(d.outcome, ConfirmOutcome::NoResponder);
     assert!(d.waited < CONFIRM_TIMEOUT);
     // The last subscriber going away ends a wait nobody else can answer.
-    let sub = b.subscribe();
+    let sub = b.subscribe().unwrap();
     let (_, handle) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
     drop(sub);
     assert_eq!(handle.await.unwrap().outcome, ConfirmOutcome::NoResponder);
     // But not while another subscriber is there.
-    let (s1, s2) = (b.subscribe(), b.subscribe());
+    let (s1, s2) = (b.subscribe().unwrap(), b.subscribe().unwrap());
     let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
     drop(s1);
     tokio::task::yield_now().await;
@@ -406,7 +552,7 @@ async fn resolution_cancels_the_browser_window() {
     let b = broker();
     let browser = Arc::new(FakeBrowser::default());
     b.set_browser(Some(browser.clone()));
-    let mut sub = b.subscribe();
+    let mut sub = b.subscribe().unwrap();
     let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, true)).await;
     b.respond(&answer(&id, ConfirmAnswer::Approve), ConfirmBy::Api)
         .unwrap();
@@ -456,7 +602,7 @@ async fn resolution_cancels_the_browser_window() {
 #[tokio::test(start_paused = true)]
 async fn the_required_notice_carries_what_is_shown() {
     let b = broker();
-    let mut sub = b.subscribe();
+    let mut sub = b.subscribe().unwrap();
     let (id, handle) = ask_in_background(&b, asking(A, ActionClass::State, false)).await;
     let notices = drain(&mut sub);
     let [ConfirmNotice::Required(r)] = &notices[..] else {
@@ -504,6 +650,8 @@ fn the_timeout_hook_needs_test_hooks() {
         Duration::from_millis(2000)
     );
     assert_eq!(timeout_with(true, None), CONFIRM_TIMEOUT);
+    // It only shortens the wait (a client waits CONFIRM_TIMEOUT).
+    assert_eq!(timeout_with(true, Some("120000")), CONFIRM_TIMEOUT);
     for bad in ["", "0", "-1", "soon"] {
         assert_eq!(timeout_with(true, Some(bad)), CONFIRM_TIMEOUT, "{bad}");
     }

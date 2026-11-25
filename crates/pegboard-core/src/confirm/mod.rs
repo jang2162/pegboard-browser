@@ -7,7 +7,7 @@
 //! `confirm_not_found`. A confirmation also ends when its time is up, when its session
 //! closes or the daemon stops, and when nobody is left who could answer it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -29,8 +29,12 @@ const CANCEL_LIMIT: Duration = Duration::from_secs(5);
 /// Notices a subscriber may fall behind by before its connection is dropped.
 const NOTICE_BACKLOG: usize = 256;
 
+/// Subscribers at once: they hold API connections, which are capped too.
+pub const MAX_SUBSCRIBERS: usize = 8;
+
 /// `PEGBOARD_TEST_CONFIRM_TIMEOUT_MS` (a test hook, with `PEGBOARD_TEST_HOOKS`), else
-/// `CONFIRM_TIMEOUT`.
+/// `CONFIRM_TIMEOUT`. The hook only shortens the wait, so a client that waits
+/// `CONFIRM_TIMEOUT` for a command (`api::Client`) never gives up before the daemon.
 pub fn confirm_timeout() -> Duration {
     timeout_with(
         crate::testenv::hooks(),
@@ -45,7 +49,7 @@ fn timeout_with(hooks: bool, value: Option<&str>) -> Duration {
         .filter(|_| hooks)
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
-        Some(ms) if ms > 0 => Duration::from_millis(ms),
+        Some(ms) if ms > 0 => Duration::from_millis(ms).min(CONFIRM_TIMEOUT),
         _ => CONFIRM_TIMEOUT,
     }
 }
@@ -127,31 +131,38 @@ struct Entry {
     in_browser: bool,
 }
 
-#[derive(Default)]
 struct Table {
     pending: HashMap<String, Entry>,
     /// Classes a person allowed for the rest of a session.
     granted: HashMap<SessionId, Vec<ActionClass>>,
+    /// Sessions being closed: a question of theirs is cancelled at once.
+    closing: HashSet<SessionId>,
     browser: Option<Arc<dyn BrowserResponder>>,
     subscribers: usize,
     /// The daemon is stopping: every question is cancelled.
     closed: bool,
     seq: u64,
     lookup: Option<PolicyLookup>,
+    notices: broadcast::Sender<ConfirmNotice>,
 }
 
 impl Table {
-    /// Ends a waiting confirmation; false when it was not waiting any more.
-    fn end(&mut self, id: &str, outcome: ConfirmOutcome, by: Option<ConfirmBy>) -> bool {
-        let Some(entry) = self.pending.remove(id) else {
-            return false;
-        };
-        let _ = entry.tx.send(Ending {
+    /// Ends a waiting confirmation and tells the subscribers, under the table's lock;
+    /// `None` when it was not waiting any more.
+    fn end(&mut self, id: &str, outcome: ConfirmOutcome, by: Option<ConfirmBy>) -> Option<Ending> {
+        let entry = self.pending.remove(id)?;
+        let ending = Ending {
             outcome,
             by,
             in_browser: entry.in_browser,
-        });
-        true
+        };
+        let _ = entry.tx.send(ending);
+        let _ = self.notices.send(ConfirmNotice::Resolved(ConfirmResolved {
+            confirm_id: id.to_string(),
+            outcome,
+            by,
+        }));
+        Some(ending)
     }
 
     /// Ends every confirmation nobody can answer any more.
@@ -190,8 +201,19 @@ fn rfc3339_in(after: Duration) -> String {
 pub struct ConfirmBroker {
     timeout: Duration,
     table: Mutex<Table>,
-    notices: broadcast::Sender<ConfirmNotice>,
     me: Weak<ConfirmBroker>,
+}
+
+/// Closes a browser window in the background (the caller holds no lock and does not wait).
+fn cancel_in_background(browser: Arc<dyn BrowserResponder>, ids: Vec<String>) {
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    rt.spawn(async move {
+        for id in ids {
+            let _ = tokio::time::timeout(CANCEL_LIMIT, browser.cancel(&id)).await;
+        }
+    });
 }
 
 /// Notices for one subscriber. While it lives the broker counts it as a responder;
@@ -236,25 +258,21 @@ impl Drop for Abandon<'_> {
         if !self.armed {
             return;
         }
-        let in_browser = {
-            let mut t = self.broker.table.lock().unwrap();
-            match t.pending.remove(self.id) {
-                Some(entry) => entry.in_browser,
-                None => return,
-            }
-        };
-        if let (true, Some(browser), Ok(rt)) = (
-            in_browser,
-            self.browser.clone(),
-            tokio::runtime::Handle::try_current(),
-        ) {
-            let id = self.id.to_string();
-            rt.spawn(async move {
-                let _ = tokio::time::timeout(CANCEL_LIMIT, browser.cancel(&id)).await;
-            });
+        let ending =
+            self.broker
+                .table
+                .lock()
+                .unwrap()
+                .end(self.id, ConfirmOutcome::Cancelled, None);
+        if let (
+            Some(Ending {
+                in_browser: true, ..
+            }),
+            Some(browser),
+        ) = (ending, self.browser.clone())
+        {
+            cancel_in_background(browser, vec![self.id.to_string()]);
         }
-        self.broker
-            .notify_resolved(self.id, ConfirmOutcome::Cancelled, None);
     }
 }
 
@@ -263,8 +281,17 @@ impl ConfirmBroker {
         let (notices, _) = broadcast::channel(NOTICE_BACKLOG);
         Arc::new_cyclic(|me| ConfirmBroker {
             timeout,
-            table: Mutex::new(Table::default()),
-            notices,
+            table: Mutex::new(Table {
+                pending: HashMap::new(),
+                granted: HashMap::new(),
+                closing: HashSet::new(),
+                browser: None,
+                subscribers: 0,
+                closed: false,
+                seq: 0,
+                lookup: None,
+                notices,
+            }),
             me: me.clone(),
         })
     }
@@ -273,14 +300,6 @@ impl ConfirmBroker {
     /// session). Without it no upload is ever granted for a session.
     pub fn set_policy_lookup(&self, lookup: PolicyLookup) {
         self.table.lock().unwrap().lookup = Some(lookup);
-    }
-
-    fn notify_resolved(&self, id: &str, outcome: ConfirmOutcome, by: Option<ConfirmBy>) {
-        let _ = self.notices.send(ConfirmNotice::Resolved(ConfirmResolved {
-            confirm_id: id.to_string(),
-            outcome,
-            by,
-        }));
     }
 
     /// Asks the responders and waits for the first answer, the time limit, a cancel, or
@@ -301,7 +320,9 @@ impl ConfirmBroker {
         let (tx, mut rx) = oneshot::channel();
         let (browser, req) = {
             let mut t = self.table.lock().unwrap();
-            if t.closed {
+            // The daemon is stopping, or the session closing (its close cancelled what
+            // was waiting; nothing of it may be approved after that).
+            if t.closed || t.closing.contains(&ask.session_id) {
                 return decided(ConfirmOutcome::Cancelled, None);
             }
             let browser = t.browser.clone().filter(|_| ask.place.is_some());
@@ -331,7 +352,7 @@ impl ConfirmBroker {
             );
             // Under the lock, so a subscriber either is counted and told, or is neither
             // (and finds it with `confirm.list`).
-            let _ = self.notices.send(ConfirmNotice::Required(req.clone()));
+            let _ = t.notices.send(ConfirmNotice::Required(req.clone()));
             (browser, req)
         };
         let mut abandon = Abandon {
@@ -365,6 +386,10 @@ impl ConfirmBroker {
                     if let Err(e) = shown {
                         eprintln!("pegboard: the browser cannot show confirmation {confirm_id}: {e:#}");
                         self.browser_dropped_out(&confirm_id);
+                        // It may have shown a window all the same.
+                        if let Some(b) = &browser {
+                            cancel_in_background(b.clone(), vec![confirm_id.clone()]);
+                        }
                     }
                 }
                 _ = &mut deadline, if timing => {
@@ -374,12 +399,12 @@ impl ConfirmBroker {
             }
         };
         abandon.armed = false;
+        // The subscribers were told when it ended; the window closes after.
         if ending.in_browser {
             if let Some(b) = &browser {
                 let _ = tokio::time::timeout(CANCEL_LIMIT, b.cancel(&confirm_id)).await;
             }
         }
-        self.notify_resolved(&confirm_id, ending.outcome, ending.by);
         decided(ending.outcome, ending.by)
     }
 
@@ -413,6 +438,10 @@ impl ConfirmBroker {
         let (session, class, offered, lookup) = {
             let t = self.table.lock().unwrap();
             let entry = t.pending.get(&p.confirm_id).ok_or_else(not_found)?;
+            // The browser answers only what it was asked (and still shows).
+            if by == ConfirmBy::Browser && !entry.in_browser {
+                return Err(not_found());
+            }
             (
                 entry.req.session_id.clone(),
                 entry.req.class,
@@ -441,8 +470,9 @@ impl ConfirmBroker {
             }
         };
         let mut t = self.table.lock().unwrap();
-        if !t.pending.contains_key(&p.confirm_id) {
-            return Err(not_found());
+        match t.pending.get(&p.confirm_id) {
+            Some(e) if by != ConfirmBy::Browser || e.in_browser => {}
+            _ => return Err(not_found()),
         }
         if outcome == ConfirmOutcome::ApprovedForSession {
             let granted = t.granted.entry(session).or_default();
@@ -454,9 +484,12 @@ impl ConfirmBroker {
         Ok(())
     }
 
-    /// Ends the session's waiting confirmations (`Cancelled`); other sessions' wait on.
+    /// The session is closing: its waiting confirmations end (`Cancelled`), and so does
+    /// any question of it until `forget_session` (closed) or `reopen_session` (the close
+    /// failed). Other sessions wait on.
     pub fn cancel_session(&self, id: &SessionId) {
         let mut t = self.table.lock().unwrap();
+        t.closing.insert(id.clone());
         let ids: Vec<String> = t
             .pending
             .iter()
@@ -479,9 +512,17 @@ impl ConfirmBroker {
         }
     }
 
-    /// Drops what a person allowed for the session (it has closed).
+    /// The session has closed: what a person allowed for it, and its closing mark, go.
     pub fn forget_session(&self, id: &SessionId) {
-        self.table.lock().unwrap().granted.remove(id);
+        let mut t = self.table.lock().unwrap();
+        t.granted.remove(id);
+        t.closing.remove(id);
+    }
+
+    /// The session's close failed and it stays open: it may be asked again (its grants
+    /// are kept).
+    pub fn reopen_session(&self, id: &SessionId) {
+        self.table.lock().unwrap().closing.remove(id);
     }
 
     /// The classes a person allowed for the rest of the session.
@@ -504,25 +545,43 @@ impl ConfirmBroker {
     }
 
     /// A new subscriber: a responder from now on, told of every confirmation asked and
-    /// ended after this call.
-    pub fn subscribe(&self) -> ConfirmSubscription {
+    /// ended after this call. At most `MAX_SUBSCRIBERS` at once (`limit_exceeded`).
+    pub fn subscribe(&self) -> Result<ConfirmSubscription, RpcError> {
         let mut t = self.table.lock().unwrap();
-        t.subscribers += 1;
-        ConfirmSubscription {
-            rx: self.notices.subscribe(),
-            broker: self.me.clone(),
+        if t.subscribers >= MAX_SUBSCRIBERS {
+            return Err(RpcError {
+                code: codes::LIMIT_EXCEEDED.to_string(),
+                message: format!("at most {MAX_SUBSCRIBERS} confirmation subscribers at once"),
+                data: None,
+            });
         }
+        t.subscribers += 1;
+        Ok(ConfirmSubscription {
+            rx: t.notices.subscribe(),
+            broker: self.me.clone(),
+        })
     }
 
     /// Sets or clears the browser responder. The waiting confirmations lose the browser
     /// they had (its link is gone); those nobody else can answer end as `NoResponder`.
+    /// The old browser's windows are closed (in the background; a link that is gone just
+    /// fails).
     pub fn set_browser(&self, responder: Option<Arc<dyn BrowserResponder>>) {
-        let mut t = self.table.lock().unwrap();
-        t.browser = responder;
-        for entry in t.pending.values_mut() {
-            entry.in_browser = false;
+        let (old, shown) = {
+            let mut t = self.table.lock().unwrap();
+            let old = std::mem::replace(&mut t.browser, responder);
+            let mut shown = Vec::new();
+            for (id, entry) in t.pending.iter_mut() {
+                if std::mem::take(&mut entry.in_browser) {
+                    shown.push(id.clone());
+                }
+            }
+            t.end_unanswerable();
+            (old, shown)
+        };
+        if let (Some(old), false) = (old, shown.is_empty()) {
+            cancel_in_background(old, shown);
         }
-        t.end_unanswerable();
     }
 }
 

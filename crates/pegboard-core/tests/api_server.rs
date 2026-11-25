@@ -59,8 +59,15 @@ impl Handler for Stub {
         }
     }
 
-    fn confirm_subscription(&self) -> Option<ConfirmSubscription> {
-        self.broker.as_ref().map(|b| b.subscribe())
+    fn confirm_subscription(&self) -> Result<ConfirmSubscription, pegboard_protocol::RpcError> {
+        match &self.broker {
+            Some(b) => b.subscribe(),
+            None => Err(pegboard_protocol::RpcError {
+                code: codes::UNKNOWN_METHOD.into(),
+                message: "unknown method".into(),
+                data: None,
+            }),
+        }
     }
 
     async fn delivery_failed(&self, req: &Request, resp: &Response) {
@@ -83,6 +90,7 @@ async fn accept_survives_many_idle_connections() {
     let opts = ServeOptions {
         max_connections: 8,
         idle_timeout: Duration::from_millis(500),
+        ..ServeOptions::default()
     };
     let server = {
         let paths = paths.clone();
@@ -138,6 +146,7 @@ async fn over_cap_connection_gets_busy_error() {
     let opts = ServeOptions {
         max_connections: 2,
         idle_timeout: Duration::from_secs(30),
+        ..ServeOptions::default()
     };
     let server = started(&paths, Stub::default(), opts).await;
     let _held: Vec<UnixStream> = (0..2)
@@ -449,5 +458,98 @@ async fn subscribe_without_a_broker_is_an_unknown_method() {
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::UNKNOWN_METHOD);
+    server.abort();
+}
+
+/// A subscriber that stops reading is dropped once a notice cannot reach it in time, and
+/// the others are told everything meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_subscriber_is_dropped_and_blocks_nobody() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let broker = ConfirmBroker::new(CONFIRM_TIMEOUT);
+    let stub = Stub {
+        broker: Some(broker.clone()),
+        ..Stub::default()
+    };
+    let opts = ServeOptions {
+        notice_write_limit: Duration::from_millis(300),
+        ..ServeOptions::default()
+    };
+    let server = started(&paths, stub, opts).await;
+    let stalled = subscribed(&paths).await;
+    let mut reader = subscribed(&paths).await;
+    // Big notices, so the stalled connection's socket buffers fill.
+    const ASKS: usize = 24;
+    let mut asks = Vec::new();
+    for i in 0..ASKS {
+        let mut ask = ask_state(&format!(
+            "s_{}",
+            "abcdefghijklmnopqrstuvwx"
+                .chars()
+                .nth(i)
+                .unwrap()
+                .to_string()
+                .repeat(8)
+        ));
+        ask.details = vec![pegboard_protocol::ConfirmDetail {
+            label: "value".into(),
+            value: "x".repeat(64 * 1024),
+        }];
+        let b = broker.clone();
+        asks.push(tokio::spawn(async move { b.ask(ask).await }));
+    }
+    let started_at = tokio::time::Instant::now();
+    for _ in 0..ASKS {
+        let n = next_line(&mut reader).await;
+        assert_eq!(n["method"], "confirm.required");
+    }
+    assert!(
+        started_at.elapsed() < Duration::from_secs(3),
+        "the reading subscriber waited on the stalled one"
+    );
+    // The stalled one was given up: its connection ends.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut stalled = stalled;
+    let mut rest = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut stalled, &mut rest),
+    )
+    .await
+    .expect("the server closed it (end of stream, not a timeout)")
+    .unwrap();
+    broker.cancel_all();
+    for a in asks {
+        assert_eq!(a.await.unwrap().outcome, ConfirmOutcome::Cancelled);
+    }
+    for _ in 0..ASKS {
+        let n = next_line(&mut reader).await;
+        assert_eq!(n["method"], "confirm.resolved");
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subscriptions_over_the_cap_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let broker = ConfirmBroker::new(CONFIRM_TIMEOUT);
+    let stub = Stub {
+        broker: Some(broker.clone()),
+        ..Stub::default()
+    };
+    let server = started(&paths, stub, ServeOptions::default()).await;
+    let mut held = Vec::new();
+    for _ in 0..pegboard_core::confirm::MAX_SUBSCRIBERS {
+        held.push(subscribed(&paths).await);
+    }
+    let e = rpc(&paths, "confirm.subscribe", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::LIMIT_EXCEEDED);
+    // The refused connection is an ordinary one: other methods still work.
+    let list = rpc(&paths, "confirm.list", json!({})).await.unwrap();
+    assert_eq!(list, json!({ "pending": [] }));
     server.abort();
 }

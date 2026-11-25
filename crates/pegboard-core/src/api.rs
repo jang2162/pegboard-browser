@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
-use crate::confirm::{confirm_timeout, ConfirmNotice, ConfirmSubscription};
+use crate::confirm::{ConfirmNotice, ConfirmSubscription, CONFIRM_TIMEOUT};
 use crate::lock::DaemonLock;
 use crate::paths::Paths;
 use crate::service::Daemon;
@@ -45,10 +45,14 @@ pub trait Handler: Send + Sync + 'static {
     /// Called when the answer to `req` could not be written (the caller went away). The
     /// handler decides which methods need cleaning up after.
     async fn delivery_failed(&self, _req: &Request, _resp: &Response) {}
-    /// A new subscriber of the confirmation broker, for `confirm.subscribe`; `None` when
-    /// there is no broker (the method is then unknown).
-    fn confirm_subscription(&self) -> Option<ConfirmSubscription> {
-        None
+    /// A new subscriber of the confirmation broker, for `confirm.subscribe`. The default
+    /// has no broker: the method is unknown.
+    fn confirm_subscription(&self) -> Result<ConfirmSubscription, RpcError> {
+        Err(RpcError {
+            code: codes::UNKNOWN_METHOD.to_string(),
+            message: "unknown method \"confirm.subscribe\"".to_string(),
+            data: None,
+        })
     }
 }
 
@@ -59,6 +63,9 @@ pub struct ServeOptions {
     /// A connection that sends no complete request line within this time is closed. It
     /// applies before each request, not while one is being handled.
     pub idle_timeout: Duration,
+    /// A subscriber (`confirm.subscribe`) that does not take a notice within this time is
+    /// dropped: it stops being a responder.
+    pub notice_write_limit: Duration,
 }
 
 impl Default for ServeOptions {
@@ -66,6 +73,7 @@ impl Default for ServeOptions {
         ServeOptions {
             max_connections: 64,
             idle_timeout: Duration::from_secs(10),
+            notice_write_limit: Duration::from_secs(10),
         }
     }
 }
@@ -115,7 +123,7 @@ pub async fn serve_with(
         };
         let handler = handler.clone();
         tokio::spawn(async move {
-            connection(stream, handler, opts.idle_timeout).await;
+            connection(stream, handler, opts).await;
             drop(permit);
         });
     }
@@ -140,7 +148,8 @@ fn error_response(id: u64, code: &str, message: impl Into<String>) -> Response {
     }
 }
 
-async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: Duration) {
+async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, opts: ServeOptions) {
+    let idle_timeout = opts.idle_timeout;
     let (read, mut write) = stream.into_split();
     let mut read = tokio::io::BufReader::new(read);
     loop {
@@ -159,16 +168,20 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
         }
         let (response, stop, request) = match serde_json::from_slice::<Request>(&line) {
             Ok(req) if req.method == "confirm.subscribe" => {
-                let Some(subscription) = daemon.confirm_subscription() else {
-                    let r = error_response(
-                        req.id,
-                        codes::UNKNOWN_METHOD,
-                        "unknown method \"confirm.subscribe\"",
-                    );
-                    if write_line(&mut write, &r).await.is_err() {
-                        return;
+                let subscription = match daemon.confirm_subscription() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let r = Response {
+                            jsonrpc: JSONRPC.to_string(),
+                            id: req.id,
+                            result: None,
+                            error: Some(e),
+                        };
+                        if write_line(&mut write, &r).await.is_err() {
+                            return;
+                        }
+                        continue;
                     }
-                    continue;
                 };
                 let ok = Response {
                     jsonrpc: JSONRPC.to_string(),
@@ -177,7 +190,7 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
                     error: None,
                 };
                 if write_line(&mut write, &ok).await.is_ok() {
-                    notice_channel(read, write, subscription).await;
+                    notice_channel(read, write, subscription, opts.notice_write_limit).await;
                 }
                 return;
             }
@@ -218,9 +231,6 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
     }
 }
 
-/// How long one notice may take to reach a subscriber.
-const NOTICE_WRITE_LIMIT: Duration = Duration::from_secs(10);
-
 /// A subscribed connection: the broker's notices go out one per line, with no idle limit.
 /// Whatever the client sends is read and dropped; the subscription ends when the client
 /// hangs up, a write fails or stalls, or the client falls behind (notices were lost: it connects
@@ -229,6 +239,7 @@ async fn notice_channel(
     mut read: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
     mut write: tokio::net::unix::OwnedWriteHalf,
     mut subscription: ConfirmSubscription,
+    write_limit: Duration,
 ) {
     let mut scratch = [0u8; 4096];
     loop {
@@ -237,7 +248,7 @@ async fn notice_channel(
                 let Ok(notice) = notice else { return };
                 // A client that stops reading stops being a responder.
                 let written =
-                    tokio::time::timeout(NOTICE_WRITE_LIMIT, write_notice(&mut write, &notice));
+                    tokio::time::timeout(write_limit, write_notice(&mut write, &notice));
                 if !matches!(written.await, Ok(Ok(()))) {
                     return;
                 }
@@ -287,7 +298,8 @@ async fn write_line(
 
 /// How long a client waits for the answer to `method`. A command may take its own time
 /// limit, and may first wait up to `confirm` for a person's answer (which its time limit
-/// does not count); everything else is quick.
+/// does not count); everything else is quick. The client passes `CONFIRM_TIMEOUT`, not its
+/// own environment's test hook: the daemon's wait is never longer (`confirm_timeout`).
 fn call_limit(method: &str, params: &serde_json::Value, confirm: Duration) -> Duration {
     match method {
         "command.exec" => {
@@ -403,7 +415,7 @@ impl Client {
         line.push(b'\n');
         let limit = self
             .limit
-            .unwrap_or_else(|| call_limit(method, &request.params, confirm_timeout()));
+            .unwrap_or_else(|| call_limit(method, &request.params, CONFIRM_TIMEOUT));
         // Any failure from here on may leave an answer to this request on the way.
         self.broken = true;
         let stream = self.reader.get_mut();

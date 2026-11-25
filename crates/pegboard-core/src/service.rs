@@ -1112,7 +1112,13 @@ impl Daemon {
             }
         }
         self.remove_files(&id);
-        self.confirm.forget_session(&id);
+        // As `close_slot` judges it: a session the manager still has stays open (it can
+        // be closed again) and may be asked again; one that is gone takes its grants along.
+        if result.is_ok() || self.sessions.info(&id).is_err() {
+            self.confirm.forget_session(&id);
+        } else {
+            self.confirm.reopen_session(&id);
+        }
         self.prune_soon();
         result
     }
@@ -1217,8 +1223,8 @@ impl crate::api::Handler for Daemon {
         Daemon::request_stop(self)
     }
 
-    fn confirm_subscription(&self) -> Option<ConfirmSubscription> {
-        Some(self.confirm.subscribe())
+    fn confirm_subscription(&self) -> Result<ConfirmSubscription, RpcError> {
+        self.confirm.subscribe()
     }
 
     async fn delivery_failed(&self, req: &Request, resp: &Response) {
@@ -1418,7 +1424,7 @@ mod tests {
             SessionState,
         };
         let broker = ConfirmBroker::new(CONFIRM_TIMEOUT);
-        let _sub = broker.subscribe();
+        let _sub = broker.subscribe().unwrap();
         let id = SessionId("s_abcdefgh".into());
         let info = SessionInfo {
             id: id.clone(),
