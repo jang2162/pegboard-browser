@@ -557,6 +557,12 @@ class ProfileDefaults : public ProfileManagerObserver {
 
 설정(설계 4.6 표, 156의 이름은 트리에서 확인하고 상수로): `signin.allowed` = false, `credentials_enable_service` = false, `credentials_enable_autosignin` = false, 패스키 저장 제안 설정 = 끔. 방법은 `PrefService`의 기본값 바꾸기(사용자 값이 이긴다). 156에 그 함수가 없거나 첫 창이 옛 값을 보면(설계 5절 위험 5) 프로필 설정 등록 시점에 거는 길을 찾고, 업스트림 줄이 들면 기록한다.
 
+- **구현에서 정한 것** (처음 제안은 `ProfileDefaults : ProfileManagerObserver`, 프로필이 더해질 때 `ApplyTo`):
+  - `ProfileDefaults`는 서비스 없는 키드 서비스 팩토리이고 `RegisterProfilePrefs`에서 기본값을 바꾼다. 로그인 허용은 서비스를 만들 때 정해져 프로필이 더해진 뒤로는 늦다. `MainParts`는 작업 8에서 만들었다.
+  - 설정은 위 넷에 `signin.allowed_on_next_startup`(설정 화면의 스위치, 시작마다 `signin.allowed`로 옮겨진다)을 더한 다섯, 패스키는 `credentials_enable_passkeys`.
+  - `a_chosen_value_wins_over_the_default`는 `credentials_enable_service`와 `signin.allowed_on_next_startup`을 본다(이 빌드는 OAuth 클라이언트가 없어 `signin.allowed`가 늘 거짓). `the_people_page_offers_no_sign_in`은 로그인 행이 없음과 `chrome://management`의 "not managed"를 본다.
+  - 두 번째 변형은 `quit_sigterms_a_daemon_that_stays`가 잡는다(`daemon_exits_when_the_browser_quits`는 파이프 EOF로 통과).
+
 - [ ] **Step 1: 시험을 쓴다** (`e2e_branding.rs`, 포크, `chrome://prefs-internals`와 `chrome://settings/people`의 본문):
 
 ```rust

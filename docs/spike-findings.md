@@ -1322,3 +1322,39 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 - 계획의 변형 "생략 줄을 빼면 선택 화면 시험도 실패"는 생략과 선택 화면이 다른 줄이라 둘로 나눴다.
 - 남는 위험: 사람이 사람 프로필에 같은 색을 고를 수 있다(창 제목은 다르다). 에이전트 창의 프로필 메뉴에는 그 에이전트 프로필 자신이 보인다(생략은 "다른 프로필" 목록에만 걸린다). 임시가 아닌 프로필의 생략은 업스트림이 의도하지 않은 조합이다(DCHECK). 버전을 올릴 때 생략을 읽는 곳(`IsOmitted()` 호출 열 곳 남짓)을 다시 본다.
+
+### 3b 작업 9. 로그인·비밀번호 관리자 기본값 (2026-11-25)
+
+`//pegboard/browser_parts/profile_defaults.{h,cc}`(`ProfileDefaults`)를 더했다. 업스트림 줄은 늘지 않았다(작업 8에서 바꾼 `MainParts`가 `PreProfileInit`에 등록한다).
+
+| 항목 | 값 |
+|---|---|
+| 첫 빌드(새 `profile_defaults.cc`) | 1분 30초 |
+| 변형 빌드 | 34~46초 |
+| 손 패치(`budget.sh`) | 업스트림 파일 15개, 합계 120줄. 증가 0 |
+
+끈 설정(156의 이름, 기본값만 `false`로. 괄호는 참고한 정책):
+
+| 설정 | 뜻 |
+|---|---|
+| `signin.allowed_on_next_startup` | 설정의 "Pegboard 로그인 허용". 시작할 때마다 `signin.allowed`로 옮겨진다 (`BrowserSignin`) |
+| `signin.allowed` | 이번 실행의 로그인 허용 |
+| `credentials_enable_service` | 비밀번호 저장 제안 (`PasswordManagerEnabled`) |
+| `credentials_enable_autosignin` | 자동 로그인 (`AutoSignInEnabled`) |
+| `credentials_enable_passkeys` | 비밀번호 관리자의 패스키 저장 (`PasswordManagerPasskeysEnabled`) |
+
+- **거는 시점** [확인]: 로그인 허용은 프로필의 서비스를 만들 때 한 번 정해진다(`AccountConsistencyModeManager`의 생성자가 `signin.allowed_on_next_startup`을 읽어 `signin.allowed`에 쓴다). `PostProfileInit`이나 `ProfileManagerObserver::OnProfileAdded`는 그 뒤라 첫 실행에 늦는다(설계 5절 위험 5). 그래서 서비스가 없는 키드 서비스 팩토리를 하나 두고, 그 `RegisterProfilePrefs`에서 레지스트리의 기본값을 바꾼다(`PrefRegistry::SetDefaultPrefValue`). 팩토리의 설정 등록은 의존 순서대로 돌므로 그 설정을 등록하는 `AccountConsistencyModeManagerFactory`, `IdentityManagerFactory`에 `DependsOn`을 건다(비밀번호 설정은 그보다 먼저 `RegisterUserProfilePrefs`가 등록한다). 등록은 팩토리 등록이 닫히기 전(`MainParts::PreProfileInit`)이다. 모든 프로필(사람, 에이전트)에 같다.
+- 기본값만 바꾸므로 사람이 고른 값(설정 화면, 이전 실행의 값)이 이긴다. 정책이 아니므로 `chrome://management`는 "Your browser is not managed"다.
+- **이 빌드는 원래 로그인을 못 한다** [확인]: 구글 OAuth 클라이언트가 없는 빌드(`args.gn`의 `google_default_client_id = ""`)는 업스트림이 로그인을 막는다(`CanEnableDiceForBuild`). `signin.allowed_on_next_startup`을 사람이 켜도 `signin.allowed`는 거짓이다. 그래서 설정 화면 시험(로그인 행이 없음)은 이 빌드에서 우리 기본값 없이도 통과하고, 로그인 기본값을 지키는 것은 설정 값 시험이다. 비밀번호 관리자 설정은 키와 상관없다.
+- 설정 "나와 Google" 화면의 본문 글에는 동기화 하위 화면의 숨은 "This setting is managed by your administrator" 글이 늘 들어 있다(관리 표시가 아니다). 관리 여부는 `chrome://management`로 본다.
+
+시험 결과 (두 번째 기기 GUI 세션, 포크): `e2e_branding` 6 passed(작업 6의 2개 + `signin_and_password_saving_are_off_by_default`, `the_first_window_sees_the_defaults`, `the_people_page_offers_no_sign_in`, `a_chosen_value_wins_over_the_default`). 메인 파츠를 바꿨으므로 `e2e_bootstrap` 9 passed.
+
+변형 [확인]:
+
+| 변형 | 실패한 시험 |
+|---|---|
+| `credentials_enable_service` 줄 제거 | `signin_and_password_saving_are_off_by_default`(`Default`의 값 `true`) |
+| `MainParts`가 `PostMainMessageLoopRun`을 넘기지 않음 | `quit_sigterms_a_daemon_that_stays`(데몬이 15초 뒤에도 남음) |
+
+- 계획은 두 번째 변형으로 `daemon_exits_when_the_browser_quits`가 실패한다고 했지만 통과했다. 브라우저 프로세스가 끝나면 파이프가 닫혀 데몬이 EOF로 스스로 끝나기 때문이다(작업 9 3a의 "SIGTERM으로 끝날 때"와 같은 길). 종료 처리가 빠진 것을 보이는 것은 파이프 EOF를 무시하는 데몬(시험 훅)에 5초 뒤 `SIGTERM`이 가는지다.
