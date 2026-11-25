@@ -43,6 +43,8 @@ fn app_under_test() -> Option<PathBuf> {
 struct Server {
     port: u16,
     seen: Arc<Mutex<HashMap<String, Instant>>>,
+    /// The `Cookie` header of the last request for each path.
+    cookies: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Server {
@@ -50,11 +52,14 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen: Arc<Mutex<HashMap<String, Instant>>> = Arc::default();
+        let cookies: Arc<Mutex<HashMap<String, String>>> = Arc::default();
         let record = seen.clone();
+        let record_cookies = cookies.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let record = record.clone();
+                let record_cookies = record_cookies.clone();
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 4096];
                     let n = stream.read(&mut buf).unwrap_or(0);
@@ -66,7 +71,21 @@ impl Server {
                         .and_then(|p| p.split('?').next())
                         .unwrap_or("/")
                         .to_string();
+                    let cookie = req
+                        .lines()
+                        .find_map(|l| {
+                            l.split_once(':')
+                                .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                                .map(|(_, v)| v.trim().to_string())
+                        })
+                        .unwrap_or_default();
+                    record_cookies.lock().unwrap().insert(path.clone(), cookie);
                     record.lock().unwrap().insert(path.clone(), Instant::now());
+                    // `/mark/<who>` sets the cookie who=<who> in the profile that loads it.
+                    let set_cookie = path
+                        .strip_prefix("/mark/")
+                        .map(|who| format!("set-cookie: who={who}; path=/; max-age=3600\r\n"))
+                        .unwrap_or_default();
                     let body = if path.starts_with("/ping/") {
                         format!(
                             "<!doctype html><title>ping</title><script>\
@@ -77,18 +96,27 @@ impl Server {
                     };
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncache-control: no-store\r\n\
-                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                         {set_cookie}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = stream.write_all(resp.as_bytes());
                 });
             }
         });
-        Server { port, seen }
+        Server {
+            port,
+            seen,
+            cookies,
+        }
     }
 
     fn url(&self, path: &str) -> String {
         format!("http://{TEST_NAME}:{}{path}", self.port)
+    }
+
+    /// The `Cookie` header `path` was last asked for with.
+    fn cookie(&self, path: &str) -> Option<String> {
+        self.cookies.lock().unwrap().get(path).cloned()
     }
 
     /// How long ago `path` was last asked for.
@@ -891,4 +919,41 @@ fn a_held_lock_shows_no_notice() {
     assert_eq!(a.notices("daemon_stopped"), Vec::<Value>::new());
     let (code, _, err) = a.cli(&["browser", "stop"], None);
     assert_eq!(code, 0, "{err}");
+}
+
+/// A link a person opens from another app (Mail, `open -a <app> <url>`: AppKit's
+/// `application:openURLs:`) after the agent's window was the last active one opens in the
+/// person's profile, never the agent's (where the agent could read it, e.g. a sign-in link).
+/// The profile is told by its cookie: the agent session loads `/mark/agent` first.
+#[test]
+#[ignore]
+fn an_external_link_opens_in_a_persons_profile() {
+    let Some(app) = app_under_test() else { return };
+    let mut a = App::new(app);
+    let person = a.server.url("/mark/person");
+    a.open(&[&person]);
+    a.wait_for_daemon(None, DAEMON_START);
+    assert!(eventually(SETTLE, || a
+        .server
+        .since("/mark/person")
+        .is_some()));
+    // The session's window: the daemon activates its tab (to set its download policy).
+    let s = a.create_session("/mark/agent");
+    let (code, _, err) = a.cli(&["get", "url"], Some(&s));
+    assert_eq!(code, 0, "{err}");
+    std::thread::sleep(Duration::from_secs(1));
+    let status = Command::new("open")
+        .arg("-a")
+        .arg(&a.app)
+        .arg(a.server.url("/external"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(
+        eventually(SETTLE, || a.server.since("/external").is_some()),
+        "the link did not open"
+    );
+    let cookie = a.server.cookie("/external").unwrap_or_default();
+    eprintln!("OBSERVED cookie of /external: {cookie:?}");
+    assert!(cookie.contains("who=person"), "{cookie:?}");
 }
