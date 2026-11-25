@@ -148,12 +148,14 @@ setTimeout(() => {{ location.href = 'http://localhost:' + location.port + '/coun
     // `/xorigin/<port>`: frames `/form` of `127.0.0.1:<port>` (another fixture): another
     // origin of the same site, so the frame stays in the page's process (agent-browser's
     // `frame` finds it); `window.__frLoaded` once it has loaded.
-    if let Some(port) = path.strip_prefix("/xorigin/") {
+    // `/xorigin/<port>/<rest>` frames `/<rest>` instead.
+    if let Some(rest) = path.strip_prefix("/xorigin/") {
+        let (port, framed) = rest.split_once('/').unwrap_or((rest, "form"));
         let port: u16 = port.parse().unwrap_or(0);
         return html(page(
             "xorigin",
             &format!(
-                r#"<iframe id="fr" onload="window.__frLoaded = true" src="http://127.0.0.1:{port}/form"></iframe>"#
+                r#"<iframe id="fr" onload="window.__frLoaded = true" src="http://127.0.0.1:{port}/{framed}"></iframe>"#
             ),
         ));
     }

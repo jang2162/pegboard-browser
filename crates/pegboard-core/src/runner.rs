@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -172,6 +172,8 @@ struct Slot {
     running: Arc<AtomicUsize>,
     /// The session's token, scrubbed from any text returned to the caller.
     token: Arc<Mutex<Option<String>>>,
+    /// agent-browser has a frame selected (`frame <selector>`; the daemon keeps track).
+    frame_selected: Arc<AtomicBool>,
 }
 
 /// Counts a running command for as long as it lives.
@@ -329,6 +331,17 @@ impl Runner {
         targets.is_some_and(|live| live(id).is_empty())
     }
 
+    /// Whether agent-browser has a frame selected for the session (as the daemon tracks it).
+    pub fn frame_selected(&self, id: &SessionId) -> bool {
+        self.slot(id).frame_selected.load(Ordering::SeqCst)
+    }
+
+    pub fn set_frame_selected(&self, id: &SessionId, selected: bool) {
+        self.slot(id)
+            .frame_selected
+            .store(selected, Ordering::SeqCst);
+    }
+
     /// The tab agent-browser's daemon is bound to (from its `.target` file), if it has one.
     pub fn bound_target(&self, id: &SessionId) -> Option<String> {
         std::fs::read_to_string(self.daemon_file(id, "target"))
@@ -481,6 +494,7 @@ impl Runner {
                 starting: Arc::new(tokio::sync::Mutex::new(())),
                 running: Arc::new(AtomicUsize::new(0)),
                 token: Arc::new(Mutex::new(None)),
+                frame_selected: Arc::new(AtomicBool::new(false)),
             })
             .clone()
     }

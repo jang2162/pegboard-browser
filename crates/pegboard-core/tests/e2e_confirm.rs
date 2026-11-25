@@ -637,54 +637,70 @@ async fn an_answer_for_session_a_does_not_release_session_b() {
     rig.finish().await;
 }
 
-/// After `frame <sel>` agent-browser writes in that frame: the person is shown (and the
-/// command pinned to) the frame's origin, with the tab's beside it, and the write lands
-/// there, not in the tab's top frame.
+/// While a frame is selected (`frame <sel>`), a storage write or an upload that would ask
+/// is refused at once, without a question: agent-browser's `upload` follows the frame, whose
+/// origin pegboard cannot read (its `eval` runs in the tab's top frame; measured on the test
+/// machine: `storage` writes in the top frame, `upload` looks for its input in the frame).
+/// A cookie, set for the pinned tab address, still asks. After `frame main` a storage write
+/// asks, shows the tab's origin, and lands there, not in the frame's origin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-async fn a_write_inside_a_frame_shows_the_frames_origin() {
+async fn a_write_or_upload_in_a_selected_frame_is_refused_without_asking() {
     let rig = rig(None).await;
-    // The page frames a page of another fixture: another origin (its port) of the same site,
-    // so the frame is in the page's process, where agent-browser's `frame` finds it (a
+    // The page frames `/upload` of another fixture: another origin (its port) of the same
+    // site, so the frame is in the page's process, where agent-browser's `frame` finds it (a
     // cross-site frame, such as one of localhost, is a target of its own: "Frame not found").
     let other = common::fixture().await;
     let port = other.origin.rsplit(':').next().unwrap().to_string();
-    let s = rig.session_at(&format!("/xorigin/{port}")).await;
-    let frame_origin = other.origin.clone();
-    assert_ne!(frame_origin, rig.fixture.origin);
+    let s = rig.session_at(&format!("/xorigin/{port}/upload")).await;
+    assert_ne!(other.origin, rig.fixture.origin);
     rig.ok(&s, &["wait", "--fn", "window.__frLoaded === true"])
         .await;
     rig.ok(&s, &["frame", "#fr"]).await;
-    // Premise: commands now act in the frame.
-    let inside = rig.ok(&s, &["eval", "location.origin"]).await;
-    assert_eq!(inside["data"]["result"], frame_origin.as_str(), "{inside}");
     let mut person = rig.subscribe().await;
-    let run = rig.exec(&s, &["storage", "local", "set", "pegframe", "f1"]);
-    let asked = person.next("confirm.required").await;
-    assert_eq!(shown(&asked, "출처"), frame_origin, "{asked}");
-    assert_eq!(
-        shown(&asked, "탭 출처 (쓰기는 그 안의 프레임)"),
-        rig.fixture.origin,
-        "{asked}"
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("fr.txt");
+    std::fs::write(&file, "fr").unwrap();
+    for argv in [
+        vec!["storage", "local", "set", "pegframe", "f1"],
+        vec!["storage", "session", "clear"],
+        vec!["upload", "#f", file.to_str().unwrap()],
+    ] {
+        let r = rig.exec(&s, &argv).await.unwrap();
+        assert_eq!(reason(&r), "unknown_origin", "{argv:?}");
+        assert!(r.error.unwrap().message.contains("frame main"), "{argv:?}");
+    }
+    assert!(
+        person
+            .try_next("confirm.required", Duration::from_secs(1))
+            .await
+            .is_none(),
+        "asked while a frame was selected"
     );
+    assert_eq!(rig.copies_left(&s), 0);
+    // A cookie is held to the tab's address: it still asks.
+    let run = rig.exec(&s, &["cookies", "set", "pegframeck", "1"]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(shown(&asked, "호스트"), "127.0.0.1", "{asked}");
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "deny")
+        .await;
+    assert_eq!(reason(&run.await.unwrap()), "denied");
+    // Back at the top: asked, shown the tab's origin, and written there.
+    rig.ok(&s, &["frame", "main"]).await;
+    let run = rig.exec(&s, &["storage", "local", "set", "pegframe", "top"]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(shown(&asked, "출처"), rig.fixture.origin, "{asked}");
     person
         .respond(asked["confirmId"].as_str().unwrap(), "approve")
         .await;
     let r = run.await.unwrap();
     assert!(r.error.is_none(), "{:?}", r.error);
-    // Where it landed: in the frame's origin, not the page's.
-    assert_eq!(rig.local_storage(&s, "pegframe").await, "f1");
-    rig.ok(&s, &["frame", "main"]).await;
-    assert_eq!(rig.local_storage(&s, "pegframe").await, Value::Null);
-    // Back in the top frame, a write shows the page's origin alone.
-    let run = rig.exec(&s, &["storage", "local", "set", "pegframe", "top"]);
-    let asked = person.next("confirm.required").await;
-    assert_eq!(shown(&asked, "출처"), rig.fixture.origin, "{asked}");
-    assert!(!asked["details"].to_string().contains("탭 출처"), "{asked}");
-    person
-        .respond(asked["confirmId"].as_str().unwrap(), "deny")
+    assert_eq!(rig.local_storage(&s, "pegframe").await, "top");
+    // Not in the frame's origin.
+    rig.ok(&s, &["open", &format!("{}/counter", other.origin)])
         .await;
-    assert_eq!(reason(&run.await.unwrap()), "denied");
+    assert_eq!(rig.local_storage(&s, "pegframe").await, Value::Null);
     rig.finish().await;
 }
 

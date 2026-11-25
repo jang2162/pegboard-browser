@@ -212,6 +212,13 @@ pub async fn run_command_with_hook(
     if let Err(e) = judge_navigation_urls(sessions, id, argv, &run_argv).await {
         return refuse(log, entry, argv, e, started);
     }
+    // A question about a write in a frame cannot be shown truthfully: refused at once.
+    if matches!(judged, Judged::Ask)
+        && acts_in_a_frame(class, &run_argv)
+        && runner.frame_selected(id)
+    {
+        return refuse(log, entry, argv, frame_selected(class), started);
+    }
     // An upload names its files; they become paths only now that the policy allows it.
     let is_upload = run_argv.first().map(String::as_str) == Some("upload");
     let mut path_names = Vec::new();
@@ -258,7 +265,7 @@ pub async fn run_command_with_hook(
                 .collect();
             staged = Some(copies);
         }
-        prepare_question(sessions, runner, id, class, &run_argv, &shown, timeout_ms).await
+        prepare_question(sessions, runner, id, class, &run_argv, &shown).await
     };
     let cleared = clear_command(confirm, judged, class, id, prepare).await;
     // A command that waited for a person is logged at the answer: its time and duration
@@ -334,13 +341,7 @@ pub async fn run_command_with_hook(
     };
 
     // Held to what the person was shown, right before it runs.
-    let now = where_it_acts(
-        sessions,
-        runner,
-        id,
-        reads_frame(class, &run_argv),
-        timeout_ms,
-    );
+    let now = tab_url(sessions, runner, id);
     if !apply_pin(&cleared.pin, &mut run_argv, now).await {
         if let Some(c) = entry.confirm.as_mut() {
             c.outcome = ConfirmOutcome::Stale;
@@ -367,6 +368,7 @@ pub async fn run_command_with_hook(
         Err(e) => Err(e.clone()),
     };
     hide_paths(&mut outcome, &path_names);
+    track_frame(runner, id, &run_argv, &outcome);
     if let (
         Some(c),
         Ok(CommandExecResult {
@@ -533,6 +535,23 @@ async fn judge_navigation_urls(
         sessions.judge_navigation(id, url).await?;
     }
     Ok(())
+}
+
+/// Keeps track of whether agent-browser has a frame selected: `frame <selector>` that
+/// succeeded selects one, `frame main` that succeeded goes back to the top. Anything else
+/// leaves it (a restarted agent-browser daemon is back at the top, which only makes pegboard
+/// refuse more than it must).
+fn track_frame(
+    runner: &Runner,
+    id: &SessionId,
+    run_argv: &[String],
+    outcome: &Result<CommandExecResult, RpcError>,
+) {
+    if let ["frame", target] = run_argv.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        if matches!(outcome, Ok(r) if succeeded(r)) {
+            runner.set_frame_selected(id, target != "main");
+        }
+    }
 }
 
 /// The words of a resolved upload and, per file, its path and its name.
@@ -987,16 +1006,31 @@ fn is_storage(run_argv: &[String]) -> bool {
 /// Whether what a command does lands in the frame agent-browser acts in, which is then read
 /// for its question and its pin: a storage write, and an upload (its file input may be in a
 /// frame of another origin).
-fn reads_frame(class: ActionClass, run_argv: &[String]) -> bool {
+fn acts_in_a_frame(class: ActionClass, run_argv: &[String]) -> bool {
     class == ActionClass::Upload || is_storage(run_argv)
 }
 
+/// An asking storage write or upload while agent-browser has a frame selected: not asked
+/// about, not run. agent-browser's `upload` follows the selected frame, whose origin
+/// pegboard cannot read (its `eval` runs in the tab's top frame), so the person could not
+/// be shown where the files go; `storage` is refused alike (fail closed).
+fn frame_selected(class: ActionClass) -> RpcError {
+    let name = class.as_str();
+    RpcError {
+        code: codes::POLICY_DENIED.to_string(),
+        message: format!(
+            "the {name} command was not run: a frame is selected (`frame <selector>`), and \
+             pegboard cannot show a person which origin it would act in; run `frame main` \
+             and try again"
+        ),
+        data: Some(serde_json::json!({ "reason": "unknown_origin" })),
+    }
+}
+
 /// The question for an asking command: the session, and for `state` what it would write
-/// where (read now: the tab, and for storage the frame agent-browser acts in) and what
-/// pins it there; for `upload` where the files would go (the frame and its tab) and `files`,
-/// the copies' real paths and sizes. Where it would write unknown: refused
-/// (`unknown_origin`).
-#[allow(clippy::too_many_arguments)]
+/// where (read now: the tab) and what pins it there; for `upload` where the files would go
+/// (the tab) and `files`, the copies' real paths and sizes. Where it would write unknown:
+/// refused (`unknown_origin`).
 async fn prepare_question(
     sessions: &SessionManager,
     runner: &Runner,
@@ -1004,20 +1038,11 @@ async fn prepare_question(
     class: ActionClass,
     run_argv: &[String],
     files: &[ShownFile],
-    timeout_ms: u64,
 ) -> Result<(ConfirmAsk, StatePin), RpcError> {
     let info = sessions.info(id)?;
-    let (acting, page) = where_it_acts(
-        sessions,
-        runner,
-        id,
-        reads_frame(class, run_argv),
-        timeout_ms,
-    )
-    .await;
+    let page = tab_url(sessions, runner, id).await;
     let at = Where {
         page_url: page.as_deref(),
-        acting_url: acting.as_deref(),
     };
     let shown = if class == ActionClass::Upload {
         upload_details(files, at)
@@ -1053,58 +1078,6 @@ fn offers_allow_for_session(class: ActionClass, policy: &SessionPolicy) -> bool 
     class != ActionClass::Upload || policy.upload_dir.is_some()
 }
 
-/// The address of the frame agent-browser acts in (for a storage command or an upload;
-/// `None` for any other) and of the tab, read now. The frame first: asking agent-browser binds it to a tab
-/// when it was bound to none, and the tab read is then that one.
-async fn where_it_acts(
-    sessions: &SessionManager,
-    runner: &Runner,
-    id: &SessionId,
-    storage: bool,
-    timeout_ms: u64,
-) -> (Option<String>, Option<String>) {
-    let acting = if storage {
-        acting_url(sessions, runner, id, timeout_ms).await
-    } else {
-        None
-    };
-    (acting, tab_url(sessions, runner, id).await)
-}
-
-/// The address of the frame agent-browser acts in: after `frame <sel>` that frame, else the
-/// tab's top frame. agent-browser alone knows which frame it selected, so it is asked
-/// (`eval location.href`, pegboard's own call: not judged, not logged). It gets the
-/// command's own time limit, which covers starting agent-browser's daemon (the first
-/// command of a session); the runner keeps that limit itself, so the call is never cut
-/// from outside half way through a daemon start, and a daemon that did not answer in time
-/// is stopped (the next command starts a fresh one). `None` when it did not answer.
-async fn acting_url(
-    sessions: &SessionManager,
-    runner: &Runner,
-    id: &SessionId,
-    timeout_ms: u64,
-) -> Option<String> {
-    let endpoint = sessions.endpoint(id).ok()?;
-    runner.set_session_targets_provider(sessions.targets_fn());
-    let argv = ["eval", "location.href"].map(String::from);
-    let r = match runner.exec(id, &endpoint, &argv, timeout_ms).await {
-        Ok(r) => r,
-        Err(e) => {
-            if e.code == codes::TIMEOUT {
-                runner.kill_daemon(id);
-            }
-            return None;
-        }
-    };
-    if !succeeded(&r) {
-        return None;
-    }
-    r.output
-        .pointer("/data/result")
-        .and_then(Value::as_str)
-        .map(String::from)
-}
-
 /// The address of the tab a command acts on (the one agent-browser is bound to, else the
 /// session's only tab); `None` when there is none or it cannot be read in time.
 async fn tab_url(sessions: &SessionManager, runner: &Runner, id: &SessionId) -> Option<String> {
@@ -1114,14 +1087,14 @@ async fn tab_url(sessions: &SessionManager, runner: &Runner, id: &SessionId) -> 
         .ok()?
 }
 
-/// Holds an approved command to what the person was shown: a cookie set without an
-/// address gets the asked tab's (`--url`); a storage write runs only while the frame it
-/// acts in and its tab are still at the asked origins (`now` reads both addresses, as
-/// `where_it_acts`). False: it must not run (`stale`).
+/// Holds an approved command to what the person was shown: a cookie set gets the asked
+/// tab's address (`--url`) and the shown path (`--path`) when it gave none; a storage write
+/// or an upload runs only while the tab is still at the asked origin (`now` reads its
+/// address). False: it must not run (`stale`).
 async fn apply_pin(
     pin: &StatePin,
     run_argv: &mut Vec<String>,
-    now: impl Future<Output = (Option<String>, Option<String>)>,
+    now: impl Future<Output = Option<String>>,
 ) -> bool {
     match pin {
         StatePin::None => true,
@@ -1134,13 +1107,7 @@ async fn apply_pin(
             }
             true
         }
-        StatePin::Origin { acting, page } => {
-            let same = |now: Option<String>, origin: &str| {
-                now.is_some_and(|url| origin_of(&url) == origin)
-            };
-            let (now_acting, now_page) = now.await;
-            same(now_acting, acting) && same(now_page, page)
-        }
+        StatePin::Origin(origin) => now.await.is_some_and(|url| origin_of(&url) == *origin),
     }
 }
 
@@ -1492,32 +1459,23 @@ mod tests {
 
     #[tokio::test]
     async fn storage_write_after_navigation_is_stale() {
-        let pin = StatePin::Origin {
-            acting: "https://frame.test".into(),
-            page: "https://a.test".into(),
-        };
+        let pin = StatePin::Origin("https://a.test".into());
         let mut run = words(&["storage", "local", "set", "k", "v"]);
-        let at = |acting: Option<&str>, page: Option<&str>| {
-            let now = (acting.map(String::from), page.map(String::from));
+        let at = |page: Option<&str>| {
+            let now = page.map(String::from);
             async move { now }
         };
-        // Same origins, other pages: it runs, unchanged.
-        let now = at(Some("https://frame.test/y"), Some("https://a.test/other?x"));
-        assert!(apply_pin(&pin, &mut run, now).await);
+        // Same origin, another page: it runs, unchanged.
+        assert!(apply_pin(&pin, &mut run, at(Some("https://a.test/other?x"))).await);
         assert_eq!(run, words(&["storage", "local", "set", "k", "v"]));
-        // The frame or the tab elsewhere, or either unreadable: it must not run.
-        for (acting, page) in [
-            (Some("https://b.test/"), Some("https://a.test/")),
-            (Some("https://frame.test/"), Some("https://b.test/")),
-            // Back in the top frame (`frame main`): another origin than the one asked.
-            (Some("https://a.test/"), Some("https://a.test/")),
-            (None, Some("https://a.test/")),
-            (Some("https://frame.test/"), None),
+        // The tab elsewhere, or unreadable: it must not run.
+        for page in [
+            Some("https://b.test/"),
+            Some("http://a.test/"),
+            Some("https://a.test:8443/"),
+            None,
         ] {
-            assert!(
-                !apply_pin(&pin, &mut run, at(acting, page)).await,
-                "{acting:?} {page:?}"
-            );
+            assert!(!apply_pin(&pin, &mut run, at(page)).await, "{page:?}");
         }
         let e = denial(
             ActionClass::State,
@@ -1537,7 +1495,7 @@ mod tests {
         let mut run = words(&["cookies", "set", "n", "v"]);
         // The tab has moved on meanwhile: what runs is still the asked address, with the
         // path that was shown.
-        let moved = async { (None, Some("https://evil.test/".to_string())) };
+        let moved = async { Some("https://evil.test/".to_string()) };
         assert!(apply_pin(&pin, &mut run, moved).await);
         assert_eq!(
             run,
@@ -1553,7 +1511,7 @@ mod tests {
             ])
         );
         let mut run = words(&["cookies", "set", "n", "v"]);
-        assert!(apply_pin(&StatePin::None, &mut run, async { (None, None) }).await);
+        assert!(apply_pin(&StatePin::None, &mut run, async { None }).await);
         assert_eq!(run, words(&["cookies", "set", "n", "v"]));
     }
 
@@ -1576,10 +1534,7 @@ mod tests {
     }
 
     fn origin_pin() -> StatePin {
-        StatePin::Origin {
-            acting: "https://a.test".into(),
-            page: "https://a.test".into(),
-        }
+        StatePin::Origin("https://a.test".into())
     }
 
     /// Answers the next confirmation that shows up with `answer`.
@@ -2009,19 +1964,24 @@ mod tests {
     }
 
     #[test]
-    fn an_upload_reads_the_frame_it_acts_in() {
-        assert!(reads_frame(
+    fn a_write_in_a_selected_frame_is_not_asked_about() {
+        assert!(acts_in_a_frame(
             ActionClass::Upload,
             &words(&["upload", "#f", "/a"])
         ));
-        assert!(reads_frame(
+        assert!(acts_in_a_frame(
             ActionClass::State,
             &words(&["storage", "local", "clear"])
         ));
-        assert!(!reads_frame(
+        // A cookie is set for the pinned tab address, whatever frame is selected.
+        assert!(!acts_in_a_frame(
             ActionClass::State,
             &words(&["cookies", "set", "a", "b"])
         ));
+        let e = frame_selected(ActionClass::Upload);
+        assert_eq!(e.code, codes::POLICY_DENIED);
+        assert_eq!(e.reason(), Some("unknown_origin"));
+        assert!(e.message.contains("frame main"), "{}", e.message);
     }
 
     #[test]

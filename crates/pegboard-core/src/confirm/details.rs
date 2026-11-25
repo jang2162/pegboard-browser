@@ -25,22 +25,22 @@ pub enum StatePin {
         url: Option<String>,
         path: Option<String>,
     },
-    /// A storage write: when it runs, the frame agent-browser acts in must still be at
-    /// `acting` and its tab at `page` (origins), else `stale`.
-    Origin { acting: String, page: String },
+    /// A storage write or an upload: when it runs, the tab must still be at this origin,
+    /// else `stale`.
+    Origin(String),
     /// Nothing to hold it to.
     #[default]
     None,
 }
 
-/// Where a state command would act, as read when it is asked about.
+/// Where a state command or an upload would act, as read when it is asked about: the tab
+/// agent-browser works on. (agent-browser's `storage` writes in the tab's top frame whatever
+/// frame is selected; its `upload` follows the selected frame, whose origin pegboard cannot
+/// read, so the daemon asks about neither while a frame is selected.)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Where<'a> {
     /// The address of the tab (its top frame).
     pub page_url: Option<&'a str>,
-    /// The address of the frame agent-browser acts in (after `frame <sel>`, that frame;
-    /// else the tab's top frame). Read for storage commands only.
-    pub acting_url: Option<&'a str>,
 }
 
 /// Why a state command cannot be shown to a person. Either way it is neither asked about
@@ -167,7 +167,7 @@ fn cookie_host(url: &str) -> Result<String, NotShown> {
     }
 }
 
-/// The origin of a frame a storage write lands in, when it is a real one: an opaque origin
+/// The origin of a page a storage write or an upload lands in, when it is a real one: an opaque origin
 /// (`about:blank`, `about:srcdoc`, `data:`) cannot be shown (`about:` frames inherit
 /// their parent's), nor a host longer than a host can be.
 fn storage_origin(url: &str) -> Result<String, NotShown> {
@@ -213,7 +213,7 @@ pub fn default_cookie_path(url: &str) -> String {
 }
 
 /// What a state command shows and what pins it, given where it would act. A storage write
-/// needs the frame it acts in and its tab; a cookie without `--url`/`--domain` needs the
+/// needs the tab; a cookie without `--url`/`--domain` needs the
 /// tab. Without them: `UnknownOrigin` (fail closed: a person is never shown a guess).
 /// `argv` is the checked command line that runs.
 pub fn state_details(
@@ -229,19 +229,8 @@ pub fn state_details(
             } else {
                 "sessionStorage"
             };
-            let (Some(acting), Some(page)) = (at.acting_url, at.page_url) else {
-                return Err(NotShown::UnknownOrigin);
-            };
-            let (acting, page) = (storage_origin(acting)?, storage_origin(page)?);
-            let mut details = vec![detail("출처", display_text(&acting, DETAIL_VALUE_CHARS))];
-            // Inside a frame of another origin: the tab's origin too, so the person sees
-            // the write does not go to the page they see.
-            if acting != page {
-                details.push(detail(
-                    "탭 출처 (쓰기는 그 안의 프레임)",
-                    display_text(&page, DETAIL_VALUE_CHARS),
-                ));
-            }
+            let origin = storage_origin(at.page_url.ok_or(NotShown::UnknownOrigin)?)?;
+            let mut details = vec![detail("출처", display_text(&origin, DETAIL_VALUE_CHARS))];
             details.push(detail("종류", store.to_string()));
             if *op == "set" {
                 details.push(detail(
@@ -255,7 +244,7 @@ pub fn state_details(
             } else {
                 details.push(detail("동작", format!("이 출처의 {store} 전체 삭제")));
             }
-            Ok((details, StatePin::Origin { acting, page }))
+            Ok((details, StatePin::Origin(origin)))
         }
         // Fail closed: nothing is asked about that these rules do not know.
         _ => Err(NotShown::Unexpected),
@@ -287,36 +276,24 @@ pub fn human_size(n: u64) -> String {
 }
 
 /// What an upload shows and what pins it (design 4.3, B7): where the files go first (the
-/// host, cut from the left like a cookie's; the origin of the frame agent-browser acts in,
-/// and the tab's when that differs), then each file's real path, whole, and its size. It is
-/// held like a storage write: when it runs, the frame and its tab must still be at the shown
-/// origins (`StatePin::Origin`), else `stale`. A path that would not show exactly as it is
+/// tab's host, cut from the left like a cookie's, and its origin), then each file's real
+/// path, whole, and its size. It is held like a storage write: when it runs, the tab must
+/// still be at the shown origin (`StatePin::Origin`), else `stale`. A path that would not show exactly as it is
 /// (escaped or cut) is `Unexpected`: the daemon refuses such a path before it asks.
 pub fn upload_details(
     files: &[ShownFile],
     at: Where<'_>,
 ) -> Result<(Vec<ConfirmDetail>, StatePin), NotShown> {
-    let (Some(acting), Some(page)) = (at.acting_url, at.page_url) else {
-        return Err(NotShown::UnknownOrigin);
-    };
-    let (acting, page) = (storage_origin(acting)?, storage_origin(page)?);
-    let host = url::Url::parse(&acting)
+    let origin = storage_origin(at.page_url.ok_or(NotShown::UnknownOrigin)?)?;
+    let host = url::Url::parse(&origin)
         .ok()
         .and_then(|u| u.host_str().map(String::from))
         .filter(|h| !h.is_empty())
         .ok_or(NotShown::UnknownOrigin)?;
     let mut details = vec![
         detail("호스트", display_tail(&host, HOST_SHOWN_CHARS)),
-        detail("대상 페이지", display_text(&acting, DETAIL_VALUE_CHARS)),
+        detail("대상 페이지", display_text(&origin, DETAIL_VALUE_CHARS)),
     ];
-    // Inside a frame of another origin: the tab's origin too, so the person sees the files
-    // do not go to the page they see.
-    if acting != page {
-        details.push(detail(
-            "탭 출처 (파일은 그 안의 프레임으로)",
-            display_text(&page, DETAIL_VALUE_CHARS),
-        ));
-    }
     if files.is_empty() {
         return Err(NotShown::Unexpected);
     }
@@ -328,7 +305,7 @@ pub fn upload_details(
         details.push(detail("파일", shown));
         details.push(detail("크기", human_size(f.size)));
     }
-    Ok((details, StatePin::Origin { acting, page }))
+    Ok((details, StatePin::Origin(origin)))
 }
 
 /// Sets a flag's value once; a second one (or none) is `Unexpected`.
@@ -529,7 +506,6 @@ mod tests {
     fn tab(url: &str) -> Where<'_> {
         Where {
             page_url: Some(url),
-            acting_url: Some(url),
         }
     }
 
@@ -704,13 +680,7 @@ mod tests {
             tab("https://a.test:8443/x?q=1"),
         )
         .unwrap();
-        assert_eq!(
-            pin,
-            StatePin::Origin {
-                acting: "https://a.test:8443".into(),
-                page: "https://a.test:8443".into()
-            }
-        );
+        assert_eq!(pin, StatePin::Origin("https://a.test:8443".into()));
         assert_eq!(value_of(&details, "출처"), "https://a.test:8443");
         assert!(details.iter().all(|d| !d.label.starts_with("탭 출처")));
         assert_eq!(value_of(&details, "종류"), "localStorage");
@@ -730,43 +700,9 @@ mod tests {
     }
 
     #[test]
-    fn a_write_inside_a_frame_shows_and_pins_the_frames_origin() {
-        let (details, pin) = state_details(
-            &s(&["storage", "local", "set", "k", "v"]),
-            Where {
-                page_url: Some("https://page.test/p"),
-                acting_url: Some("https://frame.test/inner"),
-            },
-        )
-        .unwrap();
-        assert_eq!(value_of(&details, "출처"), "https://frame.test");
-        assert_eq!(
-            value_of(&details, "탭 출처 (쓰기는 그 안의 프레임)"),
-            "https://page.test"
-        );
-        assert_eq!(
-            pin,
-            StatePin::Origin {
-                acting: "https://frame.test".into(),
-                page: "https://page.test".into()
-            }
-        );
-    }
-
-    #[test]
     fn where_it_writes_unknown_is_refused_not_asked() {
         let storage = s(&["storage", "local", "set", "k", "v"]);
-        for at in [
-            Where::default(),
-            Where {
-                page_url: Some("https://a.test/"),
-                acting_url: None,
-            },
-            Where {
-                page_url: None,
-                acting_url: Some("https://a.test/"),
-            },
-        ] {
+        for at in [Where::default(), Where { page_url: None }] {
             assert_eq!(
                 state_details(&storage, at),
                 Err(NotShown::UnknownOrigin),
@@ -830,23 +766,15 @@ mod tests {
     }
 
     #[test]
-    fn a_storage_write_in_an_opaque_frame_is_refused() {
+    fn a_storage_write_in_an_opaque_page_is_refused() {
         let storage = s(&["storage", "local", "set", "k", "v"]);
-        for acting in ["about:blank", "about:srcdoc", "data:text/html,x"] {
-            let at = Where {
-                page_url: Some("https://a.test/"),
-                acting_url: Some(acting),
-            };
+        for url in ["about:blank", "about:srcdoc", "data:text/html,x"] {
             assert_eq!(
-                state_details(&storage, at),
+                state_details(&storage, tab(url)),
                 Err(NotShown::UnknownOrigin),
-                "{acting}"
+                "{url}"
             );
         }
-        assert_eq!(
-            state_details(&storage, tab("about:blank")),
-            Err(NotShown::UnknownOrigin)
-        );
     }
 
     #[test]
@@ -887,10 +815,7 @@ mod tests {
 
     #[test]
     fn an_upload_shows_the_host_first_then_each_real_path_and_size() {
-        let at = Where {
-            page_url: Some("https://a.test/upload?x=1"),
-            acting_url: Some("https://a.test/upload?x=1"),
-        };
+        let at = tab("https://a.test/upload?x=1");
         let (details, pin) =
             upload_details(&files(&[("/tmp/r/a.txt", 12), ("/tmp/r/b.bin", 1536)]), at).unwrap();
         let shown: Vec<(&str, &str)> = details
@@ -908,23 +833,14 @@ mod tests {
                 ("크기", "1.5 KiB (1536 B)"),
             ]
         );
-        assert_eq!(
-            pin,
-            StatePin::Origin {
-                acting: "https://a.test".into(),
-                page: "https://a.test".into()
-            }
-        );
+        assert_eq!(pin, StatePin::Origin("https://a.test".into()));
     }
 
     #[test]
-    fn an_upload_into_a_frame_shows_both_origins_and_a_long_host_keeps_its_end() {
+    fn an_upload_to_a_long_host_keeps_its_end() {
         let long = format!("{}.evil.test", "a".repeat(150));
-        let acting = format!("https://{long}/f");
-        let at = Where {
-            page_url: Some("https://bank.test/"),
-            acting_url: Some(&acting),
-        };
+        let page = format!("https://{long}/f");
+        let at = tab(&page);
         let (details, pin) = upload_details(&files(&[("/tmp/a", 1)]), at).unwrap();
         assert_eq!(details[0].label, "호스트");
         assert!(details[0].value.starts_with('…'), "{}", details[0].value);
@@ -933,33 +849,16 @@ mod tests {
             "{}",
             details[0].value
         );
-        assert_eq!(
-            value_of(&details, "탭 출처 (파일은 그 안의 프레임으로)"),
-            "https://bank.test"
-        );
-        assert!(matches!(pin, StatePin::Origin { page, .. } if page == "https://bank.test"));
+        assert_eq!(pin, StatePin::Origin(format!("https://{long}")));
     }
 
     #[test]
     fn an_upload_with_no_or_an_opaque_target_or_an_unshowable_path_is_not_shown() {
-        let ok = Where {
-            page_url: Some("https://a.test/"),
-            acting_url: Some("https://a.test/"),
-        };
+        let ok = tab("https://a.test/");
         for at in [
             Where::default(),
-            Where {
-                page_url: Some("https://a.test/"),
-                acting_url: None,
-            },
-            Where {
-                page_url: Some("about:blank"),
-                acting_url: Some("about:blank"),
-            },
-            Where {
-                page_url: Some("https://a.test/"),
-                acting_url: Some("data:text/html,x"),
-            },
+            tab("about:blank"),
+            tab("data:text/html,x"),
         ] {
             assert_eq!(
                 upload_details(&files(&[("/tmp/a", 1)]), at).unwrap_err(),
