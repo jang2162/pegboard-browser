@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "base/callback_list.h"
 #include "base/functional/bind.h"
 #include "base/memory/raw_ptr.h"
 #include "base/no_destructor.h"
@@ -22,6 +23,7 @@
 #include "base/time/time.h"
 #include "base/timer/timer.h"
 #include "base/types/expected.h"
+#include "components/sessions/core/session_id.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/profiles/profile_attributes_entry.h"
@@ -42,6 +44,8 @@
 #include "content/public/browser/devtools_agent_host_client.h"
 #include "content/public/browser/devtools_agent_host_client_channel.h"
 #include "content/public/browser/web_contents.h"
+#include "pegboard/ui/confirm_dialog.h"
+#include "pegboard/ui/display_text.h"
 #include "ui/base/page_transition_types.h"
 #include "ui/base/window_open_disposition.h"
 #include "ui/gfx/range/range.h"
@@ -428,7 +432,216 @@ bool CanEdit(const std::vector<tabs::TabHandle>& tabs) {
   return true;
 }
 
+
+// Limits of requestConfirmation (design 4.5).
+constexpr size_t kMaxConfirmations = 16;
+constexpr size_t kMaxDetails = 40;
+constexpr size_t kMaxLabelChars = 40;
+constexpr size_t kMaxValueChars = 1000;
+constexpr size_t kMaxSessionIdChars = 64;
+// A dialog closes on its own (without an answer) this long after it was asked
+// for, should the daemon never cancel it. Longer than the daemon's 60 s.
+constexpr base::TimeDelta kConfirmationSafetyTime = base::Seconds(75);
+
+// 128 bits as the daemon writes them: 32 lowercase hexadecimal digits.
+bool IsConfirmId(std::string_view id) {
+  return id.size() == 32 && std::ranges::all_of(id, [](char c) {
+           return base::IsAsciiDigit(c) || (c >= 'a' && c <= 'f');
+         });
+}
+
+// "s_" and the like: ASCII letters, digits, '_' and '-'.
+bool IsSessionId(std::string_view id) {
+  return !id.empty() && id.size() <= kMaxSessionIdChars &&
+         std::ranges::all_of(id, [](char c) {
+           return base::IsAsciiAlphaNumeric(c) || c == '_' || c == '-';
+         });
+}
+
+// The normal window of `profile` whose session ID is `id`, unless it is
+// closing.
+BrowserWindowInterface* AgentWindowWithId(const SessionID& id,
+                                          const Profile* profile) {
+  for (BrowserWindowInterface* window : GetAllBrowserWindowInterfaces()) {
+    if (window->GetSessionID() == id && IsNormalWindow(window) &&
+        window->GetProfile() == profile && IsAgentProfile(profile) &&
+        !window->capabilities()->IsAttemptingToCloseBrowser()) {
+      return window;
+    }
+  }
+  return nullptr;
+}
+
 }  // namespace
+
+// The owner's open confirmations: one dialog at a time per window (a sheet
+// each; AppKit would queue a second one without showing it), the others of
+// that window waiting in the order they were asked for. Each ends once: with
+// an answer (answered_ runs, the event), or closed without one (cancelled, its
+// safety time, the owner going).
+class Confirmations {
+ public:
+  using Answered =
+      base::RepeatingCallback<void(const std::string&, ConfirmAnswer)>;
+
+  explicit Confirmations(Answered answered) : answered_(std::move(answered)) {}
+  Confirmations(const Confirmations&) = delete;
+  Confirmations& operator=(const Confirmations&) = delete;
+  // Closes every dialog without an answer.
+  ~Confirmations() {
+    for (auto& [id, entry] : entries_) {
+      if (entry->dialog) {
+        entry->dialog->Close("owner_gone");
+      }
+    }
+  }
+
+  bool Has(const std::string& id) const { return entries_.contains(id); }
+  size_t size() const { return entries_.size(); }
+
+  // Shows `request` on `window` (an agent window of `profile`), or queues it
+  // behind the dialog up there. `tab`, when there is one, is the tab the
+  // command acts on: its closing denies. False when it could not be shown.
+  bool Add(ConfirmRequest request,
+           BrowserWindowInterface* window,
+           Profile* profile,
+           tabs::TabInterface* tab) {
+    const std::string id = request.confirm_id;
+    auto entry = std::make_unique<Entry>();
+    entry->seq = next_seq_++;
+    entry->window = window->GetSessionID();
+    entry->profile = profile;
+    entry->request = std::move(request);
+    entry->safety.Start(FROM_HERE, kConfirmationSafetyTime,
+                        base::BindOnce(&Confirmations::Expire,
+                                       base::Unretained(this), id));
+    if (tab) {
+      entry->tab_watch = tab->RegisterWillDetach(
+          base::BindRepeating(&Confirmations::TabWillDetach,
+                              base::Unretained(this), id));
+    }
+    Entry* added = entries_.emplace(id, std::move(entry)).first->second.get();
+    if (!ShownIn(added->window)) {
+      if (!ShowEntry(id, added, window)) {
+        entries_.erase(id);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Closes it without an answer; nothing for one that is gone.
+  void Cancel(const std::string& id) { Remove(id, "cancelled"); }
+
+ private:
+  struct Entry {
+    uint64_t seq = 0;
+    SessionID window = SessionID::InvalidValue();
+    raw_ptr<Profile> profile = nullptr;
+    ConfirmRequest request;
+    std::unique_ptr<ConfirmDialog> dialog;
+    base::OneShotTimer safety;
+    base::CallbackListSubscription tab_watch;
+  };
+
+  bool ShownIn(const SessionID& window) const {
+    return std::ranges::any_of(entries_, [&window](const auto& e) {
+      return e.second->window == window && e.second->dialog;
+    });
+  }
+
+  bool ShowEntry(const std::string& id,
+                 Entry* entry,
+                 BrowserWindowInterface* window) {
+    ConfirmRequest copy;
+    copy.confirm_id = entry->request.confirm_id;
+    copy.session_id = entry->request.session_id;
+    copy.session_name = entry->request.session_name;
+    copy.profile_directory = entry->request.profile_directory;
+    copy.action_class = entry->request.action_class;
+    copy.details = entry->request.details;
+    copy.offer_allow_for_session = entry->request.offer_allow_for_session;
+    entry->dialog = ConfirmDialog::Show(
+        window, std::move(copy),
+        base::BindOnce(&Confirmations::Done, weak_factory_.GetWeakPtr(), id));
+    return entry->dialog != nullptr;
+  }
+
+  // The next one asked for in `window`, once nothing is shown there. One whose
+  // window has gone is denied (its window closed).
+  void ShowNext(const SessionID& window) {
+    while (!ShownIn(window)) {
+      Entry* next = nullptr;
+      std::string next_id;
+      for (auto& [id, entry] : entries_) {
+        if (entry->window == window && (!next || entry->seq < next->seq)) {
+          next = entry.get();
+          next_id = id;
+        }
+      }
+      if (!next) {
+        return;
+      }
+      BrowserWindowInterface* w = AgentWindowWithId(window, next->profile);
+      if (w && ShowEntry(next_id, next, w)) {
+        return;
+      }
+      entries_.erase(next_id);
+      answered_.Run(next_id, ConfirmAnswer::kDeny);
+    }
+  }
+
+  // The dialog's answer (in a task of its own).
+  void Done(std::string id, ConfirmAnswer answer) {
+    auto it = entries_.find(id);
+    if (it == entries_.end()) {
+      return;
+    }
+    const SessionID window = it->second->window;
+    entries_.erase(it);
+    answered_.Run(id, answer);
+    ShowNext(window);
+  }
+
+  void TabWillDetach(std::string id,
+                     tabs::TabInterface* tab,
+                     tabs::TabInterface::DetachReason reason) {
+    if (reason != tabs::TabInterface::DetachReason::kDelete) {
+      return;
+    }
+    auto it = entries_.find(id);
+    if (it == entries_.end()) {
+      return;
+    }
+    if (it->second->dialog) {
+      // Answers kDeny through Done.
+      it->second->dialog->Deny("tab_closed");
+      return;
+    }
+    entries_.erase(it);
+    answered_.Run(id, ConfirmAnswer::kDeny);
+  }
+
+  void Expire(std::string id) { Remove(id, "safety_time"); }
+
+  void Remove(const std::string& id, std::string_view why) {
+    auto it = entries_.find(id);
+    if (it == entries_.end()) {
+      return;
+    }
+    const SessionID window = it->second->window;
+    if (it->second->dialog) {
+      it->second->dialog->Close(why);
+    }
+    entries_.erase(it);
+    ShowNext(window);
+  }
+
+  Answered answered_;
+  std::map<std::string, std::unique_ptr<Entry>> entries_;
+  uint64_t next_seq_ = 1;
+  base::WeakPtrFactory<Confirmations> weak_factory_{this};
+};
 
 // static
 bool PegboardHandler::IsAvailable(
@@ -460,6 +673,8 @@ PegboardHandler::PegboardHandler(protocol::UberDispatcher* dispatcher)
 }
 
 PegboardHandler::~PegboardHandler() {
+  // The owner goes: its dialogs close, without an event.
+  confirmations_.reset();
   // Before TabStripModelObserver's destructor, which wants no observation.
   tab_strip_tracker_.reset();
   if (g_owner == this) {
@@ -881,6 +1096,122 @@ Response PegboardHandler::Ungroup(int group_id) {
     list->Ungroup(members);
   }
   return Response::Success();
+}
+
+Response PegboardHandler::RequestConfirmation(
+    const std::string& confirm_id,
+    const std::string& browser_context_id,
+    std::unique_ptr<protocol::Array<std::string>> target_ids,
+    const std::string& session_id,
+    const std::string& session_name,
+    const std::string& profile_directory,
+    const std::string& action_class,
+    std::unique_ptr<protocol::Array<protocol::Pegboard::ConfirmationDetail>>
+        details,
+    bool offer_allow_for_session) {
+  if (!IsOwner()) {
+    return NotFound("requestConfirmation");
+  }
+  if (!confirmations_) {
+    confirmations_ = std::make_unique<Confirmations>(base::BindRepeating(
+        &PegboardHandler::OnConfirmationAnswered, base::Unretained(this)));
+  }
+  if (!IsConfirmId(confirm_id)) {
+    return Response::ServerError(
+        "confirmId is not 32 lowercase hexadecimal digits");
+  }
+  if (confirmations_->Has(confirm_id)) {
+    return Response::ServerError("confirmation already open: " + confirm_id);
+  }
+  if (confirmations_->size() >= kMaxConfirmations) {
+    return Response::ServerError("too many confirmations open");
+  }
+  if (action_class != "upload" && action_class != "state") {
+    return Response::ServerError("unknown actionClass: " + action_class);
+  }
+  if (!IsSessionId(session_id)) {
+    return Response::ServerError("malformed sessionId");
+  }
+  if (details->size() > kMaxDetails) {
+    return Response::ServerError("too many details");
+  }
+  ConfirmRequest request;
+  for (const std::unique_ptr<protocol::Pegboard::ConfirmationDetail>& d :
+       *details) {
+    std::string label = d->GetLabel();
+    std::string value = d->GetValue();
+    if (CharCount(label) > kMaxLabelChars) {
+      return Response::ServerError("a detail's label is too long");
+    }
+    if (CharCount(value) > kMaxValueChars) {
+      return Response::ServerError("a detail's value is too long");
+    }
+    request.details.emplace_back(std::move(label), std::move(value));
+  }
+  Profile* profile = AgentProfileOf(browser_context_id);
+  if (!profile) {
+    return NotAgentContext(browser_context_id);
+  }
+  if (profile_directory != DirectoryOf(profile)) {
+    return Response::ServerError(
+        "profileDirectory is not the browser context's: " + profile_directory);
+  }
+  // Every tab must be one of this agent profile's (fail closed: a tab that is
+  // gone, a person's or another profile's refuses the whole request).
+  std::vector<tabs::TabInterface*> tabs;
+  for (const std::string& id : *target_ids) {
+    tabs::TabInterface* tab = AgentTabOf(id);
+    if (!tab || tab->GetBrowserWindowInterface()->GetProfile() != profile) {
+      return Response::ServerError("not a tab of " + profile_directory + ": " +
+                                   id);
+    }
+    tabs.push_back(tab);
+  }
+  BrowserWindowInterface* window = nullptr;
+  for (tabs::TabInterface* tab : tabs) {
+    BrowserWindowInterface* w = tab->GetBrowserWindowInterface();
+    if (!w->capabilities()->IsAttemptingToCloseBrowser()) {
+      window = w;
+      break;
+    }
+  }
+  if (!window) {
+    window = TabbedWindowOf(profile);
+  }
+  if (!window || !IsNormalWindow(window) || window->GetProfile() != profile) {
+    return Response::ServerError("no window");
+  }
+  request.confirm_id = confirm_id;
+  request.session_id = session_id;
+  request.session_name = session_name;
+  request.profile_directory = profile_directory;
+  request.action_class = action_class;
+  request.offer_allow_for_session = offer_allow_for_session;
+  if (!confirmations_->Add(std::move(request), window, profile,
+                           tabs.empty() ? nullptr : tabs.front())) {
+    return Response::ServerError("could not show the dialog");
+  }
+  return Response::Success();
+}
+
+Response PegboardHandler::CancelConfirmation(const std::string& confirm_id) {
+  if (!IsOwner()) {
+    return NotFound("cancelConfirmation");
+  }
+  if (confirmations_) {
+    confirmations_->Cancel(confirm_id);
+  }
+  return Response::Success();
+}
+
+void PegboardHandler::OnConfirmationAnswered(const std::string& confirm_id,
+                                             ConfirmAnswer answer) {
+  // Only the owner has confirmations, and this handler is its session's: the
+  // event goes to that session alone.
+  if (!IsOwner()) {
+    return;
+  }
+  frontend_->ConfirmationAnswered(confirm_id, std::string(AnswerName(answer)));
 }
 
 void PegboardHandler::OnProfileAdded(Profile* profile) {

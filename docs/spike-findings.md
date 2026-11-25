@@ -1233,3 +1233,45 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 - **변형** [확인]: `.grd`는 바꾸고 `.xtb`는 그대로 둔(ID를 안 바꾼) 빌드에서 `about_page_says_pegboard_in_korean`이 실패했다. 한국어 화면이 "설정 - About Pegboard"로 영어로 돌아갔다. 영어 시험은 통과.
 - **아이콘**: 주황색 둥근 판, 구멍 격자, 페그 하나. 맥미니의 앱 `Contents/Resources/app.icns`가 저장소 파일과 같다(SHA-1). Finder·Dock 화면은 SSH로 찍을 수 없어(배경만 찍힌다) 보지 못했다. 16·32px 렌더는 개발 기기에서 확대해 봤다.
 - 남은 것: 설정 About 화면의 로고 그림, `chrome://version`의 로고는 Chromium 트리의 그림 그대로다. 설정 검색의 "Go to Google Chrome help" 같은 문구는 두 대상 `.grd` 밖(`settings_strings.grdp`, `generated_resources.grd` 소속)이라 그대로다.
+
+### 3b 작업 7. 확인 창과 `Pegboard` 도메인의 확인 메서드 (2026-11-25)
+
+`//pegboard/ui`(확인 창 `confirm_dialog`, 글 거르기 `display_text`, 시험 훅 `test_hooks`, 맥 부분 `platform_mac.mm`)와 도메인의 `requestConfirmation`, `cancelConfirmation`, 이벤트 `confirmationAnswered`를 더했다. 개발 기기의 Chromium 트리에서 빌드하고 두 번째 기기의 GUI 세션에서 시험했다.
+
+| 항목 | 값 |
+|---|---|
+| 첫 빌드(새 `//pegboard/ui`, 핸들러, `.pdl`과 생성 코드) | 75초 |
+| `//pegboard/ui` 증분(`.cc` 하나) | 45~72초, 변형 빌드 45~65초 |
+| `PEGBOARD_APPLY_FORCE=1 apply.sh` 뒤 빌드 | 5분 8초(파일 시각이 바뀐 `//pegboard`와 생성 문자열) |
+| 손 패치(`budget.sh`) | 업스트림 파일 15개, 추가 96, 삭제 24, 합계 120줄. 증가 0 |
+| 새 `//pegboard/ui` | 1,053줄(파일 9개), `//pegboard/devtools` +396줄 |
+
+- **초점: 시트는 초점을 가져간다** [확인]: 처음 판은 브라우저 모달(`CreateBrowserModalDialogViews`, `ModalType::kWindow`)이었다. 맥에서 그것은 에이전트 창의 시트이고, 사람의 `Default` 창이 키 창인 상태에서 띄우면 띄운 직후는 `Default`, 200ms 뒤 키 창이 `sheet:PegboardAgent`였다(AppKit이 `beginSheet`로 시트를 키 창으로 만든다). 브리지는 시트면 보이기 상태를 보지 않으므로 `ShowInactive`도 소용없다.
+- **모달이 아닌 자식 창은 초점을 가져가지 않는다** [확인]: `ModalType::kNone`, 부모는 에이전트 창의 위젯, `ShowInactive`. 두 전제 모두 키 창과 앱 활성이 띄우기 전, 직후, 200ms 뒤에 같다: 사람 창이 키 창이고 앱이 앞이면 `Default` 그대로(Dock 튕김 없음), 다른 앱(Finder)이 앞이면 키 창 없음·앱 비활성 그대로이고 `requestUserAttention:NSInformationalRequest`를 한 번 부른다. `Show()`로 바꾼 변형에서는 키 창이 확인 창 자신(`other`)이 되어 시험이 실패했다.
+- 대가: 자식 창은 에이전트 창을 막지 않는다(사람이 에이전트 탭을 쓸 수 있다). 한 창에는 확인 창을 하나씩만 띄우고 나머지는 요청 순서로 기다린다.
+- **에이전트 입력** [확인]: 확인 창이 떠 있고 1초 잠금이 끝난 뒤, 파이프의 다른 브라우저 세션이 그 탭에 `Input.dispatchKeyEvent`(Enter, Space, Escape. `nativeVirtualKeyCode`가 있어 브라우저의 키 처리를 거치는 판 포함), 클릭, `Page.handleJavaScriptDialog {accept:true}`(오류: 대화상자 없음), `Pegboard.confirmationAnswered`라는 메서드(없는 메서드)를 보내도 답은 나가지 않았다. 확인 창은 웹 콘텐츠가 아닌 다른 창이라 탭의 렌더러로 가는 입력이 닿지 않는다.
+- **경로 표시**: 라벨 방향 LTR 고정만으로는 오른쪽에서 왼쪽 글자 디렉터리 둘이 `/`로 이어지면 한 덩어리로 뒤집힌다(UBA에서 두 R 사이의 중립 문자). `/`마다 뒤에 U+200E를 넣는다. 1,000자 경로가 줄 바꿈으로 다 보인다(시험이 기록의 글을 원문과 비교).
+- 글 거르기는 데몬과 같은 규칙이되 역슬래시는 두 번 바꾸지 않는다(데몬이 보낸 글은 그대로 보인다). 그래서 데몬을 거치는 시험으로는 `DisplayText` 변형을 잡지 못해, 도메인에 원문을 직접 보내는 시험으로 고정했다.
+- 시험 훅의 기록 파일: `base::AppendToFile`은 파일을 만들지 않는다. 첫 실행에서 기록이 비어 모든 확인 창 시험이 실패했다(없으면 `WriteFile`로 고쳤다).
+
+시험 결과 (두 번째 기기 GUI 세션, `--test-threads=1`):
+
+| 시험 | 결과 |
+|---|---|
+| 포크: `e2e_domain` 전체(새 확인 창 시험 12개 포함) | 23 passed |
+| 포크: `e2e_confirm` 전체(새 확인 창 시험 5개, 순정 전용 2개는 건너뜀) | 21 passed |
+| 포크: `e2e_proxy` | 27 passed |
+| 순정: `e2e_confirm` | 21 passed |
+
+변형 (하나씩 빌드, 모두 그 시험이 실패) [확인]:
+
+| 변형 | 실패한 시험 |
+|---|---|
+| `ShowInactive()` → `Show()` | `the_dialog_does_not_take_focus`(키 창이 확인 창으로) |
+| 1초 잠금 제거 | `early_presses_are_ignored`(100ms 뒤 누름이 답이 됨) |
+| `test_hooks::Enabled()`가 언제나 참 | `dialog_hooks_need_test_hooks`(브라우저 환경에 훅이 없는데 승인됨) |
+| `requestConfirmation`의 주인 검사 제거 | `confirmation_methods_are_only_on_the_claiming_session` |
+| 컨텍스트 검사를 아무 프로필이나 받게 | `domain_refuses_confirmations_for_human_contexts` |
+| `DisplayText`가 거르지 않음 | `bidi_text_is_shown_escaped`(U+202E가 그대로) |
+
+- `Enabled()` 검사는 두 겹이다(`Var()`와 확인 창의 훅 경로). `Var()`의 검사 하나만 뺀 변형은 시험을 통과했다(다른 겹이 막는다). 그래서 변형은 `Enabled()` 자체를 참으로 바꿨다.

@@ -21,6 +21,12 @@ version
 
 experimental domain Pegboard
 
+  # One line of a confirmation: a label and its value.
+  type ConfirmationDetail extends object
+    properties
+      string label
+      string value
+
   type ProfileInfo extends object
     properties
       string profileDirectory
@@ -96,6 +102,44 @@ experimental domain Pegboard
   command ungroup
     parameters
       integer groupId
+
+  # Asks a person, in a dialog of the browser's own UI on an agent profile's
+  # window, whether a command may run. Answers once the dialog is up (or
+  # queued behind another one of that window); the person's answer comes as
+  # confirmationAnswered. The window is that of the first of targetIds whose
+  # window is not closing, else the profile's most recently active window.
+  # Refused (-32000): a context or a tab that is not this agent profile's,
+  # profileDirectory not the context's, a confirmId that is not 32 lowercase
+  # hexadecimal digits or one already open, actionClass other than upload or
+  # state, more than 40 details, a label over 40 or a value over 1000
+  # characters, 16 confirmations open, or no window. A dialog closes on its
+  # own (without an event) 75 s after it was asked for, and when the session
+  # owning the domain goes.
+  command requestConfirmation
+    parameters
+      string confirmId
+      string browserContextId
+      # The session's tabs, the one the command acts on first.
+      array of string targetIds
+      string sessionId
+      string sessionName
+      string profileDirectory
+      string actionClass
+      array of ConfirmationDetail details
+      boolean offerAllowForSession
+
+  # Closes the dialog without an answer. Succeeds for one that is gone.
+  command cancelConfirmation
+    parameters
+      string confirmId
+
+  # A person answered, or the dialog closed some other way than
+  # cancelConfirmation (its window or tab closing: deny). Once per confirmId.
+  event confirmationAnswered
+    parameters
+      string confirmId
+      # approve, deny or allowForSession.
+      string answer
 
   # An agent profile's tab became the active one of its window.
   event tabActivated

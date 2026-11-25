@@ -29,6 +29,7 @@ source_set("devtools") {
     "//components/tab_groups",
     "//components/tabs:public",
     "//content/public/browser",
+    "//pegboard/ui",
     "//third_party/inspector_protocol:crdtp",
     "//ui/base",
     "//ui/gfx/range",

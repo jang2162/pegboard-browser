@@ -1,0 +1,34 @@
+# Pegboard's own browser UI: the confirmation dialog the Pegboard CDP domain
+# shows (//pegboard/devtools), the display text rule for what an agent chose,
+# and the browser side's test hooks.
+
+source_set("ui") {
+  visibility = [ "//pegboard/devtools:*" ]
+  sources = [
+    "confirm_dialog.cc",
+    "confirm_dialog.h",
+    "display_text.cc",
+    "display_text.h",
+    "platform.h",
+    "test_hooks.cc",
+    "test_hooks.h",
+  ]
+  if (is_mac) {
+    sources += [ "platform_mac.mm" ]
+    frameworks = [ "AppKit.framework" ]
+  }
+
+  # Like //pegboard/devtools, this uses //chrome/browser headers without
+  # depending on //chrome/browser, which depends on it (through
+  # //chrome/browser/devtools).
+  check_includes = false
+  public_deps = [ "//chrome/browser:browser_public_dependencies" ]
+  deps = [
+    "//base",
+    "//chrome/browser/profiles:profile",
+    "//chrome/browser/ui/browser_window",
+    "//ui/base",
+    "//ui/gfx",
+    "//ui/views",
+  ]
+}

@@ -22,6 +22,7 @@
 #include "chrome/browser/ui/browser_tab_strip_tracker_delegate.h"
 #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
 #include "components/saved_tab_groups/public/tab_group_sync_service.h"
+#include "pegboard/ui/confirm_dialog.h"
 
 class Profile;
 
@@ -30,6 +31,8 @@ class DevToolsAgentHostClientChannel;
 }  // namespace content
 
 namespace pegboard {
+
+class Confirmations;
 
 // Calls back once a profile's saved-tab-group service has started (true), or
 // went or took too long (false); in a later task, never from its own methods.
@@ -111,6 +114,18 @@ class PegboardHandler : public protocol::Pegboard::Backend,
   protocol::Response UngroupTargets(
       std::unique_ptr<protocol::Array<std::string>> target_ids) override;
   protocol::Response Ungroup(int group_id) override;
+  protocol::Response RequestConfirmation(
+      const std::string& confirm_id,
+      const std::string& browser_context_id,
+      std::unique_ptr<protocol::Array<std::string>> target_ids,
+      const std::string& session_id,
+      const std::string& session_name,
+      const std::string& profile_directory,
+      const std::string& action_class,
+      std::unique_ptr<protocol::Array<protocol::Pegboard::ConfirmationDetail>>
+          details,
+      bool offer_allow_for_session) override;
+  protocol::Response CancelConfirmation(const std::string& confirm_id) override;
 
   // ProfileManagerObserver:
   void OnProfileAdded(Profile* profile) override;
@@ -138,6 +153,8 @@ class PegboardHandler : public protocol::Pegboard::Backend,
   void OnProfileReady(std::string profile_directory,
                       std::unique_ptr<OpenProfileWindowCallback> callback,
                       Profile* profile);
+  void OnConfirmationAnswered(const std::string& confirm_id,
+                              ConfirmAnswer answer);
   void OnTabGroupSyncStarted(
       int waiter,
       std::string browser_context_id,
@@ -154,6 +171,9 @@ class PegboardHandler : public protocol::Pegboard::Backend,
   // openProfileWindow calls waiting for a profile's tab groups to start.
   std::map<int, std::unique_ptr<TabGroupSyncWaiter>> waiters_;
   int next_waiter_id_ = 1;
+  // The owner's confirmation dialogs (requestConfirmation). They go with it,
+  // before the frontend.
+  std::unique_ptr<Confirmations> confirmations_;
   base::WeakPtrFactory<PegboardHandler> weak_factory_{this};
 };
 

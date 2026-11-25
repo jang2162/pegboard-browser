@@ -8,7 +8,7 @@ Chromium 소스는 이 저장소에 넣지 않는다. 여기에는 버전, 패�
 | `args.gn` | 개발 빌드 GN 인자(`<src>/out/Pegboard/args.gn`으로 복사된다) |
 | `patches/series` | 패치 적용 순서. 한 줄에 패치 파일 이름 하나 |
 | `patches/*.patch` | 업스트림 파일 수정. 패치 하나 = 작업 브랜치의 커밋 하나. 머리말에 목적과 건드리는 파일 |
-| `pegboard/` | 트리의 `//pegboard/`로 복사되는 새 소스 |
+| `pegboard/` | 트리의 `//pegboard/`로 복사되는 새 소스: `devtools/`(Pegboard CDP 도메인), `bootstrap/`(데몬 띄우기), `ui/`(확인 창, 글 거르기, 브라우저 쪽 시험 훅. `//pegboard/devtools`만 쓴다) |
 | `branding/` | 아이콘(`mac/app.icns`, `mac/Assets.car`)과 그 생성 스크립트. 트리의 `//pegboard/branding/`으로 복사된다 |
 | `scripts/` | 아래 스크립트와 `rebrand-strings.py`(제품 이름 문자열), 그 시험 `test_rebrand_strings.py` |
 
