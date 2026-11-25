@@ -8,7 +8,7 @@ Chromium 소스는 이 저장소에 넣지 않는다. 여기에는 버전, 패�
 | `args.gn` | 개발 빌드 GN 인자(`<src>/out/Pegboard/args.gn`으로 복사된다) |
 | `patches/series` | 패치 적용 순서. 한 줄에 패치 파일 이름 하나 |
 | `patches/*.patch` | 업스트림 파일 수정. 패치 하나 = 작업 브랜치의 커밋 하나. 머리말에 목적과 건드리는 파일 |
-| `pegboard/` | 트리의 `//pegboard/`로 복사되는 새 소스: `devtools/`(Pegboard CDP 도메인), `bootstrap/`(데몬 띄우기), `ui/`(확인 창, 글 거르기, 브라우저 쪽 시험 훅. `//pegboard/devtools`만 쓴다) |
+| `pegboard/` | 트리의 `//pegboard/`로 복사되는 새 소스: `devtools/`(Pegboard CDP 도메인, 확인 메서드), `bootstrap/`(데몬 띄우기, 다시 띄우기, 포기 알림 띄우기), `ui/`(확인 창 `confirm_dialog`, 데몬 포기 알림 `daemon_notice`, 글 거르기 `display_text`, 키 창 기록 `window_focus`, 브라우저 쪽 시험 훅 `test_hooks`와 그 GN 인자 `test_hooks.gni`), `browser_parts/`(부트스트랩 패치가 넣는 `MainParts`, 에이전트 프로필 표시·숨기기 `AgentProfiles`와 맥의 마지막 프로필 되돌리기, 로그인·비밀번호 기본값 `ProfileDefaults`), `common/`(에이전트 프로필 규칙 하나) |
 | `branding/` | 아이콘(`mac/app.icns`, `mac/Assets.car`)과 그 생성 스크립트. 트리의 `//pegboard/branding/`으로 복사된다 |
 | `scripts/` | 아래 스크립트와 `rebrand-strings.py`(제품 이름 문자열), 그 시험 `test_rebrand_strings.py` |
 
@@ -55,6 +55,15 @@ browser/scripts/package-dev.sh <src> <out>/Pegboard.app   # pegboard, agent-brow
 ## 아이콘
 
 주황색 둥근 판에 구멍 격자와 페그 하나(`branding/icon.swift`). macOS 아이콘 격자(1024 중 824 본체, 바깥 여백과 그림자)를 따르고, 64px 미만은 3×3 격자와 큰 구멍으로 16px에서도 형태가 보인다. 바꾸려면 `icon.swift`를 고치고 `branding/make-icons.sh`를 돌린 뒤 결과 파일(`mac/app.icns`, `mac/Assets.car`)을 커밋한다. 설정의 About 화면 등 웹 UI의 로고 그림은 Chromium 트리의 것 그대로다.
+
+## 3b의 브라우저 화면
+
+업스트림 파일은 고치지 않았다(손 패치 3a와 같음). 모두 `//pegboard` 안에서 Chromium의 기존 기능으로 건다.
+
+- 확인 창(`ui/confirm_dialog`): 데몬이 `Pegboard.requestConfirmation`으로 띄우는 에이전트 창의 자식 창. 비활성으로 띄우고(맥의 시트는 키 창을 가져가서 쓰지 않는다) 답은 `Pegboard.confirmationAnswered`로 주인 세션에만 간다. 규칙은 [3b 설계](../docs/plans/2026-11-25-phase3b-browser-ui-design.md) 4.5.
+- 에이전트 창 표시와 숨기기(`browser_parts/agent_profiles`): 브라우저가 시작할 때부터 에이전트 프로필에 테마 색과 창 제목을 걸고 프로필 목록에서 생략한다. 업스트림 기능의 이름(`SetIsOmitted`, `SetUserColorAndBrowserColorVariant`, `SetWindowUserTitle`, `browser.profile_picker_availability_on_startup`)은 버전을 올릴 때 다시 본다.
+- 로그인·비밀번호 기본값(`browser_parts/profile_defaults`): 설정 등록 때 기본값을 바꾼다. 설정 이름이 사라지면 시작에서 `CHECK`로 멈춘다(버전을 올릴 때 알아챈다).
+- 시험 훅은 `args.gn`의 `pegboard_test_hooks = true`인 빌드에만 있다(위 "처음부터 빌드").
 
 ## 확인
 

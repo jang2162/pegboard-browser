@@ -1413,3 +1413,110 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 - `ProfileDefaults`: 설정이 없거나 불리언이 아니면 `CHECK`(버전을 올려 이름이 바뀌면 조용히 다시 켜지지 않게 시작부터 멈춘다).
 - `AgentProfiles`: DCHECK 빌드에서는 생략하지 않는다(업스트림이 임시 프로필만 생략된다고 DCHECK한다). 로그 한 줄.
 - 남는 위험: 사람의 유일한 프로필을 지우면 업스트림이 다음 프로필(에이전트 프로필일 수 있다)로 넘어간다(`delete_profile_helper.cc`). 에이전트 프로필의 시크릿 창에는 창 제목 표시가 없다(테마는 따른다).
+
+### 3b 작업 11. 전체 확인, 측정, 정리 (2026-11-25)
+
+포크 구성과 순정 구성의 실제 브라우저 시험 전체를 두 번째 기기의 GUI 세션에서 `--test-threads=1 --no-fail-fast`로 돌렸다. 앱은 작업 8~10 검토 반영(`28cc4cc`)까지의 마지막 Chromium 빌드에 이 브랜치의 `pegboard`를 `package-dev.sh`로 넣은 것이다(두 기기의 프레임워크 UUID가 같음을 확인). 화면 잠금 풀림, 원격 데스크톱 연결 없음, 각 묶음 전에 클립보드를 일반 텍스트로 바꿨다.
+
+- 포크 구성: `PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<앱> PEGBOARD_TEST_APP=<앱> cargo test -p pegboard-core --no-fail-fast -- --ignored --test-threads=1`
+- 순정 구성: `cargo test --workspace --no-fail-fast -- --ignored --test-threads=1 --skip diag_`(`diag_bridge_worker_stop_and_wake`는 판정하지 않는 진단이라 뺀다. README "시험")
+
+#### 시험 결과
+
+| 시험 묶음 | 포크 구성 | 순정 구성 |
+|---|---|---|
+| `pegboard-core` `e2e_actionlog` | 17 passed | 17 passed |
+| `e2e_bootstrap` | 13 passed | 건너뜀(포크 전용, 13개가 바로 끝난다) |
+| `e2e_branding` | 6 passed | 건너뜀(포크 전용, 6개) |
+| `e2e_bridge` | 8 passed | 8 passed |
+| `e2e_browser` | 6 passed | 6 passed |
+| `e2e_clipboard` | 20 passed | 20 passed |
+| `e2e_confirm` | 21 passed | 21 passed(확인 창 시험은 건너뛰고 API 시험만 돈다) |
+| `e2e_domain` | 34 passed | 건너뜀(포크 전용, 34개) |
+| `e2e_isolated_world` | 1 passed | 1 passed |
+| `e2e_link` | 10 passed | 10 passed |
+| `e2e_policy` | 17 passed | 17 passed |
+| `e2e_proxy` | 27 passed | 27 passed |
+| `e2e_replay` | 4 passed | 4 passed |
+| `e2e_runner` | 17 passed | 17 passed |
+| `e2e_session` | 15 passed | 15 passed |
+| `pegboard-core` 합계 | **216 passed, 0 failed** (11분 48초) | **216 passed, 0 failed** (그중 53개는 포크 전용이라 바로 끝남) |
+| `pegboard-cli` | (포크는 녹화 지연만, 아래) | `e2e_cli` 15, `e2e_isolation` 16, `e2e_mcp` 23, `e2e_mcp_isolation` 17, `e2e_policy` 30, `e2e_recording` 36 passed: **137 passed, 0 failed** |
+
+- 순정 구성 전체(두 패키지)는 18분 14초, 포크 구성(`pegboard-core`)은 11분 48초. 두 구성 모두 다시 돌릴 실패가 없었다(포크에서만 실패하는 것 없음).
+- 3a 때 알려진 실패 둘(`e2e_isolation::unattributed_download_is_deleted`, `e2e_policy::second_session_cannot_widen_a_pinned_profile`)도 이번 전체 실행에서 통과했다.
+- **남은 프로세스**: 전체 실행 뒤 시험이 남긴 agent-browser 데몬이 구성마다 19개(그중 15개는 같은 분에 시작한 한 묶음) 남아 손으로 껐다(3a부터 열린 항목). 기본 사용자 데이터 디렉터리(`Crashpad/`만)도 다시 생겨 지웠다(README "확인").
+
+#### 녹화가 명령에 더하는 시간 (포크, 배포용 빌드, 20쌍)
+
+`PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<앱> cargo test --release -p pegboard-cli --test e2e_recording recording_overhead_meets_the_targets -- --ignored --nocapture`. 시험이 띄운 브라우저가 포크(`--remote-debugging-pipe --pegboard-no-daemon`)인 것을 프로세스 목록으로 확인했다. **통과**: 명령별 추가 중앙값 24~52ms(기준 60ms 이하), 가장 큰 단일 값 76ms(기준 1초). 3a 끝(27~48ms, 최대 75ms)과 같은 수준이다.
+
+| 명령 | 켜짐 중앙값 | 추가 중앙값 | 추가 최대 | 3a 끝 추가 중앙값 |
+|---|---|---|---|---|
+| open | 62 | 44 | 65 | 44 |
+| snapshot -i | 38 | 28 | 45 | 28 |
+| click | 58 | 45 | 76 | 36 |
+| fill | 69 | 50 | 58 | 48 |
+| type | 74 | 52 | 72 | 48 |
+| press Enter | 44 | 35 | 63 | 32 |
+| get url | 42 | 34 | 45 | 31 |
+| get text | 40 | 30 | 50 | 32 |
+| eval | 39 | 30 | 47 | 32 |
+| scroll down 200 | 44 | 34 | 51 | 34 |
+| wait 100 | 136 | 24 | 47 | 28 |
+| screenshot | 66 | 38 | 53 | 40 |
+| tab new | 82 | 35 | 52 | 46 |
+| tab list | 40 | 34 | 50 | 27 |
+
+- 포크인지 확인하려고 한 쌍(`PEGBOARD_OVERHEAD_REPS=1`)으로 다시 돌린 것은 `type` 70ms로 시험이 실패했다. 한 쌍의 값이라 중앙값이 아니다(기준은 20쌍의 중앙값).
+
+#### 확인 창이 뜨기까지
+
+포크 앱을 브라우저 시험 훅(기록만, 자동 답 없음)으로 켜고, API 구독자가 `confirm.required`를 받은 때부터 브라우저의 `confirm_shown` 기록 줄이 생길 때까지(2ms 간격으로 파일을 봄) `cookies set`으로 10번씩 두 번 쟀다. 답은 API로 거부.
+
+| 구간 | 중앙값 | 범위 |
+|---|---|---|
+| `confirm.required` → 창이 뜸 | 20ms, 23ms | 9~26ms |
+| CLI가 명령을 보냄 → 창이 뜸 | 33ms, 35ms | 17~40ms |
+
+#### 3b 측정 정리 (빌드는 작업 기기, 동시 작업 8개)
+
+| 항목 | 값 | 출처 |
+|---|---|---|
+| 빈 상태 빌드 | 없음(3b는 업스트림 파일과 컴파일 인자를 바꾸지 않았다) | |
+| 문자열 생성 커밋 첫 빌드(`apply.sh` 다시 적용 포함) | 907단계, 4분 40초 / 5분 11초. 문자열만 바뀐 빌드 47초 | 작업 6 |
+| `//pegboard/ui` 첫 빌드 | 75초 | 작업 7 |
+| `//pegboard`의 `.cc` 하나 증분 | 28~72초(`ui` 45~72, `browser_parts` 30~59, `profile_defaults` 34~46, `daemon_launcher` 28~31) | 작업 7~10 변형 빌드 |
+| 새 디렉터리 첫 빌드 | `browser_parts` 49초, `profile_defaults` 1분 30초, `daemon_notice` 49초 | 작업 8~10 |
+| `PEGBOARD_APPLY_FORCE=1 apply.sh`·`export.sh` 뒤 빌드(파일 시각) | 3분 32초 ~ 5분 8초 | 작업 7, 8, 10 |
+| 디스크(2026-11-25) | `out/Pegboard` 9.4GB(앱 541MB), 소스 트리 전체 72GB. 3a 끝과 같다 | `du -sh` |
+| 손 패치(`budget.sh`) | 업스트림 파일 15개, +96 −24, **120줄. 3b 증가 0줄**(목표 15줄 이하) | 아래 |
+| 생성 커밋(`budget.sh`) | 업스트림 파일 165개, +47,447 −47,447 | 작업 6 |
+| 새 소스(`//pegboard`, `.cc/.h/.mm/.gn/.gni/.pdl`) | 4,805줄: `ui` 1,850, `devtools` 1,648, `browser_parts` 751, `bootstrap` 500, `common` 47. 3b에서 +3,094 −18(파일 34개) | `wc -l`, `git diff --shortstat` |
+| 실제 브라우저 시험 | 포크 `pegboard-core` 216개 11분 48초, 순정 전체 353개 18분 14초 | 위 |
+
+패치별 업스트림 줄 수(태그 대비, 3b 끝. 3a 작업 10의 표에 3a 끝에 더한 `clipboard-mac-seqno.patch`가 있다):
+
+| 패치 | 파일 | 추가 | 삭제 | 합계 |
+|---|---|---|---|---|
+| `branding.patch` | 4 | 8 | 8 | 16 |
+| `pegboard-cdp-domain.patch` | 5 | 34 | 3 | 37 |
+| `devtools-pipe-fds.patch` | 2 | 15 | 0 | 15 |
+| `pegboard-bootstrap.patch` | 2 | 6 | 1 | 7 |
+| `clipboard-mac-seqno.patch`(157 이상에서 지움) | 2 | 33 | 12 | 45 |
+| 손 패치 합계 | 15 | 96 | 24 | 120 |
+| `rebrand-strings (generated)` | 165 | 47,447 | 47,447 | 94,894 |
+
+- 3b의 다섯 패치 작업(6~10)은 모두 업스트림 손 패치를 늘리지 않았다. 부트스트랩 패치가 넣는 메인 파츠 이름이 `MainParts`로 바뀐 것은 줄 수가 같다(작업 8).
+
+#### 사람이 본 확인
+
+[phase3b-notes/manual-check.md](./plans/phase3b-notes/manual-check.md)의 순서(약 10분). 도우미 스크립트 `manual-3b.sh`가 앱을 임시 홈·임시 브라우저 데이터로 켜고 확인 창과 알림을 하나씩 띄운다. 스크립트는 사람 없이 끝까지 돌려 확인했다: 업로드(API로 허용 → 올라감), `--upload-dir` 업로드(이 세션에서 계속 허용 → 두 번째는 묻지 않음), 쿠키(거부 → `reason: denied`), 저장소(허용), 구독자가 네 결과(`approved`, `approvedForSession`, `denied`, `approved`)를 받음, 데몬 네 번 죽이기 → 데몬 없음, 끄면 프로세스와 임시 파일이 남지 않음. **사람의 확인은 아직이다.** 결과는 아래에 적는다.
+
+| 번호 | 결과 |
+|---|---|
+| 1~9 | (아직) |
+
+#### 찾은 것
+
+- **코어 API는 쓰기 쪽을 닫은 클라이언트에 답하지 않는다** [확인]. README에 처음 적은 예(`printf … | nc -U <소켓>`)는 `confirm.list`, `confirm.respond`, `confirm.subscribe` 모두 아무 답도 받지 못했다. `nc`는 입력이 끝나면 쓰기 쪽을 닫고(EOF), 서버는 답을 쓰기 전에 EOF를 보면 클라이언트가 떠난 것으로 보고 답을 버린다(`api.rs`, 전달 실패로 처리해 `session.create`의 세션을 치우는 2a 규칙). 구독 연결도 EOF에서 끝난다. 의도한 동작이라 코드는 두고, README의 예를 쓰기 쪽을 열어 두는 꼴(`{ printf …; sleep 1; } | nc -U`, 구독은 `cat`)로 고치고 이 규칙을 적었다. 고친 꼴로 실제 앱에 답해 확인했다.

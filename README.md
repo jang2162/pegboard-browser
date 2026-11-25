@@ -10,7 +10,9 @@ AI 에이전트가 브라우저를 쓰되, 사람이 쓰는 브라우저 데이�
 
 **2b단계(녹화와 재생).** 세션 탭의 화면, 탐색 기록, 사람 개입 가능성, 선택 기록(네트워크, 콘솔)을 남기고, 보존 정리와 `pegboard recording open`(재생 화면)을 더했다(아래 "녹화"). 자동 시험은 끝났다(2026-11-18). 손으로 하는 확인은 [docs/phase2b-manual-checks.md](docs/phase2b-manual-checks.md)에 있다(아직 수행하지 않았다).
 
-**3a단계(Chromium 포크 뼈대).** Chromium `156.0.8078.109`에 패치 넷을 얹은 `Pegboard.app`을 빌드할 수 있다(`browser/`). 앱을 켜면 앱이 `pegboard` 데몬을 자식으로 띄우고 DevTools를 파이프로 넘긴다. TCP 디버깅 포트는 열리지 않는다. 탭그룹과 에이전트 프로필은 확장 프로그램 대신 브라우저 안의 `Pegboard` CDP 도메인이 다룬다. 1~2단계의 실제 브라우저 시험 전체가 포크 구성과 순정 구성 양쪽에서 통과했다(2026-11-24, 알려진 실패 둘 제외: 아래 "시험"). 아직 개발용 빌드다: 임시 서명이고 설치 패키지, 자동 업데이트, 에이전트 탭 표시, 확인 창이 없다(3b, 3c). 순정 Chrome 구성은 개발·시험용으로 남는다.
+**3a단계(Chromium 포크 뼈대).** Chromium `156.0.8078.109`에 패치 넷을 얹은 `Pegboard.app`을 빌드할 수 있다(`browser/`). 앱을 켜면 앱이 `pegboard` 데몬을 자식으로 띄우고 DevTools를 파이프로 넘긴다. TCP 디버깅 포트는 열리지 않는다. 탭그룹과 에이전트 프로필은 확장 프로그램 대신 브라우저 안의 `Pegboard` CDP 도메인이 다룬다. 1~2단계의 실제 브라우저 시험 전체가 포크 구성과 순정 구성 양쪽에서 통과했다(2026-11-24, 알려진 실패 둘 제외. 그 둘은 3b 끝에 통과했다: 아래 "시험"). 순정 Chrome 구성은 개발·시험용으로 남는다.
+
+**3b단계(브라우저 화면).** `upload`와 `state`(쿠키·저장소 쓰기)가 거부 대신 **사람에게 묻는다**(아래 "확인"). 포크에서는 그 세션의 에이전트 창에 브라우저 자체의 확인 창이 뜨고, 어느 구성에서든 코어 API(`confirm.*`)로 답할 수 있다. 에이전트 창은 짙은 호박색 테마와 창 제목 "Pegboard 에이전트"로 구분되고, 에이전트 프로필은 프로필 메뉴에 나오지 않는다. 구글 로그인과 내장 비밀번호 관리자는 기본으로 꺼져 있고, 메뉴와 설정의 제품 이름이 Pegboard이며 앱 아이콘이 생겼다. 데몬 다시 띄우기를 포기하면 알림이 뜬다. 실제 브라우저 시험 전체가 두 구성에서 통과했다(2026-11-25). 업스트림 손 패치는 3a와 같다(파일 15개, 120줄). 아직 개발용 빌드다: 임시 서명이고 설치 패키지와 자동 업데이트가 없다(3c). 사람이 직접 보는 확인은 [docs/plans/phase3b-notes/manual-check.md](docs/plans/phase3b-notes/manual-check.md)(아직 수행하지 않았다).
 
 ## 준비
 
@@ -40,10 +42,12 @@ browser/scripts/package-dev.sh <src> ~/Applications/Pegboard.app   # pegboard와
 - `package-dev.sh`는 이 저장소의 `pegboard`를 배포용으로 빌드해 `Contents/Helpers/pegboard`에, agent-browser를 `Contents/Helpers/agent-browser`에 넣는다. Rust만 고쳤으면 Chromium을 다시 빌드하지 않고 이것만 다시 돌린다.
 - 켜기: Dock이나 Finder, `open -a Pegboard`, 또는 `pegboard browser start`(앱이 `/Applications`나 `~/Applications`에 있으면 기본이 포크다. 아래 "설정"의 `[browser] kind`). 브라우저 데이터는 `~/Library/Application Support/Pegboard`에 있다.
 - 앱이 켜지면 데몬(`pegboard daemon --cdp-pipe`)이 따라 뜬다. CLI와 MCP는 순정 모드와 똑같이 쓴다. CLI는 앱 안의 `Contents/Helpers/pegboard`를 쓰거나 같은 판으로 빌드한 것을 쓴다(데몬과 판이 다르면 세션 만들기가 거부될 수 있다).
-- 데몬이 죽으면 앱이 1초 뒤 다시 띄운다. 1분 안에 3번까지이고, 넘으면 그 브라우저 프로세스가 끝날 때까지 데몬 없이 간다(알림 화면은 없다. 브라우저를 다시 켠다). 다른 데몬(순정 모드 데몬 등)이 이미 같은 홈을 쥐고 있으면 앱의 데몬은 종료 코드 4로 끝나고 다시 띄우지 않는다.
+- 데몬이 죽으면 앱이 1초 뒤 다시 띄운다. 1분 안에 3번까지이고, 넘으면 다시 띄우지 않고 사람 창에 알림 "Pegboard 에이전트 데몬이 멈췄습니다"를 띄운다(초점을 가져가지 않는다). **다시 시작**을 누르면 횟수를 비우고 데몬을 띄운다. 닫기를 누르면 브라우저를 다시 켤 때까지 데몬 없이 간다. 다른 데몬(순정 모드 데몬 등)이 이미 같은 홈을 쥐고 있으면 앱의 데몬은 종료 코드 4로 끝나고 다시 띄우지 않는다.
 - 새 데몬은 시작할 때 에이전트 프로필에 남은 탭을 닫고 이전 세션의 녹화를 마감한다. 세션은 이어지지 않으므로 에이전트는 세션을 다시 만든다.
 - 브라우저를 끄면(Cmd-Q, `pegboard browser stop`) 데몬은 파이프가 끝난 것을 보고 세션을 정리한 뒤 끝난다. 5초 안에 끝나지 않으면 브라우저가 `SIGTERM`을, 다시 3초 뒤 `SIGKILL`을 보낸다.
 - 에이전트 프로필은 디렉터리 이름이 `PegboardAgent` 또는 `PegboardAgent-`로 시작하는 프로필이다. 그 밖의 모든 프로필(사람이 더 만든 프로필 포함)은 사람 것이고, 브라우저의 `Pegboard` 도메인이 그 컨텍스트와 탭을 거부한다.
+- 에이전트 프로필의 창은 짙은 호박색 테마이고 제목이 "Pegboard 에이전트"다(창 메뉴, Mission Control). 에이전트 프로필은 프로필 메뉴와 프로필 선택 화면에 나오지 않고, 그 때문에 시작할 때 선택 화면이 뜨지 않는다(사람 프로필이 둘 이상이면 업스트림대로 뜬다). 지난번에 열려 있던 에이전트 창은 다시 열리지 않고, 다른 앱에서 연 링크는 사람 프로필에서 열린다.
+- 구글 로그인 허용, 비밀번호 저장 제안, 자동 로그인, 패스키 저장은 모든 프로필에서 기본으로 꺼져 있다. 기본값만 바꾼 것이라 설정에서 다시 켤 수 있다. 비밀번호는 Bitwarden 같은 확장으로 관리한다.
 - **처음 켤 때 키체인 확인**: 새로 빌드(또는 다시 서명)한 앱은 쿠키 저장소를 처음 열 때 키체인 항목 `Pegboard Safe Storage`를 만들며 묻는다. 답할 때까지 모든 HTTP 요청이 멈춘다(에이전트 세션의 탐색도). 처음 한 번은 사람이 화면 앞에서 켜서 "항상 허용"으로 답한다. 시험은 `--use-mock-keychain`으로 피한다.
 - 시험·개발용으로 데몬이 포크를 직접 띄우는 구성도 있다: `PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>`(아래 "시험").
 
@@ -135,12 +139,12 @@ pegboard profile delete work                            # 열린 세션이 있�
 
 | 옵션 | 뜻 | 기본 |
 |---|---|---|
-| `--allow <분류,...>` | 기본이 거부인 분류를 연다: `upload`, `state`, `clipboard` | 없음 |
-| `--deny <분류,...>` | 기본이 허용인 분류를 닫는다(예: `eval`, `download`) | 없음 |
+| `--allow <분류,...>` | `upload`, `state`를 묻지 않고 허용한다. 기본이 거부인 `clipboard`를 연다 | 없음 |
+| `--deny <분류,...>` | 분류를 묻지 않고 거부한다(예: `eval`, `download`, `upload`, `state`) | 없음 |
 | `--allow-domain <도메인,...>` | 주소 허용목록. 목록의 도메인과 하위 도메인만 열린다(루프백도 목록에 있어야 열린다) | 목록 없음 |
 | `--allow-private-network` | 사설망 주소(RFC 1918, 링크 로컬, CGNAT, IPv6 ULA)를 연다 | 닫힘 |
 | `--no-localhost` | localhost와 루프백 주소를 닫는다(허용목록에 있어도) | 열림 |
-| `--upload-dir <폴더>` | 업로드할 파일이 있는 폴더(절대 경로, `--allow upload`와 함께만. pegboard 데이터 디렉터리와 겹치면 거부) | 없음 |
+| `--upload-dir <폴더>` | 업로드할 파일이 있는 폴더(절대 경로. pegboard 데이터 디렉터리와 겹치면 거부). `--allow upload`에는 꼭 있어야 하고, 묻는 세션에서는 파일을 그 폴더의 맨 이름으로만 고르게 묶는다 | 없음 |
 | `--no-expire` | 쉬어도 1시간 뒤에 닫지 않는다 | 닫음 |
 | `--record <network,console>` | 녹화에 네트워크 요청(`network.jsonl`: 방법, 주소, 상태, 크기, 시간, 오류만. 헤더와 본문은 남기지 않는다)과 콘솔 메시지·페이지 오류(`console.jsonl`)를 더한다. **콘솔 기록에는 비밀이 들어갈 수 있다**(아래 "알려진 한계"의 녹화). 세션마다 정하며 프로필에 고정되지 않는다 | 끔 |
 
@@ -149,8 +153,8 @@ pegboard profile delete work                            # 열린 세션이 있�
 | `navigate`, `click`, `fill`, `snapshot`, `scroll`, `wait`, `read`, `get`, `interact` | 허용 | `open`, `click`, `fill`, `snapshot`, `get`, `tab`, `cookies`(읽기) |
 | `eval` | 허용 | `eval`, `wait --fn` |
 | `download` | 허용, 세션 파일 디렉터리로만 | 페이지에서 시작된 다운로드 |
-| `upload` | 거부 (`--allow upload`와 `--upload-dir`이 둘 다 있어야 열린다) | `upload <선택자> <파일 이름>...` |
-| `state` | 거부 (1단계와 다르다) | `cookies set`, `storage local set`, `storage session clear` |
+| `upload` | **묻기** (`--allow upload --upload-dir`이면 묻지 않고 허용, `--deny upload`면 거부) | `upload <선택자> <파일>...` |
+| `state` | **묻기** (`--allow state`면 묻지 않고 허용, `--deny state`면 거부) | `cookies set`, `storage local set`, `storage session clear` |
 | `clipboard` | 거부 | 페이지의 복사·잘라내기·붙여넣기, `navigator.clipboard`, `press Control+c` 같은 키 |
 
 - 분류는 명령마다 붙는다. `eval`이 허용된 세션에서는 스크립트로 쿠키와 저장소를 쓰고(`document.cookie`, `localStorage`) 다른 주소로 탐색할 수 있다(주소 규칙은 그대로 적용된다). `state`를 거부하거나 `navigate`를 `--deny`해도 스크립트로 하는 같은 일은 막히지 않는다. 막으려면 `--deny eval`도 준다.
@@ -158,8 +162,36 @@ pegboard profile delete work                            # 열린 세션이 있�
 - 거부된 명령은 `policy_denied`와 함께 어떤 분류가 막혔는지, 사람이 어떤 옵션으로 열 수 있는지를 알려 준다.
 - pegboard 자신의 포트(브라우저 디버깅 포트, 세션 프록시)로 가는 HTTP 요청은 어떤 정책에서도 요청 가드가 거부한다. CSP가 붙지 않는 문서(`data:`, `about:blank`, 정책이 허용한 로컬 주소의 문서)에서 연 웹소켓은 가드를 거치지 않고, 세션 프록시의 베어러 토큰과 Chrome 디버깅 포트의 Origin 검사가 막는다. 자세한 주소 규칙과 닿지 않는 곳은 아래 "알려진 한계"의 주소 규칙 항목.
 - 클립보드 허용 여부와 주소 정책(`--allow-domain`, `--allow-private-network`, `--no-localhost`)은 프로필 단위로만 걸린다. 그 프로필에 열린 세션이 있는 동안 첫 세션의 값으로 고정되고, 다른 값을 원하는 세션은 `profile_policy_conflict`로 거부된다. 다른 값이 필요하면 다른 프로필(`--profile`)을 쓴다.
-- 업로드는 `--allow upload`와 `--upload-dir`이 둘 다 있어야 열린다(하나만 주면 세션을 만들 때 거부된다). 파일은 맨 파일 이름으로만 고르며, `--upload-dir` 폴더에서 먼저 찾고 거기 없으면 세션 파일 디렉터리(받은 파일, 스크린샷)에서 찾는다. 경로, 심볼릭 링크, 폴더 밖의 파일은 거부한다. 프록시도 `DOM.setFileInputFiles`의 경로가 그 두 폴더 바로 안의 파일인지 다시 검사한다.
+- 묻지 않는 업로드(`--allow upload`)는 `--upload-dir`이 있어야 한다(없으면 세션을 만들 때 거부된다). 파일은 맨 파일 이름으로만 고르며, `--upload-dir` 폴더에서 먼저 찾고 거기 없으면 세션 파일 디렉터리(받은 파일, 스크린샷)에서 찾는다. 경로, 심볼릭 링크, 폴더 밖의 파일은 거부한다. 프록시도 `DOM.setFileInputFiles`의 경로가 그 두 폴더 바로 안의 파일인지 다시 검사한다.
 - 받은 파일은 `<PEGBOARD_HOME>/sessions/<id>/files`에 생기고(파일 하나 200 MiB, 세션 합계 1 GiB까지) `pegboard files list`나 `pegboard_files_list`로 본다. 세션을 닫으면 지워진다.
+
+## 확인 (3b)
+
+`upload`와 `state`(쿠키·저장소 쓰기) 명령은 기본으로 **사람에게 묻는다**. 명령은 답을 기다리고(명령 시간 제한과 따로), 60초 안에 답이 없으면 거부된다.
+
+**무엇을 묻나**
+- 업로드: 대상 페이지의 호스트와 출처, 파일마다 실제 경로 전체(심볼릭 링크를 푼 것)와 크기, "허용하면 이 파일의 내용을 에이전트와 그 페이지가 읽을 수 있다". 데몬은 묻기 전에 파일의 사본을 떠 두고, 허용하면 그 사본이 올라간다(묻는 동안 원본이 바뀌어도 보인 내용이 올라간다).
+- `cookies set`: 호스트, 쿠키 이름과 값(200자까지), 도메인·경로, 플래그. `--url`·`--domain`이 없으면 물을 때의 탭 주소에 쓴다.
+- `storage local|session set|clear`: 출처, 저장소, 키와 값. 허용한 뒤 탭이 다른 출처로 갔으면 쓰지 않는다(`stale`).
+- 묻는 곳을 알 수 없으면 묻지 않고 거부한다(`unknown_origin`): `frame <선택자>`로 프레임을 고른 동안의 저장소 쓰기와 업로드(먼저 `frame main`), 탭이 여럿인데 고른 탭이 없을 때, `about:blank`·`data:` 같은 출처.
+- 업로드 파일: 폴더가 없는 세션에서는 에이전트가 절대 경로를 줄 수 있고 사람이 그 경로를 보고 승인한다. pegboard 홈, 브라우저 데이터와 캐시, `/dev` 등의 파일, 심볼릭 링크, 일반 파일이 아닌 것, 200 MiB를 넘는 파일은 묻기 전에 거부한다. 한 명령 16개까지. `--upload-dir`이 있는 세션에서는 그 폴더(와 세션 파일 디렉터리)의 맨 이름만 된다.
+
+**답하는 법**
+- **포크(Pegboard.app)**: 그 세션의 에이전트 창 위에 확인 창이 뜬다. 첫 줄은 세션 ID와 프로필이고, 에이전트가 붙인 세션 이름은 그 아래 따로 보인다(이름은 에이전트가 정하므로 ID로 확인한다). 버튼은 **허용**, **거부**(기본 버튼, Esc, 창 닫기도 거부), **이 세션에서 계속 허용**(그 세션의 그 분류만 이후 묻지 않는다. 업로드는 `--upload-dir`이 있는 세션에만 나온다). 버튼은 뜬 뒤 1초, 그리고 창 위의 입력이 0.5초 멈출 때까지 눌리지 않는다. 창은 초점을 가져가지 않으므로 사람 창에서 치던 글은 그대로이고, 앱이 뒤에 있으면 Dock 아이콘이 한 번 튄다. 탭이나 에이전트 창을 닫으면 거부다.
+- **어느 구성이든: 코어 API**. 데몬 소켓(`<PEGBOARD_HOME>/pegboardd.sock`)에 JSON-RPC 한 줄로 `confirm.subscribe`를 보내면 그 연결로 `confirm.required`(`{confirmId, sessionId, sessionName, profile, class, details, offerAllowForSession, expiresAt}`)와 `confirm.resolved` 알림이 한 줄씩 온다. 지금 기다리는 것은 `confirm.list`, 답은 `confirm.respond {"confirmId": …, "answer": "approve" | "deny" | "allowForSession"}`. 먼저 온 답(확인 창이든 API든)이 이기고, 늦은 답은 `confirm_not_found`다. 순정 모드에는 확인 창이 없으므로 구독자가 없으면 바로 거부된다("confirmation needs the Pegboard browser").
+
+```bash
+sock="$HOME/Library/Application Support/Pegboard/pegboardd.sock"   # PEGBOARD_HOME을 쓰면 그 아래
+# 알림을 계속 읽는다(Ctrl-C로 끝). cat이 쓰기 쪽을 열어 둔다
+{ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"confirm.subscribe","params":{}}'; cat; } | nc -U "$sock"
+# 답 하나. 응답이 올 때까지 쓰기 쪽을 열어 둔다(sleep 1)
+{ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"confirm.respond","params":{"confirmId":"<32자>","answer":"deny"}}'; sleep 1; } | nc -U "$sock"
+```
+
+- 서버는 요청을 보낸 연결의 쓰기 쪽이 닫히면(EOF) 클라이언트가 떠난 것으로 보고 답을 보내지 않는다. 그래서 `printf … | nc -U`처럼 보내자마자 입력을 닫는 클라이언트는 답을 못 받는다(위처럼 열어 둔다). 구독 연결도 EOF에서 끝난다.
+- 묻지 않으려면 세션을 만들 때 `--allow upload --upload-dir <폴더>`, `--allow state`(묻지 않고 허용) 또는 `--deny upload`, `--deny state`(묻지 않고 거부)를 준다. MCP 기본 모드에서는 `pegboard mcp`의 옵션이 그 서버의 모든 세션에 걸린다. 에이전트는 어떤 도구로도 답하거나 정책을 넓힐 수 없다(MCP 도구에 `confirm`이 없다). `pegboard confirm` 같은 CLI 명령은 없다(셸을 가진 에이전트가 스스로 승인하기 쉬워질 뿐이라서).
+- 결과: 거부는 `policy_denied`이고 `data.reason`이 이유다: `denied`(사람이 거부), `timed_out`(60초), `no_responder`(답할 곳 없음), `cancelled`(세션 닫기, 데몬 종료), `stale`(허용 뒤 출처가 바뀜), `unknown_origin`. CLI는 `(reason: …)`를 붙인다. 허용된 명령의 결과에는 `"confirmed": {"by": "browser" | "api" | "session"}`(MCP는 "confirmed by …")가 붙고, 동작 기록 줄에는 `confirm: {outcome, by, waitMs}`가 남는다(창에 보인 값은 남기지 않는다). `session info`는 사람이 "이 세션에서 계속 허용"한 분류를 정책과 따로 보인다.
+- 같은 사용자의 프로세스는 소켓으로 답할 수 있다(지금도 더 넓은 세션을 만들 수 있는 것과 같은 수준. 아래 "알려진 한계"). 도구 호출을 60초 안팎에서 끊는 MCP 클라이언트는 확인을 기다린 명령의 결과를 못 볼 수 있다.
 
 ## 녹화
 
@@ -238,7 +270,7 @@ pegboard recording open <기록 id>      # 사람의 기본 브라우저에서 �
 
 ## 아직 안 되는 것
 
-- 확인 요청(동작을 실시간으로 승인하기), 원격 제어, 프로필 복사(`profile create --from`, 임시 프로필).
+- 원격 제어, 프로필 복사(`profile create --from`, 임시 프로필). `network` 분류의 확인(요청 가로채기를 에이전트에게 주면 데몬의 요청 가드보다 먼저 판정할 수 있어서 넣지 않았다).
 - 녹화의 동영상 내보내기(`recording export`), 네트워크 본문 기록, 화면 기록 전체를 끄는 설정(도메인 단위로만 끈다).
 - 허용목록에서 뺀 명령. 허용목록(`crates/pegboard-core/src/argv.rs`)에 없는 것은 모두 거부되며, 아래는 그중 알려 둘 만한 것이다.
   - `cookies clear`, `set media`, `set geo`, `set offline`: 필요한 CDP 메서드(`Network.clearBrowserCookies`, 에뮬레이션·네트워크 조건 계열)를 프록시가 허용하지 않는다.
@@ -294,7 +326,9 @@ pegboard recording open <기록 id>      # 사람의 기본 브라우저에서 �
 - 다운로드 정책을 건 연결이 끊기면 데몬은 그 프로필의 명령을 `browser_failed`로 거부하고, 정책을 다시 걸려고 그 프로필의 탭 하나를 활성화한다. **이때 에이전트 창이 앞으로 나와 사람의 키보드 초점을 가져갈 수 있다**(페이지가 일으킬 수 없는 드문 경우다). 5초 안에 못 걸면 그 프로필의 세션을 닫는다. 그 사이 남은 탭이나 이미 열린 페이지가 시작한 다운로드는 `~/Downloads`로 갈 수 있다.
 - 시험용 데몬 메서드 `test.dropDownloadPolicy`는 `PEGBOARD_TEST_HOOKS`를 준 데몬에만 있다(실제 사용에서는 주지 않는다).
 
-### 업로드 (2a)
+### 업로드 (2a, 3b)
+
+- 3b: 확인 창의 업로드를 허용하면 그 파일의 내용을 에이전트와 그 페이지가 읽을 수 있다(창이 말한다). 허용한 업로드의 사본은 세션이 닫힐 때까지 `<PEGBOARD_HOME>/sessions/<id>/confirm/` 아래에 남는다(브라우저가 폼을 보낼 때 파일을 읽기 때문이다. 세션 4 GiB, 전체 8 GiB까지). 경로가 묻기 전에 거부되었는지는 에이전트가 알 수 있어, 그 경로에 받을 만한 파일이 있는지는 숨겨지지 않는다(이유는 가린다).
 
 - 파일 이름은 영문자, 숫자, `.`, `_`, `-`만 된다(공백이 든 이름은 업로드할 수 없다).
 - 프록시의 경로 검사는 맨 이름 규칙을 다시 적용하지 않는다. 세션 엔드포인트에 직접 붙은 클라이언트는 업로드 폴더 바로 안의 점 파일이나 공백이 든 이름의 파일을 올릴 수 있다(폴더 밖은 안 된다).
@@ -363,7 +397,7 @@ PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<Pegboard.app> PEGBOARD_TEST_AP
   cargo test --workspace -- --ignored --test-threads=1 --skip diag_    # 같은 시험을 포크 구성으로 (데몬이 포크를 파이프로 띄운다)
 ```
 
-포크 구성(`PEGBOARD_TEST_BROWSER=fork:<앱>`)에서는 데몬이 포크를 `--remote-debugging-pipe --pegboard-no-daemon --use-mock-keychain`으로 띄우고 브리지는 `Pegboard` 도메인 판을 쓴다. 포크에서만 도는 시험이 있다: `e2e_domain`(도메인), `e2e_bootstrap`(앱이 데몬을 띄우고 다시 띄우고 끈다. `package-dev.sh`로 만든 앱을 `PEGBOARD_TEST_APP`에 준다), `e2e_browser`의 `hosted_start_closes_leftover_agent_tabs`. 순정 구성에서는 건너뛴다. 알려진 실패 둘은 3a 전부터 두 구성 모두에서 실패한다: `e2e_isolation::unattributed_download_is_deleted`, `e2e_policy::second_session_cannot_widen_a_pinned_profile`(둘 다 `pegboard-cli`).
+포크 구성(`PEGBOARD_TEST_BROWSER=fork:<앱>`)에서는 데몬이 포크를 `--remote-debugging-pipe --pegboard-no-daemon --use-mock-keychain`으로 띄우고 브리지는 `Pegboard` 도메인 판을 쓴다. 포크에서만 도는 시험이 있다: `e2e_domain`(도메인, 확인 창의 도메인 검사, 에이전트 창 표시와 숨기기), `e2e_branding`(제품 이름, 로그인·비밀번호 기본값), `e2e_confirm`의 확인 창 시험(순정에서는 API 구독자가 답하는 시험만 돌고, 답할 곳이 없어야 하는 시험은 순정 전용이다), `e2e_bootstrap`(앱이 데몬을 띄우고 다시 띄우고 끈다. `package-dev.sh`로 만든 앱을 `PEGBOARD_TEST_APP`에 준다), `e2e_browser`의 `hosted_start_closes_leftover_agent_tabs`. 순정 구성에서는 건너뛴다. 3a 때 알려진 실패 둘(`e2e_isolation::unattributed_download_is_deleted`, `e2e_policy::second_session_cannot_widen_a_pinned_profile`, 둘 다 `pegboard-cli`)은 3b 끝의 순정 구성 전체 실행(2026-11-25)에서 통과했다. 전체 실행 뒤에는 시험이 남긴 agent-browser 데몬이 남을 수 있다(`pkill -f vendor/agent-browser/agent-browser`).
 
 클립보드 시험과 MCP 격리 시험 묶음의 `mcp_agent_cannot_write_the_clipboard`는 시스템 클립보드를 저장하고 표식을 넣었다가 되돌린다(비어 있었으면 다시 비운다). 텍스트가 아닌 내용(그림, 서식 있는 글)이 있으면 돌지 않는다. 돌리기 전에 `printf x | pbcopy`처럼 클립보드를 일반 텍스트로 바꿔 둔다.
 
@@ -373,7 +407,7 @@ PEGBOARD_TEST_HOOKS=1 PEGBOARD_TEST_BROWSER=fork:<Pegboard.app> PEGBOARD_TEST_AP
 
 실제 브라우저를 띄우는 시험은 `#[ignore]`가 붙어 있고, 임시 `PEGBOARD_HOME`에서 돌며 끝나면 브라우저를 정리한다. 격리 시험 묶음 둘은 에이전트가 할 수 있는 일을 시도한다. CLI 묶음(`crates/pegboard-cli/tests/e2e_isolation.rs`)은 세션 핸들 하나로 agent-browser 명령만 쓰는 에이전트가 사람 프로필, 다른 세션, 세션 밖의 브라우저, 토큰에 닿지 못함을 확인한다(CLI 전체를 가진 에이전트는 사람의 권한이라 정책을 넓히는 시도는 다루지 않는다). MCP 묶음(`e2e_mcp_isolation.rs`)은 MCP 도구만으로 같은 것에 더해 더 넓은 정책과 세션 밖에 남는 탭에 닿지 못함을 확인한다. 시험마다 새 브라우저를 띄우며, 이후 모든 단계에서 유지한다. 손으로 하는 확인은 [docs/phase1-manual-checks.md](docs/phase1-manual-checks.md), [docs/phase2a-manual-checks.md](docs/phase2a-manual-checks.md), [docs/phase2b-manual-checks.md](docs/phase2b-manual-checks.md).
 
-시험용 환경 변수는 모두 `PEGBOARD_TEST_HOOKS`를 함께 줄 때만 읽는다(실제 사용에서는 주지 않는다): `PEGBOARD_TEST_HOST_RULES`, `PEGBOARD_TEST_BROWSER_HOST_RULES`, `PEGBOARD_TEST_IP_SPACE_OVERRIDES`, `PEGBOARD_TEST_LAUNCH_LOG`, `PEGBOARD_TEST_IDLE_SECS`, `PEGBOARD_TEST_DOWNLOAD_LIMITS`, `PEGBOARD_TEST_NO_CLIPBOARD_SHIELD`, 그리고 2b의 `PEGBOARD_TEST_CAPTURE_DELAY_MS`(직후 캡처를 늦춘다), `PEGBOARD_TEST_EVENT_DELAY_MS`(녹화기가 주 프레임 탐색 이벤트를 늦게 처리한다), `PEGBOARD_TEST_PRUNE_SECS`(정리 주기), `PEGBOARD_TEST_REPLAY_TTL_SECS`(재생 링크의 수명), `PEGBOARD_TEST_OPEN_LOG`(CLI가 `recording open`에서 `open`을 부르지 않고 링크를 그 파일에 적는다). `PEGBOARD_TEST_HOOKS`는 데몬의 시험용 메서드와 진단 기록(daemon.log)도 켠다. 2b의 시험용 메서드는 모두 세션 토큰이 필요하다: `test.recordTarget`(탭이 녹화되는지), `test.setScreen`(세션의 화면 기록을 끄고 켠다), `test.dropRecorder`(녹화기 연결을 끊어 둔다), `test.detachBridge`(브리지가 워커에서 떨어진다). 3a의 `test.linkStats`(데몬의 한 브라우저 연결 위에 열린 가상 연결 수)도 세션 토큰이 필요하다. `PEGBOARD_TEST_MCP_SLOW_CREATE`는 디버그 빌드의 MCP 서버에만 있다.
+시험용 환경 변수는 모두 `PEGBOARD_TEST_HOOKS`를 함께 줄 때만 읽는다(실제 사용에서는 주지 않는다): `PEGBOARD_TEST_HOST_RULES`, `PEGBOARD_TEST_BROWSER_HOST_RULES`, `PEGBOARD_TEST_IP_SPACE_OVERRIDES`, `PEGBOARD_TEST_LAUNCH_LOG`, `PEGBOARD_TEST_IDLE_SECS`, `PEGBOARD_TEST_DOWNLOAD_LIMITS`, `PEGBOARD_TEST_NO_CLIPBOARD_SHIELD`, 그리고 2b의 `PEGBOARD_TEST_CAPTURE_DELAY_MS`(직후 캡처를 늦춘다), `PEGBOARD_TEST_EVENT_DELAY_MS`(녹화기가 주 프레임 탐색 이벤트를 늦게 처리한다), `PEGBOARD_TEST_PRUNE_SECS`(정리 주기), `PEGBOARD_TEST_REPLAY_TTL_SECS`(재생 링크의 수명), `PEGBOARD_TEST_OPEN_LOG`(CLI가 `recording open`에서 `open`을 부르지 않고 링크를 그 파일에 적는다). `PEGBOARD_TEST_HOOKS`는 데몬의 시험용 메서드와 진단 기록(daemon.log)도 켠다. 2b의 시험용 메서드는 모두 세션 토큰이 필요하다: `test.recordTarget`(탭이 녹화되는지), `test.setScreen`(세션의 화면 기록을 끄고 켠다), `test.dropRecorder`(녹화기 연결을 끊어 둔다), `test.detachBridge`(브리지가 워커에서 떨어진다). 3a의 `test.linkStats`(데몬의 한 브라우저 연결 위에 열린 가상 연결 수)도 세션 토큰이 필요하다. 3b: `PEGBOARD_TEST_CONFIRM_TIMEOUT_MS`(확인 대기를 줄이기만 한다. 데몬에는 자동으로 답하는 훅이 없다), `PEGBOARD_TEST_BROWSER_NO_HOOKS`(시험 데몬이 띄우는 포크의 환경에서 `PEGBOARD_TEST_HOOKS`를 뺀다). 포크 브라우저 자신의 시험 훅은 브라우저 환경에 `PEGBOARD_TEST_HOOKS`가 있고 빌드가 GN 인자 `pegboard_test_hooks`를 켰을 때만 읽는다: `PEGBOARD_TEST_DIALOG_LOG`(확인 창과 알림이 보인 글, 키 창, 누름을 한 줄씩), `PEGBOARD_TEST_DIALOG_ANSWER`(`<세션 이름>=<답>` 쉼표 목록, `*`는 나머지. 답 `approve`, `deny`, `allowForSession`, `none`, 알림의 `restart`, `close`), `PEGBOARD_TEST_DIALOG_ANSWER_AFTER_MS`(기본 1,700), `PEGBOARD_TEST_DIALOG_INPUT_AT_MS`(잠금 중 클릭). `PEGBOARD_TEST_MCP_SLOW_CREATE`는 디버그 빌드의 MCP 서버에만 있다.
 
 ## 라이선스
 
