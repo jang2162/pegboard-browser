@@ -1402,3 +1402,14 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 - 처음 전체 실행에서 `e2e_domain`의 작업 7 시험 둘(`confirmation_methods_are_only_on_the_claiming_session`, `domain_refuses_confirmations_for_human_contexts`)이 "확인 창 기록이 비어 있다"를 기록 전체로 단언해서, 작업 8의 `window` 줄 때문에 실패했다. 확인 창 줄만 보게 고친 뒤 통과(`DialogLog::dialogs`).
 - 작업 8의 처음 판(실행 중 `profile.last_used` 되돌리기)은 포크의 세션 만들기를 깨뜨렸다(위 작업 8). `e2e_bootstrap`이 잡았다.
+
+#### 작업 8~10 검토 반영 (2026-11-25)
+
+- **사람의 링크가 에이전트 프로필로 간다** [확인, 고침. 3a부터]: 맥의 `AppController`는 마지막 주 창의 프로필(`_lastProfile`)을 창이 없는 길에 쓴다: 다른 앱에서 연 링크(`application:openURLs:`), 앱 메뉴의 설정과 새 창, 창이 없을 때의 Dock 클릭(`RunInLastProfileSafely`). 데몬이 다운로드 정책 때문에 에이전트 탭을 활성화하면 에이전트 창이 주 창이 된다. 실측: 세션을 만든 뒤 `open -a <앱> <URL>`로 연 링크가 에이전트 프로필에서 열렸다(그 페이지 요청의 쿠키가 에이전트 프로필의 것). 사람이 메일에서 누른 로그인 링크를 에이전트가 읽을 수 있었다.
+  - 고침(`//pegboard`만, 업스트림 줄 0): `AgentProfiles`가 `NSWindowDidBecomeMainNotification`을 지켜보다(`app_last_profile_mac.mm`, 알림 뒤 작업으로) 마지막 프로필이 에이전트 것이면 가장 최근 사람 창의 프로필로 `[AppController setLastProfile:]`을 부른다. 사람 창이 없으면 올라와 있는 마지막 사람 프로필, 그것도 없으면 그 프로필을 올려서 건다. 메뉴 막대(방문 기록, 북마크 메뉴)도 사람 프로필의 것이 된다.
+  - 창이 없을 때의 Dock 클릭과 프로필이 내려간 뒤의 길은 Local State `profile.last_used`로 간다. 실행 중에는 그 값이 DevTools의 기본 컨텍스트라 에이전트 창이 있는 동안은 두고, 마지막 에이전트 창이 닫히면 사람 프로필로 되돌린다.
+  - 시험 `e2e_bootstrap::an_external_link_opens_in_a_persons_profile`(고치기 전 빌드에서 실패, 쿠키 `who=agent`). 변형: `setLastProfile:` 호출 제거 → 같은 시험 실패.
+- `DaemonNotice`: 알림이 떠 있던 사람 창이 닫히면(종료가 아니면) 다음 사람 창에 다시 뜬다. "다시 시작"은 뜬 뒤 1초 동안 비활성이다. 답하는 훅은 키 창 기록(200ms) 뒤에 누르고, 기록이 그 전에 닫히면 닫기 전에 `daemon_stopped`를 쓴다.
+- `ProfileDefaults`: 설정이 없거나 불리언이 아니면 `CHECK`(버전을 올려 이름이 바뀌면 조용히 다시 켜지지 않게 시작부터 멈춘다).
+- `AgentProfiles`: DCHECK 빌드에서는 생략하지 않는다(업스트림이 임시 프로필만 생략된다고 DCHECK한다). 로그 한 줄.
+- 남는 위험: 사람의 유일한 프로필을 지우면 업스트림이 다음 프로필(에이전트 프로필일 수 있다)로 넘어간다(`delete_profile_helper.cc`). 에이전트 프로필의 시크릿 창에는 창 제목 표시가 없다(테마는 따른다).
