@@ -2161,7 +2161,8 @@ async fn agent_profiles_are_omitted_from_the_profile_list() {
     agent_tab(&c, "PegboardAgent-t8").await;
     let default = default_context(&c).await.expect("no Default profile");
     let list = profile_list(&c, &a_page_in(&c, &default).await).await;
-    eprintln!("profiles: {list:?}");
+    let omitted: Vec<_> = list.iter().map(|(d, r)| (d, &r["Omitted"])).collect();
+    eprintln!("omitted: {omitted:?}");
     for dir in [AGENT, "PegboardAgent-t8"] {
         assert_eq!(list[dir]["Omitted"], "true", "{dir}: {:?}", list[dir]);
     }
@@ -2213,18 +2214,34 @@ async fn no_profile_picker_at_launch_with_agent_profiles() {
     drop(c);
     let f = f.quit_and_start_again(None).await;
     let c = f.control().await;
-    let Some(default) = default_context(&c).await else {
-        panic!("no Default window; targets: {:?}", target_urls(&c).await);
-    };
-    a_page_in(&c, &default).await;
-    let urls = target_urls(&c).await;
+    // The person's window or the picker, whichever comes.
+    let mut default = None;
+    let mut urls = Vec::new();
+    for _ in 0..75 {
+        urls = target_urls(&c).await;
+        if let Some(p) = profile(&c, "Default").await {
+            let ctx = p["browserContextId"].as_str().unwrap().to_string();
+            if !pages_in(&c, &ctx).await.is_empty() {
+                default = Some(ctx);
+                break;
+            }
+        }
+        if urls
+            .iter()
+            .any(|u| u.starts_with("chrome://profile-picker"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     eprintln!("targets after the restart: {urls:?}");
     assert!(
         !urls
             .iter()
             .any(|u| u.starts_with("chrome://profile-picker")),
-        "{urls:?}"
+        "the profile picker came up: {urls:?}"
     );
+    let default = default.unwrap_or_else(|| panic!("no Default window: {urls:?}"));
     let list = profile_list(&c, &a_page_in(&c, &default).await).await;
     for dir in [AGENT, "PegboardAgent-t8"] {
         assert_eq!(list[dir]["Omitted"], "true", "{dir}: {:?}", list[dir]);
