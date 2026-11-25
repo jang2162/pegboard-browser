@@ -7,6 +7,10 @@
 //!
 //! Run in a GUI session: `PEGBOARD_TEST_APP=<app> cargo test -p pegboard-core --test
 //! e2e_bootstrap -- --ignored --test-threads=1`.
+//!
+//! Phase 3b task 10: when the browser gives up restarting the daemon it shows the person a
+//! notice with a restart button (`//pegboard/ui/daemon_notice.h`), seen through the
+//! browser's dialog log and answered by its answer hook (test hooks of the browser).
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -122,6 +126,49 @@ impl App {
         self.extra_env
             .extend(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         self
+    }
+
+    /// The browser's dialog log (`PEGBOARD_TEST_DIALOG_LOG`) and its answer hook
+    /// (`PEGBOARD_TEST_DIALOG_ANSWER`, `*=restart`, `*=close` or `*=none` for the notice).
+    fn with_notice_hooks(self, answer: &str) -> App {
+        let log = self.notice_log().display().to_string();
+        self.with_env(&[
+            ("PEGBOARD_TEST_DIALOG_LOG", &log),
+            ("PEGBOARD_TEST_DIALOG_ANSWER", answer),
+        ])
+    }
+
+    fn notice_log(&self) -> PathBuf {
+        self.home.path().join("dialogs.jsonl")
+    }
+
+    /// The dialog log's entries of `kind` (`daemon_stopped`, `daemon_notice_closed`).
+    fn notices(&self, kind: &str) -> Vec<Value> {
+        std::fs::read_to_string(self.notice_log())
+            .unwrap_or_default()
+            .lines()
+            .map(json)
+            .filter(|e| e["kind"] == kind)
+            .collect()
+    }
+
+    /// Kills each daemon the browser starts, four times within the minute (F8: the fourth
+    /// end is not followed by a restart). The last daemon's pid.
+    fn kill_four_times(&mut self, after: Option<i32>) -> i32 {
+        let start = Instant::now();
+        let mut last = after;
+        for kill in 1..=4 {
+            let pid = self.wait_for_daemon(last, SETTLE);
+            // SAFETY: plain syscall on this test's daemon.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            assert!(eventually(SETTLE, || !alive(pid)), "kill {kill}");
+            last = Some(pid);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(50),
+            "too slow for the window"
+        );
+        last.unwrap()
     }
 
     fn helper(&self) -> PathBuf {
@@ -730,4 +777,108 @@ fn a_daemon_that_hangs_up_is_replaced() {
     let second = a.wait_for_daemon(Some(first), SETTLE);
     assert_ne!(second, first);
     assert!(alive(a.browser()));
+}
+
+/// B16: the browser gives up (the fourth end within a minute) and shows the person one
+/// notice, over the person's window, without taking the keyboard or activating the app.
+#[test]
+#[ignore]
+fn giving_up_shows_a_notice_without_taking_focus() {
+    let Some(app) = app_under_test() else { return };
+    let mut a = App::new(app).with_notice_hooks("*=none");
+    let person = a.server.url("/person");
+    a.open(&[&person]);
+    a.kill_four_times(None);
+    assert!(
+        eventually(SETTLE, || !a.notices("daemon_stopped").is_empty()),
+        "no notice; dialog log: {:?}",
+        std::fs::read_to_string(a.notice_log())
+    );
+    let e = a.notices("daemon_stopped").remove(0);
+    eprintln!("notice: {e}");
+    assert_eq!(e["profile"], "Default", "{e}");
+    let before = &e["keyWindowProfileBefore"];
+    assert_ne!(before, "other", "{e}");
+    assert_eq!(&e["keyWindowProfileAt0"], before, "{e}");
+    assert_eq!(&e["keyWindowProfileAt200ms"], before, "{e}");
+    assert_eq!(e["appActiveAt0"], e["appActiveBefore"], "{e}");
+    assert_eq!(e["appActiveAt200ms"], e["appActiveBefore"], "{e}");
+    // One notice, no daemon, the browser lives on.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(a.notices("daemon_stopped").len(), 1);
+    assert_eq!(a.daemons(), Vec::<i32>::new());
+    assert!(alive(a.browser()));
+}
+
+/// 다시 시작 on the notice starts a daemon that answers, and the restarts count from there:
+/// four more ends within a minute bring the notice again.
+#[test]
+#[ignore]
+fn restart_from_the_notice_starts_a_daemon() {
+    let Some(app) = app_under_test() else { return };
+    let mut a = App::new(app).with_notice_hooks("*=restart");
+    a.open(&[]);
+    let last = a.kill_four_times(None);
+    assert!(
+        eventually(SETTLE, || a
+            .notices("daemon_notice_closed")
+            .iter()
+            .any(|e| e["pressed"] == "restart")),
+        "the notice was not answered; dialog log: {:?}",
+        std::fs::read_to_string(a.notice_log())
+    );
+    let restarted = a.wait_for_daemon(Some(last), SETTLE);
+    let s = a.create_session("/after-restart");
+    let (code, _, err) = a.cli(&["get", "url"], Some(&s));
+    assert_eq!(code, 0, "{err}");
+    // Three restarts again, then the notice again.
+    a.kill_four_times(Some(restarted));
+    assert!(
+        eventually(SETTLE, || a.notices("daemon_stopped").len() == 2),
+        "no second notice; dialog log: {:?}",
+        std::fs::read_to_string(a.notice_log())
+    );
+}
+
+/// Another daemon holds the lock (exit code 4): the browser does not start one again, and
+/// shows no notice either (there is a daemon, just not the browser's).
+#[test]
+#[ignore]
+fn a_held_lock_shows_no_notice() {
+    let Some(app) = app_under_test() else { return };
+    let a = App::new(app.clone()).with_notice_hooks("*=none");
+    std::fs::write(
+        a.home.path().join("config.toml"),
+        "[browser]\nkind = \"stock\"\n",
+    )
+    .unwrap();
+    let mut held = Command::new(a.helper());
+    held.env("PEGBOARD_HOME", a.home.path())
+        .env("PEGBOARD_TEST_BROWSER", format!("fork:{}", app.display()))
+        .env(
+            "PEGBOARD_AGENT_BROWSER",
+            app.join("Contents/Helpers/agent-browser"),
+        )
+        .args(["browser", "start"])
+        .stdin(Stdio::null());
+    for (k, v) in a.test_env() {
+        held.env(k, v);
+    }
+    let out = held.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    a.open(&[]);
+    assert!(
+        eventually(SETTLE, || a.log().contains("another daemon holds")),
+        "the app's daemon never ran; daemon.log:\n{}",
+        a.log()
+    );
+    // Several restart delays later: no notice.
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(a.notices("daemon_stopped"), Vec::<Value>::new());
+    let (code, _, err) = a.cli(&["browser", "stop"], None);
+    assert_eq!(code, 0, "{err}");
 }

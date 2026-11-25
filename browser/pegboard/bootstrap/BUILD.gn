@@ -18,5 +18,6 @@ source_set("bootstrap") {
     "//base",
     "//content/public/browser",
     "//content/public/common",
+    "//pegboard/ui",
   ]
 }

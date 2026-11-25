@@ -1,5 +1,6 @@
 # Pegboard's own browser UI: the confirmation dialog the Pegboard CDP domain
-# shows (//pegboard/devtools), the display text rule for what an agent chose,
+# shows (//pegboard/devtools), the notice that the daemon will not be started
+# again (//pegboard/bootstrap), the display text rule for what an agent chose,
 # and the browser side's test hooks.
 
 import("//build/buildflag_header.gni")
@@ -19,11 +20,15 @@ source_set("ui") {
   sources = [
     "confirm_dialog.cc",
     "confirm_dialog.h",
+    "daemon_notice.cc",
+    "daemon_notice.h",
     "display_text.cc",
     "display_text.h",
     "platform.h",
     "test_hooks.cc",
     "test_hooks.h",
+    "window_focus.cc",
+    "window_focus.h",
   ]
   if (is_mac) {
     sources += [ "platform_mac.mm" ]
@@ -41,6 +46,7 @@ source_set("ui") {
     "//chrome/browser/picture_in_picture",
     "//chrome/browser/profiles:profile",
     "//chrome/browser/ui/browser_window",
+    "//pegboard/common",
     "//ui/base",
     "//ui/gfx",
     "//ui/views",

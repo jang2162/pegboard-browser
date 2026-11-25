@@ -14,10 +14,10 @@
 #include "chrome/browser/picture_in_picture/scoped_picture_in_picture_occlusion_observation.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
-#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
 #include "pegboard/ui/display_text.h"
 #include "pegboard/ui/platform.h"
 #include "pegboard/ui/test_hooks.h"
+#include "pegboard/ui/window_focus.h"
 #include "ui/base/base_window.h"
 #include "ui/base/mojom/dialog_button.mojom.h"
 #include "ui/base/mojom/ui_base_types.mojom-shared.h"
@@ -81,35 +81,6 @@ constexpr char16_t kApproveLabel[] = u"허용";
 constexpr char16_t kDenyLabel[] = u"거부";
 constexpr char16_t kAllowForSessionLabel[] = u"이 세션에서 계속 허용";
 constexpr char16_t kFooter[] = u"60초 안에 답하지 않으면 거부됩니다";
-
-std::string DirectoryOf(BrowserWindowInterface* browser) {
-  Profile* profile = browser ? browser->GetProfile() : nullptr;
-  return profile ? profile->GetBaseName().AsUTF8Unsafe() : std::string();
-}
-
-// The profile directory of the app's key window ("sheet:<dir>" when a sheet
-// attached to that window is key; this dialog is none), "none" when there is
-// no key window, "other" when it is no browser window's (this dialog itself).
-std::string KeyWindowProfile() {
-  if (!platform::HasKeyWindow()) {
-    return "none";
-  }
-  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
-    ui::BaseWindow* window = browser->GetWindow();
-    if (!window) {
-      continue;
-    }
-    switch (platform::KeyRelationOf(window->GetNativeWindow())) {
-      case platform::KeyRelation::kKey:
-        return DirectoryOf(browser);
-      case platform::KeyRelation::kSheetIsKey:
-        return "sheet:" + DirectoryOf(browser);
-      case platform::KeyRelation::kNotKey:
-        break;
-    }
-  }
-  return "other";
-}
 
 // Text inside a sentence of the other language direction kept apart from it.
 std::u16string Isolated(std::u16string text, char16_t opener) {
@@ -330,7 +301,7 @@ bool ConfirmDialog::Open(BrowserWindowInterface* browser) {
   if (!window) {
     return false;
   }
-  profile_ = DirectoryOf(browser);
+  profile_ = ProfileDirectoryOf(browser);
   views::LayoutProvider* layout = views::LayoutProvider::Get();
   const int width = std::max(
       kMinWidth,

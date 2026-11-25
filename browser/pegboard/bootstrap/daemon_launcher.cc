@@ -31,6 +31,7 @@
 #include "base/threading/platform_thread.h"
 #include "content/public/browser/devtools_agent_host.h"
 #include "content/public/common/content_switches.h"
+#include "pegboard/ui/daemon_notice.h"
 
 namespace pegboard {
 
@@ -150,6 +151,8 @@ void DaemonLauncher::Launch() {
   if (quitting_) {
     return;
   }
+  // A daemon starts: the notice that there is none goes.
+  notice_.reset();
   const int run = ++run_;
   term_timer_.Stop();
   base::ScopedFD daemon_read, browser_write;  // browser -> daemon
@@ -256,6 +259,8 @@ void DaemonLauncher::OnExited(int run, int exit_code) {
     LOG(ERROR) << "pegboard: the daemon ended " << kMaxRestarts + 1
                << " times within " << kRestartWindow
                << "; not restarting it";
+    notice_ = std::make_unique<DaemonNotice>(base::BindOnce(
+        &DaemonLauncher::RestartFromNotice, weak_factory_.GetWeakPtr()));
     return;
   }
   restarts_.push_back(now);
@@ -263,6 +268,16 @@ void DaemonLauncher::OnExited(int run, int exit_code) {
       FROM_HERE,
       base::BindOnce(&DaemonLauncher::Launch, weak_factory_.GetWeakPtr()),
       kRestartDelay);
+}
+
+void DaemonLauncher::RestartFromNotice() {
+  if (quitting_ || pid_ != base::kNullProcessId) {
+    return;
+  }
+  LOG(WARNING) << "pegboard: starting the daemon again (from the notice)";
+  // The person asked: F8 counts from here.
+  restarts_.clear();
+  Launch();
 }
 
 void DaemonLauncher::EndPipe() {
@@ -307,6 +322,7 @@ void DaemonLauncher::KillIfRunning(int run) {
 void DaemonLauncher::PostMainMessageLoopRun() {
   quitting_ = true;
   weak_factory_.InvalidateWeakPtrs();
+  notice_.reset();
   term_timer_.Stop();
   if (pid_ == base::kNullProcessId) {
     return;

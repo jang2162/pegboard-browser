@@ -6,6 +6,7 @@
 #define PEGBOARD_BOOTSTRAP_DAEMON_LAUNCHER_H_
 
 #include <atomic>
+#include <memory>
 
 #include "base/containers/circular_deque.h"
 #include "base/files/file_path.h"
@@ -24,6 +25,8 @@ class RefCountedData;
 
 namespace pegboard {
 
+class DaemonNotice;
+
 // Runs pegboardd as a child of the browser and hands it the browser's DevTools
 // pipe (design 4.2): `Contents/Helpers/pegboard daemon --cdp-pipe`, reading
 // fd 3 and writing fd 4, NUL-terminated JSON. The browser's ends go to
@@ -37,7 +40,11 @@ namespace pegboard {
 // - When the daemon ends (its end of the pipe or the process), the pipe
 //   handler stops and the daemon is started again, at most kMaxRestarts times
 //   in kRestartWindow, and never after it exited with kExitLockHeld (another
-//   daemon holds the lock). After that the browser goes on without one (F8).
+//   daemon holds the lock). After that the browser goes on without one (F8)
+//   and, when it gave up after kMaxRestarts (not for kExitLockHeld), shows
+//   the person a DaemonNotice (//pegboard/ui) whose 다시 시작 forgets the
+//   restarts so far and starts the daemon again; a daemon that starts closes
+//   a notice still open.
 // - When the browser quits, the pipe is closed (the daemon sees its end,
 //   closes its sessions and exits); a daemon still there after kQuitWait gets
 //   SIGTERM, and SIGKILL kKillWait later. A daemon that closed its end of the
@@ -81,6 +88,8 @@ class DaemonLauncher : public ChromeBrowserMainExtraParts {
   using ExitFlag = base::RefCountedData<std::atomic<bool>>;
 
   void Launch();
+  // 다시 시작 on the notice: the restarts so far are forgotten.
+  void RestartFromNotice();
   // The daemon's end of the pipe closed (content's handler saw it).
   void OnPipeClosed(int run);
   void OnExited(int run, int exit_code);
@@ -110,6 +119,8 @@ class DaemonLauncher : public ChromeBrowserMainExtraParts {
   // launch: the pipe can be seen closed after the process was seen gone, and a
   // late timer must not reach the next daemon.
   base::OneShotTimer term_timer_;
+  // The notice that the daemon will not be started again, while it is up.
+  std::unique_ptr<DaemonNotice> notice_;
   base::WeakPtrFactory<DaemonLauncher> weak_factory_{this};
 };
 
