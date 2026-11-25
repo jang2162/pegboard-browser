@@ -632,6 +632,83 @@ fn allow_clipboard_opens_it() {
     });
 }
 
+/// Records the keyboard, clipboard and input events of a document (from scratch on each
+/// call) and answers its visibility and focus.
+const RECORD_KEYS: &str = "(()=>{if(!window.__keys){window.__keys=[];const r=e=>window.__keys.push(e.type);for(const t of ['keydown','keyup','copy','cut','paste','beforeinput','input'])document.addEventListener(t,r,true)}window.__keys.length=0;return document.visibilityState+' '+document.hasFocus()})()";
+
+/// The clipboard keys one session sends (`Input.dispatchKeyEvent` with `commands`) act in
+/// that session's tab only: another session's tab in the same agent profile and every other
+/// page (the human's included) get no event, a paste lands in the sender's text field only
+/// and a copy takes the sender's selection. The tabs are background tabs in the fork (spike
+/// findings, 3a task 10): on macOS a Cmd shortcut of a real keyboard goes to the window's
+/// active tab, which this would catch if a CDP key took that route.
+#[test]
+#[ignore]
+fn clipboard_keys_reach_only_their_own_tab() {
+    common::run(async {
+        let clip = Clipboard::take();
+        let h = Harness::start();
+        let a = agent(&h, true).await;
+        let b = agent(&h, true).await;
+        let ta = a.tab(&a.first()).await;
+        let tb = b.tab(&b.first()).await;
+        ta.load("/clip").await;
+        tb.load("/clip").await;
+        // Every other page of the browser, through the daemon's own connection.
+        let conn = &h.browser.conn;
+        let mut others = vec![(format!("session B {}", b.first()), tb)];
+        for t in page_targets(conn).await.unwrap() {
+            if t.target_id == a.first() || t.target_id == b.first() {
+                continue;
+            }
+            if let Ok(sid) = conn.attach(&t.target_id).await {
+                others.push((format!("{} {}", t.target_id, t.url), Tab { c: conn, sid }));
+            }
+        }
+        // Distinct texts: the digit after the prefix tells the two sessions apart.
+        let select = |n: u8| format!("(()=>{{const t=document.getElementById('t');t.value='SELECTED-{n}'+Date.now();t.focus();t.select();return t.value}})()");
+        for (name, key, code, vk, modifiers, command) in [
+            ("Meta+v", "v", "KeyV", 86, META, "paste"),
+            ("Control+v", "v", "KeyV", 86, CONTROL, "paste"),
+            ("Meta+c", "c", "KeyC", 67, META, "copy"),
+            ("Meta+x", "x", "KeyX", 88, META, "cut"),
+        ] {
+            ta.load("/clip").await;
+            ta.eval(RECORD_KEYS, false).await;
+            for (_, t) in &others {
+                t.eval(RECORD_KEYS, false).await;
+            }
+            // B has a focused text field that a stray paste would fill, and a selection a
+            // stray copy would take.
+            let b_text = others[0].1.eval(&select(2), false).await;
+            let a_text = if command == "paste" {
+                ta.empty_focused_textarea().await;
+                String::new()
+            } else {
+                ta.eval(&select(1), false).await
+            };
+            let marker = clip.mark();
+            ta.key(key, code, vk, modifiers, &[command]).await;
+            settle().await;
+            let now = clip.get();
+            let a_events = ta.eval("JSON.stringify(window.__keys)", false).await;
+            assert!(a_events.contains(command), "{name}: A had no {command} event: {a_events}");
+            for (who, t) in &others {
+                let got = t.eval("JSON.stringify(window.__keys)", false).await;
+                assert!(
+                    got == "[]" || got.starts_with("CDPERR"),
+                    "{name} of session A reached {who}: {got}"
+                );
+            }
+            assert_eq!(others[0].1.textarea().await, b_text, "{name} changed B's text field");
+            match command {
+                "paste" => assert_eq!(ta.textarea().await, marker, "{name} did not paste into A"),
+                _ => assert_eq!(now.trim(), a_text, "{name} did not copy A's selection"),
+            }
+        }
+    });
+}
+
 /// Tabs and documents that appear after the session started are covered as well: a tab the
 /// agent opens, a popup a page opens, a cross-site frame (its own target) and a sandboxed
 /// srcdoc frame (attached running). Each is tried in a denied and in an allowed session.
