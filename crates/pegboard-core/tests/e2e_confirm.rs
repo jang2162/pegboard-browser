@@ -107,10 +107,14 @@ impl Rig {
     }
 
     async fn session(&self) -> Session {
+        self.session_at("/counter").await
+    }
+
+    async fn session_at(&self, path: &str) -> Session {
         let r = self
             .call(
                 "session.create",
-                json!({ "url": format!("{}/counter", self.fixture.origin) }),
+                json!({ "url": format!("{}{path}", self.fixture.origin) }),
             )
             .await;
         let info = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
@@ -599,5 +603,49 @@ async fn an_answer_for_session_a_does_not_release_session_b() {
     let _ = rig
         .ok(&a, &["eval", "localStorage.removeItem('pegab')"])
         .await;
+    rig.finish().await;
+}
+
+/// After `frame <sel>` agent-browser writes in that frame: the person is shown (and the
+/// command pinned to) the frame's origin, with the tab's beside it, and the write lands
+/// there, not in the tab's top frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn a_write_inside_a_frame_shows_the_frames_origin() {
+    let rig = rig(None).await;
+    // The page (127.0.0.1) frames a page of localhost: another origin.
+    let s = rig.session_at("/xsite/counter").await;
+    let port = rig.fixture.origin.rsplit(':').next().unwrap().to_string();
+    let frame_origin = format!("http://localhost:{port}");
+    rig.ok(&s, &["wait", "#fr"]).await;
+    rig.ok(&s, &["wait", "1000"]).await;
+    rig.ok(&s, &["frame", "#fr"]).await;
+    let mut person = rig.subscribe().await;
+    let run = rig.exec(&s, &["storage", "local", "set", "pegframe", "f1"]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(shown(&asked, "출처"), frame_origin, "{asked}");
+    assert_eq!(
+        shown(&asked, "탭 출처 (쓰기는 그 안의 프레임)"),
+        rig.fixture.origin,
+        "{asked}"
+    );
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "approve")
+        .await;
+    let r = run.await.unwrap();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    // Where it landed: in the frame's origin, not the page's.
+    assert_eq!(rig.local_storage(&s, "pegframe").await, "f1");
+    rig.ok(&s, &["frame", "main"]).await;
+    assert_eq!(rig.local_storage(&s, "pegframe").await, Value::Null);
+    // Back in the top frame, a write shows the page's origin alone.
+    let run = rig.exec(&s, &["storage", "local", "set", "pegframe", "top"]);
+    let asked = person.next("confirm.required").await;
+    assert_eq!(shown(&asked, "출처"), rig.fixture.origin, "{asked}");
+    assert!(!asked["details"].to_string().contains("탭 출처"), "{asked}");
+    person
+        .respond(asked["confirmId"].as_str().unwrap(), "deny")
+        .await;
+    assert_eq!(reason(&run.await.unwrap()), "denied");
     rig.finish().await;
 }

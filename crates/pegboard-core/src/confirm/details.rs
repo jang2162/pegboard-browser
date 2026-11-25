@@ -20,12 +20,27 @@ pub enum StatePin {
     /// A cookie set without `--url` or `--domain`: it runs with `--url <this>`, the address
     /// of the tab when the person was asked.
     CookieUrl(String),
-    /// A storage write: the tab must still be at this origin when it runs, else `stale`.
-    Origin(String),
-    /// Nothing to hold it to.
+    /// A storage write: when it runs, the frame agent-browser acts in must still be at
+    /// `acting` and its tab at `page` (origins), else `stale`.
+    Origin { acting: String, page: String },
+    /// Nothing to hold it to (the command names where it writes).
     #[default]
     None,
 }
+
+/// Where a state command would act, as read when it is asked about.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Where<'a> {
+    /// The address of the tab (its top frame).
+    pub page_url: Option<&'a str>,
+    /// The address of the frame agent-browser acts in (after `frame <sel>`, that frame;
+    /// else the tab's top frame). Read for storage commands only.
+    pub acting_url: Option<&'a str>,
+}
+
+/// Where the command would write cannot be told: it is neither asked about nor run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownOrigin;
 
 /// Format characters (Unicode category Cf) and the line and paragraph separators: they
 /// change how the text around them looks (bidirectional overrides and isolates, marks,
@@ -91,8 +106,6 @@ pub fn origin_of(url: &str) -> String {
     }
 }
 
-const NO_TAB: &str = "(탭 없음)";
-
 fn detail(label: &str, value: String) -> ConfirmDetail {
     ConfirmDetail {
         label: label.to_string(),
@@ -100,26 +113,47 @@ fn detail(label: &str, value: String) -> ConfirmDetail {
     }
 }
 
-/// What a state command shows and what pins it, given the address of the tab it would act
-/// on (`None`: no tab is known). `argv` is the checked command line that runs.
-pub fn state_details(argv: &[String], tab_url: Option<&str>) -> (Vec<ConfirmDetail>, StatePin) {
+/// The path a cookie set for `url` without `--path` gets (RFC 6265 5.1.4, default-path).
+pub fn default_cookie_path(url: &str) -> String {
+    let path = url::Url::parse(url)
+        .map(|u| u.path().to_string())
+        .unwrap_or_default();
+    match path.rfind('/') {
+        Some(i) if path.starts_with('/') && i > 0 => path[..i].to_string(),
+        _ => "/".to_string(),
+    }
+}
+
+/// What a state command shows and what pins it, given where it would act. A storage write
+/// needs the frame it acts in and its tab; a cookie without `--url`/`--domain` needs the
+/// tab. Without them: `UnknownOrigin` (fail closed: a person is never shown a guess).
+/// `argv` is the checked command line that runs.
+pub fn state_details(
+    argv: &[String],
+    at: Where<'_>,
+) -> Result<(Vec<ConfirmDetail>, StatePin), UnknownOrigin> {
     let words: Vec<&str> = argv.iter().map(String::as_str).collect();
     match words.as_slice() {
-        ["cookies", "set", rest @ ..] => cookie_details(rest, tab_url),
+        ["cookies", "set", rest @ ..] => cookie_details(rest, at.page_url),
         ["storage", kind @ ("local" | "session"), op @ ("set" | "clear"), rest @ ..] => {
             let store = if *kind == "local" {
                 "localStorage"
             } else {
                 "sessionStorage"
             };
-            let origin = tab_url.map(origin_of);
-            let mut details = vec![detail(
-                "출처",
-                origin
-                    .as_deref()
-                    .map(|o| display_text(o, DETAIL_VALUE_CHARS))
-                    .unwrap_or_else(|| NO_TAB.to_string()),
-            )];
+            let (Some(acting), Some(page)) = (at.acting_url, at.page_url) else {
+                return Err(UnknownOrigin);
+            };
+            let (acting, page) = (origin_of(acting), origin_of(page));
+            let mut details = vec![detail("출처", display_text(&acting, DETAIL_VALUE_CHARS))];
+            // Inside a frame of another origin: the tab's origin too, so the person sees
+            // the write does not go to the page they see.
+            if acting != page {
+                details.push(detail(
+                    "탭 출처 (쓰기는 그 안의 프레임)",
+                    display_text(&page, DETAIL_VALUE_CHARS),
+                ));
+            }
             details.push(detail("종류", store.to_string()));
             if *op == "set" {
                 details.push(detail(
@@ -133,16 +167,18 @@ pub fn state_details(argv: &[String], tab_url: Option<&str>) -> (Vec<ConfirmDeta
             } else {
                 details.push(detail("동작", format!("이 출처의 {store} 전체 삭제")));
             }
-            let pin = origin.map(StatePin::Origin).unwrap_or_default();
-            (details, pin)
+            Ok((details, StatePin::Origin { acting, page }))
         }
-        _ => (Vec::new(), StatePin::None),
+        _ => Ok((Vec::new(), StatePin::None)),
     }
 }
 
 /// `cookies set <name> <value>` and its flags (`argv::COOKIE_FLAGS`: `--url`, `--domain`,
 /// `--path`, `--same-site`, `--expires` take a value; `--http-only`, `--secure` do not).
-fn cookie_details(rest: &[&str], tab_url: Option<&str>) -> (Vec<ConfirmDetail>, StatePin) {
+fn cookie_details(
+    rest: &[&str],
+    tab_url: Option<&str>,
+) -> Result<(Vec<ConfirmDetail>, StatePin), UnknownOrigin> {
     let mut positional = Vec::new();
     let (mut url, mut domain, mut path) = (None, None, None);
     let mut flags = Vec::new();
@@ -173,6 +209,7 @@ fn cookie_details(rest: &[&str], tab_url: Option<&str>) -> (Vec<ConfirmDetail>, 
         }
         i += 2;
     }
+    let shown = |v: &str| display_text(v, DETAIL_VALUE_CHARS);
     let mut details = vec![
         detail(
             "이름",
@@ -186,31 +223,36 @@ fn cookie_details(rest: &[&str], tab_url: Option<&str>) -> (Vec<ConfirmDetail>, 
             display_text(positional.get(1).copied().unwrap_or(""), SHOWN_VALUE_CHARS),
         ),
     ];
-    let shown = |v: &str| display_text(v, DETAIL_VALUE_CHARS);
     let mut pin = StatePin::None;
-    if let Some(u) = url {
+    // The address the cookie is set for: the one given, else the tab's (pinned, so a
+    // navigation meanwhile changes nothing). No address and no tab: unknown.
+    let effective_url = match (url, domain) {
+        (Some(u), _) => Some(u.to_string()),
+        (None, Some(_)) => None,
+        (None, None) => {
+            let u = tab_url.ok_or(UnknownOrigin)?;
+            pin = StatePin::CookieUrl(u.to_string());
+            Some(u.to_string())
+        }
+    };
+    if let Some(u) = &effective_url {
         details.push(detail("URL", shown(u)));
     }
     if let Some(d) = domain {
         details.push(detail("도메인", shown(d)));
     }
-    if url.is_none() && domain.is_none() {
-        // Pinned to the tab the person was shown, so a navigation meanwhile changes nothing.
-        details.push(detail(
-            "URL",
-            tab_url.map(shown).unwrap_or_else(|| NO_TAB.to_string()),
-        ));
-        if let Some(u) = tab_url {
-            pin = StatePin::CookieUrl(u.to_string());
-        }
-    }
-    if let Some(p) = path {
-        details.push(detail("경로", shown(p)));
-    }
+    // The path it gets: the one given, else the default for its address ("/" for a
+    // domain alone).
+    let effective_path = match (path, &effective_url) {
+        (Some(p), _) => p.to_string(),
+        (None, Some(u)) => default_cookie_path(u),
+        (None, None) => "/".to_string(),
+    };
+    details.push(detail("경로", shown(&effective_path)));
     if !flags.is_empty() {
         details.push(detail("플래그", shown(&flags.join(", "))));
     }
-    (details, pin)
+    Ok((details, pin))
 }
 
 #[cfg(test)]
@@ -259,14 +301,22 @@ mod tests {
         assert_eq!(display_text("세션 one é 日本", 100), "세션 one é 日本");
     }
 
+    fn tab(url: &str) -> Where<'_> {
+        Where {
+            page_url: Some(url),
+            acting_url: Some(url),
+        }
+    }
+
     #[test]
     fn details_cap_values_at_200_chars() {
         let long = "v".repeat(500);
         let argv = s(&["storage", "local", "set", "k", &long]);
-        let (details, _) = state_details(&argv, Some("https://a.test/x"));
+        let (details, _) = state_details(&argv, tab("https://a.test/x")).unwrap();
         let v = value_of(&details, "값");
         assert_eq!(v, format!("{}…", "v".repeat(SHOWN_VALUE_CHARS)));
-        let (details, _) = state_details(&s(&["cookies", "set", "n", &long]), None);
+        let (details, _) =
+            state_details(&s(&["cookies", "set", "n", &long]), tab("https://a.test/")).unwrap();
         assert_eq!(
             value_of(&details, "값").chars().count(),
             SHOWN_VALUE_CHARS + 1
@@ -281,29 +331,64 @@ mod tests {
     fn cookie_without_url_is_pinned_to_the_asked_tab() {
         let (details, pin) = state_details(
             &s(&["cookies", "set", "n", "v", "--path", "/p", "--secure"]),
-            Some("https://a.test/x"),
-        );
+            tab("https://a.test/x"),
+        )
+        .unwrap();
         assert_eq!(pin, StatePin::CookieUrl("https://a.test/x".into()));
         assert_eq!(value_of(&details, "이름"), "n");
         assert_eq!(value_of(&details, "값"), "v");
         assert_eq!(value_of(&details, "URL"), "https://a.test/x");
         assert_eq!(value_of(&details, "경로"), "/p");
         assert_eq!(value_of(&details, "플래그"), "Secure");
-        // No tab known: nothing to pin it to, and the window says so.
-        let (details, pin) = state_details(&s(&["cookies", "set", "n", "v"]), None);
-        assert_eq!(pin, StatePin::None);
-        assert_eq!(value_of(&details, "URL"), "(탭 없음)");
+    }
+
+    #[test]
+    fn the_cookie_path_shown_is_the_one_it_gets() {
+        let path = |argv: &[&str], url: &str| {
+            let (details, _) = state_details(&s(argv), tab(url)).unwrap();
+            value_of(&details, "경로").to_string()
+        };
+        // No --path: the default path of the address it is set for (RFC 6265 5.1.4).
+        assert_eq!(
+            path(&["cookies", "set", "n", "v"], "https://a.test/a/b/c?q"),
+            "/a/b"
+        );
+        assert_eq!(path(&["cookies", "set", "n", "v"], "https://a.test/x"), "/");
+        assert_eq!(path(&["cookies", "set", "n", "v"], "https://a.test/"), "/");
+        assert_eq!(
+            path(
+                &["cookies", "set", "n", "v", "--url", "https://c.test/d/e"],
+                "https://a.test/a/b"
+            ),
+            "/d"
+        );
+        assert_eq!(
+            path(
+                &["cookies", "set", "n", "v", "--domain", "b.test"],
+                "https://a.test/a/b"
+            ),
+            "/"
+        );
+        assert_eq!(
+            path(
+                &["cookies", "set", "n", "v", "--path", "/z"],
+                "https://a.test/a/b"
+            ),
+            "/z"
+        );
     }
 
     #[test]
     fn cookie_with_domain_is_not_repinned() {
         let (details, pin) = state_details(
             &s(&["cookies", "set", "n", "v", "--domain", "b.test"]),
-            Some("https://a.test/x"),
-        );
+            tab("https://a.test/x"),
+        )
+        .unwrap();
         assert_eq!(pin, StatePin::None);
         assert_eq!(value_of(&details, "도메인"), "b.test");
         assert!(details.iter().all(|d| d.label != "URL"), "{details:?}");
+        // Given an address or a domain, no tab is needed.
         let (details, pin) = state_details(
             &s(&[
                 "cookies",
@@ -316,29 +401,43 @@ mod tests {
                 "Lax",
                 "--http-only",
             ]),
-            Some("https://a.test/x"),
-        );
+            Where::default(),
+        )
+        .unwrap();
         assert_eq!(pin, StatePin::None);
         assert_eq!(value_of(&details, "URL"), "https://c.test/");
         assert_eq!(value_of(&details, "이름"), "n");
         assert_eq!(value_of(&details, "플래그"), "SameSite=Lax, HttpOnly");
+        assert!(state_details(
+            &s(&["cookies", "set", "n", "v", "--domain", "b.test"]),
+            Where::default()
+        )
+        .is_ok());
     }
 
     #[test]
     fn storage_set_pins_the_origin() {
         let (details, pin) = state_details(
             &s(&["storage", "local", "set", "k\u{202E}", "v"]),
-            Some("https://a.test:8443/x?q=1"),
+            tab("https://a.test:8443/x?q=1"),
+        )
+        .unwrap();
+        assert_eq!(
+            pin,
+            StatePin::Origin {
+                acting: "https://a.test:8443".into(),
+                page: "https://a.test:8443".into()
+            }
         );
-        assert_eq!(pin, StatePin::Origin("https://a.test:8443".into()));
         assert_eq!(value_of(&details, "출처"), "https://a.test:8443");
+        assert!(details.iter().all(|d| !d.label.starts_with("탭 출처")));
         assert_eq!(value_of(&details, "종류"), "localStorage");
         assert_eq!(value_of(&details, "키"), "k\\u{202e}");
-        let (details, pin) = state_details(
+        let (details, _) = state_details(
             &s(&["storage", "session", "clear"]),
-            Some("https://a.test/x"),
-        );
-        assert_eq!(pin, StatePin::Origin("https://a.test".into()));
+            tab("https://a.test/x"),
+        )
+        .unwrap();
         assert_eq!(
             value_of(&details, "동작"),
             "이 출처의 sessionStorage 전체 삭제"
@@ -349,11 +448,53 @@ mod tests {
     }
 
     #[test]
-    fn a_tabless_state_command_shows_no_origin_and_pins_none() {
-        let (details, pin) = state_details(&s(&["storage", "local", "set", "k", "v"]), None);
-        assert_eq!(pin, StatePin::None);
-        assert_eq!(value_of(&details, "출처"), "(탭 없음)");
-        let (_, pin) = state_details(&s(&["storage", "local", "clear"]), None);
-        assert_eq!(pin, StatePin::None);
+    fn a_write_inside_a_frame_shows_and_pins_the_frames_origin() {
+        let (details, pin) = state_details(
+            &s(&["storage", "local", "set", "k", "v"]),
+            Where {
+                page_url: Some("https://page.test/p"),
+                acting_url: Some("https://frame.test/inner"),
+            },
+        )
+        .unwrap();
+        assert_eq!(value_of(&details, "출처"), "https://frame.test");
+        assert_eq!(
+            value_of(&details, "탭 출처 (쓰기는 그 안의 프레임)"),
+            "https://page.test"
+        );
+        assert_eq!(
+            pin,
+            StatePin::Origin {
+                acting: "https://frame.test".into(),
+                page: "https://page.test".into()
+            }
+        );
+    }
+
+    #[test]
+    fn where_it_writes_unknown_is_refused_not_asked() {
+        let storage = s(&["storage", "local", "set", "k", "v"]);
+        for at in [
+            Where::default(),
+            Where {
+                page_url: Some("https://a.test/"),
+                acting_url: None,
+            },
+            Where {
+                page_url: None,
+                acting_url: Some("https://a.test/"),
+            },
+        ] {
+            assert_eq!(state_details(&storage, at), Err(UnknownOrigin), "{at:?}");
+            assert_eq!(
+                state_details(&s(&["storage", "session", "clear"]), at),
+                Err(UnknownOrigin)
+            );
+        }
+        // A cookie without an address needs the tab's.
+        assert_eq!(
+            state_details(&s(&["cookies", "set", "n", "v"]), Where::default()),
+            Err(UnknownOrigin)
+        );
     }
 }

@@ -15,7 +15,9 @@ use crate::actionlog::{
     ActionEntry, ActionLog, ConfirmLog, MAX_ERROR_CHARS, SENSITIVE_FOCUS_JS,
 };
 use crate::argv::{self, rejected, Checked, TextDestination};
-use crate::confirm::details::{display_text, origin_of, state_details, StatePin, NAME_CHARS};
+use crate::confirm::details::{
+    display_text, origin_of, state_details, StatePin, Where, NAME_CHARS,
+};
 use crate::confirm::{ConfirmAsk, ConfirmBroker, ConfirmDecision};
 use crate::downloads::Report;
 use crate::paths::Paths;
@@ -270,7 +272,8 @@ pub async fn run_command_with_hook(
     };
 
     // Held to what the person was shown, right before it runs.
-    if !apply_pin(&cleared.pin, &mut run_argv, tab_url(sessions, runner, id)).await {
+    let now = where_it_acts(sessions, runner, id, is_storage(&run_argv));
+    if !apply_pin(&cleared.pin, &mut run_argv, now).await {
         if let Some(c) = entry.confirm.as_mut() {
             c.outcome = ConfirmOutcome::Stale;
         }
@@ -747,8 +750,29 @@ fn denial(
     }
 }
 
+/// Where a state command would write cannot be told (design decision: fail closed). It is
+/// neither asked about nor run.
+fn unknown_origin(class: ActionClass) -> RpcError {
+    let name = class.as_str();
+    RpcError {
+        code: codes::POLICY_DENIED.to_string(),
+        message: format!(
+            "the {name} command was not run: pegboard cannot tell which origin it would \
+             write to (no tab is selected among several, or the address could not be read \
+             within 2 s); select a tab (`tab <id>`) and run it again"
+        ),
+        data: Some(serde_json::json!({ "reason": "unknown_origin" })),
+    }
+}
+
+/// A storage command (it writes in the frame agent-browser acts in).
+fn is_storage(run_argv: &[String]) -> bool {
+    run_argv.first().map(String::as_str) == Some("storage")
+}
+
 /// The question for an asking command: the session, and for `state` what it would write
-/// where (the tab it would act on, read now) and what pins it there.
+/// where (read now: the tab, and for storage the frame agent-browser acts in) and what
+/// pins it there. Where it would write unknown: refused (`unknown_origin`).
 async fn prepare_question(
     sessions: &SessionManager,
     runner: &Runner,
@@ -757,8 +781,15 @@ async fn prepare_question(
     run_argv: &[String],
 ) -> Result<(ConfirmAsk, StatePin), RpcError> {
     let info = sessions.info(id)?;
-    let url = tab_url(sessions, runner, id).await;
-    let (details, pin) = state_details(run_argv, url.as_deref());
+    let (acting, page) = where_it_acts(sessions, runner, id, is_storage(run_argv)).await;
+    let (details, pin) = state_details(
+        run_argv,
+        Where {
+            page_url: page.as_deref(),
+            acting_url: acting.as_deref(),
+        },
+    )
+    .map_err(|_| unknown_origin(class))?;
     Ok((
         ConfirmAsk {
             session_id: id.clone(),
@@ -772,6 +803,45 @@ async fn prepare_question(
         },
         pin,
     ))
+}
+
+/// The address of the frame agent-browser acts in (for a storage command; `None` for any
+/// other) and of the tab, read now. The frame first: asking agent-browser binds it to a tab
+/// when it was bound to none, and the tab read is then that one.
+async fn where_it_acts(
+    sessions: &SessionManager,
+    runner: &Runner,
+    id: &SessionId,
+    storage: bool,
+) -> (Option<String>, Option<String>) {
+    let acting = if storage {
+        acting_url(sessions, runner, id).await
+    } else {
+        None
+    };
+    (acting, tab_url(sessions, runner, id).await)
+}
+
+/// The address of the frame agent-browser acts in: after `frame <sel>` that frame, else the
+/// tab's top frame. agent-browser alone knows which frame it selected, so it is asked
+/// (`eval location.href`, pegboard's own call: not judged, not logged). `None` when it
+/// cannot answer within `PROBE_TIMEOUT`.
+async fn acting_url(sessions: &SessionManager, runner: &Runner, id: &SessionId) -> Option<String> {
+    let endpoint = sessions.endpoint(id).ok()?;
+    runner.set_session_targets_provider(sessions.targets_fn());
+    let argv = ["eval", "location.href"].map(String::from);
+    let ms = u64::try_from(PROBE_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+    let r = tokio::time::timeout(PROBE_TIMEOUT, runner.exec(id, &endpoint, &argv, ms))
+        .await
+        .ok()?
+        .ok()?;
+    if !succeeded(&r) {
+        return None;
+    }
+    r.output
+        .pointer("/data/result")
+        .and_then(Value::as_str)
+        .map(String::from)
 }
 
 /// The address of the tab a command acts on (the one agent-browser is bound to, else the
@@ -790,12 +860,13 @@ async fn tab_url(sessions: &SessionManager, runner: &Runner, id: &SessionId) -> 
 }
 
 /// Holds an approved command to what the person was shown: a cookie set without an
-/// address gets the asked tab's (`--url`); a storage write runs only while the tab is
-/// still at the asked origin (`now` reads its address). False: it must not run (`stale`).
+/// address gets the asked tab's (`--url`); a storage write runs only while the frame it
+/// acts in and its tab are still at the asked origins (`now` reads both addresses, as
+/// `where_it_acts`). False: it must not run (`stale`).
 async fn apply_pin(
     pin: &StatePin,
     run_argv: &mut Vec<String>,
-    now: impl Future<Output = Option<String>>,
+    now: impl Future<Output = (Option<String>, Option<String>)>,
 ) -> bool {
     match pin {
         StatePin::None => true,
@@ -804,7 +875,13 @@ async fn apply_pin(
             run_argv.push(url.clone());
             true
         }
-        StatePin::Origin(origin) => now.await.is_some_and(|url| origin_of(&url) == *origin),
+        StatePin::Origin { acting, page } => {
+            let same = |now: Option<String>, origin: &str| {
+                now.is_some_and(|url| origin_of(&url) == origin)
+            };
+            let (now_acting, now_page) = now.await;
+            same(now_acting, acting) && same(now_page, page)
+        }
     }
 }
 
@@ -1156,15 +1233,32 @@ mod tests {
 
     #[tokio::test]
     async fn storage_write_after_navigation_is_stale() {
-        let pin = StatePin::Origin("https://a.test".into());
+        let pin = StatePin::Origin {
+            acting: "https://frame.test".into(),
+            page: "https://a.test".into(),
+        };
         let mut run = words(&["storage", "local", "set", "k", "v"]);
-        // Same origin, another page: it runs, unchanged.
-        let now = async { Some("https://a.test/other?x".to_string()) };
+        let at = |acting: Option<&str>, page: Option<&str>| {
+            let now = (acting.map(String::from), page.map(String::from));
+            async move { now }
+        };
+        // Same origins, other pages: it runs, unchanged.
+        let now = at(Some("https://frame.test/y"), Some("https://a.test/other?x"));
         assert!(apply_pin(&pin, &mut run, now).await);
         assert_eq!(run, words(&["storage", "local", "set", "k", "v"]));
-        // Another origin, or no readable tab: it must not run.
-        for now in [Some("https://b.test/".to_string()), None] {
-            assert!(!apply_pin(&pin, &mut run, async { now }).await);
+        // The frame or the tab elsewhere, or either unreadable: it must not run.
+        for (acting, page) in [
+            (Some("https://b.test/"), Some("https://a.test/")),
+            (Some("https://frame.test/"), Some("https://b.test/")),
+            // Back in the top frame (`frame main`): another origin than the one asked.
+            (Some("https://a.test/"), Some("https://a.test/")),
+            (None, Some("https://a.test/")),
+            (Some("https://frame.test/"), None),
+        ] {
+            assert!(
+                !apply_pin(&pin, &mut run, at(acting, page)).await,
+                "{acting:?} {page:?}"
+            );
         }
         let e = denial(
             ActionClass::State,
@@ -1180,14 +1274,14 @@ mod tests {
         let pin = StatePin::CookieUrl("https://a.test/x".into());
         let mut run = words(&["cookies", "set", "n", "v"]);
         // The tab has moved on meanwhile: what runs is still the asked address.
-        let moved = async { Some("https://evil.test/".to_string()) };
+        let moved = async { (None, Some("https://evil.test/".to_string())) };
         assert!(apply_pin(&pin, &mut run, moved).await);
         assert_eq!(
             run,
             words(&["cookies", "set", "n", "v", "--url", "https://a.test/x"])
         );
         let mut run = words(&["cookies", "set", "n", "v"]);
-        assert!(apply_pin(&StatePin::None, &mut run, async { None }).await);
+        assert!(apply_pin(&StatePin::None, &mut run, async { (None, None) }).await);
         assert_eq!(run, words(&["cookies", "set", "n", "v"]));
     }
 
@@ -1206,10 +1300,14 @@ mod tests {
     fn prepared(
         session: &SessionId,
     ) -> impl Future<Output = Result<(ConfirmAsk, StatePin), RpcError>> {
-        std::future::ready(Ok((
-            question(session),
-            StatePin::Origin("https://a.test".into()),
-        )))
+        std::future::ready(Ok((question(session), origin_pin())))
+    }
+
+    fn origin_pin() -> StatePin {
+        StatePin::Origin {
+            acting: "https://a.test".into(),
+            page: "https://a.test".into(),
+        }
     }
 
     /// Answers the next confirmation that shows up with `answer`.
@@ -1266,7 +1364,7 @@ mod tests {
             answer_next(&broker, ConfirmAnswer::Approve)
         );
         let cleared = r.expect("approved");
-        assert_eq!(cleared.pin, StatePin::Origin("https://a.test".into()));
+        assert_eq!(cleared.pin, origin_pin());
         assert_eq!(cleared.confirm_id.map(|c| c.len()), Some(32));
         let c = cleared.confirm.unwrap();
         assert_eq!(
@@ -1326,6 +1424,28 @@ mod tests {
         // And one that starts while the session closes ends at once too.
         let r = clear_command(&broker, Judged::Ask, ActionClass::State, &id, prepared(&id)).await;
         assert_eq!(r.unwrap_err().error.reason(), Some("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn where_it_writes_unknown_is_denied_without_asking() {
+        let broker = ConfirmBroker::new(crate::confirm::CONFIRM_TIMEOUT);
+        let mut sub = broker.subscribe().unwrap();
+        let id = SessionId("s_abcdefgh".into());
+        let unknown = std::future::ready(Err(unknown_origin(ActionClass::State)));
+        let refused = clear_command(&broker, Judged::Ask, ActionClass::State, &id, unknown)
+            .await
+            .expect_err("unknown origin");
+        assert_eq!(refused.error.code, codes::POLICY_DENIED);
+        assert_eq!(refused.error.reason(), Some("unknown_origin"));
+        assert!(
+            refused.error.message.contains("select a tab"),
+            "{}",
+            refused.error.message
+        );
+        // Nobody was asked.
+        assert!(refused.confirm.is_none());
+        assert!(sub.try_recv().is_err(), "a person was asked");
+        assert!(broker.pending().is_empty());
     }
 
     #[test]
