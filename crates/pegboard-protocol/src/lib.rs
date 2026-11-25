@@ -166,9 +166,9 @@ pub enum RecordExtra {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct SessionPolicy {
-    /// Opens a class that is denied by default.
+    /// `--allow`: allows an asking or denied class without asking.
     pub allow: Vec<ActionClass>,
-    /// Closes a class that is allowed by default.
+    /// `--deny`: denies an allowed or asking class without asking.
     pub deny: Vec<ActionClass>,
     /// Empty means no allow-list.
     pub allow_domains: Vec<String>,
@@ -330,6 +330,88 @@ pub struct RecordingList {
     pub kept_bytes: u64,
 }
 
+/// A person's answer to a confirmation (`confirm.respond`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfirmAnswer {
+    Approve,
+    Deny,
+    /// Approve, and stop asking about this class for the rest of the session.
+    AllowForSession,
+}
+
+/// How a confirmation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfirmOutcome {
+    Approved,
+    ApprovedForSession,
+    Denied,
+    TimedOut,
+    /// Nobody could be asked (or everybody who could went away).
+    NoResponder,
+    /// The session closed or the daemon stopped.
+    Cancelled,
+    /// The page changed after a person approved.
+    Stale,
+}
+
+/// Who answered a confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfirmBy {
+    /// The confirmation window of the Pegboard browser.
+    Browser,
+    /// A client of the core API (`confirm.respond`).
+    Api,
+    /// An earlier "allow for the rest of the session".
+    Session,
+}
+
+/// One line a confirmation shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmDetail {
+    pub label: String,
+    pub value: String,
+}
+
+/// A confirmation waiting for a person: the params of `confirm.required`, and an entry of
+/// `confirm.list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmRequired {
+    /// 32 lowercase hex characters.
+    pub confirm_id: String,
+    pub session_id: SessionId,
+    pub session_name: String,
+    pub profile: String,
+    pub class: ActionClass,
+    pub details: Vec<ConfirmDetail>,
+    /// Whether `allowForSession` is an answer this confirmation takes.
+    pub offer_allow_for_session: bool,
+    /// RFC 3339, UTC: when it is denied unanswered.
+    pub expires_at: String,
+}
+
+/// The params of `confirm.resolved`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmResolved {
+    pub confirm_id: String,
+    pub outcome: ConfirmOutcome,
+    pub by: Option<ConfirmBy>,
+}
+
+/// `confirm.respond`. An answer names one confirmation and nothing else: no session or
+/// class rides along (unknown fields are refused).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfirmRespondParams {
+    pub confirm_id: String,
+    pub answer: ConfirmAnswer,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +445,59 @@ mod tests {
         let back: SessionInfo = serde_json::from_value(old).unwrap();
         assert!(back.allowed_for_session.is_empty());
         assert_eq!(codes::CONFIRM_NOT_FOUND, "confirm_not_found");
+    }
+
+    #[test]
+    fn confirmation_types_are_camel_case() {
+        let r: ConfirmRespondParams = serde_json::from_str(
+            r#"{"confirmId":"00112233445566778899aabbccddeeff","answer":"allowForSession"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.answer, ConfirmAnswer::AllowForSession);
+        for bad in [
+            r#"{"confirmId":"x","answer":"approve","sessionId":"s_abcdefgh"}"#,
+            r#"{"confirmId":"x","answer":"approve","class":"upload"}"#,
+            r#"{"confirmId":"x","answer":"allow_for_session"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ConfirmRespondParams>(bad).is_err(),
+                "{bad}"
+            );
+        }
+        let v = serde_json::to_value(ConfirmResolved {
+            confirm_id: "x".into(),
+            outcome: ConfirmOutcome::NoResponder,
+            by: Some(ConfirmBy::Api),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"confirmId": "x", "outcome": "noResponder", "by": "api"})
+        );
+        let v = serde_json::to_value(ConfirmRequired {
+            confirm_id: "x".into(),
+            session_id: SessionId("s_abcdefgh".into()),
+            session_name: "n".into(),
+            profile: "default".into(),
+            class: ActionClass::State,
+            details: vec![ConfirmDetail {
+                label: "k".into(),
+                value: "v".into(),
+            }],
+            offer_allow_for_session: true,
+            expires_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        for key in [
+            "confirmId",
+            "sessionId",
+            "sessionName",
+            "offerAllowForSession",
+            "expiresAt",
+        ] {
+            assert!(v.get(key).is_some(), "{key}: {v}");
+        }
+        assert_eq!(v["class"], "state");
     }
 
     #[test]

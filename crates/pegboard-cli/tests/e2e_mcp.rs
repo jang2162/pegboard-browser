@@ -1065,7 +1065,7 @@ fn the_session_policy_applies_to_mcp_actions() {
     for (tool, args) in [
         ("pegboard_eval", json!({ "expression": "1" })),
         ("pegboard_wait", json!({ "fn": "true" })),
-        // State is denied by default.
+        // State asks a person by default, and nobody here can answer (no_responder).
         (
             "pegboard_cookies",
             json!({ "command": "set", "name": "n", "value": "v" }),

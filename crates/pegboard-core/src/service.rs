@@ -21,6 +21,7 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 
 use crate::actionlog::{ActionLog, Manifest, SessionLog};
 use crate::browser::{find_chrome, test_fork_binary, Browser, BrowserConfig};
+use crate::confirm::{confirm_method, confirm_timeout, ConfirmBroker, ConfirmSubscription};
 use crate::daemon::run_command;
 use crate::downloads::list_files;
 use crate::link::BrowserLink;
@@ -121,6 +122,8 @@ pub struct Daemon {
     replay: Arc<ReplayServer>,
     /// Kept alive for the daemon's lifetime (it serves the session endpoints).
     _proxy: Arc<ProxyServer>,
+    /// Commands that ask a person wait here (`confirm.*`).
+    confirm: Arc<ConfirmBroker>,
     chrome_version: String,
     slots: Mutex<HashMap<SessionId, Arc<Slot>>>,
     /// Set once shutdown begins; new sessions and commands are refused from then on.
@@ -487,6 +490,7 @@ impl Daemon {
         runner.set_session_targets_provider(sessions.targets_fn());
         let (stop, _) = watch::channel(false);
         let idle = idle_period(crate::testenv::var("PEGBOARD_TEST_IDLE_SECS").as_deref());
+        let confirm = ConfirmBroker::new(confirm_timeout());
         let daemon = Arc::new_cyclic(|me| Daemon {
             paths,
             browser,
@@ -496,6 +500,7 @@ impl Daemon {
             store,
             replay,
             _proxy: proxy,
+            confirm,
             chrome_version,
             slots: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
@@ -504,6 +509,13 @@ impl Daemon {
             stop,
             me: me.clone(),
         });
+        // What a person may allow for the rest of a session depends on its policy.
+        let weak = Arc::downgrade(&daemon);
+        daemon
+            .confirm
+            .set_policy_lookup(Arc::new(move |id: &SessionId| {
+                weak.upgrade()?.sessions.policy(id).ok()
+            }));
         // A profile whose download policy could not be set again in time loses its sessions.
         let weak = Arc::downgrade(&daemon);
         daemon
@@ -687,12 +699,18 @@ impl Daemon {
                 Ok(json!({}))
             }
             "session.create" => to_value(self.create_session(params(p)?).await?),
-            "session.list" => to_value(self.sessions.list()),
+            "session.list" => to_value(
+                self.sessions
+                    .list()
+                    .into_iter()
+                    .map(|s| with_grants(&self.confirm, s))
+                    .collect::<Vec<_>>(),
+            ),
             "session.info" => {
                 let p: SessionIdParams = params(p)?;
                 let id = checked_session(&p.session_id)?;
                 self.authorize(&id, p.token.as_deref())?;
-                to_value(self.sessions.info(&id)?)
+                to_value(with_grants(&self.confirm, self.sessions.info(&id)?))
             }
             "session.close" => {
                 let p: CloseParams = params(p)?;
@@ -705,7 +723,7 @@ impl Daemon {
                 let p: InfoAnyParams = params(p)?;
                 let id = checked_session(&p.session_id)?;
                 self.open_slot(&id)?;
-                to_value(self.sessions.info(&id)?)
+                to_value(with_grants(&self.confirm, self.sessions.info(&id)?))
             }
             "session.close_any" => {
                 let p: CloseAnyParams = params(p)?;
@@ -714,6 +732,11 @@ impl Daemon {
                 to_value(self.close_open_slot(id, slot, p.keep_tabs).await?)
             }
             "command.exec" => to_value(self.exec(params(p)?).await?),
+            // Owner methods: answering a person's confirmations from outside the browser
+            // (any client of the socket; not offered over MCP, no CLI command).
+            // `confirm.subscribe` is served by the API connection itself.
+            "confirm.list" | "confirm.respond" => confirm_method(&self.confirm, method, p)
+                .unwrap_or_else(|| Err(internal("not a confirmation method"))),
             // Test hook, only when the daemon was started with `PEGBOARD_TEST_HOOKS`: drops
             // the download policy connection of the session's profile and keeps it down for
             // `holdMs`. Needs the session's token; unknown otherwise.
@@ -1059,6 +1082,9 @@ impl Daemon {
         close_tabs: bool,
     ) -> Result<SessionInfo, RpcError> {
         let id = p.session_id.clone();
+        // First: a command waiting for a person holds the session's log, which the close
+        // takes below. Its question ends now (`cancelled`), so the command ends and lets go.
+        self.confirm.cancel_session(&id);
         if let Err(e) = self.runner.detach(&id).await {
             eprintln!("pegboard: {}: {}", e.code, e.message);
         }
@@ -1086,6 +1112,7 @@ impl Daemon {
             }
         }
         self.remove_files(&id);
+        self.confirm.forget_session(&id);
         self.prune_soon();
         result
     }
@@ -1130,6 +1157,8 @@ impl Daemon {
     /// Closes every session, then the browser if the daemon launched it. Safe to call more
     /// than once.
     pub async fn shutdown(&self) {
+        // Before anything waits: commands waiting for a person end at once.
+        self.confirm.cancel_all();
         let mut done = self.shutdown_done.lock().await;
         if *done {
             return;
@@ -1148,6 +1177,14 @@ impl Daemon {
             let _ = tokio::time::timeout(SESSION_CLOSE_LIMIT, finish).await;
         }
         self.browser.close().await;
+    }
+}
+
+/// What a person allowed for the rest of the session, beside its (fixed) policy.
+fn with_grants(confirm: &ConfirmBroker, info: SessionInfo) -> SessionInfo {
+    SessionInfo {
+        allowed_for_session: confirm.granted(&info.id),
+        ..info
     }
 }
 
@@ -1178,6 +1215,10 @@ impl crate::api::Handler for Daemon {
 
     fn request_stop(&self) {
         Daemon::request_stop(self)
+    }
+
+    fn confirm_subscription(&self) -> Option<ConfirmSubscription> {
+        Some(self.confirm.subscribe())
     }
 
     async fn delivery_failed(&self, req: &Request, resp: &Response) {
@@ -1367,6 +1408,71 @@ mod tests {
         stop_taking_requests(&stopping, &replay);
         assert!(stopping.load(Ordering::SeqCst));
         assert_eq!(status(&path), "404");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_info_shows_what_a_person_allowed_beside_the_policy() {
+        use crate::confirm::{ConfirmAsk, CONFIRM_TIMEOUT};
+        use pegboard_protocol::{
+            ActionClass, ConfirmAnswer, ConfirmBy, ConfirmRespondParams, SessionPolicy,
+            SessionState,
+        };
+        let broker = ConfirmBroker::new(CONFIRM_TIMEOUT);
+        let _sub = broker.subscribe();
+        let id = SessionId("s_abcdefgh".into());
+        let info = SessionInfo {
+            id: id.clone(),
+            name: "demo".into(),
+            profile: "default".into(),
+            tab_group_id: 1,
+            targets: Vec::new(),
+            state: SessionState::Active,
+            recording_id: "r_abcdefgh".into(),
+            created_at: now(),
+            last_activity_at: now(),
+            token: None,
+            policy: SessionPolicy::default(),
+            allowed_for_session: Vec::new(),
+        };
+        assert!(with_grants(&broker, info.clone())
+            .allowed_for_session
+            .is_empty());
+        let asking = {
+            let b = broker.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                b.ask(ConfirmAsk {
+                    session_id: id,
+                    session_name: "demo".into(),
+                    profile: "default".into(),
+                    class: ActionClass::State,
+                    details: Vec::new(),
+                    offer_allow_for_session: true,
+                    place: None,
+                })
+                .await
+            })
+        };
+        let confirm_id = loop {
+            tokio::task::yield_now().await;
+            if let Some(r) = broker.pending().pop() {
+                break r.confirm_id;
+            }
+        };
+        broker
+            .respond(
+                &ConfirmRespondParams {
+                    confirm_id,
+                    answer: ConfirmAnswer::AllowForSession,
+                },
+                ConfirmBy::Api,
+            )
+            .unwrap();
+        asking.await.unwrap();
+        let shown = with_grants(&broker, info);
+        assert_eq!(shown.allowed_for_session, vec![ActionClass::State]);
+        // The policy is what the session was created with.
+        assert_eq!(shown.policy, SessionPolicy::default());
     }
 
     #[test]

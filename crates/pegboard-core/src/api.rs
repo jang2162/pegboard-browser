@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
+use crate::confirm::{confirm_timeout, ConfirmNotice, ConfirmSubscription};
 use crate::lock::DaemonLock;
 use crate::paths::Paths;
 use crate::service::Daemon;
@@ -44,6 +45,11 @@ pub trait Handler: Send + Sync + 'static {
     /// Called when the answer to `req` could not be written (the caller went away). The
     /// handler decides which methods need cleaning up after.
     async fn delivery_failed(&self, _req: &Request, _resp: &Response) {}
+    /// A new subscriber of the confirmation broker, for `confirm.subscribe`; `None` when
+    /// there is no broker (the method is then unknown).
+    fn confirm_subscription(&self) -> Option<ConfirmSubscription> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +158,29 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
             return;
         }
         let (response, stop, request) = match serde_json::from_slice::<Request>(&line) {
+            Ok(req) if req.method == "confirm.subscribe" => {
+                let Some(subscription) = daemon.confirm_subscription() else {
+                    let r = error_response(
+                        req.id,
+                        codes::UNKNOWN_METHOD,
+                        "unknown method \"confirm.subscribe\"",
+                    );
+                    if write_line(&mut write, &r).await.is_err() {
+                        return;
+                    }
+                    continue;
+                };
+                let ok = Response {
+                    jsonrpc: JSONRPC.to_string(),
+                    id: req.id,
+                    result: Some(serde_json::json!({})),
+                    error: None,
+                };
+                if write_line(&mut write, &ok).await.is_ok() {
+                    notice_channel(read, write, subscription).await;
+                }
+                return;
+            }
             Ok(req) => {
                 let (id, stop) = (req.id, is_stop(&req.method));
                 let kept = req.clone();
@@ -189,6 +218,58 @@ async fn connection(stream: UnixStream, daemon: Arc<dyn Handler>, idle_timeout: 
     }
 }
 
+/// How long one notice may take to reach a subscriber.
+const NOTICE_WRITE_LIMIT: Duration = Duration::from_secs(10);
+
+/// A subscribed connection: the broker's notices go out one per line, with no idle limit.
+/// Whatever the client sends is read and dropped; the subscription ends when the client
+/// hangs up, a write fails or stalls, or the client falls behind (notices were lost: it connects
+/// again and reads `confirm.list`).
+async fn notice_channel(
+    mut read: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+    mut subscription: ConfirmSubscription,
+) {
+    let mut scratch = [0u8; 4096];
+    loop {
+        tokio::select! {
+            notice = subscription.recv() => {
+                let Ok(notice) = notice else { return };
+                // A client that stops reading stops being a responder.
+                let written =
+                    tokio::time::timeout(NOTICE_WRITE_LIMIT, write_notice(&mut write, &notice));
+                if !matches!(written.await, Ok(Ok(()))) {
+                    return;
+                }
+            }
+            got = read.read(&mut scratch) => {
+                if !matches!(got, Ok(n) if n > 0) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn write_notice(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    notice: &ConfirmNotice,
+) -> std::io::Result<()> {
+    let (method, params) = match notice {
+        ConfirmNotice::Required(r) => ("confirm.required", serde_json::to_value(r)),
+        ConfirmNotice::Resolved(r) => ("confirm.resolved", serde_json::to_value(r)),
+    };
+    let line = serde_json::json!({
+        "jsonrpc": JSONRPC,
+        "method": method,
+        "params": params.map_err(std::io::Error::other)?,
+    });
+    let mut bytes = serde_json::to_vec(&line).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    write.write_all(&bytes).await?;
+    write.flush().await
+}
+
 /// Methods after whose answer the daemon ends.
 fn is_stop(method: &str) -> bool {
     matches!(method, "browser.stop" | "browser.quit")
@@ -202,6 +283,23 @@ async fn write_line(
     bytes.push(b'\n');
     write.write_all(&bytes).await?;
     write.flush().await
+}
+
+/// How long a client waits for the answer to `method`. A command may take its own time
+/// limit, and may first wait up to `confirm` for a person's answer (which its time limit
+/// does not count); everything else is quick.
+fn call_limit(method: &str, params: &serde_json::Value, confirm: Duration) -> Duration {
+    match method {
+        "command.exec" => {
+            let ms = params["timeoutMs"].as_u64().unwrap_or(60_000);
+            Duration::from_millis(ms) + Duration::from_secs(15) + confirm
+        }
+        // A page load and the attach of agent-browser.
+        "session.create" => Duration::from_secs(180),
+        // Closes every session in turn.
+        "browser.stop" | "browser.quit" => Duration::from_secs(300),
+        _ => Duration::from_secs(60),
+    }
 }
 
 /// A blocking client of the core API.
@@ -303,19 +401,9 @@ impl Client {
         };
         let mut line = serde_json::to_vec(&request).map_err(|e| io_error(e.into()))?;
         line.push(b'\n');
-        // A command may take its own time limit; everything else is quick.
-        let limit = match method {
-            "command.exec" => {
-                let ms = request.params["timeoutMs"].as_u64().unwrap_or(60_000);
-                Duration::from_millis(ms) + Duration::from_secs(15)
-            }
-            // A page load and the attach of agent-browser.
-            "session.create" => Duration::from_secs(180),
-            // Closes every session in turn.
-            "browser.stop" | "browser.quit" => Duration::from_secs(300),
-            _ => Duration::from_secs(60),
-        };
-        let limit = self.limit.unwrap_or(limit);
+        let limit = self
+            .limit
+            .unwrap_or_else(|| call_limit(method, &request.params, confirm_timeout()));
         // Any failure from here on may leave an answer to this request on the way.
         self.broken = true;
         let stream = self.reader.get_mut();
@@ -360,5 +448,30 @@ impl Client {
         }
         serde_json::from_value(response.result.unwrap_or(serde_json::Value::Null))
             .map_err(|e| io_error(e.into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_call_limit_includes_the_confirmation_wait() {
+        let confirm = crate::confirm::CONFIRM_TIMEOUT;
+        let p = serde_json::json!({ "timeoutMs": 30_000 });
+        assert_eq!(
+            call_limit("command.exec", &p, confirm),
+            Duration::from_secs(30 + 15 + 60)
+        );
+        // Without a time limit of its own, a command gets a minute.
+        assert_eq!(
+            call_limit("command.exec", &serde_json::json!({}), confirm),
+            Duration::from_secs(60 + 15 + 60)
+        );
+        // Only commands wait for a person.
+        assert_eq!(
+            call_limit("session.info", &p, confirm),
+            Duration::from_secs(60)
+        );
     }
 }

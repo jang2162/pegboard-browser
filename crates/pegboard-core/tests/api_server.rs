@@ -7,20 +7,44 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pegboard_core::api::{serve_with, Client, Handler, ServeOptions};
+use pegboard_core::confirm::{
+    confirm_method, ConfirmAsk, ConfirmBroker, ConfirmSubscription, CONFIRM_TIMEOUT,
+};
 use pegboard_core::paths::paths_in;
-use pegboard_protocol::{Request, Response, JSONRPC};
+use pegboard_protocol::{
+    codes, ActionClass, ConfirmBy, ConfirmOutcome, Request, Response, SessionId, JSONRPC,
+};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 
 /// Answers every request; `session.create` answers slowly with a session id, and the ids of
 /// answers that could not be delivered are recorded.
+/// With a broker, it answers the confirmation methods as the daemon does.
 #[derive(Default)]
 struct Stub {
     undelivered: Arc<Mutex<Vec<String>>>,
+    broker: Option<Arc<ConfirmBroker>>,
 }
 
 #[async_trait]
 impl Handler for Stub {
     async fn handle(&self, req: Request) -> Response {
+        if let Some(outcome) = self
+            .broker
+            .as_ref()
+            .and_then(|b| confirm_method(b, &req.method, &req.params))
+        {
+            let (result, error) = match outcome {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
+            };
+            return Response {
+                jsonrpc: JSONRPC.to_string(),
+                id: req.id,
+                result,
+                error,
+            };
+        }
         let result = if req.method == "session.create" {
             tokio::time::sleep(Duration::from_millis(300)).await;
             json!({ "id": "s_aaaaaaaa" })
@@ -33,6 +57,10 @@ impl Handler for Stub {
             result: Some(result),
             error: None,
         }
+    }
+
+    fn confirm_subscription(&self) -> Option<ConfirmSubscription> {
+        self.broker.as_ref().map(|b| b.subscribe())
     }
 
     async fn delivery_failed(&self, req: &Request, resp: &Response) {
@@ -225,4 +253,201 @@ fn an_answer_with_another_id_is_an_internal_error_and_drops_the_connection() {
     // The next call connects anew (its id starts again) and is judged by the same rule.
     let e = client.call::<_, Value>("b", json!({})).unwrap_err();
     assert_eq!(e.code, pegboard_protocol::codes::INTERNAL);
+}
+
+fn ask_state(session: &str) -> ConfirmAsk {
+    ConfirmAsk {
+        session_id: SessionId(session.into()),
+        session_name: "demo".into(),
+        profile: "default".into(),
+        class: ActionClass::State,
+        details: Vec::new(),
+        offer_allow_for_session: true,
+        place: None,
+    }
+}
+
+/// A raw connection that subscribed: its answer to `confirm.subscribe` is read.
+async fn subscribed(paths: &pegboard_core::paths::Paths) -> AsyncBufReader<tokio::net::UnixStream> {
+    let stream = tokio::net::UnixStream::connect(&paths.socket)
+        .await
+        .unwrap();
+    let mut conn = AsyncBufReader::new(stream);
+    conn.get_mut()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"confirm.subscribe\"}\n")
+        .await
+        .unwrap();
+    let answer = next_line(&mut conn).await;
+    assert_eq!(answer["id"], 1, "{answer}");
+    assert_eq!(answer["result"], json!({}), "{answer}");
+    conn
+}
+
+async fn next_line(conn: &mut AsyncBufReader<tokio::net::UnixStream>) -> Value {
+    let mut line = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), conn.read_line(&mut line))
+        .await
+        .expect("a line within 5 s")
+        .unwrap();
+    assert!(n > 0, "the connection ended");
+    serde_json::from_str(&line).unwrap()
+}
+
+async fn rpc(
+    paths: &pegboard_core::paths::Paths,
+    method: &str,
+    params: Value,
+) -> Result<Value, pegboard_protocol::RpcError> {
+    let p = paths.clone();
+    let method = method.to_string();
+    tokio::task::spawn_blocking(move || Client::connect(&p).unwrap().call(&method, params))
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribe_streams_required_and_resolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let broker = ConfirmBroker::new(CONFIRM_TIMEOUT);
+    let stub = Stub {
+        broker: Some(broker.clone()),
+        ..Stub::default()
+    };
+    let server = started(&paths, stub, ServeOptions::default()).await;
+    let mut conn = subscribed(&paths).await;
+    // A request on a subscribed connection is not answered: it only carries notices.
+    conn.get_mut()
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"confirm.list\"}\n")
+        .await
+        .unwrap();
+    let asking = {
+        let b = broker.clone();
+        tokio::spawn(async move { b.ask(ask_state("s_aaaaaaaa")).await })
+    };
+    let required = next_line(&mut conn).await;
+    assert_eq!(required["jsonrpc"], "2.0", "{required}");
+    assert_eq!(required["method"], "confirm.required", "{required}");
+    assert!(required.get("id").is_none(), "{required}");
+    let params = &required["params"];
+    let id = params["confirmId"].as_str().unwrap().to_string();
+    assert_eq!(params["sessionId"], "s_aaaaaaaa");
+    assert_eq!(params["class"], "state");
+    assert_eq!(params["offerAllowForSession"], true);
+    // A client that comes later sees it in the list.
+    let list = rpc(&paths, "confirm.list", json!({})).await.unwrap();
+    assert_eq!(list["pending"][0]["confirmId"], id.as_str(), "{list}");
+    let answered = rpc(
+        &paths,
+        "confirm.respond",
+        json!({ "confirmId": id, "answer": "approve" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answered, json!({}));
+    let resolved = next_line(&mut conn).await;
+    assert_eq!(resolved["method"], "confirm.resolved", "{resolved}");
+    assert_eq!(
+        resolved["params"],
+        json!({ "confirmId": id, "outcome": "approved", "by": "api" })
+    );
+    let d = asking.await.unwrap();
+    assert_eq!(
+        (d.outcome, d.by),
+        (ConfirmOutcome::Approved, Some(ConfirmBy::Api))
+    );
+    // The subscriber hangs up: the subscription ends, and nobody is left to ask.
+    drop(conn);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let d = broker.ask(ask_state("s_aaaaaaaa")).await;
+        if d.outcome == ConfirmOutcome::NoResponder {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "still subscribed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscribed_connection_is_not_idle_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let broker = ConfirmBroker::new(CONFIRM_TIMEOUT);
+    let stub = Stub {
+        broker: Some(broker.clone()),
+        ..Stub::default()
+    };
+    let opts = ServeOptions {
+        idle_timeout: Duration::from_millis(300),
+        ..ServeOptions::default()
+    };
+    let server = started(&paths, stub, opts).await;
+    let mut conn = subscribed(&paths).await;
+    // Many idle periods pass.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let asking = {
+        let b = broker.clone();
+        tokio::spawn(async move { b.ask(ask_state("s_aaaaaaaa")).await })
+    };
+    let required = next_line(&mut conn).await;
+    assert_eq!(required["method"], "confirm.required", "{required}");
+    broker.cancel_all();
+    assert_eq!(asking.await.unwrap().outcome, ConfirmOutcome::Cancelled);
+    let resolved = next_line(&mut conn).await;
+    assert_eq!(resolved["params"]["outcome"], "cancelled", "{resolved}");
+    // A connection that does not subscribe is still closed when idle.
+    let mut idle = UnixStream::connect(&paths.socket).unwrap();
+    idle.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut rest = Vec::new();
+    idle.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn respond_unknown_is_confirm_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let broker = ConfirmBroker::new(CONFIRM_TIMEOUT);
+    let stub = Stub {
+        broker: Some(broker.clone()),
+        ..Stub::default()
+    };
+    let server = started(&paths, stub, ServeOptions::default()).await;
+    let e = rpc(
+        &paths,
+        "confirm.respond",
+        json!({ "confirmId": "00112233445566778899aabbccddeeff", "answer": "approve" }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, codes::CONFIRM_NOT_FOUND);
+    // An answer carries no session or class, and only the three answers exist.
+    for bad in [
+        json!({ "confirmId": "x", "answer": "approve", "sessionId": "s_aaaaaaaa" }),
+        json!({ "confirmId": "x", "answer": "yes" }),
+        json!({ "answer": "approve" }),
+    ] {
+        let e = rpc(&paths, "confirm.respond", bad.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, codes::INVALID_PARAMS, "{bad}");
+    }
+    let list = rpc(&paths, "confirm.list", json!({})).await.unwrap();
+    assert_eq!(list, json!({ "pending": [] }));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribe_without_a_broker_is_an_unknown_method() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let server = started(&paths, Stub::default(), ServeOptions::default()).await;
+    let e = rpc(&paths, "confirm.subscribe", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::UNKNOWN_METHOD);
+    server.abort();
 }

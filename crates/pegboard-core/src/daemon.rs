@@ -477,9 +477,6 @@ fn hide_paths(outcome: &mut Result<CommandExecResult, RpcError>, names: &[(Strin
     }
 }
 
-/// Logs a command refused before it ran (its line, or the policy) and returns the error.
-/// The command word is shown when the grammar knows it; every later word is hidden, since
-/// the error message may name one and they may be typed text.
 /// The verdict for a command of the session. No class is allowed for the session by a
 /// person yet: nothing can ask one.
 fn judged_verdict(
@@ -508,6 +505,9 @@ fn no_confirmation_yet(class: ActionClass) -> RpcError {
     }
 }
 
+/// Logs a command refused before it ran (its line, or the policy) and returns the error.
+/// The command word is shown when the grammar knows it; every later word is hidden, since
+/// the error message may name one and they may be typed text.
 fn refuse(
     log: &mut ActionLog,
     mut entry: ActionEntry,

@@ -518,6 +518,20 @@ fn address_rules(p: &SessionPolicy) -> (&'static str, &'static str) {
     }
 }
 
+/// The classes a person allowed for the rest of the session, answering a confirmation: a
+/// line of its own, since the policy stays as the session was created. `None` when there
+/// are none.
+fn describe_grants(granted: &[ActionClass]) -> Option<String> {
+    if granted.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = granted.iter().map(|c| c.as_str()).collect();
+    Some(format!(
+        "allowed for this session by a person: {}",
+        names.join(",")
+    ))
+}
+
 fn describe_policy(p: &SessionPolicy) -> String {
     let names = |list: &[ActionClass]| {
         if list.is_empty() {
@@ -768,6 +782,9 @@ fn session(paths: &Paths, command: SessionCmd, json: bool) -> Result<(), RpcErro
             } else {
                 println!("{}", describe(&s));
                 println!("{}", describe_policy(&s.policy));
+                if let Some(line) = describe_grants(&s.allowed_for_session) {
+                    println!("{line}");
+                }
             }
         }
         SessionCmd::Close { id, keep_tabs } => {
@@ -1763,6 +1780,15 @@ mod tests {
         });
         assert!(line.ends_with("; record network,console"), "{line}");
         assert!(describe_policy(&SessionPolicy::default()).ends_with("; record -"));
+    }
+
+    #[test]
+    fn session_info_shows_what_a_person_allowed_apart_from_the_policy() {
+        assert_eq!(describe_grants(&[]), None);
+        assert_eq!(
+            describe_grants(&[ActionClass::State, ActionClass::Upload]).as_deref(),
+            Some("allowed for this session by a person: state,upload")
+        );
     }
 
     #[test]
