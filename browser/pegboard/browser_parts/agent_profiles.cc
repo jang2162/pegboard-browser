@@ -6,7 +6,9 @@
 
 #include <utility>
 
+#include "base/check.h"
 #include "base/functional/bind.h"
+#include "base/logging.h"
 #include "base/values.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/profiles/profile.h"
@@ -95,9 +97,17 @@ void AgentProfiles::OmitIfAgent(const base::FilePath& path) {
   ProfileAttributesStorage* storage = Storage();
   ProfileAttributesEntry* entry =
       storage ? storage->GetProfileAttributesWithPath(path) : nullptr;
-  if (entry && !entry->IsOmitted()) {
-    entry->SetIsOmitted(true);
+  if (!entry || entry->IsOmitted()) {
+    return;
   }
+#if DCHECK_IS_ON()
+  // Upstream omits only ephemeral profiles and DCHECKs it; a build with
+  // DCHECKs could not start with an agent profile. Not hidden there.
+  LOG(WARNING) << "pegboard: DCHECK build; agent profile " << path
+               << " is not omitted from the profile list";
+#else
+  entry->SetIsOmitted(true);
+#endif
 }
 
 void AgentProfiles::UpdatePickerDefault() {

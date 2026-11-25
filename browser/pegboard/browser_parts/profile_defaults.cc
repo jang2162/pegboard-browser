@@ -4,7 +4,7 @@
 
 #include "pegboard/browser_parts/profile_defaults.h"
 
-#include "base/logging.h"
+#include "base/check.h"
 #include "base/values.h"
 #include "chrome/browser/signin/account_consistency_mode_manager_factory.h"
 #include "chrome/browser/signin/identity_manager_factory.h"
@@ -59,11 +59,13 @@ ProfileDefaults::BuildServiceInstanceForBrowserContext(
 void ProfileDefaults::RegisterProfilePrefs(
     user_prefs::PrefRegistrySyncable* registry) {
   for (const char* name : kOff) {
+    // Loudly: a Chromium version that renamed or moved one of these (or
+    // registers it after this) must not quietly turn sign-in or password
+    // saving back on.
     const base::Value* value = nullptr;
-    if (!registry->defaults()->GetValue(name, &value) || !value->is_bool()) {
-      LOG(ERROR) << "pegboard: no boolean preference " << name;
-      continue;
-    }
+    CHECK(registry->defaults()->GetValue(name, &value) && value->is_bool())
+        << "pegboard: no boolean preference " << name
+        << " registered before ProfileDefaults";
     registry->SetDefaultPrefValue(name, base::Value(false));
   }
 }

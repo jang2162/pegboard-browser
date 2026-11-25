@@ -37,8 +37,11 @@ namespace pegboard {
 // open, it shows on the next one that opens.
 //
 // `restart` runs once, when 다시 시작 is pressed (in a task of its own, after
-// the notice closed; it may delete the notice). Closing it any other way, or
-// deleting it, runs nothing.
+// the notice closed; it may delete the notice). The button is disabled for its
+// first second (as the confirmation dialog's lock), against a press meant for
+// something else. Closing the notice any other way, or deleting it, runs
+// nothing. When the window under it closes while the browser goes on, it
+// shows again on the next person's window.
 //
 // Test hooks (test_hooks.h): a {"kind":"daemon_stopped", "profile",
 // "keyWindowProfile{Before,At0,At200ms}", "appActive{Before,At0,At200ms}",
@@ -67,10 +70,17 @@ class DaemonNotice : public BrowserCollectionObserver,
   // there is one that is on screen; else waits for one.
   void TryShow();
   bool ShowOver(BrowserWindowInterface* browser);
+  // The notice's window closed while the browser goes on: wait for the next
+  // person's window.
+  void WaitAgain();
+  void Unlock();
   void Press(bool restart, std::string_view by);
   void Finish(bool restart);
   void Close(std::string_view why);
   void SampleFocus();
+  // The daemon_stopped line, once per showing (from SampleFocus, or before the
+  // notice closes if that comes first).
+  void LogStopped();
   void LogClosed(std::string_view pressed, std::string_view by,
                  std::string_view why);
 
@@ -87,6 +97,10 @@ class DaemonNotice : public BrowserCollectionObserver,
   base::OneShotTimer retry_timer_;
   int retries_ = 0;
   base::OneShotTimer sample_timer_;
+  bool stopped_logged_ = false;
+  // 다시 시작 is not pressed by mistake right as the notice appears.
+  base::OneShotTimer unlock_timer_;
+  bool locked_ = true;
   base::OneShotTimer hook_timer_;
   base::DictValue focus_;
   base::WeakPtrFactory<DaemonNotice> weak_factory_{this};
