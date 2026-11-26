@@ -301,6 +301,9 @@ pub struct BrowserStatus {
     /// refused, and the browser is ended with `browser.quit`.
     #[serde(default)]
     pub hosted: bool,
+    /// The daemon's version (`pegboard_core::version`); empty from a daemon older than 3c.
+    #[serde(default)]
+    pub version: String,
 }
 
 /// One recording as `recording.list` and `recording.keep` tell it.

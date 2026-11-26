@@ -763,10 +763,9 @@ impl Guard {
             hold_until: Mutex::new(None),
             body_budget: Arc::new(tokio::sync::Semaphore::new(BODY_BUDGET / BODY_UNIT)),
             profile_budgets: Mutex::new(HashMap::new()),
-            trace: std::env::var_os("PEGBOARD_TEST_HOOKS").is_some(),
+            trace: crate::testenv::hooks(),
             csp_header: std::sync::atomic::AtomicBool::new(true),
-            no_shield: std::env::var_os("PEGBOARD_TEST_HOOKS").is_some()
-                && std::env::var_os("PEGBOARD_TEST_NO_CLIPBOARD_SHIELD").is_some(),
+            no_shield: crate::testenv::var("PEGBOARD_TEST_NO_CLIPBOARD_SHIELD").is_some(),
             early_delay: Mutex::new(Duration::ZERO),
             fail_shield: std::sync::atomic::AtomicBool::new(false),
             nonce: random_hex(),

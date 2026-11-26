@@ -215,6 +215,7 @@ pub fn find_extension() -> anyhow::Result<PathBuf> {
         candidates.push(PathBuf::from(p));
     } else {
         if let Some(dir) = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
             .ok()
             .as_deref()
             .and_then(|p| p.parent())
@@ -745,7 +746,7 @@ impl Daemon {
             // Test hook, only when the daemon was started with `PEGBOARD_TEST_HOOKS`: drops
             // the download policy connection of the session's profile and keeps it down for
             // `holdMs`. Needs the session's token; unknown otherwise.
-            "test.dropDownloadPolicy" if std::env::var_os("PEGBOARD_TEST_HOOKS").is_some() => {
+            "test.dropDownloadPolicy" if crate::testenv::hooks() => {
                 let p: DropPolicyParams = params(p)?;
                 let id = checked_session(&p.session_id)?;
                 self.authorize(&id, p.token.as_deref())?;
@@ -861,14 +862,12 @@ impl Daemon {
     }
 
     fn status(&self) -> BrowserStatus {
-        BrowserStatus {
-            running: !self.browser.has_exited(),
-            pid: Some(self.browser.pid),
-            chrome_version: Some(self.chrome_version.clone()),
-            sessions: self.sessions.list().len(),
-            stopping: self.stopping.load(Ordering::SeqCst),
-            hosted: self.browser.is_hosted(),
-        }
+        status_of(
+            &self.browser,
+            &self.chrome_version,
+            self.sessions.list().len(),
+            self.stopping.load(Ordering::SeqCst),
+        )
     }
 
     fn running(&self) -> Result<(), RpcError> {
@@ -1249,9 +1248,56 @@ impl crate::api::Handler for Daemon {
     }
 }
 
+/// `browser.status`: the browser, and this daemon's version.
+fn status_of(
+    browser: &Browser,
+    chrome_version: &str,
+    sessions: usize,
+    stopping: bool,
+) -> BrowserStatus {
+    BrowserStatus {
+        running: !browser.has_exited(),
+        pid: Some(browser.pid),
+        chrome_version: Some(chrome_version.to_string()),
+        sessions,
+        stopping,
+        hosted: browser.is_hosted(),
+        version: crate::version().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn browser_status_carries_the_daemon_version() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = crate::paths::paths_in(home.path());
+        let (link, mut fake) = crate::link::fake::FakeBrowser::start();
+        let start = tokio::spawn(async move { Browser::hosted(&paths, link).await });
+        for (method, result) in [
+            ("Pegboard.claim", json!({})),
+            ("Pegboard.getProfiles", json!({ "profiles": [] })),
+            ("Target.getTargets", json!({ "targetInfos": [] })),
+        ] {
+            let m = fake.next().await;
+            assert_eq!(m["method"], method, "{m}");
+            fake.answer(&m, result);
+        }
+        let browser = start.await.unwrap().unwrap();
+        let status = status_of(&browser, "156.0.8078.109", 2, false);
+        assert_eq!(status.version, crate::version());
+        assert!(status.hosted);
+        assert_eq!(status.sessions, 2);
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(wire["version"], crate::version());
+        // A daemon older than 3c says nothing: the field is empty, not an error.
+        let mut old = wire.clone();
+        old.as_object_mut().unwrap().remove("version");
+        let old: BrowserStatus = serde_json::from_value(old).unwrap();
+        assert_eq!(old.version, "");
+    }
 
     /// A daemon the browser launched does not stop on `browser.stop` (the browser would only
     /// start it again, F8): the refusal says how to end the browser instead. The status

@@ -870,6 +870,9 @@ fn hosted_daemon_without_the_pipe_is_a_usage_error() {
     assert!(log.contains("fds 3 and 4"), "{log}");
 }
 
+/// The version the stand-in daemon reports.
+const FAKE_DAEMON_VERSION: &str = "156.0.8078.109-pb.7";
+
 /// A daemon stand-in on the home's socket: answers `browser.status` (a daemon the browser
 /// launched when `hosted`) and every other request with an empty result, and records the
 /// methods. After `browser.stop` or `browser.quit` it removes the socket, as the
@@ -892,7 +895,8 @@ fn fake_daemon(home: &Home, hosted: bool) -> std::sync::Arc<std::sync::Mutex<Vec
                 log.lock().unwrap().push(method.clone());
                 let result = if method == "browser.status" {
                     serde_json::json!({ "running": true, "pid": 1, "chromeVersion": null,
-                        "sessions": 0, "stopping": false, "hosted": hosted })
+                        "sessions": 0, "stopping": false, "hosted": hosted,
+                        "version": FAKE_DAEMON_VERSION })
                 } else {
                     serde_json::json!({})
                 };
@@ -1149,4 +1153,55 @@ fn hosted_daemon_exits_4_while_a_legacy_daemon_runs() {
     assert!(!support.join(pegboard_core::paths::HOME_DIR_NAME).exists());
     assert!(!support.join(pegboard_core::paths::MOVING_DIR_NAME).exists());
     drop(held);
+}
+
+/// `browser status` shows the daemon's version on a line of its own.
+#[test]
+fn browser_status_shows_the_daemon_version() {
+    let home = Home::new();
+    let _seen = fake_daemon(&home, false);
+    let (code, out, err) = home.run(&["browser", "status"]);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with("running pid 1 "), "{out}");
+    assert_eq!(lines[1], format!("daemon {FAKE_DAEMON_VERSION}"));
+}
+
+/// `pegboard --version` says the build's version (`-dev` in a build without
+/// `PEGBOARD_RELEASE_VERSION`).
+#[test]
+fn version_flag_says_the_version() {
+    let (code, out, err) = Home::new().run(&["--version"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), format!("pegboard {}", pegboard_core::version()));
+    assert!(out.trim().ends_with("-dev"), "{out}");
+}
+
+/// Design R20: `pegboard` on `PATH` is a symbolic link into the app. Through it the CLI
+/// runs and resolves itself to the app's copy (its daemon and agent-browser come from the
+/// bundle: `self_exe` in main.rs, `agent_browser_candidates` in pegboard-core).
+#[test]
+fn cli_through_a_symlink_finds_its_bundle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let helpers = tmp.path().join("Pegboard.app/Contents/Helpers");
+    std::fs::create_dir_all(&helpers).unwrap();
+    let inside = helpers.join("pegboard");
+    std::fs::copy(common::bin(), &inside).unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(&inside, bin.join("pegboard")).unwrap();
+    let out = Command::new(bin.join("pegboard"))
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("pegboard {}", pegboard_core::version())
+    );
+    assert_eq!(
+        std::fs::canonicalize(bin.join("pegboard")).unwrap(),
+        std::fs::canonicalize(&inside).unwrap()
+    );
 }

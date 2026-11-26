@@ -785,7 +785,7 @@ impl SessionManager {
     /// Returns whether it did.
     #[doc(hidden)]
     pub fn drop_download_policy_for_test(&self, id: &SessionId, hold: Duration) -> bool {
-        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+        if !crate::testenv::hooks() {
             return false;
         }
         let context = {
@@ -806,7 +806,7 @@ impl SessionManager {
     /// Returns whether it did.
     #[doc(hidden)]
     pub fn drop_clipboard_policy_for_test(&self, id: &SessionId, hold: Duration) -> bool {
-        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+        if !crate::testenv::hooks() {
             return false;
         }
         let context = {
@@ -857,7 +857,7 @@ impl SessionManager {
     /// the CSP header. Returns whether it did anything.
     #[doc(hidden)]
     pub fn set_guard_csp_header_for_test(&self, on: bool) -> bool {
-        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+        if !crate::testenv::hooks() {
             return false;
         }
         self.inner.guard.set_csp_header_for_test(on);
@@ -869,7 +869,7 @@ impl SessionManager {
     /// did.
     #[doc(hidden)]
     pub fn set_guard_early_delay_for_test(&self, delay: Duration) -> bool {
-        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+        if !crate::testenv::hooks() {
             return false;
         }
         self.inner.guard.set_early_delay_for_test(delay);
@@ -881,7 +881,7 @@ impl SessionManager {
     /// (the guard's session is older). Returns whether it did.
     #[doc(hidden)]
     pub fn allow_page_scripts_for_test(&self, id: &SessionId) -> bool {
-        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+        if !crate::testenv::hooks() {
             return false;
         }
         self.inner.proxy.set_page_scripts_allowed(id, true);
@@ -892,7 +892,7 @@ impl SessionManager {
     /// its `open`/`write` wrappers (`on: false`). Returns whether it did.
     #[doc(hidden)]
     pub fn set_guard_shield_wrappers_for_test(&self, on: bool) -> bool {
-        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+        if !crate::testenv::hooks() {
             return false;
         }
         self.inner.guard.set_shield_wrappers_for_test(on);
@@ -903,7 +903,7 @@ impl SessionManager {
     /// as failed. Returns whether it did.
     #[doc(hidden)]
     pub fn set_guard_fail_frame_shield_for_test(&self, on: bool) -> bool {
-        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+        if !crate::testenv::hooks() {
             return false;
         }
         self.inner.guard.set_fail_frame_shield_for_test(on);
@@ -914,7 +914,7 @@ impl SessionManager {
     /// failure would and keeps it down for `hold`. Returns whether it did.
     #[doc(hidden)]
     pub fn drop_guard_for_test(&self, hold: Duration) -> bool {
-        if std::env::var_os("PEGBOARD_TEST_HOOKS").is_none() {
+        if !crate::testenv::hooks() {
             return false;
         }
         self.inner.guard.drop_connection_for_test(hold);

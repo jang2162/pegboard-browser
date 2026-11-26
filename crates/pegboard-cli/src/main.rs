@@ -46,7 +46,7 @@ const EXIT_NO_DAEMON: i32 = 3;
 #[derive(Parser)]
 #[command(
     name = "pegboard",
-    version,
+    version = pegboard_core::version(),
     about = "Drive a browser through isolated sessions.",
     after_help = "Any other command is an agent-browser command run in a session:\n  pegboard --session <id> snapshot -i",
     subcommand_required = true,
@@ -442,7 +442,7 @@ fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
                     print_json(&s);
                 } else {
                     println!(
-                        "{} pid {} chrome {} sessions {}",
+                        "{} pid {} chrome {} sessions {}\ndaemon {}",
                         if s.stopping {
                             "stopping"
                         } else if s.running {
@@ -452,7 +452,12 @@ fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
                         },
                         s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
                         s.chrome_version.as_deref().unwrap_or("-"),
-                        s.sessions
+                        s.sessions,
+                        if s.version.is_empty() {
+                            "-"
+                        } else {
+                            &s.version
+                        }
                     );
                 }
                 Ok(())
@@ -1183,7 +1188,7 @@ fn spawn_daemon(paths: &Paths) -> Result<std::process::Child, RpcError> {
         .mode(0o600)
         .open(paths.home.join("daemon.log"))
         .map_err(|e| io_failure("opening daemon.log", e))?;
-    let exe = std::env::current_exe().map_err(|e| io_failure("finding the executable", e))?;
+    let exe = self_exe().map_err(|e| io_failure("finding the executable", e))?;
     Command::new(exe)
         .arg("daemon")
         .stdin(Stdio::null())
@@ -1193,6 +1198,17 @@ fn spawn_daemon(paths: &Paths) -> Result<std::process::Child, RpcError> {
         .process_group(0)
         .spawn()
         .map_err(|e| io_failure("starting the daemon", e))
+}
+
+/// This executable, symbolic links resolved: a `pegboard` on `PATH` that links to
+/// `/Applications/Pegboard.app/Contents/Helpers/pegboard` (design R20) starts the app's own
+/// daemon, which finds the app's agent-browser beside it.
+fn self_exe() -> std::io::Result<std::path::PathBuf> {
+    canonical_exe(std::env::current_exe()?)
+}
+
+fn canonical_exe(exe: std::path::PathBuf) -> std::io::Result<std::path::PathBuf> {
+    exe.canonicalize()
 }
 
 /// A daemon that answers and is not shutting down.
@@ -1521,6 +1537,24 @@ fn inherited_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::Owned
 
 #[cfg(test)]
 mod tests {
+    /// Design R20: through a symbolic link (or a chain of them) on `PATH`, the CLI's own
+    /// path is the app's copy, so the daemon it starts is the app's.
+    #[test]
+    fn a_linked_cli_resolves_to_the_app_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helpers = tmp.path().join("Pegboard.app/Contents/Helpers");
+        std::fs::create_dir_all(&helpers).unwrap();
+        let inside = helpers.join("pegboard");
+        std::fs::write(&inside, b"").unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::os::unix::fs::symlink(&inside, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        let want = std::fs::canonicalize(&inside).unwrap();
+        assert_eq!(super::canonical_exe(second).unwrap(), want);
+        assert!(want.ends_with("Pegboard.app/Contents/Helpers/pegboard"));
+    }
+
     #[test]
     fn limit_exceeded_is_a_usage_exit() {
         assert_eq!(super::exit_code("limit_exceeded"), 2);

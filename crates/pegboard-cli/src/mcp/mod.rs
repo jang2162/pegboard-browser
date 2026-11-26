@@ -577,7 +577,9 @@ impl ClientCore {
             // Debug builds only: a release binary has no such hook.
             slow_create: std::env::var("PEGBOARD_TEST_MCP_SLOW_CREATE")
                 .ok()
-                .filter(|name| cfg!(debug_assertions) && !name.is_empty()),
+                .filter(|name| {
+                    cfg!(debug_assertions) && !pegboard_core::is_release_build() && !name.is_empty()
+                }),
         }
     }
 

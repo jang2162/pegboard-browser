@@ -66,7 +66,8 @@ fn missing(looked_at: &[PathBuf]) -> RpcError {
     )
 }
 
-/// `$PEGBOARD_AGENT_BROWSER`, else `vendor/agent-browser/agent-browser` next to the
+/// `$PEGBOARD_AGENT_BROWSER`, else (see `agent_browser_candidates`) `agent-browser` beside
+/// `pegboard` in the app bundle, or `vendor/agent-browser/agent-browser` next to the
 /// executable or in the repository this crate was built from. No other directory is
 /// searched: a parent directory such as `/tmp` could hold a planted binary.
 pub fn find_agent_browser() -> Result<PathBuf, RpcError> {
@@ -78,12 +79,27 @@ pub fn find_agent_browser() -> Result<PathBuf, RpcError> {
             Err(missing(&[p]))
         };
     }
+    let exe = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+    let candidates = agent_browser_candidates(exe.as_deref());
+    match candidates.iter().find(|p| p.is_file()) {
+        Some(p) => Ok(p.clone()),
+        None => Err(missing(&candidates)),
+    }
+}
+
+/// Where `find_agent_browser` looks, given this executable's canonical path (symbolic
+/// links resolved, so a `pegboard` on `PATH` that links into the app finds the app's):
+/// - `<X>.app/Contents/Helpers/agent-browser` when the executable is
+///   `<X>.app/Contents/Helpers/pegboard` (the app bundle's layout, design 4.2); a bare
+///   binary's own directory is never searched;
+/// - `vendor/agent-browser/agent-browser` under the executable's directory;
+/// - the same under the repository this crate was built from.
+fn agent_browser_candidates(exe: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .as_deref()
-        .and_then(Path::parent)
-    {
+    if let Some(dir) = exe.filter(|e| in_app_helpers(e)).and_then(Path::parent) {
+        candidates.push(dir.join("agent-browser"));
+    }
+    if let Some(dir) = exe.and_then(Path::parent) {
         candidates.push(dir.join(BIN_IN_REPO));
     }
     candidates.push(
@@ -91,10 +107,20 @@ pub fn find_agent_browser() -> Result<PathBuf, RpcError> {
             .join("../..")
             .join(BIN_IN_REPO),
     );
-    match candidates.iter().find(|p| p.is_file()) {
-        Some(p) => Ok(p.clone()),
-        None => Err(missing(&candidates)),
-    }
+    candidates
+}
+
+/// `exe` is `<X>.app/Contents/Helpers/pegboard`.
+fn in_app_helpers(exe: &Path) -> bool {
+    let mut up = exe.ancestors().skip(1).map(Path::file_name);
+    exe.file_name() == Some(std::ffi::OsStr::new("pegboard"))
+        && up.next() == Some(Some(std::ffi::OsStr::new("Helpers")))
+        && up.next() == Some(Some(std::ffi::OsStr::new("Contents")))
+        && up
+            .next()
+            .flatten()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.len() > ".app".len() && n.ends_with(".app"))
 }
 
 /// The agent-browser session (and daemon) name of a pegboard session.
@@ -709,6 +735,62 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn touch_exe(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn agent_browser_is_found_beside_pegboard_in_an_app_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helpers = tmp.path().join("Pegboard.app/Contents/Helpers");
+        touch_exe(&helpers.join("pegboard"));
+        touch_exe(&helpers.join("agent-browser"));
+        let exe = helpers.join("pegboard");
+        let c = agent_browser_candidates(Some(&exe));
+        assert_eq!(c[0], helpers.join("agent-browser"));
+        assert_eq!(
+            c.iter().find(|p| p.is_file()),
+            Some(&helpers.join("agent-browser"))
+        );
+        // Through a symbolic link on PATH: find_agent_browser resolves it first.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&exe, bin.join("pegboard")).unwrap();
+        let resolved = std::fs::canonicalize(bin.join("pegboard")).unwrap();
+        assert_eq!(
+            agent_browser_candidates(Some(&resolved))[0],
+            std::fs::canonicalize(helpers.join("agent-browser")).unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_browser_is_not_taken_beside_a_bare_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("x");
+        touch_exe(&dir.join("pegboard"));
+        touch_exe(&dir.join("agent-browser"));
+        let c = agent_browser_candidates(Some(&dir.join("pegboard")));
+        assert!(!c.contains(&dir.join("agent-browser")), "{c:?}");
+        // Nor in a directory that only looks like part of a bundle.
+        for fake in [
+            "Contents/Helpers/pegboard",
+            ".app/Contents/Helpers/pegboard",
+            "X.app/Helpers/pegboard",
+            "X.app/Contents/MacOS/pegboard",
+            "X.app/Contents/Helpers/other",
+        ] {
+            let exe = tmp.path().join(fake);
+            let beside = exe.parent().unwrap().join("agent-browser");
+            assert!(
+                !agent_browser_candidates(Some(&exe)).contains(&beside),
+                "{fake}"
+            );
+        }
+    }
 
     fn result(exit_code: i32, output: Value) -> CommandExecResult {
         CommandExecResult {
