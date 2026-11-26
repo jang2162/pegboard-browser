@@ -13,7 +13,7 @@ mod common;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -1054,4 +1054,99 @@ fn stop_works_with_a_broken_config() {
             "browser.quit".to_string()
         ]
     );
+}
+
+/// A user's `HOME` under `/tmp` (short, so the default home's socket path fits) with a
+/// legacy home that pegboard used: `config.toml` (stock) and `state.json`.
+fn user_with_legacy_home() -> (tempfile::TempDir, PathBuf) {
+    let user = tempfile::tempdir_in("/tmp").unwrap();
+    let support = user.path().join("Library/Application Support");
+    let legacy = support.join(pegboard_core::paths::LEGACY_HOME_DIR_NAME);
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(legacy.join("config.toml"), STOCK_BROWSER).unwrap();
+    std::fs::write(legacy.join("state.json"), b"{}").unwrap();
+    std::fs::write(legacy.join("Local State"), b"{}").unwrap();
+    (user, support)
+}
+
+/// `pegboard <args>` as a person runs it: no `PEGBOARD_HOME`, the given `HOME`.
+fn run_as_user(user: &Path, env: &[(&str, &str)], args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(common::bin())
+        .env_remove("PEGBOARD_HOME")
+        .env_remove("PEGBOARD_SESSION")
+        .env("HOME", user)
+        .envs(env.iter().copied())
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Review Focus 5: the first command moves pegboard's entries to the new home and says so
+/// in its log; the browser's entries stay.
+#[test]
+fn legacy_home_is_moved_by_the_first_command() {
+    let (user, support) = user_with_legacy_home();
+    let (code, _, err) = run_as_user(user.path(), &[], &["session", "list"]);
+    assert_eq!(code, 3, "no daemon: {err}");
+    let home = support.join(pegboard_core::paths::HOME_DIR_NAME);
+    let legacy = support.join(pegboard_core::paths::LEGACY_HOME_DIR_NAME);
+    assert_eq!(std::fs::read(home.join("state.json")).unwrap(), b"{}");
+    assert!(home.join("config.toml").exists());
+    assert!(!legacy.join("state.json").exists());
+    assert!(legacy.join("Local State").exists());
+    let log = std::fs::read_to_string(home.join("daemon.log")).unwrap();
+    assert!(
+        log.contains("moved the home") && log.contains("state.json"),
+        "{log}"
+    );
+}
+
+/// `PEGBOARD_HOME` wins: nothing of the legacy home moves.
+#[test]
+fn legacy_home_stays_with_pegboard_home_set() {
+    let (user, support) = user_with_legacy_home();
+    let elsewhere = tempfile::tempdir_in("/tmp").unwrap();
+    let (code, _, err) = run_as_user(
+        user.path(),
+        &[("PEGBOARD_HOME", elsewhere.path().to_str().unwrap())],
+        &["session", "list"],
+    );
+    assert_eq!(code, 3, "{err}");
+    let legacy = support.join(pegboard_core::paths::LEGACY_HOME_DIR_NAME);
+    assert!(legacy.join("state.json").exists());
+    assert!(!support.join(pegboard_core::paths::HOME_DIR_NAME).exists());
+}
+
+/// Review Focus 5: while a daemon of the legacy home runs, nothing moves; a command fails
+/// with `browser_failed`, and a daemon the browser launched exits 4 (F8: not started again).
+#[test]
+fn hosted_daemon_exits_4_while_a_legacy_daemon_runs() {
+    let (user, support) = user_with_legacy_home();
+    let legacy = support.join(pegboard_core::paths::LEGACY_HOME_DIR_NAME);
+    let held =
+        pegboard_core::lock::DaemonLock::try_acquire(&pegboard_core::paths::paths_in(&legacy))
+            .unwrap()
+            .expect("free");
+    let (code, _, err) = run_as_user(user.path(), &[], &["daemon", "--cdp-pipe"]);
+    assert_eq!(code, pegboard_core::lock::EXIT_LOCK_HELD, "{err}");
+    assert!(err.contains("an older pegboard daemon is running"), "{err}");
+    let (code, _, err) = run_as_user(user.path(), &[], &["session", "list"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains(
+            "browser_failed: an older pegboard daemon is running; quit Pegboard and try again"
+        ),
+        "{err}"
+    );
+    assert!(legacy.join("state.json").exists());
+    assert!(!support.join(pegboard_core::paths::HOME_DIR_NAME).exists());
+    assert!(!support.join(pegboard_core::paths::MOVING_DIR_NAME).exists());
+    drop(held);
 }

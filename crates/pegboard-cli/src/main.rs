@@ -16,7 +16,10 @@ use pegboard_core::api::{serve, Client};
 use pegboard_core::daemon::Daemon;
 use pegboard_core::link::BrowserLink;
 use pegboard_core::lock::{DaemonLock, EXIT_LOCK_HELD};
-use pegboard_core::paths::{ensure_home, paths, socket_path_fits, Paths};
+use pegboard_core::paths::{
+    ensure_home, migrate_legacy_home, migration_support_dir, paths, socket_path_fits, Migration,
+    Paths,
+};
 use pegboard_core::policy::{self, ClassDefault};
 use pegboard_core::recording::config::RecordingConfig;
 use pegboard_core::recording::screen::valid_frame_name;
@@ -283,6 +286,55 @@ fn main() {
     std::process::exit(code);
 }
 
+/// The legacy home's message when its daemon still runs (design 4.8).
+const LEGACY_DAEMON_RUNNING: &str =
+    "an older pegboard daemon is running; quit Pegboard and try again";
+
+/// Moves pegboard's entries out of the legacy home (the fork's user data directory) before
+/// anything creates the home, when `PEGBOARD_HOME` is unset (`migrate_legacy_home`). While
+/// a daemon of the legacy home runs nothing moves: a command fails with `browser_failed`,
+/// and a daemon the browser launched exits `EXIT_LOCK_HELD`, as with any daemon holding
+/// the lock (the browser does not start it again and shows nothing).
+fn move_legacy_home(paths: &Paths, hosted: bool) -> Result<(), RpcError> {
+    let Some(support) = migration_support_dir(
+        std::env::var_os("PEGBOARD_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    ) else {
+        return Ok(());
+    };
+    match migrate_legacy_home(&support) {
+        Ok(Migration::NotNeeded) => Ok(()),
+        Ok(Migration::Moved { entries }) => {
+            if let Ok(mut log) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(paths.home.join("daemon.log"))
+            {
+                let _ = writeln!(
+                    log,
+                    "pegboard: moved the home to {} (moved here: {})",
+                    paths.home.display(),
+                    if entries.is_empty() {
+                        "-".to_string()
+                    } else {
+                        entries.join(", ")
+                    }
+                );
+            }
+            Ok(())
+        }
+        Ok(Migration::LegacyDaemonRunning) if hosted => {
+            eprintln!("pegboard: {LEGACY_DAEMON_RUNNING}");
+            std::process::exit(EXIT_LOCK_HELD);
+        }
+        Ok(Migration::LegacyDaemonRunning) => {
+            Err(error(codes::BROWSER_FAILED, LEGACY_DAEMON_RUNNING))
+        }
+        Err(e) => Err(io_failure("moving the pegboard home", e)),
+    }
+}
+
 /// Prints the error and returns the exit code it stands for.
 fn report(e: &RpcError) -> i32 {
     eprintln!("pegboard: {}", error_line(e));
@@ -349,6 +401,7 @@ fn print_json<T: Serialize>(value: &T) {
 
 fn run(cli: Cli, paths: &Paths) -> Result<(), RpcError> {
     let json = cli.json;
+    move_legacy_home(paths, matches!(cli.command, Cmd::Daemon { cdp_pipe: true }))?;
     match cli.command {
         Cmd::Daemon { cdp_pipe } => daemon_main(paths, cdp_pipe),
         Cmd::Mcp {
