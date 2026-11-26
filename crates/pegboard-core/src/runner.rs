@@ -66,10 +66,11 @@ fn missing(looked_at: &[PathBuf]) -> RpcError {
     )
 }
 
-/// `$PEGBOARD_AGENT_BROWSER`, else (see `agent_browser_candidates`) `agent-browser` beside
-/// `pegboard` in the app bundle, or `vendor/agent-browser/agent-browser` next to the
-/// executable or in the repository this crate was built from. No other directory is
-/// searched: a parent directory such as `/tmp` could hold a planted binary.
+/// `$PEGBOARD_AGENT_BROWSER` (the app's daemon launcher sets it to the bundle's), else (see
+/// `agent_browser_candidates`) `agent-browser` beside `pegboard` in the app bundle, or, in a
+/// development build only, `vendor/agent-browser/agent-browser` next to the executable or in
+/// the repository this crate was built from. No other directory is searched: a parent
+/// directory such as `/tmp` could hold a planted binary.
 pub fn find_agent_browser() -> Result<PathBuf, RpcError> {
     if let Some(p) = std::env::var_os("PEGBOARD_AGENT_BROWSER") {
         let p = PathBuf::from(p);
@@ -80,7 +81,7 @@ pub fn find_agent_browser() -> Result<PathBuf, RpcError> {
         };
     }
     let exe = std::env::current_exe().and_then(std::fs::canonicalize).ok();
-    let candidates = agent_browser_candidates(exe.as_deref());
+    let candidates = agent_browser_candidates(exe.as_deref(), crate::BUILD_REPO);
     match candidates.iter().find(|p| p.is_file()) {
         Some(p) => Ok(p.clone()),
         None => Err(missing(&candidates)),
@@ -92,21 +93,20 @@ pub fn find_agent_browser() -> Result<PathBuf, RpcError> {
 /// - `<X>.app/Contents/Helpers/agent-browser` when the executable is
 ///   `<X>.app/Contents/Helpers/pegboard` (the app bundle's layout, design 4.2); a bare
 ///   binary's own directory is never searched;
-/// - `vendor/agent-browser/agent-browser` under the executable's directory;
-/// - the same under the repository this crate was built from.
-fn agent_browser_candidates(exe: Option<&Path>) -> Vec<PathBuf> {
+/// - with `build_repo` (a development build, `crate::BUILD_REPO`):
+///   `vendor/agent-browser/agent-browser` under the executable's directory, and the same
+///   under `build_repo`. A release build looks only inside its bundle.
+fn agent_browser_candidates(exe: Option<&Path>, build_repo: Option<&str>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dir) = exe.filter(|e| in_app_helpers(e)).and_then(Path::parent) {
         candidates.push(dir.join("agent-browser"));
     }
-    if let Some(dir) = exe.and_then(Path::parent) {
-        candidates.push(dir.join(BIN_IN_REPO));
+    if let Some(repo) = build_repo {
+        if let Some(dir) = exe.and_then(Path::parent) {
+            candidates.push(dir.join(BIN_IN_REPO));
+        }
+        candidates.push(Path::new(repo).join(BIN_IN_REPO));
     }
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(BIN_IN_REPO),
-    );
     candidates
 }
 
@@ -750,7 +750,7 @@ mod tests {
         touch_exe(&helpers.join("pegboard"));
         touch_exe(&helpers.join("agent-browser"));
         let exe = helpers.join("pegboard");
-        let c = agent_browser_candidates(Some(&exe));
+        let c = agent_browser_candidates(Some(&exe), crate::BUILD_REPO);
         assert_eq!(c[0], helpers.join("agent-browser"));
         assert_eq!(
             c.iter().find(|p| p.is_file()),
@@ -762,7 +762,7 @@ mod tests {
         std::os::unix::fs::symlink(&exe, bin.join("pegboard")).unwrap();
         let resolved = std::fs::canonicalize(bin.join("pegboard")).unwrap();
         assert_eq!(
-            agent_browser_candidates(Some(&resolved))[0],
+            agent_browser_candidates(Some(&resolved), crate::BUILD_REPO)[0],
             std::fs::canonicalize(helpers.join("agent-browser")).unwrap()
         );
     }
@@ -773,7 +773,7 @@ mod tests {
         let dir = tmp.path().join("x");
         touch_exe(&dir.join("pegboard"));
         touch_exe(&dir.join("agent-browser"));
-        let c = agent_browser_candidates(Some(&dir.join("pegboard")));
+        let c = agent_browser_candidates(Some(&dir.join("pegboard")), crate::BUILD_REPO);
         assert!(!c.contains(&dir.join("agent-browser")), "{c:?}");
         // Nor in a directory that only looks like part of a bundle.
         for fake in [
@@ -786,10 +786,28 @@ mod tests {
             let exe = tmp.path().join(fake);
             let beside = exe.parent().unwrap().join("agent-browser");
             assert!(
-                !agent_browser_candidates(Some(&exe)).contains(&beside),
+                !agent_browser_candidates(Some(&exe), crate::BUILD_REPO).contains(&beside),
                 "{fake}"
             );
         }
+    }
+
+    /// A release build (no build repository) looks only beside `pegboard` in its bundle.
+    #[test]
+    fn a_release_build_looks_only_in_its_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helpers = tmp.path().join("Pegboard.app/Contents/Helpers");
+        let exe = helpers.join("pegboard");
+        assert_eq!(
+            agent_browser_candidates(Some(&exe), None),
+            vec![helpers.join("agent-browser")]
+        );
+        assert!(agent_browser_candidates(Some(&tmp.path().join("pegboard")), None).is_empty());
+        assert!(agent_browser_candidates(None, None).is_empty());
+        // A development build also has the repository's vendor/ copy.
+        assert!(
+            agent_browser_candidates(None, Some("/r")).contains(&Path::new("/r").join(BIN_IN_REPO))
+        );
     }
 
     fn result(exit_code: i32, output: Value) -> CommandExecResult {

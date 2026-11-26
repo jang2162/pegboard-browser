@@ -140,6 +140,30 @@ test_sparkle_lock_must_be_one_sha256() {
   [ ! -e "$T/repo/vendor/sparkle" ] || fail "something was unpacked"
 }
 
+test_sparkle_refuses_a_link_out_of_the_framework() {
+  fake_repo scripts/fetch-sparkle.sh
+  fake_curl
+  local d="$T/sparkle-src"
+  fake_sparkle_archive
+  # Deep inside the framework, a link that leaves it.
+  ln -s ../../../../LICENSE "$d/Sparkle.framework/Versions/B/Resources/escape"
+  tar -cJf "$T/sparkle.tar.xz" -C "$d" Sparkle.framework bin LICENSE
+  sha "$T/sparkle.tar.xz" > "$T/repo/vendor/sparkle.lock"
+  if "$T/repo/scripts/fetch-sparkle.sh" > "$T/out" 2>&1; then
+    fail "a link out of the framework passed"
+  fi
+  grep -q "escape" "$T/out" || fail "does not name the link: $(cat "$T/out")"
+  [ ! -e "$T/repo/vendor/sparkle" ] || fail "something was unpacked"
+  # An absolute link too.
+  rm "$d/Sparkle.framework/Versions/B/Resources/escape"
+  ln -s /etc/hosts "$d/Sparkle.framework/Versions/B/Resources/escape"
+  tar -cJf "$T/sparkle.tar.xz" -C "$d" Sparkle.framework bin LICENSE
+  sha "$T/sparkle.tar.xz" > "$T/repo/vendor/sparkle.lock"
+  if "$T/repo/scripts/fetch-sparkle.sh" > "$T/out" 2>&1; then
+    fail "an absolute link passed"
+  fi
+}
+
 # ---- scripts/fetch-agent-browser.sh ----
 
 test_agent_browser_locked_refuses_an_empty_lock() {
@@ -195,6 +219,65 @@ test_agent_browser_lock_mismatch_fails() {
   if "$T/repo/scripts/fetch-agent-browser.sh" > "$T/out" 2>&1; then
     fail "a lock of another version passed"
   fi
+}
+
+test_agent_browser_refuses_duplicate_lock_lines() {
+  fake_repo scripts/fetch-agent-browser.sh
+  fake_curl
+  fake_agent_browser_archive
+  {
+    printf '%s  agent-browser-0.42.0.tgz\n' "$(sha "$T/ab.tgz")"
+    printf '%064d  agent-browser-0.42.0.tgz\n' 0
+  } > "$T/repo/vendor/agent-browser.lock"
+  if "$T/repo/scripts/fetch-agent-browser.sh" > "$T/out" 2>&1; then
+    fail "two lines for one name passed"
+  fi
+  grep -q "two lines" "$T/out" || fail "$(cat "$T/out")"
+  [ ! -e "$T/curl.log" ] || fail "fetched with a bad lock"
+}
+
+test_agent_browser_refuses_a_linked_license_file() {
+  fake_repo scripts/fetch-agent-browser.sh
+  fake_curl
+  fake_agent_browser_archive
+  local d="$T/ab-src"
+  ln -s /etc/hosts "$d/package/NOTICE-linked"
+  tar -czf "$T/ab.tgz" -C "$d" package
+  printf '%s  agent-browser-0.42.0.tgz\n' "$(sha "$T/ab.tgz")" > "$T/repo/vendor/agent-browser.lock"
+  if "$T/repo/scripts/fetch-agent-browser.sh" > "$T/out" 2>&1; then
+    fail "a linked license file passed"
+  fi
+  grep -q "NOTICE-linked is not a regular file" "$T/out" || fail "$(cat "$T/out")"
+  [ ! -e "$T/repo/vendor/agent-browser/licenses" ] || fail "installed anyway"
+}
+
+test_agent_browser_member_names_are_literal() {
+  fake_repo scripts/fetch-agent-browser.sh
+  fake_curl
+  fake_agent_browser_archive
+  local d="$T/ab-src"
+  # A license file whose name is a tar pattern: only it is taken, not what the pattern matches.
+  echo star > "$d/package/LICENSE-[ab]"
+  echo a > "$d/package/LICENSE-a"
+  rm "$d/package/LICENSE-a"
+  tar -czf "$T/ab.tgz" -C "$d" package
+  printf '%s  agent-browser-0.42.0.tgz\n' "$(sha "$T/ab.tgz")" > "$T/repo/vendor/agent-browser.lock"
+  "$T/repo/scripts/fetch-agent-browser.sh" > "$T/out" 2>&1 || fail "$(cat "$T/out")"
+  [ "$(cat "$T/repo/vendor/agent-browser/licenses/LICENSE-[ab]")" = star ] || fail "LICENSE-[ab]"
+}
+
+test_agent_browser_drops_an_old_license() {
+  fake_repo scripts/fetch-agent-browser.sh
+  fake_curl
+  fake_agent_browser_archive
+  local d="$T/ab-src"
+  rm "$d/package/LICENSE"
+  tar -czf "$T/ab.tgz" -C "$d" package
+  printf '%s  agent-browser-0.42.0.tgz\n' "$(sha "$T/ab.tgz")" > "$T/repo/vendor/agent-browser.lock"
+  mkdir -p "$T/repo/vendor/agent-browser"
+  echo old > "$T/repo/vendor/agent-browser/LICENSE"
+  "$T/repo/scripts/fetch-agent-browser.sh" > "$T/out" 2>&1 || fail "$(cat "$T/out")"
+  [ ! -e "$T/repo/vendor/agent-browser/LICENSE" ] || fail "the old LICENSE was left"
 }
 
 test_agent_browser_keeps_every_license_file() {

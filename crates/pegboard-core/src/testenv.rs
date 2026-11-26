@@ -4,21 +4,40 @@
 //! whatever the environment says: that is decided when it is compiled, and nothing at run
 //! time turns them back on (design R16).
 
-/// Whether test hooks are on (`PEGBOARD_TEST_HOOKS` set, and not a release build).
+/// Whether test hooks are on (`PEGBOARD_TEST_HOOKS` set, and not a release build). A release
+/// build returns before reading the environment.
+#[inline]
 pub fn hooks() -> bool {
-    hooks_in(
+    if crate::is_release_build() {
+        return false;
+    }
+    hooks_in(crate::is_release_build(), hooks_env_set())
+}
+
+/// The value of the test variable `name`, only when test hooks are on. A release build
+/// returns before reading anything, so the call (and the hook's name) folds away.
+#[inline]
+pub fn var(name: &str) -> Option<String> {
+    if crate::is_release_build() {
+        return None;
+    }
+    var_in(
         crate::is_release_build(),
-        std::env::var_os("PEGBOARD_TEST_HOOKS").is_some(),
+        hooks_env_set(),
+        std::env::var(name).ok(),
     )
 }
 
-/// The value of the test variable `name`, only when test hooks are on.
-pub fn var(name: &str) -> Option<String> {
-    var_in(
-        crate::is_release_build(),
-        std::env::var_os("PEGBOARD_TEST_HOOKS").is_some(),
-        std::env::var(name).ok(),
-    )
+/// The name of the variable that turns the hooks on; `None` in a release build, so the name
+/// is not even in its binary (a const: decided when compiling).
+pub(crate) const HOOKS_ENV: Option<&str> = if crate::is_release_build() {
+    None
+} else {
+    Some("PEGBOARD_TEST_HOOKS")
+};
+
+fn hooks_env_set() -> bool {
+    HOOKS_ENV.is_some_and(|name| std::env::var_os(name).is_some())
 }
 
 fn hooks_in(release: bool, hooks_on: bool) -> bool {

@@ -137,6 +137,27 @@ PY
   return "$rc"
 }
 
+# The rustc flags of the release build of pegboard: the build machine's paths (the
+# repository, cargo's and rustup's homes, which hold the user name) are mapped to fixed
+# names, so the binary does not carry them. One flag per line (CARGO_ENCODED_RUSTFLAGS form,
+# with the line breaks as its separator), so a path with spaces stays one flag.
+release_rustflags() {
+  printf -- '--remap-path-prefix=%s=/pegboard\n' "$REPO_ROOT"
+  printf -- '--remap-path-prefix=%s=/cargo\n' "${CARGO_HOME:-$HOME/.cargo}"
+  printf -- '--remap-path-prefix=%s=/rustup\n' "${RUSTUP_HOME:-$HOME/.rustup}"
+}
+
+# Builds pegboard for the app as release version $1 (the display version, e.g.
+# 156.0.8078.109-pb.3) in RELEASE_CARGO_TARGET_DIR; prints the binary's path.
+cargo_release_build() {
+  local version="$1" flags
+  flags="$(release_rustflags | tr '\n' '\037')"
+  flags="${flags%$'\037'}"
+  (cd "$REPO_ROOT" && PEGBOARD_RELEASE_VERSION="$version" CARGO_ENCODED_RUSTFLAGS="$flags" \
+    cargo build --release --locked -p pegboard-cli --target-dir "$REPO_ROOT/$RELEASE_CARGO_TARGET_DIR" >&2)
+  echo "$REPO_ROOT/$RELEASE_CARGO_TARGET_DIR/release/pegboard"
+}
+
 # ---- preflight ----
 
 PREFLIGHT_PROBLEMS=0

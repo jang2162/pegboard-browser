@@ -52,6 +52,29 @@ for want in Sparkle.framework bin/sign_update bin/generate_keys LICENSE; do
   [ -e "$tmp/unpacked/$want" ] || die "$ARCHIVE has no $want"
 done
 [ ! -L "$tmp/unpacked/Sparkle.framework" ] || die "$ARCHIVE: Sparkle.framework is a symbolic link"
+[ -f "$tmp/unpacked/LICENSE" ] && [ ! -L "$tmp/unpacked/LICENSE" ] || die "$ARCHIVE: LICENSE is not a regular file"
+# Every symbolic link anywhere in what is kept (the framework's Versions/Current and the like)
+# must be relative and stay inside its own top directory (Sparkle.framework, bin).
+python3 -I - "$tmp/unpacked" Sparkle.framework bin << 'PY' || die "$ARCHIVE has a symbolic link that points outside"
+import os, sys
+
+root = os.path.realpath(sys.argv[1])
+bad = []
+for top in sys.argv[2:]:
+    base = os.path.join(root, top)
+    for dirpath, dirnames, filenames in os.walk(base):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            if not os.path.islink(path):
+                continue
+            target = os.readlink(path)
+            resolved = os.path.normpath(os.path.join(dirpath, target))
+            if os.path.isabs(target) or os.path.commonpath([resolved, base]) != base:
+                bad.append(f"{os.path.relpath(path, root)} -> {target}")
+for b in bad:
+    print(f"error: {b}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PY
 
 stage="$DEST.new"
 rm -rf "$stage"

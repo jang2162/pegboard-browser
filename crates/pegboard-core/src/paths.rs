@@ -110,6 +110,11 @@ pub const LEGACY_ENTRIES: &[&str] = &[
 const LEGACY_MARKERS: &[&str] = &["state.json", "config.toml", "recordings", "sessions"];
 /// The legacy daemon's socket; removed, not moved (so is its `daemon.lock`).
 const LEGACY_SOCKET: &str = "pegboardd.sock";
+/// Pegboard's names in the legacy home that are not moved but removed with the move (never
+/// followed): each is made again from nothing. `downloads/` is the daemon's staging root
+/// (emptied whenever a daemon starts), `agent-browser.json` is written by every daemon, and
+/// `state.json.tmp` is a leftover of an interrupted state write.
+const LEGACY_LEFTOVERS: &[&str] = &["downloads", "agent-browser.json", "state.json.tmp"];
 
 /// `home` is `$PEGBOARD_HOME` or `~/Library/Application Support/Pegboard Agent`.
 pub fn paths() -> Paths {
@@ -152,6 +157,10 @@ pub enum Migration {
     Moved { entries: Vec<String> },
     /// A pegboard daemon of the legacy home holds its lock: nothing was changed.
     LegacyDaemonRunning,
+    /// Nothing was moved, and nothing will be until a person acts on `why` (it says what to
+    /// do): the legacy home is not a real directory of this user, or a `.moving` directory
+    /// is left beside the new home. Not an error: pegboard goes on with the new home.
+    LeftAlone { why: String },
 }
 
 /// How long `migrate_legacy_home` waits for the legacy lock: another new pegboard process
@@ -175,13 +184,24 @@ const LEGACY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(2
 /// - Nothing is overwritten or deleted: an entry whose name is already taken in `.moving`
 ///   stops the move with an error, both left as they are. Only the legacy daemon's socket
 ///   and lock file are removed, and a note (`MOVED_NOTE`) is left in the legacy home.
-/// - The legacy home must be a real directory of this user; anything else is refused.
+/// - The legacy home must be a real directory of this user; anything else is left alone
+///   (`LeftAlone`), as is a `.moving` directory found beside an existing new home.
 pub fn migrate_legacy_home(support: &Path) -> std::io::Result<Migration> {
     use std::io::ErrorKind;
 
     let legacy = support.join(LEGACY_HOME_DIR_NAME);
     let home = support.join(HOME_DIR_NAME);
     let moving = support.join(MOVING_DIR_NAME);
+    if exists_no_follow(&home)? && exists_no_follow(&moving)? {
+        return Ok(Migration::LeftAlone {
+            why: format!(
+                "{} is left over beside {}: look inside it, move what you want to keep into \
+                 the home, and remove it",
+                moving.display(),
+                home.display()
+            ),
+        });
+    }
     let needed = |legacy: &Path| -> std::io::Result<bool> {
         if exists_no_follow(&home)? {
             return Ok(false);
@@ -198,8 +218,16 @@ pub fn migrate_legacy_home(support: &Path) -> std::io::Result<Migration> {
     };
     match std::fs::symlink_metadata(&legacy) {
         Err(e) if e.kind() == ErrorKind::NotFound => {
+            if !exists_no_follow(&moving)? {
+                return Ok(Migration::NotNeeded);
+            }
+            // The legacy home went away after a move began; finish what was moved, holding
+            // a lock on `.moving` itself (there is no legacy lock file any more) and looking
+            // again once it is ours: another process may have finished first.
+            let Some(_lock) = lock_dir(&moving)? else {
+                return Ok(Migration::NotNeeded);
+            };
             return Ok(if exists_no_follow(&moving)? && !exists_no_follow(&home)? {
-                // The legacy home went away after a move began; finish what was moved.
                 finish_move(&legacy, &moving, &home, Vec::new())?
             } else {
                 Migration::NotNeeded
@@ -211,7 +239,12 @@ pub fn migrate_legacy_home(support: &Path) -> std::io::Result<Migration> {
     if !needed(&legacy)? {
         return Ok(Migration::NotNeeded);
     }
-    require_own_dir(&legacy)?;
+    if let Err(e) = require_own_dir(&legacy) {
+        if e.kind() == ErrorKind::PermissionDenied {
+            return Ok(Migration::LeftAlone { why: e.to_string() });
+        }
+        return Err(e);
+    }
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -255,7 +288,8 @@ pub fn migrate_legacy_home(support: &Path) -> std::io::Result<Migration> {
             std::io::Error::new(
                 e.kind(),
                 format!(
-                    "moving {} to {}: {e}; nothing was deleted",
+                    "moving {} to {}: {e}; nothing was deleted. Both are kept: compare them, \
+                     keep one (move the other out of both directories), and start Pegboard again",
                     from.display(),
                     moving.display()
                 ),
@@ -288,6 +322,17 @@ fn finish_move(
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        for name in LEGACY_LEFTOVERS {
+            let path = legacy.join(name);
+            match std::fs::symlink_metadata(&path) {
+                // A real directory goes with what is in it; anything else (a link included,
+                // never followed) is unlinked.
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path)?,
+                Ok(_) => std::fs::remove_file(&path)?,
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
         let note = format!(
             "Pegboard keeps its sessions, recordings and settings in {} since 3c; \
              this directory is the Pegboard browser's own data.\n",
@@ -297,6 +342,26 @@ fn finish_move(
     }
     rename_no_replace(moving, home)?;
     Ok(Migration::Moved { entries: moved })
+}
+
+/// An exclusive lock on the directory `dir` (never through a symbolic link), held while the
+/// file lives; `None` when `dir` is gone.
+fn lock_dir(dir: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // SAFETY: the descriptor is open for the whole call. A move is a few renames, so
+    // waiting for another process's lock is short.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(file))
 }
 
 /// Whether `path` names anything, a symbolic link included (it is not followed).
@@ -795,11 +860,105 @@ mod tests {
             .unwrap();
         std::fs::write(real.join("state.json"), b"s").unwrap();
         std::os::unix::fs::symlink(&real, support.join(LEGACY_HOME_DIR_NAME)).unwrap();
-        let e = migrate_legacy_home(&support).unwrap_err();
-        assert!(e.to_string().contains("symbolic link"), "{e}");
+        // Left alone, not an error that would stop every start; the reason says what to do.
+        let Migration::LeftAlone { why } = migrate_legacy_home(&support).unwrap() else {
+            panic!("not left alone");
+        };
+        assert!(
+            why.contains("symbolic link") && why.contains("PEGBOARD_HOME"),
+            "{why}"
+        );
         assert!(real.join("state.json").exists());
+        assert!(!real.join("daemon.lock").exists());
         assert!(!support.join(HOME_DIR_NAME).exists());
         assert!(!support.join(MOVING_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn migration_removes_pegboards_leftovers_without_following_links() {
+        let (tmp, support) = support_with_legacy();
+        let legacy = support.join(LEGACY_HOME_DIR_NAME);
+        plant_everything(&legacy);
+        std::fs::create_dir(legacy.join("downloads")).unwrap();
+        std::fs::write(legacy.join("downloads/partial"), b"x").unwrap();
+        std::fs::write(legacy.join("state.json.tmp"), b"x").unwrap();
+        // A link in a leftover's place goes, not what it points at.
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, legacy.join("agent-browser.json")).unwrap();
+        assert!(matches!(
+            migrate_legacy_home(&support).unwrap(),
+            Migration::Moved { .. }
+        ));
+        for name in LEGACY_LEFTOVERS {
+            assert!(!exists_no_follow(&legacy.join(name)).unwrap(), "{name}");
+            assert!(!exists_no_follow(&support.join(HOME_DIR_NAME).join(name)).unwrap());
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        assert_browsers_entries_stay(&legacy);
+    }
+
+    #[test]
+    fn migration_leaves_a_stray_moving_dir_beside_the_home() {
+        let (_tmp, support) = support_with_legacy();
+        let legacy = support.join(LEGACY_HOME_DIR_NAME);
+        plant_everything(&legacy);
+        for dir in [HOME_DIR_NAME, MOVING_DIR_NAME] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(support.join(dir))
+                .unwrap();
+        }
+        std::fs::write(support.join(MOVING_DIR_NAME).join("state.json"), b"stray").unwrap();
+        let Migration::LeftAlone { why } = migrate_legacy_home(&support).unwrap() else {
+            panic!("not left alone");
+        };
+        assert!(why.contains(MOVING_DIR_NAME), "{why}");
+        assert_eq!(
+            std::fs::read(support.join(MOVING_DIR_NAME).join("state.json")).unwrap(),
+            b"stray"
+        );
+        for name in LEGACY_ENTRIES {
+            assert_entry_is(&legacy.join(name), name);
+        }
+    }
+
+    /// With the legacy home gone, finishing a half-done move takes a lock on `.moving`, and a
+    /// process that gets the lock after another finished does nothing.
+    #[test]
+    fn finishing_without_a_legacy_home_takes_a_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let support = tmp.path();
+        let moving = support.join(MOVING_DIR_NAME);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&moving)
+            .unwrap();
+        std::fs::write(moving.join("state.json"), b"state.json").unwrap();
+        let held = lock_dir(&moving).unwrap().expect("there");
+        let support2 = support.to_path_buf();
+        let other = std::thread::spawn(move || migrate_legacy_home(&support2).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!other.is_finished(), "did not wait for the lock");
+        // The holder finishes the move meanwhile.
+        rename_no_replace(&moving, &support.join(HOME_DIR_NAME)).unwrap();
+        drop(held);
+        assert_eq!(other.join().unwrap(), Migration::NotNeeded);
+        assert_entry_is(
+            &support.join(HOME_DIR_NAME).join("state.json"),
+            "state.json",
+        );
+        // And without a holder it finishes itself.
+        let tmp = tempfile::tempdir().unwrap();
+        let moving = tmp.path().join(MOVING_DIR_NAME);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&moving)
+            .unwrap();
+        assert_eq!(
+            migrate_legacy_home(tmp.path()).unwrap(),
+            Migration::Moved { entries: vec![] }
+        );
     }
 
     #[test]

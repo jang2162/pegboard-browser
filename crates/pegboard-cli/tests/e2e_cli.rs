@@ -1129,17 +1129,23 @@ fn legacy_home_stays_with_pegboard_home_set() {
 }
 
 /// Review Focus 5: while a daemon of the legacy home runs, nothing moves; a command fails
-/// with `browser_failed`, and a daemon the browser launched exits 4 (F8: not started again).
+/// with `browser_failed` at once, and a daemon the browser launched waits 10 s for it, then
+/// exits 5 (not 4: the browser starts it again, F8, and shows its notice if it never works).
 #[test]
-fn hosted_daemon_exits_4_while_a_legacy_daemon_runs() {
+fn hosted_daemon_exits_5_while_a_legacy_daemon_runs() {
     let (user, support) = user_with_legacy_home();
     let legacy = support.join(pegboard_core::paths::LEGACY_HOME_DIR_NAME);
     let held =
         pegboard_core::lock::DaemonLock::try_acquire(&pegboard_core::paths::paths_in(&legacy))
             .unwrap()
             .expect("free");
+    let start = std::time::Instant::now();
     let (code, _, err) = run_as_user(user.path(), &[], &["daemon", "--cdp-pipe"]);
-    assert_eq!(code, pegboard_core::lock::EXIT_LOCK_HELD, "{err}");
+    assert_eq!(code, 5, "{err}");
+    assert!(
+        start.elapsed() >= std::time::Duration::from_secs(9),
+        "did not wait"
+    );
     assert!(err.contains("an older pegboard daemon is running"), "{err}");
     let (code, _, err) = run_as_user(user.path(), &[], &["session", "list"]);
     assert_eq!(code, 1, "{err}");
@@ -1153,6 +1159,33 @@ fn hosted_daemon_exits_4_while_a_legacy_daemon_runs() {
     assert!(!support.join(pegboard_core::paths::HOME_DIR_NAME).exists());
     assert!(!support.join(pegboard_core::paths::MOVING_DIR_NAME).exists());
     drop(held);
+}
+
+/// A hosted daemon that starts while the old app is still quitting moves the home once the
+/// old daemon lets go of its lock, within the wait.
+#[test]
+fn hosted_daemon_moves_the_home_when_the_legacy_daemon_goes() {
+    let (user, support) = user_with_legacy_home();
+    let legacy = support.join(pegboard_core::paths::LEGACY_HOME_DIR_NAME);
+    let held =
+        pegboard_core::lock::DaemonLock::try_acquire(&pegboard_core::paths::paths_in(&legacy))
+            .unwrap()
+            .expect("free");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        drop(held);
+    });
+    // Without the browser's pipe the daemon stops right after the move (a usage error).
+    let (code, _, err) = run_as_user(user.path(), &[], &["daemon", "--cdp-pipe"]);
+    release.join().unwrap();
+    assert_ne!(code, 5, "{err}");
+    assert!(
+        !err.contains("an older pegboard daemon is running"),
+        "{err}"
+    );
+    let home = support.join(pegboard_core::paths::HOME_DIR_NAME);
+    assert!(home.join("state.json").exists(), "{err}");
+    assert!(!legacy.join("state.json").exists());
 }
 
 /// `browser status` shows the daemon's version on a line of its own.

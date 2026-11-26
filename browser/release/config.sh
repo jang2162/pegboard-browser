@@ -17,3 +17,6 @@ APPCAST_KEEP=20
 PAGES_WAIT_SECS=600
 # The most parallel jobs a build may use: more has hung the build machine (kernel panic).
 MAX_BUILD_JOBS=8
+# The cargo target directory of the release build of pegboard (relative to the repository):
+# its own, so nothing built without PEGBOARD_RELEASE_VERSION is reused.
+RELEASE_CARGO_TARGET_DIR="target/release-cargo"

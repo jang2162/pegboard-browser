@@ -42,6 +42,15 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 const EXIT_NO_DAEMON: i32 = 3;
+/// A daemon the browser launched found the legacy home's daemon still running after
+/// `LEGACY_HOSTED_WAIT`. Not `EXIT_LOCK_HELD` (4, "another daemon serves this home"): that
+/// one serves the legacy home on another socket, so the browser treats this exit like any
+/// failure and starts the daemon again (F8: a few times, then its notice).
+const EXIT_LEGACY_DAEMON_RUNNING: i32 = 5;
+/// How long a daemon the browser launched waits for the legacy daemon to let go of its lock
+/// (the old app quitting during an update, or a stock daemon going idle).
+const LEGACY_HOSTED_WAIT: Duration = Duration::from_secs(10);
+const LEGACY_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Parser)]
 #[command(
@@ -292,9 +301,10 @@ const LEGACY_DAEMON_RUNNING: &str =
 
 /// Moves pegboard's entries out of the legacy home (the fork's user data directory) before
 /// anything creates the home, when `PEGBOARD_HOME` is unset (`migrate_legacy_home`). While
-/// a daemon of the legacy home runs nothing moves: a command fails with `browser_failed`,
-/// and a daemon the browser launched exits `EXIT_LOCK_HELD`, as with any daemon holding
-/// the lock (the browser does not start it again and shows nothing).
+/// a daemon of the legacy home runs nothing moves: a command fails with `browser_failed`
+/// at once; a daemon the browser launched waits up to `LEGACY_HOSTED_WAIT` for it to go,
+/// then exits `EXIT_LEGACY_DAEMON_RUNNING`, which the browser restarts. A legacy home left
+/// alone (`Migration::LeftAlone`) is noted in the new home's `daemon.log` and pegboard goes on.
 fn move_legacy_home(paths: &Paths, hosted: bool) -> Result<(), RpcError> {
     let Some(support) = migration_support_dir(
         std::env::var_os("PEGBOARD_HOME").as_deref(),
@@ -302,36 +312,72 @@ fn move_legacy_home(paths: &Paths, hosted: bool) -> Result<(), RpcError> {
     ) else {
         return Ok(());
     };
-    match migrate_legacy_home(&support) {
+    let wait = if hosted {
+        LEGACY_HOSTED_WAIT
+    } else {
+        Duration::ZERO
+    };
+    match migrate_waiting(|| migrate_legacy_home(&support), wait, LEGACY_POLL) {
         Ok(Migration::NotNeeded) => Ok(()),
         Ok(Migration::Moved { entries }) => {
-            if let Ok(mut log) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(paths.home.join("daemon.log"))
-            {
-                let _ = writeln!(
-                    log,
-                    "pegboard: moved the home to {} (moved here: {})",
+            note_in_daemon_log(
+                paths,
+                &format!(
+                    "moved the home to {} (moved here: {})",
                     paths.home.display(),
                     if entries.is_empty() {
                         "-".to_string()
                     } else {
                         entries.join(", ")
                     }
-                );
-            }
+                ),
+            );
+            Ok(())
+        }
+        Ok(Migration::LeftAlone { why }) => {
+            note_in_daemon_log(paths, &format!("the legacy home was not moved: {why}"));
             Ok(())
         }
         Ok(Migration::LegacyDaemonRunning) if hosted => {
             eprintln!("pegboard: {LEGACY_DAEMON_RUNNING}");
-            std::process::exit(EXIT_LOCK_HELD);
+            std::process::exit(EXIT_LEGACY_DAEMON_RUNNING);
         }
         Ok(Migration::LegacyDaemonRunning) => {
             Err(error(codes::BROWSER_FAILED, LEGACY_DAEMON_RUNNING))
         }
         Err(e) => Err(io_failure("moving the pegboard home", e)),
+    }
+}
+
+/// Calls `attempt` until it is not `LegacyDaemonRunning` or `wait` has passed, `poll` apart
+/// (once when `wait` is zero).
+fn migrate_waiting(
+    mut attempt: impl FnMut() -> std::io::Result<Migration>,
+    wait: Duration,
+    poll: Duration,
+) -> std::io::Result<Migration> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let m = attempt()?;
+        if m != Migration::LegacyDaemonRunning || std::time::Instant::now() >= deadline {
+            return Ok(m);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Appends a line to the home's `daemon.log`, creating the home if need be; best effort.
+fn note_in_daemon_log(paths: &Paths, line: &str) {
+    if ensure_home(paths).is_err() {
+        return;
+    }
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(paths.home.join("daemon.log"))
+    {
+        let _ = writeln!(log, "pegboard: {line}");
     }
 }
 
@@ -1537,6 +1583,64 @@ fn inherited_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::Owned
 
 #[cfg(test)]
 mod tests {
+    use pegboard_core::paths::Migration;
+    use std::time::Duration;
+
+    /// A daemon the browser launched waits for the legacy daemon to go, then moves on; when
+    /// it never goes the result is still `LegacyDaemonRunning` (exit 5, restarted), and a
+    /// command (no wait) tries once.
+    #[test]
+    fn a_hosted_daemon_waits_for_the_legacy_lock() {
+        let mut calls = 0;
+        let m = super::migrate_waiting(
+            || {
+                calls += 1;
+                Ok(if calls < 3 {
+                    Migration::LegacyDaemonRunning
+                } else {
+                    Migration::Moved { entries: vec![] }
+                })
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(m, Migration::Moved { entries: vec![] });
+        assert_eq!(calls, 3);
+
+        let start = std::time::Instant::now();
+        let m = super::migrate_waiting(
+            || Ok(Migration::LegacyDaemonRunning),
+            Duration::from_millis(60),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        assert_eq!(m, Migration::LegacyDaemonRunning);
+        assert!(start.elapsed() >= Duration::from_millis(60));
+
+        let mut calls = 0;
+        let m = super::migrate_waiting(
+            || {
+                calls += 1;
+                Ok(Migration::LegacyDaemonRunning)
+            },
+            Duration::ZERO,
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        assert_eq!((m, calls), (Migration::LegacyDaemonRunning, 1));
+    }
+
+    /// The browser restarts every exit code but `EXIT_LOCK_HELD` (daemon_launcher.cc).
+    #[test]
+    fn the_legacy_daemon_exit_is_restartable() {
+        assert_ne!(
+            super::EXIT_LEGACY_DAEMON_RUNNING,
+            pegboard_core::lock::EXIT_LOCK_HELD
+        );
+        assert_eq!(super::LEGACY_HOSTED_WAIT, Duration::from_secs(10));
+    }
+
     /// Design R20: through a symbolic link (or a chain of them) on `PATH`, the CLI's own
     /// path is the app's copy, so the daemon it starts is the app's.
     #[test]

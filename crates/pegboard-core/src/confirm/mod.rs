@@ -41,9 +41,7 @@ pub const MAX_SUBSCRIBERS: usize = 8;
 pub fn confirm_timeout() -> Duration {
     timeout_with(
         crate::testenv::hooks(),
-        std::env::var("PEGBOARD_TEST_CONFIRM_TIMEOUT_MS")
-            .ok()
-            .as_deref(),
+        crate::testenv::var("PEGBOARD_TEST_CONFIRM_TIMEOUT_MS").as_deref(),
     )
 }
 

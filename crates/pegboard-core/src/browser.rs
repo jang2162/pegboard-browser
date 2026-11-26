@@ -332,7 +332,9 @@ impl Browser {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         if test_browser_without_hooks() {
-            cmd.env_remove("PEGBOARD_TEST_HOOKS");
+            if let Some(name) = crate::testenv::HOOKS_ENV {
+                cmd.env_remove(name);
+            }
         }
         // SAFETY: the closure only makes async-signal-safe system calls.
         unsafe { cmd.pre_exec(pipes.child_setup()) };

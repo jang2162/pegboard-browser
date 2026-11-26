@@ -34,9 +34,10 @@ case "${1:-}" in
 esac
 [ $# -le 1 ] || die "usage: $(basename "$0") [--locked]"
 
-# The lock's SHA-256 for a name, empty when it has none. Every line must be well formed.
+# The lock's SHA-256 for a name, empty when it has none. Every line must be well formed, and
+# no name may have two lines.
 lock_sum() {
-  local want="$1" sum name rest
+  local want="$1" sum name rest seen=" "
   [ -f "$LOCK" ] || return 0
   while read -r sum name rest; do
     [ -n "$sum" ] || continue
@@ -46,6 +47,10 @@ lock_sum() {
       "$TARBALL" | "$BINARY") ;;
       *) die "vendor/agent-browser.lock names $name, not $TARBALL or $BINARY (another version?)" ;;
     esac
+    case "$seen" in
+      *" $name "*) die "vendor/agent-browser.lock has two lines for $name" ;;
+    esac
+    seen="$seen$name "
     if [ "$name" = "$want" ]; then
       echo "$sum"
       return 0
@@ -100,12 +105,22 @@ while IFS= read -r member; do
 done < <(tar -tzf "$tmp/download/$TARBALL")
 [ "${#licenses[@]}" -gt 0 ] || die "$TARBALL has no license file"
 
-tar -xzf "$tmp/download/$TARBALL" -C "$tmp/unpacked" "package/$BINARY" "${licenses[@]}"
+# The whole package into the new empty directory (no member names on the command line: tar
+# would read them as patterns), then the chosen files by their literal paths. Each must be a
+# regular file, never a link: a link's target is not what the lock or the notices vouch for.
+tar -xzf "$tmp/download/$TARBALL" -C "$tmp/unpacked"
+for member in "package/$BINARY" "${licenses[@]}"; do
+  [ -f "$tmp/unpacked/$member" ] && [ ! -L "$tmp/unpacked/$member" ] ||
+    die "$TARBALL: $member is not a regular file"
+done
 check "$BINARY" "$tmp/unpacked/package/$BINARY"
 
 mkdir -p "$DEST"
 install -m 0755 "$tmp/unpacked/package/$BINARY" "$DEST/agent-browser"
-[ -f "$tmp/unpacked/package/LICENSE" ] && cp "$tmp/unpacked/package/LICENSE" "$DEST/LICENSE"
+rm -f "$DEST/LICENSE"
+if [ -f "$tmp/unpacked/package/LICENSE" ]; then
+  cp "$tmp/unpacked/package/LICENSE" "$DEST/LICENSE"
+fi
 rm -rf "$DEST/licenses"
 for member in "${licenses[@]}"; do
   rel="${member#package/}"

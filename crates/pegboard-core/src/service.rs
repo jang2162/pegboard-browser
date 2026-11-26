@@ -207,8 +207,8 @@ fn invalid(message: impl Into<String>) -> RpcError {
     rpc_error(codes::INVALID_PARAMS, message)
 }
 
-/// `$PEGBOARD_EXTENSION`, else `extension/bridge` next to the executable or in the
-/// repository this crate was built from.
+/// `$PEGBOARD_EXTENSION`, else `extension/bridge` next to the executable or, in a
+/// development build only, in the repository this crate was built from.
 pub fn find_extension() -> anyhow::Result<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(p) = std::env::var_os("PEGBOARD_EXTENSION") {
@@ -222,7 +222,9 @@ pub fn find_extension() -> anyhow::Result<PathBuf> {
         {
             candidates.push(dir.join("extension/bridge"));
         }
-        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extension/bridge"));
+        if let Some(repo) = crate::BUILD_REPO {
+            candidates.push(PathBuf::from(repo).join("extension/bridge"));
+        }
     }
     candidates
         .iter()
