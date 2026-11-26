@@ -21,7 +21,7 @@
 3. **앱이 뒤에 있을 때(Dock)**: `manual-3b.sh state`. 세는 동안 Finder(또는 다른 앱)를 눌러 앞으로 가져온다.
    - [ ] 확인 창이 뜨면 Dock의 Pegboard 아이콘이 한 번 튄다. Finder가 그대로 앞에 있다.
    - [ ] 쿠키 창: 호스트 `127.0.0.1`, 이름 `demo`, 값 `hello`, 경로가 보인다.
-   - [ ] Pegboard로 돌아가 Esc를 누르면(거부) 터미널에 `policy_denied … (reason: denied)`가 나온다.
+   - [ ] 확인 창의 "거부"를 마우스로 누르면 터미널에 `policy_denied … (reason: denied)`가 나온다. (확인 창은 초점을 받지 않으므로 Esc 같은 키는 닿지 않는다.)
 4. **이 세션에서 계속 허용**: `manual-3b.sh upload-dir`.
    - [ ] 버튼이 셋이다("이 세션에서 계속 허용" 포함). 그것을 누르면 업로드된다.
    - [ ] `manual-3b.sh upload-dir`를 한 번 더: 확인 창 없이 바로 끝난다.
