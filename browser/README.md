@@ -6,6 +6,7 @@ Chromium 소스는 이 저장소에 넣지 않는다. 여기에는 버전, 패�
 |---|---|
 | `CHROMIUM_VERSION` | 고정한 Chromium 태그 한 줄 |
 | `args.gn` | 개발 빌드 GN 인자(`<src>/out/Pegboard/args.gn`으로 복사된다) |
+| `args.release.gn` | 배포 빌드 GN 인자(`<src>/out/Release/args.gn`으로 복사된다). `args.gn`과 다른 줄은 `pegboard_test_hooks = false` 하나 |
 | `patches/series` | 패치 적용 순서. 한 줄에 패치 파일 이름 하나 |
 | `patches/*.patch` | 업스트림 파일 수정. 패치 하나 = 작업 브랜치의 커밋 하나. 머리말에 목적과 건드리는 파일 |
 | `pegboard/` | 트리의 `//pegboard/`로 복사되는 새 소스: `devtools/`(Pegboard CDP 도메인, 확인 메서드), `bootstrap/`(데몬 띄우기, 다시 띄우기, 포기 알림 띄우기), `ui/`(확인 창 `confirm_dialog`, 데몬 포기 알림 `daemon_notice`, 글 거르기 `display_text`, 키 창 기록 `window_focus`, 브라우저 쪽 시험 훅 `test_hooks`와 그 GN 인자 `test_hooks.gni`), `browser_parts/`(부트스트랩 패치가 넣는 `MainParts`, 에이전트 프로필 표시·숨기기 `AgentProfiles`와 맥의 마지막 프로필 되돌리기, 로그인·비밀번호 기본값 `ProfileDefaults`), `common/`(에이전트 프로필 규칙 하나) |
@@ -27,6 +28,10 @@ browser/scripts/package-dev.sh <src> <out>/Pegboard.app   # pegboard, agent-brow
 - depot_tools는 `PATH`, `$DEPOT_TOOLS`, `~/depot_tools` 순으로 찾는다.
 - `args.gn`은 개발·시험 빌드라 `pegboard_test_hooks = true`다(브라우저 쪽 시험 훅, `//pegboard/ui/test_hooks.gni`). 사람에게 줄 빌드는 이것을 켜지 않는다: 그러면 환경 변수로도 확인 창의 자동 답을 켤 수 없다.
 - `args.gn`에는 `enable_nacl`이 없다. 이 버전에서는 효과가 없다고 `gn`이 경고한다. 대신 `disable_fieldtrial_testing_config = true`가 있다. 이것이 없으면 Chromium 이름의 빌드가 `testing/variations/fieldtrial_testing_config.json`의 실험을 켜고, 그중 `AperitifHelpers`의 도우미 프로세스가 샌드박스를 못 열고 죽어 네트워크가 안 된다(작업 7에서 겪음).
+
+## 배포 빌드
+
+`browser/scripts/build.sh <src> release`는 `args.release.gn`으로 `<src>/out/Release/Pegboard.app`을 만든다(둘째 인자가 없거나 `dev`면 지금처럼 `args.gn` → `out/Pegboard`). 산출 디렉터리가 따로라 개발 빌드와 배포 빌드가 둘 다 증분으로 남는다. 빈 상태는 개발 빌드와 같이 약 2시간 45분이고 디스크를 약 10 GB 더 쓴다. 도구 시간 제한에 끊기지 않게 `nohup browser/scripts/build.sh <src> release > <로그> 2>&1 &`로 떼어 돌리고 로그 끝의 `== built in …`을 본다. `PEGBOARD_BUILD_JOBS`는 8보다 크면 거부한다. 배포 빌드는 브라우저 쪽 시험 훅이 빠져 있어 `PEGBOARD_TEST_HOOKS`를 줘도 확인 창이 자동으로 답하지 않는다. `is_official_build`는 켜지 않는다(3c 설계 R3). `bash browser/scripts/test_release_args.sh`가 두 인자 파일의 차이와 공통 설정을 확인한다.
 
 ## 패치 고치기
 

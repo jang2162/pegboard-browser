@@ -11,8 +11,10 @@ WORK_BRANCH="pegboard-work"
 PEGBOARD_SUBJECT="pegboard"
 # The commit subject of the generated string change (rebrand-strings.py), the last commit.
 GENERATED_SUBJECT="rebrand-strings (generated)"
-# The build directory under the Chromium tree.
+# The development build directory under the Chromium tree (out_dir_for dev).
 OUT_DIR="out/Pegboard"
+# The most parallel jobs a build may use: more has hung the build machine (kernel panic).
+MAX_BUILD_JOBS=8
 
 die() {
   echo "error: $*" >&2
@@ -51,4 +53,23 @@ require_clean() {
   if [ -n "$untracked" ]; then
     die "$src has untracked files under pegboard/ (commit or remove them): $(echo "$untracked" | head -5 | tr '\n' ' ')"
   fi
+}
+
+# The build directory under the Chromium tree for a build kind: dev (development and test,
+# browser/args.gn) or release (the build for people, browser/args.release.gn).
+out_dir_for() {
+  case "$1" in
+    dev) echo "$OUT_DIR" ;;
+    release) echo "out/Release" ;;
+    *) die "unknown build kind: $1 (dev or release)" ;;
+  esac
+}
+
+# The GN arguments file for a build kind (see out_dir_for).
+args_for() {
+  case "$1" in
+    dev) echo "$BROWSER_DIR/args.gn" ;;
+    release) echo "$BROWSER_DIR/args.release.gn" ;;
+    *) die "unknown build kind: $1 (dev or release)" ;;
+  esac
 }
