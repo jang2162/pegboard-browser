@@ -45,6 +45,39 @@ pub enum BrowserConfig {
     ForkLaunched { binary: PathBuf },
 }
 
+/// Features every test launch of the fork turns off. Chromium's code-sign clone
+/// (`kMacAppCodeSignClone`, on by default) copies the app bundle at each launch and removes
+/// the copy only on a normal quit; tests kill the browser, so the copies piled up in
+/// `$TMPDIR/../X/app.pegboard.browser.code_sign_clone/` until a reboot (888 of them, about
+/// 35 GB, on the test machine). The product's launch keeps it: a person quits normally, and
+/// the clone keeps a running app whole while an update replaces its bundle.
+pub const FORK_TEST_DISABLED_FEATURES: &[&str] = &["MacAppCodeSignClone"];
+
+/// `extra` (a test launch's own arguments) with every `--disable-features=` in it merged
+/// with `FORK_TEST_DISABLED_FEATURES` into one flag at the end: Chromium reads only the last
+/// `--disable-features`, so a second one would undo the first.
+pub fn fork_test_args<S: AsRef<str>>(extra: &[S]) -> Vec<String> {
+    const FLAG: &str = "--disable-features=";
+    let mut features: Vec<String> = FORK_TEST_DISABLED_FEATURES
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+    let mut args = Vec::new();
+    for arg in extra.iter().map(AsRef::as_ref) {
+        match arg.strip_prefix(FLAG) {
+            Some(list) => features.extend(
+                list.split(',')
+                    .filter(|f| !f.is_empty() && !features.iter().any(|g| g == f))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ),
+            None => args.push(arg.to_string()),
+        }
+    }
+    args.push(format!("{FLAG}{}", features.join(",")));
+    args
+}
+
 /// The fork's app bundle or executable the tests are to launch: the test variable
 /// `PEGBOARD_TEST_BROWSER=fork:<Pegboard.app>`. `None`: stock Chrome.
 pub fn test_fork_binary() -> Option<PathBuf> {
@@ -325,6 +358,7 @@ impl Browser {
             // Test and development only: a build's first "Pegboard Safe Storage" keychain
             // prompt would hold every HTTP request until someone answers it.
             .arg("--use-mock-keychain")
+            .args(fork_test_args::<&str>(&[]))
             .args(test_host_rules())
             .args(test_address_spaces())
             .stdin(Stdio::null())
@@ -1078,5 +1112,86 @@ mod fork_tests {
         std::fs::File::from(read).read_to_end(&mut got).unwrap();
         assert_eq!(got, b"{\"id\":1}\0");
         assert!(child.wait().unwrap().success());
+    }
+}
+
+#[cfg(test)]
+mod code_sign_clone_tests {
+    use super::fork_test_args;
+    use std::path::Path;
+
+    #[test]
+    fn fork_test_args_merge_into_one_disable_features() {
+        assert_eq!(
+            fork_test_args::<&str>(&[]),
+            vec!["--disable-features=MacAppCodeSignClone"]
+        );
+        assert_eq!(
+            fork_test_args(&[
+                "--load-extension=x",
+                "--disable-features=A,B",
+                "--no-startup-window",
+                "--disable-features=MacAppCodeSignClone,C",
+            ]),
+            vec![
+                "--load-extension=x",
+                "--no-startup-window",
+                "--disable-features=MacAppCodeSignClone,A,B,C",
+            ]
+        );
+    }
+
+    /// Every launch of the fork in the tests (each passes the test-only mock keychain flag)
+    /// goes with `fork_test_args`, so the code-sign clone is off; so does the manual-check
+    /// script. A new launch without it fails here.
+    #[test]
+    fn every_fork_test_launch_turns_off_the_code_sign_clone() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo = manifest.join("../..");
+        // Built here, so this test's own text does not count.
+        let launch = format!("\"--use-{}\"", "mock-keychain");
+        let calls = [
+            format!("{}(", "fork_test_args"),
+            format!("{}::<", "fork_test_args"),
+        ];
+        let mut files = vec![manifest.join("src/browser.rs")];
+        for dir in ["crates/pegboard-core/tests", "crates/pegboard-cli/tests"] {
+            for entry in std::fs::read_dir(repo.join(dir)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let mut launches = 0;
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let code: Vec<&str> = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect();
+            let n = code.iter().filter(|l| l.contains(&launch)).count();
+            let with = code
+                .iter()
+                .filter(|l| calls.iter().any(|c| l.contains(c.as_str())))
+                .count();
+            assert!(
+                with >= n,
+                "{}: {n} fork launches, {with} with fork_test_args",
+                file.display()
+            );
+            launches += n;
+        }
+        assert!(launches >= 7, "only {launches} fork launches found");
+        let script =
+            std::fs::read_to_string(repo.join("docs/plans/phase3b-notes/manual-3b.sh")).unwrap();
+        let opens = script.matches("--use-mock-keychain").count();
+        assert_eq!(
+            script
+                .matches("--disable-features=MacAppCodeSignClone")
+                .count(),
+            opens,
+            "manual-3b.sh"
+        );
     }
 }

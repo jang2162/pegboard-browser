@@ -60,7 +60,7 @@ impl Fork {
             .arg("--no-default-browser-check")
             // No "Pegboard Safe Storage" keychain prompt holding every HTTP request.
             .arg("--use-mock-keychain")
-            .args(extra)
+            .args(pegboard_core::browser::fork_test_args(extra))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -152,6 +152,7 @@ impl Fork {
                 .arg(format!("--profile-directory={dir}"))
                 .arg("--no-first-run")
                 .arg("--use-mock-keychain")
+                .args(pegboard_core::browser::fork_test_args::<&str>(&[]))
                 .arg("about:blank")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

@@ -83,7 +83,8 @@ EOF
   hooks=()   # PBM_HOOKS=1: measurement only (the browser logs its dialogs; nothing answers)
   [ "${PBM_HOOKS:-}" = 1 ] && hooks=(--env PEGBOARD_TEST_HOOKS=1 --env PEGBOARD_TEST_DIALOG_LOG=$ST/dialogs.jsonl)
   open -n -a "$APP" --env PEGBOARD_HOME=$H "${hooks[@]}" --args --user-data-dir=$UDD \
-    --use-mock-keychain --no-first-run --no-default-browser-check || die "open 실패"
+    --use-mock-keychain --disable-features=MacAppCodeSignClone \
+    --no-first-run --no-default-browser-check || die "open 실패"
   wait_daemon
   say "켜졌다. 창 하나(사람 프로필)가 떴는지 본다. 그다음: upload, upload-dir, state, storage, giveup"
   ;;

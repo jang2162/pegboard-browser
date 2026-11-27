@@ -43,6 +43,7 @@ impl PipeLink {
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--use-mock-keychain")
+            .args(pegboard_core::browser::fork_test_args::<&str>(&[]))
             .arg("about:blank")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

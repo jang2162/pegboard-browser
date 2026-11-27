@@ -128,6 +128,7 @@ async fn hosted_start_closes_leftover_agent_tabs() {
         .arg("--no-default-browser-check")
         // No "Pegboard Safe Storage" keychain prompt holding every HTTP request.
         .arg("--use-mock-keychain")
+        .args(pegboard_core::browser::fork_test_args::<&str>(&[]))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

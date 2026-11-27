@@ -75,6 +75,7 @@ impl RawLink {
             // A fresh build has no "Pegboard Safe Storage" keychain item yet: creating it asks
             // the user, and until they answer the cookie store (so every HTTP request) waits.
             .arg("--use-mock-keychain")
+            .args(pegboard_core::browser::fork_test_args::<&str>(&[]))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

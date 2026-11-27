@@ -238,7 +238,7 @@ impl App {
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg(format!("--host-resolver-rules={}", self.rules()))
-            .args(extra);
+            .args(pegboard_core::browser::fork_test_args(extra));
         let status = cmd.status().unwrap();
         assert!(status.success(), "open failed: {status}");
     }

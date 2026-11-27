@@ -433,6 +433,7 @@ class Updater {
   2. 다시 켜기 → 창이 없어야 한다.
   3. 사용자가 그 항목을 키체인 접근에서 지운 뒤 첫 실행 → 창이 뜨는지(새 항목 만들기).
   4. 같은 `Info.plist`에 `N=2`로만 다시 묶고 서명한 앱으로 바꿔 끼워 켜기(업데이트 흉내) → 창이 없어야 한다. 뜨면 **멈추고** `codesign -d -r- `의 지정 요구 사항을 두 판에서 비교해 보고한다.
+- [ ] **Step 4b: 코드 서명 사본이 남지 않는지 본다.** Chromium의 `MacAppCodeSignClone`(기본 켜짐)은 켤 때마다 앱 번들을 `$TMPDIR/../X/app.pegboard.browser.code_sign_clone/`에 복제하고 보통 종료 때만 지운다(시험 실행은 끄지 않고 죽이므로 시험은 `--disable-features=MacAppCodeSignClone`로 끈다, `browser::fork_test_args`). 배포 앱은 그대로 켠다: 보통 실행 → 그 디렉터리에 사본 하나 → 메뉴의 "종료"(⌘Q)로 끔 → 사본이 없어졌는지(`ls`·`du -sh`). 남으면 멈추고 보고한다.
 - [ ] **Step 5: `AperitifHelpers`를 잰다(R14):** 같은 앱을 `--user-data-dir=<임시> --enable-features=AperitifHelpers`로 켜고 로컬 시험 서버로 HTTP 요청 하나, `Pegboard Helper (Aperitif).app`이 떴는지와 `aperitif: Failed to initialize sandbox`가 로그에 있는지. 결과를 적는다(`disable_fieldtrial_testing_config`는 결과와 상관없이 둔다, 설계 R14).
 - [ ] **Step 6: 퇴행:** 같은 커밋의 개발 앱(`package-dev.sh`, 시험 훅 빌드)으로 3b 작업 11의 두 명령 그대로(포크 `pegboard-core` 전체, 순정 워크스페이스 전체 `--skip diag_`). 기대: 3b 끝과 같은 수 + 3c에서 더한 시험, 실패 0. 녹화 지연 중앙값 60ms 이하.
 - [ ] **Step 7: 측정을 spike-findings "3c 작업 12"에 적고 커밋** `docs: phase 3c release build measurements (keychain, Aperitif, hooks)`
