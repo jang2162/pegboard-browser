@@ -22,12 +22,19 @@ namespace pegboard::test_hooks {
 
 namespace {
 
+constexpr base::TimeDelta kDefaultAnswerAfter = base::Milliseconds(1700);
+
+}  // namespace
+
+#if BUILDFLAG(PEGBOARD_TEST_HOOKS)
+
+namespace {
+
 constexpr char kHooks[] = "PEGBOARD_TEST_HOOKS";
 constexpr char kLog[] = "PEGBOARD_TEST_DIALOG_LOG";
 constexpr char kAnswer[] = "PEGBOARD_TEST_DIALOG_ANSWER";
 constexpr char kAnswerAfter[] = "PEGBOARD_TEST_DIALOG_ANSWER_AFTER_MS";
 constexpr char kInputAt[] = "PEGBOARD_TEST_DIALOG_INPUT_AT_MS";
-constexpr base::TimeDelta kDefaultAnswerAfter = base::Milliseconds(1700);
 
 // The value of the test variable `name`, only with test hooks on.
 std::optional<std::string> Var(base::cstring_view name) {
@@ -40,11 +47,7 @@ std::optional<std::string> Var(base::cstring_view name) {
 }  // namespace
 
 bool Enabled() {
-#if BUILDFLAG(PEGBOARD_TEST_HOOKS)
   return base::Environment::Create()->HasVar(kHooks);
-#else
-  return false;
-#endif
 }
 
 void LogDialog(const base::DictValue& entry) {
@@ -117,5 +120,30 @@ std::vector<base::TimeDelta> InputAt() {
   }
   return at;
 }
+
+#else  // BUILDFLAG(PEGBOARD_TEST_HOOKS)
+
+// A build without test hooks (the release build): no hook's name and no
+// environment read is compiled in; each hook is off.
+
+bool Enabled() {
+  return false;
+}
+
+void LogDialog(const base::DictValue& entry) {}
+
+std::optional<std::string> AnswerFor(const std::string& session_name) {
+  return std::nullopt;
+}
+
+base::TimeDelta AnswerAfter() {
+  return kDefaultAnswerAfter;
+}
+
+std::vector<base::TimeDelta> InputAt() {
+  return {};
+}
+
+#endif  // BUILDFLAG(PEGBOARD_TEST_HOOKS)
 
 }  // namespace pegboard::test_hooks
